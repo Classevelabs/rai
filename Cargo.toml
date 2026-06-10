@@ -1,0 +1,15 @@
+[workspace]
+members = ["rem-nra", "rai-core", "rai-server", "rai-compress", "rai-infer"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["ClassEve"]
+license = "Apache-2.0"
+homepage = "https://classeve.com"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

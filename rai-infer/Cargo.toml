@@ -1,0 +1,40 @@
+[package]
+name = "rai-infer"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+description = "CPU inference engine for 4-bit quantized LLMs — hand-written AVX2 GEMM kernels, .raimodel format, speculative decoding"
+
+[dependencies]
+memmap2 = "0.9"
+half = "2.4"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokenizers = "0.21"
+rand = "0.8"
+rayon = "1.10"
+tiny_http = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[bin]]
+name = "rai-generate"
+path = "src/bin/generate.rs"
+
+[[bin]]
+name = "rai-chat"
+path = "src/bin/chat.rs"
+
+[[bin]]
+name = "profile-fwd"
+path = "src/bin/profile_fwd.rs"
+
+[[bin]]
+name = "gemm-bench"
+path = "src/bin/gemm_bench.rs"
+
+[[bin]]
+name = "bw-bench"
+path = "src/bin/bw_bench.rs"

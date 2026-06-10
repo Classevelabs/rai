@@ -1,0 +1,35 @@
+# Rust build artifacts
+/target/
+**/target/
+
+# Environment files
+.env
+.env.*
+
+# Model weights, calibration data, and other large local assets
+*.raimodel
+*.safetensors
+*.bin
+*.gguf
+*.npy
+test_weights/
+rai-infer/scripts/tokenizer.json
+rai-infer/scripts/mistral-tokenizer.json
+rai-infer/scripts/teacher_data/
+rai-infer/scripts/train.log
+
+# Python cache
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Cargo.lock is intentionally tracked (this workspace ships binaries)

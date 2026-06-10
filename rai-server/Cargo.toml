@@ -1,0 +1,18 @@
+[package]
+name = "rai-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+description = "Local REST and MCP server for the RAI memory and reasoning layer"
+
+[dependencies]
+rai-core = { path = "../rai-core" }
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tower-http = { version = "0.6", features = ["cors"] }
+log = "0.4"
+env_logger = "0.11"
