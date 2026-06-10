@@ -1,11 +1,17 @@
 [package]
-name = "rai-compress"
+name = "classeve-rai-compress"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 homepage.workspace = true
+repository.workspace = true
 description = "Weight quantization and compression toolkit — GPTQ with calibration, adaptive bit allocation, bit-packing"
+
+# Keep the original crate (import) name: benches do `use rai_compress::...`.
+[lib]
+name = "rai_compress"
+path = "src/lib.rs"
 
 [dependencies]
 nalgebra = { version = "0.33", features = ["serde-serialize"] }

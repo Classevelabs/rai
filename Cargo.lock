@@ -324,6 +324,75 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a822ea5bc7590f9d40f1ba12c0dc3c2760f3482c6984db1573ad11031420831"
 
 [[package]]
+name = "classeve-rai-compress"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "nalgebra",
+ "rand 0.8.5",
+ "rand_distr",
+ "serde",
+]
+
+[[package]]
+name = "classeve-rai-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "classeve-rai-rem-nra",
+ "log",
+ "nalgebra",
+ "rand 0.8.5",
+ "rand_distr",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "classeve-rai-infer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "half",
+ "memmap2",
+ "rand 0.8.5",
+ "rayon",
+ "serde",
+ "serde_json",
+ "tiny_http",
+ "tokenizers",
+]
+
+[[package]]
+name = "classeve-rai-rem-nra"
+version = "0.1.0"
+dependencies = [
+ "nalgebra",
+ "rand 0.8.5",
+ "rand_distr",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "classeve-rai-server"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "classeve-rai-core",
+ "env_logger",
+ "log",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower-http",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1446,64 +1515,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
 
 [[package]]
-name = "rai-compress"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "nalgebra",
- "rand 0.8.5",
- "rand_distr",
- "serde",
-]
-
-[[package]]
-name = "rai-core"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "log",
- "nalgebra",
- "rand 0.8.5",
- "rand_distr",
- "rem-nra",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
-]
-
-[[package]]
-name = "rai-infer"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "half",
- "memmap2",
- "rand 0.8.5",
- "rayon",
- "serde",
- "serde_json",
- "tiny_http",
- "tokenizers",
-]
-
-[[package]]
-name = "rai-server"
-version = "0.1.0"
-dependencies = [
- "axum",
- "env_logger",
- "log",
- "rai-core",
- "serde",
- "serde_json",
- "tokio",
- "tower-http",
-]
-
-[[package]]
 name = "rand"
 version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1646,17 +1657,6 @@ name = "regex-syntax"
 version = "0.8.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
-
-[[package]]
-name = "rem-nra"
-version = "0.1.0"
-dependencies = [
- "nalgebra",
- "rand 0.8.5",
- "rand_distr",
- "serde",
- "thiserror",
-]
 
 [[package]]
 name = "reqwest"

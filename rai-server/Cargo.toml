@@ -1,14 +1,22 @@
 [package]
-name = "rai-server"
+name = "classeve-rai-server"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 homepage.workspace = true
+repository.workspace = true
 description = "Local REST and MCP server for the RAI memory and reasoning layer"
 
+# Keep the installed binary named `rai-server` (default would follow the package name).
+[[bin]]
+name = "rai-server"
+path = "src/main.rs"
+
 [dependencies]
-rai-core = { path = "../rai-core" }
+# Dependency key stays `rai-core` so `use rai_core::...` keeps resolving;
+# `package` points at the published crates.io name.
+rai-core = { path = "../rai-core", version = "0.1.0", package = "classeve-rai-core" }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

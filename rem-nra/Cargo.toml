@@ -1,11 +1,17 @@
 [package]
-name = "rem-nra"
+name = "classeve-rai-rem-nra"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 homepage.workspace = true
+repository.workspace = true
 description = "Local resonance memory backend used by the RAI workspace"
+
+# Keep the original crate (import) name: code does `use rem_nra::...`.
+[lib]
+name = "rem_nra"
+path = "src/lib.rs"
 
 [dependencies]
 nalgebra = { version = "0.33", features = ["serde-serialize"] }
