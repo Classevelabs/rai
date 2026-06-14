@@ -126,7 +126,7 @@ impl RaiModelFile {
         }
 
         // Parse header
-        if &data[0..4] != MAGIC {
+        if data[0..4] != MAGIC {
             bail!("invalid magic bytes");
         }
         let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
@@ -200,7 +200,7 @@ impl RaiModelFile {
         let vocab = self.config.vocab_size as usize;
         let hidden = self.config.hidden_size as usize;
         let gs = self.config.embed_group_size as usize;
-        let num_groups = (hidden + gs - 1) / gs;
+        let num_groups = hidden.div_ceil(gs);
         let params_size = vocab * num_groups * 4;
         let data_size = vocab * hidden;
 
@@ -261,7 +261,7 @@ impl RaiModelFile {
             }
             offset += 8;
 
-            let num_groups = (cols + gs - 1) / gs;
+            let num_groups = cols.div_ceil(gs);
             let params_size = rows * num_groups * 4;
             let nibble_size = rows * cols / 2;
 
@@ -349,7 +349,7 @@ impl RaiModelFile {
             bail!("lm_head dimension mismatch: expected ({vocab},{hidden}), got ({rows},{cols})");
         }
 
-        let num_groups = (cols + gs - 1) / gs;
+        let num_groups = cols.div_ceil(gs);
         let params_size = rows * num_groups * 4;
         let nibble_size = rows * cols / 2;
         let offset = 8;

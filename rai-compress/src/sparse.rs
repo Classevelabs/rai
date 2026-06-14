@@ -1,11 +1,11 @@
-/// Sparse outlier extraction.
-///
-/// Key insight: after SVD, the residual has a few large outliers and
-/// many near-zero values. The outliers dominate quantization error.
-/// By extracting them at full precision and quantizing only the dense
-/// remainder, we get dramatically better accuracy at minimal cost.
-///
-/// This is the single biggest accuracy win in the pipeline.
+//! Sparse outlier extraction.
+//!
+//! Key insight: after SVD, the residual has a few large outliers and
+//! many near-zero values. The outliers dominate quantization error.
+//! By extracting them at full precision and quantizing only the dense
+//! remainder, we get dramatically better accuracy at minimal cost.
+//!
+//! This is the single biggest accuracy win in the pipeline.
 
 /// Sparse + Dense decomposition of a residual vector.
 #[derive(Debug, Clone)]
@@ -28,7 +28,11 @@ impl SparseDenseDecomp {
     /// `fraction` = fraction of values to treat as outliers (e.g., 0.01 = top 1%)
     pub fn from_residual(values: &[f64], fraction: f64) -> Self {
         let n = values.len();
-        let k = ((n as f64 * fraction).ceil() as usize).max(1).min(n);
+        let k = if n == 0 {
+            0
+        } else {
+            ((n as f64 * fraction).ceil() as usize).clamp(1, n)
+        };
 
         // Find the threshold: k-th largest absolute value
         let mut abs_values: Vec<(usize, f64)> = values

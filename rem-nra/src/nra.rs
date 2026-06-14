@@ -160,6 +160,10 @@ impl NonlinearResonanceMemory {
         self.items.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
     pub fn items(&self) -> &[(Vec64, Vec64)] {
         &self.items
     }

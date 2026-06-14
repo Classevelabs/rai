@@ -5,7 +5,7 @@ language models with hand-written AVX2 kernels — no GPU, no Python runtime, no
 PyTorch, no GGML, no BLAS. Load a `.raimodel` file and generate text on any
 modern x86-64 laptop.
 
-Built by [ClassEve](https://classeve.com). Licensed under Apache-2.0.
+Built by [Classeve](https://classeve.com). Licensed under Apache-2.0.
 
 ## Why
 
@@ -37,6 +37,14 @@ dependency tree fits in a `Cargo.lock`.
 | `rai-core` | Memory, embedding, and reasoning primitives used by `rai-server` |
 | `rem-nra` | Resonance-memory backend used by `rai-core` |
 
+## Documentation
+
+- [Installation](./docs/INSTALL.md)
+- [Architecture](./docs/ARCHITECTURE.md)
+- [Benchmarks](./BENCHMARKS.md)
+- [Release procedure](./docs/RELEASE.md)
+- [Security policy](./SECURITY.md)
+
 ## Requirements
 
 | Requirement | Details |
@@ -56,12 +64,38 @@ dependency tree fits in a `Cargo.lock`.
 cargo build --workspace --release
 ```
 
+## Install
+
+Install the end-user inference binaries (`rai-generate`, `rai-chat`,
+`profile-fwd`, `gemm-bench`, and `bw-bench`) directly from GitHub:
+
+```bash
+cargo install --git https://github.com/classeve-public/rai \
+  --package classeve-rai-infer \
+  --locked
+```
+
+Install the local REST/MCP server:
+
+```bash
+cargo install --git https://github.com/classeve-public/rai \
+  --package classeve-rai-server \
+  --locked
+```
+
+For local development from a checkout:
+
+```bash
+cargo install --path rai-infer --locked
+cargo install --path rai-server --locked
+```
+
 Development checks:
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets
-cargo test --workspace
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
 ```
 
 ## Get a model
@@ -215,24 +249,30 @@ compression-quality measurements.
 
 ## Project status
 
-RAI is young software, released because it is useful and readable — not
-because it is finished. Interfaces may change. Current state:
+RAI is an active initial public release from Classeve. The Rust workspace,
+CPU inference path, quantization toolkit, REST/MCP server, tests, benchmarks,
+and CI gates are public and maintained. Current production-readiness boundaries:
 
-- Small models (135M class) are well-exercised end to end; Mistral-7B-family
-  export and inference paths exist and are under active development.
-- Quantization quality is measured by Hessian-weighted output error against
-  an FP16 reference (see BENCHMARKS.md); published perplexity sweeps are
-  planned.
-- x86-64 only for the optimized paths. There is a scalar fallback, but ARM
-  NEON kernels are future work.
+- Small models (135M class) are exercised end to end; Mistral-7B-family export
+  and inference paths are available and continue to be hardened.
+- Quantization quality is measured by Hessian-weighted output error against an
+  FP16 reference (see BENCHMARKS.md). End-to-end perplexity sweeps are still a
+  planned benchmark addition, not a claimed result.
+- Optimized inference targets x86-64 CPUs with AVX2, FMA, and F16C. Scalar
+  fallbacks exist for portability, while dedicated ARM NEON kernels remain on
+  the roadmap.
+- Public APIs may evolve before `1.0`; release notes will call out breaking
+  changes.
 
-Issues and PRs are welcome.
+Security reports, issues, and pull requests are welcome. See
+[SECURITY.md](./SECURITY.md), [SUPPORT.md](./SUPPORT.md), and
+[CONTRIBUTING.md](./CONTRIBUTING.md).
 
 ## About
 
-Built and maintained by [ClassEve](https://classeve.com) — engineering for AI agents and developer tooling. Project page: [classeve.com/public/rai](https://classeve.com/public/rai).
+Built and maintained by [Classeve](https://classeve.com) — engineering for AI agents and developer tooling. Project page: [classeve.com/public/rai](https://classeve.com/public/rai).
 
 ## License
 
 Apache License 2.0 — see [LICENSE](./LICENSE).
-Copyright 2025-2026 ClassEve.
+Copyright 2025-2026 Classeve.

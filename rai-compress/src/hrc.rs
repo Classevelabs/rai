@@ -551,7 +551,6 @@ mod tests {
     /// The big test: simulate a full transformer layer's worth of weights.
     #[test]
     fn hrc_full_transformer_layer() {
-        let mut rng = rand::thread_rng();
         let d_model = 256;
         let d_ff = d_model * 4;
 

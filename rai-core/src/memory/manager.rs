@@ -449,6 +449,12 @@ impl MemoryManager {
         nra.len()
     }
 
+    /// Return true when no memories are stored.
+    pub async fn is_empty(&self) -> bool {
+        let nra = self.nra.lock().await;
+        nra.is_empty()
+    }
+
     /// Take an NRA energy snapshot for external use.
     pub async fn energy_snapshot(&self) -> Vec<(Vec64, f64)> {
         let nra = self.nra.lock().await;

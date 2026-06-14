@@ -24,13 +24,13 @@
 //! better estimate than any single noisy sample.
 //! - Pass 1: clean (writes KV cache normally)
 //! - Pass 2..N: noisy (read-only, don't modify KV cache)
-//! Cost: N forward passes. Quality: smoother, more calibrated distributions.
+//!   Cost: N forward passes. Quality: smoother, more calibrated distributions.
 //!
 //! ## 3. Adaptive Confidence Gating
 //! Don't waste compute on easy tokens. Run 1 forward pass, check entropy:
 //! - Low entropy (confident) → emit immediately. 1 forward pass.
 //! - High entropy (uncertain) → apply CFG + ensemble. 2-N forward passes.
-//! Average cost: 1.3-1.8x depending on text difficulty. Maximum quality gain.
+//!   Average cost: 1.3-1.8x depending on text difficulty. Maximum quality gain.
 
 use crate::kv_cache::KVCache;
 use crate::model::{InferenceWork, RaiModel};
@@ -383,7 +383,7 @@ fn forward_cfg_ensemble(
     let mut logits_cond_sum = work.scratch.logits.clone();
 
     // Pass 2..N-1: Noisy conditional (read-only KV)
-    let noisy_passes = if n > 2 { n - 2 } else { 0 };
+    let noisy_passes = n.saturating_sub(2);
     for _ in 0..noisy_passes {
         work2.hidden.resize(hs, 0.0);
         model.embed_token(token_id, &mut work2.hidden)?;
@@ -609,7 +609,7 @@ mod tests {
     #[test]
     fn test_cfg_math() {
         let cond = vec![1.0, 2.0, 3.0];
-        let uncond = vec![0.5, 0.5, 0.5];
+        let uncond = [0.5, 0.5, 0.5];
         let scale = 1.0;
         let result: Vec<f32> = uncond
             .iter()

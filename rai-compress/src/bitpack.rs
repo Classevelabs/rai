@@ -14,10 +14,10 @@ pub struct BitPacker {
 impl BitPacker {
     /// Pack a slice of unsigned integers using `bits` bits each.
     pub fn pack(values: &[u32], bits: u8) -> Self {
-        assert!(bits > 0 && bits <= 8, "bits must be 1-8");
+        assert!((1..=8).contains(&bits), "bits must be 1-8");
         let mask = (1u32 << bits) - 1;
         let total_bits = values.len() * bits as usize;
-        let num_bytes = (total_bits + 7) / 8;
+        let num_bytes = total_bits.div_ceil(8);
         let mut data = vec![0u8; num_bytes];
 
         for (i, &val) in values.iter().enumerate() {

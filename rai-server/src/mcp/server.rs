@@ -1,6 +1,7 @@
 use crate::mcp::schema::{JsonRpcRequest, JsonRpcResponse, ToolCallResult};
 use crate::mcp::tools::tool_definitions;
 use rai_core::MemoryManager;
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -23,23 +24,25 @@ pub async fn run_mcp_stdio(manager: Arc<MemoryManager>) {
             Ok(r) => r,
             Err(e) => {
                 let resp = JsonRpcResponse::error(Value::Null, -32700, format!("Parse error: {e}"));
-                let out = serde_json::to_string(&resp).unwrap();
-                let _ = stdout.write_all(out.as_bytes()).await;
-                let _ = stdout.write_all(b"\n").await;
-                let _ = stdout.flush().await;
+                write_response(&mut stdout, &resp).await;
                 continue;
             }
         };
 
         let response = handle_request(&manager, request).await;
-        let out = serde_json::to_string(&response).unwrap();
-        let _ = stdout.write_all(out.as_bytes()).await;
-        let _ = stdout.write_all(b"\n").await;
-        let _ = stdout.flush().await;
+        write_response(&mut stdout, &response).await;
     }
 }
 
 async fn handle_request(manager: &Arc<MemoryManager>, request: JsonRpcRequest) -> JsonRpcResponse {
+    if request.jsonrpc != "2.0" {
+        return JsonRpcResponse::error(
+            request.id,
+            -32600,
+            "Invalid JSON-RPC version; expected 2.0".to_string(),
+        );
+    }
+
     match request.method.as_str() {
         "initialize" => JsonRpcResponse::success(
             request.id,
@@ -79,7 +82,14 @@ async fn handle_request(manager: &Arc<MemoryManager>, request: JsonRpcRequest) -
 
             let result = handle_tool_call(manager, tool_name, arguments).await;
 
-            JsonRpcResponse::success(request.id, serde_json::to_value(result).unwrap())
+            match serde_json::to_value(result) {
+                Ok(value) => JsonRpcResponse::success(request.id, value),
+                Err(e) => JsonRpcResponse::error(
+                    request.id,
+                    -32603,
+                    format!("Failed to serialize tool result: {e}"),
+                ),
+            }
         }
 
         _ => JsonRpcResponse::error(
@@ -88,6 +98,33 @@ async fn handle_request(manager: &Arc<MemoryManager>, request: JsonRpcRequest) -
             format!("Method not found: {}", request.method),
         ),
     }
+}
+
+async fn write_response(stdout: &mut tokio::io::Stdout, response: &JsonRpcResponse) {
+    let out = match serde_json::to_string(response) {
+        Ok(out) => out,
+        Err(e) => {
+            log::error!("failed to serialize MCP response: {e}");
+            return;
+        }
+    };
+
+    if let Err(e) = stdout.write_all(out.as_bytes()).await {
+        log::error!("failed to write MCP response: {e}");
+        return;
+    }
+    if let Err(e) = stdout.write_all(b"\n").await {
+        log::error!("failed to terminate MCP response: {e}");
+        return;
+    }
+    if let Err(e) = stdout.flush().await {
+        log::error!("failed to flush MCP response: {e}");
+    }
+}
+
+fn pretty_json<T: Serialize>(value: &T) -> Result<String, ToolCallResult> {
+    serde_json::to_string_pretty(value)
+        .map_err(|e| ToolCallResult::error(format!("Failed to serialize response: {e}")))
 }
 
 async fn handle_tool_call(
@@ -103,7 +140,10 @@ async fn handle_tool_call(
             };
             match manager.store(content).await {
                 Ok(report) => {
-                    let text = serde_json::to_string_pretty(&report).unwrap();
+                    let text = match pretty_json(&report) {
+                        Ok(text) => text,
+                        Err(result) => return result,
+                    };
                     ToolCallResult::text(format!(
                         "Stored successfully.\n\nInterference report:\n{text}"
                     ))
@@ -119,7 +159,10 @@ async fn handle_tool_call(
             };
             match manager.recall(query).await {
                 Ok(result) => {
-                    let text = serde_json::to_string_pretty(&result).unwrap();
+                    let text = match pretty_json(&result) {
+                        Ok(text) => text,
+                        Err(result) => return result,
+                    };
                     ToolCallResult::text(text)
                 }
                 Err(e) => ToolCallResult::error(format!("Recall failed: {e}")),
@@ -136,7 +179,10 @@ async fn handle_tool_call(
             };
             match manager.intersect(&concepts).await {
                 Ok(result) => {
-                    let text = serde_json::to_string_pretty(&result).unwrap();
+                    let text = match pretty_json(&result) {
+                        Ok(text) => text,
+                        Err(result) => return result,
+                    };
                     ToolCallResult::text(text)
                 }
                 Err(e) => ToolCallResult::error(format!("Intersect failed: {e}")),
@@ -150,7 +196,10 @@ async fn handle_tool_call(
             };
             match manager.check_contradiction(fact).await {
                 Ok(report) => {
-                    let text = serde_json::to_string_pretty(&report).unwrap();
+                    let text = match pretty_json(&report) {
+                        Ok(text) => text,
+                        Err(result) => return result,
+                    };
                     ToolCallResult::text(text)
                 }
                 Err(e) => ToolCallResult::error(format!("Contradiction check failed: {e}")),
@@ -164,7 +213,10 @@ async fn handle_tool_call(
             };
             match manager.measure_surprise(content).await {
                 Ok(result) => {
-                    let text = serde_json::to_string_pretty(&result).unwrap();
+                    let text = match pretty_json(&result) {
+                        Ok(text) => text,
+                        Err(result) => return result,
+                    };
                     ToolCallResult::text(text)
                 }
                 Err(e) => ToolCallResult::error(format!("Surprise measurement failed: {e}")),
@@ -178,7 +230,10 @@ async fn handle_tool_call(
             };
             match manager.explain_confidence(query).await {
                 Ok(result) => {
-                    let text = serde_json::to_string_pretty(&result).unwrap();
+                    let text = match pretty_json(&result) {
+                        Ok(text) => text,
+                        Err(result) => return result,
+                    };
                     ToolCallResult::text(text)
                 }
                 Err(e) => ToolCallResult::error(format!("Confidence explanation failed: {e}")),
@@ -187,7 +242,10 @@ async fn handle_tool_call(
 
         "rai_memory_health" => match manager.health().await {
             Ok(report) => {
-                let text = serde_json::to_string_pretty(&report).unwrap();
+                let text = match pretty_json(&report) {
+                    Ok(text) => text,
+                    Err(result) => return result,
+                };
                 ToolCallResult::text(text)
             }
             Err(e) => ToolCallResult::error(format!("Health check failed: {e}")),
