@@ -5,6 +5,14 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    ignore:
+      # rand_distr 0.6 moves to the newer rand API while this workspace is on
+      # rand 0.8, which breaks StandardNormal sampling. Handle that migration
+      # intentionally instead of letting Dependabot open red launch-day PRs.
+      - dependency-name: rand_distr
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-major
 
   - package-ecosystem: github-actions
     directory: /
