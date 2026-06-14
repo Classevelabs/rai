@@ -52,8 +52,8 @@ impl GptqResult {
     /// At 4-bit, group_size=128: metadata overhead ~ 0.25 bpw
     pub fn compressed_bytes(&self) -> usize {
         let data_bits = self.rows * self.cols * self.bits as usize;
-        let data_bytes = (data_bits + 7) / 8;
-        let num_groups = (self.cols + self.group_size - 1) / self.group_size;
+        let data_bytes = data_bits.div_ceil(8);
+        let num_groups = self.cols.div_ceil(self.group_size);
         let meta_bytes = self.rows * num_groups * 4;
         data_bytes + meta_bytes
     }
@@ -78,14 +78,14 @@ pub fn gptq_quantize(
     let cols = weights.ncols();
     assert_eq!(hessian.nrows(), cols, "Hessian rows must match weight cols");
     assert_eq!(hessian.ncols(), cols, "Hessian must be square");
-    assert!(bits >= 2 && bits <= 8, "bits must be 2-8");
+    assert!((2..=8).contains(&bits), "bits must be 2-8");
 
     let levels = (1u32 << bits) as f64;
 
     // Working copy of weights (modified during error propagation)
     let mut w = weights.clone();
 
-    let num_groups = (cols + group_size - 1) / group_size;
+    let num_groups = cols.div_ceil(group_size);
 
     // Group params will be computed lazily from current (error-compensated) weights
     // at the start of each group. Indexed as group_params[gid * rows + r].
@@ -185,7 +185,7 @@ pub fn gptq_quantize(
         if block_end < cols {
             let remaining = cols - block_end;
             let h_inv_cross = h_inv.view((block_start, block_end), (bsize, remaining));
-            let update = &err_block * &h_inv_cross;
+            let update = &err_block * h_inv_cross;
             for r in 0..rows {
                 for c in 0..remaining {
                     w[(r, block_end + c)] -= update[(r, c)];
@@ -216,7 +216,7 @@ pub fn gptq_quantize(
 
     let compressed_bytes = {
         let data_bits = rows * cols * bits as usize;
-        let data_bytes = (data_bits + 7) / 8;
+        let data_bytes = data_bits.div_ceil(8);
         let meta_bytes = rows * num_groups * 4;
         data_bytes + meta_bytes
     };

@@ -103,7 +103,7 @@ fn read_f16_le(data: &[u8], offset: usize) -> f32 {
 /// Compute per-group input sums for the factored dequant formula.
 #[inline]
 fn compute_input_sums(input: &[f32], cols: usize, group_size: usize) -> [f32; MAX_GROUPS] {
-    let num_groups = (cols + group_size - 1) / group_size;
+    let num_groups = cols.div_ceil(group_size);
     let mut sums = [0.0f32; MAX_GROUPS];
 
     #[cfg(target_arch = "x86_64")]
@@ -209,8 +209,8 @@ fn quantize_input_split(
         let mut col = start;
         while col + 1 < end {
             let k = col / 2;
-            input_even[k] = (input[col] * inv_scale).round().max(-128.0).min(127.0) as i8;
-            input_odd[k] = (input[col + 1] * inv_scale).round().max(-128.0).min(127.0) as i8;
+            input_even[k] = (input[col] * inv_scale).round().clamp(-128.0, 127.0) as i8;
+            input_odd[k] = (input[col + 1] * inv_scale).round().clamp(-128.0, 127.0) as i8;
             col += 2;
         }
     }
@@ -306,12 +306,10 @@ unsafe fn quantize_input_split_avx2(
             let k = col / 2;
             input_even[k] = (*input.as_ptr().add(col) * inv_scale)
                 .round()
-                .max(-128.0)
-                .min(127.0) as i8;
+                .clamp(-128.0, 127.0) as i8;
             input_odd[k] = (*input.as_ptr().add(col + 1) * inv_scale)
                 .round()
-                .max(-128.0)
-                .min(127.0) as i8;
+                .clamp(-128.0, 127.0) as i8;
             col += 2;
         }
     }
@@ -881,7 +879,7 @@ fn quantize_hidden_i8(
         let inv_scale = 1.0 / scale;
         scales[g] = scale;
         for i in start..end {
-            output[i] = (hidden[i] * inv_scale).round().max(-63.0).min(63.0) as i8;
+            output[i] = (hidden[i] * inv_scale).round().clamp(-63.0, 63.0) as i8;
         }
     }
 }
@@ -957,7 +955,7 @@ unsafe fn quantize_hidden_i8_avx2(
 
         // Scalar tail
         for i in (chunks8 * 8)..len {
-            *(out_ptr.add(i)) = (*inp.add(i) * inv_scale).round().max(-63.0).min(63.0) as i8;
+            *(out_ptr.add(i)) = (*inp.add(i) * inv_scale).round().clamp(-63.0, 63.0) as i8;
         }
     }
 }
@@ -1073,7 +1071,7 @@ fn w4a32_matvec_inner(
             if rows >= PAR_THRESHOLD {
                 // Adaptive chunk sizing: keeps per-chunk weight data in L1 (32KB).
                 let cr = chunk_rows_for(cols);
-                let num_chunks = (rows + cr - 1) / cr;
+                let num_chunks = rows.div_ceil(cr);
                 let out_ptr = SendPtr(output.as_mut_ptr());
                 let nib_ptr = SyncU8Ptr(nibble_data.as_ptr());
                 let inp_f32_ptr = SyncF32Ptr(input.as_ptr());
@@ -1152,7 +1150,7 @@ pub fn w4a32_matvec(
     cols: usize,
     group_size: usize,
 ) {
-    let num_groups = (cols + group_size - 1) / group_size;
+    let num_groups = cols.div_ceil(group_size);
     debug_assert!(num_groups <= MAX_GROUPS);
     let input_sums = compute_input_sums(input, cols, group_size);
     let half_cols = cols / 2;
@@ -1198,7 +1196,7 @@ pub fn w4a32_fused_qkv(
 ) {
     let cols = q_proj.cols;
     let group_size = q_proj.group_size;
-    let num_groups = (cols + group_size - 1) / group_size;
+    let num_groups = cols.div_ceil(group_size);
     let input_sums = compute_input_sums(input, cols, group_size);
     let half_cols = cols / 2;
     let mut input_even = vec![0i8; half_cols];
@@ -1218,9 +1216,9 @@ pub fn w4a32_fused_qkv(
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             let cr = chunk_rows_for(cols);
-            let q_chunks = (q_proj.rows + cr - 1) / cr;
-            let k_chunks = (k_proj.rows + cr - 1) / cr;
-            let v_chunks = (v_proj.rows + cr - 1) / cr;
+            let q_chunks = q_proj.rows.div_ceil(cr);
+            let k_chunks = k_proj.rows.div_ceil(cr);
+            let v_chunks = v_proj.rows.div_ceil(cr);
             let total_chunks = q_chunks + k_chunks + v_chunks;
 
             let q_ptr = SendPtr(q_out.as_mut_ptr());
@@ -1329,7 +1327,7 @@ pub fn w4a32_fused_gate_up(
 ) {
     let cols = gate_proj.cols;
     let group_size = gate_proj.group_size;
-    let num_groups = (cols + group_size - 1) / group_size;
+    let num_groups = cols.div_ceil(group_size);
     let input_sums = compute_input_sums(input, cols, group_size);
     let half_cols = cols / 2;
     let mut input_even = vec![0i8; half_cols];
@@ -1349,8 +1347,8 @@ pub fn w4a32_fused_gate_up(
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             let cr = chunk_rows_for(cols);
-            let g_chunks = (gate_proj.rows + cr - 1) / cr;
-            let u_chunks = (up_proj.rows + cr - 1) / cr;
+            let g_chunks = gate_proj.rows.div_ceil(cr);
+            let u_chunks = up_proj.rows.div_ceil(cr);
             let total_chunks = g_chunks + u_chunks;
 
             let g_ptr = SendPtr(gate_out.as_mut_ptr());
@@ -1462,7 +1460,7 @@ pub struct QuantizedBatchInput {
 impl QuantizedBatchInput {
     /// Quantize a batch of float inputs into int8 even/odd split format.
     pub fn quantize(input: &[f32], cols: usize, num_tokens: usize, group_size: usize) -> Self {
-        let num_groups = (cols + group_size - 1) / group_size;
+        let num_groups = cols.div_ceil(group_size);
         let half_cols = cols / 2;
         let mut sums = Vec::with_capacity(num_tokens);
         let mut even_flat = vec![0i8; num_tokens * half_cols];
@@ -1518,7 +1516,7 @@ pub fn w4a32_matmul_preq(
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             let cr = chunk_rows_for(cols);
-            let num_chunks = (rows + cr - 1) / cr;
+            let num_chunks = rows.div_ceil(cr);
 
             let out_ptr = SendPtr(output.as_mut_ptr());
             let nib_ptr = SyncU8Ptr(nibble_data.as_ptr());
@@ -1551,7 +1549,7 @@ pub fn w4a32_matmul_preq(
                             len,
                             cols,
                             group_size,
-                            (cols + group_size - 1) / group_size,
+                            cols.div_ceil(group_size),
                         );
                     }
                 }
@@ -1575,7 +1573,7 @@ pub fn w4a32_matmul_preq(
                 row,
                 cols,
                 group_size,
-                (cols + group_size - 1) / group_size,
+                cols.div_ceil(group_size),
             );
         }
     }
@@ -1610,7 +1608,7 @@ pub fn w4a32_matmul(
         );
     }
 
-    let num_groups = (cols + group_size - 1) / group_size;
+    let num_groups = cols.div_ceil(group_size);
     let half_cols = cols / 2;
 
     // Pre-quantize all token inputs into flat contiguous buffers (2 allocs, not 2*num_tokens)
@@ -1633,7 +1631,7 @@ pub fn w4a32_matmul(
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             let cr = chunk_rows_for(cols);
-            let num_chunks = (rows + cr - 1) / cr;
+            let num_chunks = rows.div_ceil(cr);
 
             let out_ptr = SendPtr(output.as_mut_ptr());
             let nib_ptr = SyncU8Ptr(nibble_data.as_ptr());
@@ -1712,7 +1710,7 @@ pub fn embed_lookup(
     group_size: usize,
 ) {
     debug_assert!(token_id < vocab_size);
-    let num_groups = (hidden_size + group_size - 1) / group_size;
+    let num_groups = hidden_size.div_ceil(group_size);
     let row_data_start = token_id * hidden_size;
     let row_param_start = token_id * num_groups * 4;
 
@@ -1740,7 +1738,7 @@ pub fn tied_lm_head(
     hidden_size: usize,
     group_size: usize,
 ) {
-    let num_groups = (hidden_size + group_size - 1) / group_size;
+    let num_groups = hidden_size.div_ceil(group_size);
     debug_assert!(num_groups <= MAX_GROUPS);
 
     let hidden_sums = compute_input_sums(hidden, hidden_size, group_size);
@@ -1760,7 +1758,7 @@ pub fn tied_lm_head(
                 num_groups,
             );
 
-            let num_chunks = (vocab_size + LM_CHUNK - 1) / LM_CHUNK;
+            let num_chunks = vocab_size.div_ceil(LM_CHUNK);
             let out_ptr = SendPtr(logits.as_mut_ptr());
             let emb_ptr = SyncU8Ptr(embed_data.as_ptr());
             let hid_i8_ptr = SyncU8Ptr(hidden_i8.as_ptr() as *const u8);
@@ -1818,7 +1816,7 @@ mod _speculative_lm_head {
         hidden_size: usize,
         group_size: usize,
     ) {
-        let num_groups = (hidden_size + group_size - 1) / group_size;
+        let num_groups = hidden_size.div_ceil(group_size);
         debug_assert!(num_groups <= MAX_GROUPS);
 
         // Only use speculative path for large vocabs with enough groups to split
@@ -1861,7 +1859,7 @@ mod _speculative_lm_head {
                 let hscales = hidden_scales;
 
                 // Phase 1: parallel partial evaluation
-                let num_chunks = (vocab_size + LM_CHUNK - 1) / LM_CHUNK;
+                let num_chunks = vocab_size.div_ceil(LM_CHUNK);
                 (0..num_chunks).into_par_iter().for_each(|ci| {
                     let start = ci * LM_CHUNK;
                     let len = LM_CHUNK.min(vocab_size - start);
@@ -2278,7 +2276,7 @@ mod tests {
         let num_groups = 2;
 
         let mut embed_params = vec![0u8; vocab * num_groups * 4];
-        let off = 1 * num_groups * 4;
+        let off = num_groups * 4;
         embed_params[off..off + 2].copy_from_slice(&f16::from_f32(0.1).to_le_bytes());
         embed_params[off + 2..off + 4].copy_from_slice(&f16::from_f32(-0.5).to_le_bytes());
         let off2 = off + 4;
@@ -2286,10 +2284,10 @@ mod tests {
         embed_params[off2 + 2..off2 + 4].copy_from_slice(&f16::from_f32(-1.0).to_le_bytes());
 
         let mut embed_data = vec![0u8; vocab * hidden];
-        embed_data[1 * hidden + 0] = 10;
-        embed_data[1 * hidden + 1] = 20;
-        embed_data[1 * hidden + 2] = 30;
-        embed_data[1 * hidden + 3] = 40;
+        embed_data[hidden] = 10;
+        embed_data[hidden + 1] = 20;
+        embed_data[hidden + 2] = 30;
+        embed_data[hidden + 3] = 40;
 
         let mut output = vec![0.0f32; hidden];
         embed_lookup(

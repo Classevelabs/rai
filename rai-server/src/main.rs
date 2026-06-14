@@ -8,7 +8,7 @@ use rai_core::MemoryManager;
 use std::sync::Arc;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     env_logger::init();
 
     let config = ServerConfig::from_env();
@@ -18,10 +18,12 @@ async fn main() {
     let embedder: Arc<dyn rai_core::embedding::Embedder> = match config.embedding_provider.as_str()
     {
         "openai" => {
-            let api_key = config
-                .openai_api_key
-                .clone()
-                .expect("OPENAI_API_KEY must be set for OpenAI provider");
+            let api_key = config.openai_api_key.clone().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "OPENAI_API_KEY must be set when RAI_EMBEDDING_PROVIDER=openai",
+                )
+            })?;
             Arc::new(OpenAIEmbedder::new(api_key))
         }
         _ => Arc::new(MockEmbedder::new(384)),
@@ -52,6 +54,7 @@ async fn main() {
         // MCP stdio mode for MCP clients (e.g. Claude Desktop, Claude Code)
         log::info!("Starting RAI MCP server on stdio");
         mcp::server::run_mcp_stdio(manager).await;
+        Ok(())
     } else {
         // REST API mode
         let addr = format!("{}:{}", config.host, config.port);
@@ -59,9 +62,7 @@ async fn main() {
 
         let router = api::routes::build_router(manager);
 
-        let listener = tokio::net::TcpListener::bind(&addr)
-            .await
-            .expect("Failed to bind");
+        let listener = tokio::net::TcpListener::bind(&addr).await?;
 
         println!("RAI server listening on {addr}");
         println!("  POST /v1/store       - Store a fact");
@@ -74,6 +75,7 @@ async fn main() {
         println!("  POST /v1/snapshot    - Energy snapshot");
         println!("  GET  /v1/health      - System diagnostics");
 
-        axum::serve(listener, router).await.unwrap();
+        axum::serve(listener, router).await?;
+        Ok(())
     }
 }

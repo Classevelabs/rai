@@ -84,7 +84,7 @@ mod tests {
     #[test]
     fn single_omega_returns_same() {
         let a = DVector::from_vec(vec![0.5, 0.5, 0.0, 0.0]);
-        let result = Compositor::intersect(&[a.clone()]);
+        let result = Compositor::intersect(std::slice::from_ref(&a));
         assert_eq!(result, a);
     }
 }

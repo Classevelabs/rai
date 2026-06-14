@@ -210,7 +210,7 @@ pub fn sac_decompress(compressed: &SACCompressed) -> DMatrix<f64> {
 
     // Stage 1: Denormalize
     // Convert flat back to matrix (column-major, matching nalgebra's iter() order)
-    let w_norm = DMatrix::from_iterator(rows, cols, dense_flat.into_iter());
+    let w_norm = DMatrix::from_iterator(rows, cols, dense_flat);
     compressed.channel_norm.denormalize(&w_norm)
 }
 

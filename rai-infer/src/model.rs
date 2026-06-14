@@ -573,6 +573,12 @@ impl Scratch {
     }
 }
 
+impl Default for Scratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Workspace bundle: hidden state + scratch. Convenience for callers.
 pub struct InferenceWork {
     pub hidden: Vec<f32>,
@@ -585,6 +591,12 @@ impl InferenceWork {
             hidden: Vec::new(),
             scratch: Scratch::new(),
         }
+    }
+}
+
+impl Default for InferenceWork {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -631,5 +643,11 @@ impl BatchScratch {
         self.gate_batch.resize(batch * inter, 0.0);
         self.up_batch.resize(batch * inter, 0.0);
         self.mlp_out.resize(batch * hs, 0.0);
+    }
+}
+
+impl Default for BatchScratch {
+    fn default() -> Self {
+        Self::new()
     }
 }

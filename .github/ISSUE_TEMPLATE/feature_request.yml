@@ -1,0 +1,36 @@
+name: Feature request
+description: Suggest an improvement or integration for RAI.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What should RAI help you do?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior, API, CLI, or documentation change.
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - rai-infer
+        - rai-compress
+        - rai-server
+        - rai-core
+        - rem-nra
+        - documentation
+        - CI/release
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Constraints
+      description: Performance, compatibility, hardware, or model constraints.

@@ -58,7 +58,7 @@ pub fn sample_token(logits: &mut [f32], config: &SamplerConfig, rng: &mut impl R
     if config.top_k > 0 && config.top_k < vocab_size {
         let k = config.top_k;
         // Only allocation: a copy of the values for quickselect (192 KB)
-        let mut vals: Vec<f32> = logits.iter().copied().collect();
+        let mut vals: Vec<f32> = logits.to_vec();
         // Put the k-th largest value at position k-1 (0-indexed)
         vals.select_nth_unstable_by(k - 1, |a, b| {
             b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)

@@ -143,9 +143,8 @@ impl<'a> SelfSpecDecoder<'a> {
         let mut draft_tokens = Vec::with_capacity(k);
         let mut draft_probs = Vec::with_capacity(k);
         let mut current_token = last_token;
-        let mut draft_pos = pos;
 
-        for _ in 0..k {
+        for draft_pos in pos..pos.saturating_add(k) {
             if draft_pos >= max_ctx {
                 break;
             }
@@ -189,7 +188,6 @@ impl<'a> SelfSpecDecoder<'a> {
             draft_probs.push((draft_logits, prob));
             draft_tokens.push(next);
             current_token = next;
-            draft_pos += 1;
         }
 
         let n_drafted = draft_tokens.len();

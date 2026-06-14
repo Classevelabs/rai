@@ -180,10 +180,9 @@ impl<'a> SpeculativeDecoder<'a> {
         let mut draft_tokens = Vec::with_capacity(k);
         let mut draft_logits_list = Vec::with_capacity(k);
         let mut current_token = last_token;
-        let mut draft_pos = pos;
         let mut draft_hidden = vec![0.0f32; dhs];
 
-        for _ in 0..k {
+        for draft_pos in pos..pos.saturating_add(k) {
             if draft_pos >= draft_max || draft_pos >= target_max {
                 break;
             }
@@ -223,7 +222,6 @@ impl<'a> SpeculativeDecoder<'a> {
             draft_logits_list.push(draft_logits_snapshot);
             draft_tokens.push(next);
             current_token = next;
-            draft_pos += 1;
         }
 
         let n_drafted = draft_tokens.len();

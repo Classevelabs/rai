@@ -152,7 +152,7 @@ fn main() -> Result<()> {
             .any(|s| {
                 tokenizer
                     .token_to_id(s)
-                    .map_or(false, |id| tok == id as usize)
+                    .is_some_and(|id| tok == id as usize)
             })
     };
 

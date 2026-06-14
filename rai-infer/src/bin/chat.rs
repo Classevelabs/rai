@@ -158,7 +158,7 @@ fn handle_generate(state: &AppState, req_body: &str) -> Result<String> {
                 state
                     .tokenizer
                     .token_to_id(tok)
-                    .map_or(false, |id| next_token == id as usize)
+                    .is_some_and(|id| next_token == id as usize)
             });
         if is_eos {
             break;

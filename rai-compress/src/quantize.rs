@@ -24,7 +24,7 @@ pub struct QuantizedBlock {
 /// Our advantage: because we operate on RESIDUALS (not raw weights),
 /// the range is much smaller → same bits give better precision.
 pub fn quantize_uniform(values: &[f64], bits: u8) -> QuantizedBlock {
-    assert!(bits > 0 && bits <= 8);
+    assert!((1..=8).contains(&bits));
     let levels = (1u32 << bits) as f64;
 
     let min = values.iter().cloned().fold(f64::INFINITY, f64::min);
@@ -42,7 +42,7 @@ pub fn quantize_uniform(values: &[f64], bits: u8) -> QuantizedBlock {
         .iter()
         .map(|&v| {
             let q = ((v - zero_point) / scale).round() as i64;
-            q.max(0).min(levels as i64 - 1) as u32
+            q.clamp(0, levels as i64 - 1) as u32
         })
         .collect();
 
@@ -94,7 +94,7 @@ pub fn choose_bits(residual_block: &[f64], abs_tol: f64) -> u8 {
     // This gives enough quantization levels to cover the range with abs_tol precision
     let bits_needed = (range / abs_tol).log2().ceil() as i32;
 
-    (bits_needed.max(1).min(8)) as u8
+    bits_needed.clamp(1, 8) as u8
 }
 
 /// Non-uniform quantization using learned centroids.

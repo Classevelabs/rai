@@ -1,3 +1,9 @@
+#![allow(
+    clippy::needless_range_loop,
+    clippy::too_many_arguments,
+    reason = "The profiler mirrors the forward-pass hot path and uses explicit indices to keep timings comparable to production kernels."
+)]
+
 //! Per-operation timing profiler for RaiModel forward pass.
 //! Measures time spent in each operation across all layers.
 
@@ -68,8 +74,6 @@ fn main() -> Result<()> {
     let mut t_residual1_total = 0.0f64;
     let mut t_norm2_total = 0.0f64;
     let mut t_gate_up_total = 0.0f64;
-    let mut t_silu_total = 0.0f64;
-    let mut t_down_total = 0.0f64;
     let mut t_residual2_total = 0.0f64;
     let mut t_final_norm_total = 0.0f64;
     let mut t_lm_head_total = 0.0f64;
