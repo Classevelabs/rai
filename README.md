@@ -1,5 +1,7 @@
 # RAI
 
+[![Latest release](https://img.shields.io/github/v/release/classeve-public/rai)](https://github.com/classeve-public/rai/releases/latest) [![License](https://img.shields.io/github/license/classeve-public/rai)](LICENSE)
+
 **A CPU-only LLM inference engine in pure Rust.** RAI runs 4-bit quantized
 language models with hand-written AVX2 kernels — no GPU, no Python runtime, no
 PyTorch, no GGML, no BLAS. Load a `.raimodel` file and generate text on any
