@@ -1,6 +1,6 @@
 # RAI
 
-[![Latest release](https://img.shields.io/github/v/release/classeve-public/rai)](https://github.com/classeve-public/rai/releases/latest) [![License](https://img.shields.io/github/license/classeve-public/rai)](LICENSE)
+[![Latest release](https://img.shields.io/github/v/release/Classevelabs/rai)](https://github.com/Classevelabs/rai/releases/latest) [![License](https://img.shields.io/github/license/Classevelabs/rai)](LICENSE)
 
 **A CPU-only LLM inference engine in pure Rust.** RAI runs 4-bit quantized
 language models with hand-written AVX2 kernels — no GPU, no Python runtime, no
@@ -76,7 +76,7 @@ Install the end-user inference binaries (`rai-generate`, `rai-chat`,
 `profile-fwd`, `gemm-bench`, and `bw-bench`) directly from GitHub:
 
 ```bash
-cargo install --git https://github.com/classeve-public/rai \
+cargo install --git https://github.com/Classevelabs/rai \
   --package classeve-rai-infer \
   --locked
 ```
@@ -84,7 +84,7 @@ cargo install --git https://github.com/classeve-public/rai \
 Install the local REST/MCP server:
 
 ```bash
-cargo install --git https://github.com/classeve-public/rai \
+cargo install --git https://github.com/Classevelabs/rai \
   --package classeve-rai-server \
   --locked
 ```
