@@ -7,7 +7,11 @@ language models with hand-written AVX2 kernels — no GPU, no Python runtime, no
 PyTorch, no GGML, no BLAS. Load a `.raimodel` file and generate text on any
 modern x86-64 laptop.
 
-Built by [Classeve](https://classeve.com). Licensed under Apache-2.0.
+Built by [ClassEve](https://classeve.com). Licensed under Apache-2.0.
+
+> **Official repository.** This is the only official repository for RAI.
+> ClassEve's complete list of official accounts is at [classeve.com/official](https://classeve.com/official).
+> The GitHub account `github.com/ClassEve` is an unrelated third party, not affiliated with ClassEve.
 
 ## Why
 
@@ -251,7 +255,7 @@ compression-quality measurements.
 
 ## Project status
 
-RAI is an active initial public release from Classeve. The Rust workspace,
+RAI is an active initial public release from ClassEve. The Rust workspace,
 CPU inference path, quantization toolkit, REST/MCP server, tests, benchmarks,
 and CI gates are public and maintained. Current production-readiness boundaries:
 
@@ -272,9 +276,9 @@ Security reports, issues, and pull requests are welcome. See
 
 ## About
 
-Built and maintained by [Classeve](https://classeve.com) — engineering for AI agents and developer tooling. Project page: [classeve.com/public/rai](https://classeve.com/public/rai).
+Built and maintained by [ClassEve](https://classeve.com) — engineering for AI agents and developer tooling. Project page: [classeve.com/public/rai](https://classeve.com/public/rai).
 
 ## License
 
 Apache License 2.0 — see [LICENSE](./LICENSE).
-Copyright 2025-2026 Classeve.
+Copyright 2025-2026 ClassEve.
