@@ -1,0 +1,60 @@
+name: Bug report
+description: Report a reproducible problem in RAI.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve RAI. Please remove secrets, API keys, private
+        prompts, and model files before attaching logs.
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - rai-infer
+        - rai-compress
+        - rai-server
+        - rai-core
+        - rem-nra
+        - documentation
+        - CI/release
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the failure and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      description: Include commands, request payloads, or model export steps.
+      placeholder: |
+        1. Run ...
+        2. Open ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, CPU, rustc, cargo, and relevant configuration.
+      placeholder: |
+        OS:
+        CPU:
+        rustc --version:
+        cargo --version:
+        RAI_* env vars:
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or output
+      render: text
