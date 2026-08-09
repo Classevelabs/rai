@@ -7,10 +7,10 @@
 //! Key requirement: draft and target must share the exact same token-to-ID mapping. Matching
 //! vocabulary sizes alone cannot prove this, so callers must supply both models with one tokenizer.
 //!
-//! Performance model (typical dual-channel DDR4, ~25 GB/s):
-//!   Draft (50MB, K=8): 8 × 2ms = 16ms
-//!   Verify (3.7GB, 1 batched pass): 150ms
-//!   Accept ~4-5 tokens → 24-30 tok/s (vs 6 tok/s baseline)
+//! The throughput gain comes from bandwidth reuse: the small draft model iterates
+//! cheaply, and the target model reads its weights once per verification batch
+//! instead of once per token. The actual speedup depends on the model pair, the
+//! acceptance rate, and memory bandwidth — measure on the deployment hardware.
 
 // Draft/verification loops intentionally index parallel token, probability, logit, and cache
 // sequences. Explicit counters keep acceptance positions aligned with KV-cache positions.
@@ -21,7 +21,7 @@ use rand::Rng;
 
 use crate::kv_cache::KVCache;
 use crate::model::{BatchScratch, RaiModel, Scratch};
-use crate::sampler::{apply_repetition_penalty, sample_token, SamplerConfig};
+use crate::sampler::{sample_token, SamplerConfig};
 
 /// Configuration for speculative decoding.
 #[derive(Debug, Clone)]
@@ -64,17 +64,21 @@ pub struct SpeculativeDecoder<'a> {
     pub target: &'a RaiModel,
     pub draft_kv: KVCache,
     pub target_kv: KVCache,
+    // Each model gets its own scratch: the two models generally have
+    // different hidden sizes, so sharing one workspace would corrupt it.
     draft_scratch: Scratch,
-    target_scratch: Scratch, // FIX BUG 1: separate scratch for target
+    target_scratch: Scratch,
     target_batch_scratch: BatchScratch,
-    draft_logits_buf: Vec<f32>, // FIX BUG 4: clear naming
-    vocab_size: usize,          // shared vocab size (validated at construction)
+    /// Reused draft-logits buffer: avoids a vocab-sized allocation per drafted token.
+    draft_logits_buf: Vec<f32>,
+    vocab_size: usize, // shared vocab size (validated at construction)
     max_ctx: usize,
 }
 
 impl<'a> SpeculativeDecoder<'a> {
     pub fn new(draft: &'a RaiModel, target: &'a RaiModel, max_ctx: usize) -> Result<Self> {
-        // FIX BUG 3: validate vocab sizes match
+        // The acceptance math compares per-token probabilities across the two
+        // models, which is meaningless unless they index the same token space.
         let dvs = draft.config.vocab_size as usize;
         let tvs = target.config.vocab_size as usize;
         if dvs != tvs {
@@ -124,7 +128,9 @@ impl<'a> SpeculativeDecoder<'a> {
         }
         let mut pos = 0;
 
-        // FIX BUG 2: process tokens 0..N-2, leave last for step()
+        // Process tokens 0..N-2 only: step() consumes the final prompt token
+        // at position N-1, so prefilling it here would store its KV entry at
+        // two positions.
         let n_to_prefill = if prompt_tokens.len() > 1 {
             prompt_tokens.len() - 1
         } else {
@@ -168,12 +174,15 @@ impl<'a> SpeculativeDecoder<'a> {
     ///
     /// `pos` is the position where `last_token` will be processed.
     /// After prefill of N tokens, pos = N-1 and last_token = prompt[N-1].
+    ///
+    /// No generation-history argument is taken: `validate_speculative_config`
+    /// requires `repetition_penalty == 1.0`, so exact verification never
+    /// consults previously generated tokens.
     pub fn step(
         &mut self,
         pos: usize,
         last_token: usize,
         config: &SpeculativeConfig,
-        all_tokens: &[usize],
         rng: &mut impl Rng,
     ) -> Result<(Vec<usize>, SpeculativeMetrics)> {
         let dhs = self.draft.config.hidden_size as usize;
@@ -204,7 +213,6 @@ impl<'a> SpeculativeDecoder<'a> {
                 &mut self.target_scratch.normed,
                 &mut logits,
             )?;
-            apply_repetition_penalty(&mut logits, all_tokens, config.sampler.repetition_penalty);
             let token = sample_token(&mut logits, &config.sampler, rng);
             return Ok((
                 vec![token],
@@ -246,15 +254,6 @@ impl<'a> SpeculativeDecoder<'a> {
                 &mut self.draft_logits_buf,
             )?;
 
-            // Apply repetition penalty
-            let mut context = all_tokens.to_vec();
-            context.extend_from_slice(&draft_tokens);
-            apply_repetition_penalty(
-                &mut self.draft_logits_buf,
-                &context,
-                config.sampler.repetition_penalty,
-            );
-
             // Save draft logits (before sampling mutates them) and sample
             let draft_logits_snapshot = self.draft_logits_buf.clone();
             let next = sample_token(&mut self.draft_logits_buf, &config.sampler, rng);
@@ -265,18 +264,10 @@ impl<'a> SpeculativeDecoder<'a> {
             draft_pos += 1;
         }
 
+        // The draft loop runs exactly k >= 1 iterations and pushes one token
+        // per iteration, so at least one candidate always exists here.
         let n_drafted = draft_tokens.len();
-        if n_drafted == 0 {
-            return Ok((
-                vec![],
-                SpeculativeMetrics {
-                    accepted: 0,
-                    drafted: 0,
-                    produced: 0,
-                    accept_rate: 0.0,
-                },
-            ));
-        }
+        debug_assert!(n_drafted >= 1);
 
         // ================================================================
         // Phase 2: Target verifies ALL tokens in ONE batched forward pass
@@ -327,13 +318,6 @@ impl<'a> SpeculativeDecoder<'a> {
             let draft_token = draft_tokens[i];
             let target_logits_i = &mut all_target_logits[i * vs..(i + 1) * vs];
 
-            // Apply repetition penalty to target logits
-            let mut context = all_tokens.to_vec();
-            for j in 0..i {
-                context.push(draft_tokens[j]);
-            }
-            apply_repetition_penalty(target_logits_i, &context, config.sampler.repetition_penalty);
-
             // Compare probabilities
             let p_target =
                 softmax_prob_of(target_logits_i, draft_token, config.sampler.temperature);
@@ -364,33 +348,26 @@ impl<'a> SpeculativeDecoder<'a> {
             }
         }
 
-        // If all K tokens accepted, sample bonus from target's last logits
-        if n_accepted == n_drafted && n_drafted > 0 {
+        // If all K tokens were accepted, sample the bonus token from the
+        // target's last logits. `verify_batch == n_drafted + 1`, so index
+        // `n_drafted` is always the final verification position.
+        if n_accepted == n_drafted {
             let last_idx = n_drafted;
-            if last_idx < verify_batch {
-                let target_logits_last = &mut all_target_logits[last_idx * vs..(last_idx + 1) * vs];
-                let mut context = all_tokens.to_vec();
-                context.extend_from_slice(&draft_tokens);
-                apply_repetition_penalty(
-                    target_logits_last,
-                    &context,
-                    config.sampler.repetition_penalty,
-                );
-                let bonus = sample_token(target_logits_last, &config.sampler, rng);
-                accepted_tokens.push(bonus);
+            let target_logits_last = &mut all_target_logits[last_idx * vs..(last_idx + 1) * vs];
+            let bonus = sample_token(target_logits_last, &config.sampler, rng);
+            accepted_tokens.push(bonus);
 
-                // The draft loop proposed the last draft token but did not yet process it as
-                // input. Advance its KV cache so the next step has no missing context position.
-                self.draft
-                    .embed_token(draft_tokens[n_drafted - 1], &mut draft_hidden)?;
-                self.draft.forward_from_hidden(
-                    &mut draft_hidden,
-                    pos + n_drafted,
-                    &mut self.draft_kv,
-                    true,
-                    &mut self.draft_scratch,
-                )?;
-            }
+            // The draft loop proposed the last draft token but did not yet process it as
+            // input. Advance its KV cache so the next step has no missing context position.
+            self.draft
+                .embed_token(draft_tokens[n_drafted - 1], &mut draft_hidden)?;
+            self.draft.forward_from_hidden(
+                &mut draft_hidden,
+                pos + n_drafted,
+                &mut self.draft_kv,
+                true,
+                &mut self.draft_scratch,
+            )?;
         }
 
         // Drop rejected-draft KV entries in both caches: positions beyond the
@@ -400,11 +377,8 @@ impl<'a> SpeculativeDecoder<'a> {
         let produced = accepted_tokens.len();
         self.draft_kv.truncate(pos + produced);
         self.target_kv.truncate(pos + produced);
-        let accept_rate = if n_drafted > 0 {
-            n_accepted as f32 / n_drafted as f32
-        } else {
-            0.0
-        };
+        // n_drafted >= 1 whenever this point is reached (k == 0 returned early).
+        let accept_rate = n_accepted as f32 / n_drafted as f32;
 
         Ok((
             accepted_tokens,

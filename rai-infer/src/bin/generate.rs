@@ -354,8 +354,7 @@ fn main() -> Result<()> {
 
         while tokens_generated < args.max_tokens && pos < max_ctx {
             let last_token = *all_tokens.last().unwrap();
-            let (new_tokens, metrics) =
-                decoder.step(pos, last_token, &spec_config, &all_tokens, &mut rng)?;
+            let (new_tokens, metrics) = decoder.step(pos, last_token, &spec_config, &mut rng)?;
             ensure!(
                 !new_tokens.is_empty(),
                 "self-speculative decoder made no progress"
@@ -472,8 +471,7 @@ fn main() -> Result<()> {
 
         while tokens_generated < args.max_tokens && pos < max_ctx {
             let last_token = *all_tokens.last().unwrap();
-            let (new_tokens, metrics) =
-                decoder.step(pos, last_token, &spec_config, &all_tokens, &mut rng)?;
+            let (new_tokens, metrics) = decoder.step(pos, last_token, &spec_config, &mut rng)?;
             ensure!(
                 !new_tokens.is_empty(),
                 "speculative decoder made no progress"

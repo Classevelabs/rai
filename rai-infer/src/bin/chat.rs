@@ -3,7 +3,6 @@
 use std::fmt;
 use std::io::Read;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::Result;
@@ -447,14 +446,12 @@ fn main() -> Result<()> {
     let template = ChatTemplate::from_str_arg(&args.chat_template, &tokenizer);
     eprintln!("Chat template: {}", template.display_name());
 
-    let state = Arc::new(AppState {
+    let state = AppState {
         model,
         tokenizer,
         max_context,
         template,
-    });
-
-    let infer_lock = Arc::new(Mutex::new(()));
+    };
 
     let addr = format!("127.0.0.1:{}", args.port);
     let server = Server::http(&addr).map_err(|e| anyhow::anyhow!("bind: {e}"))?;
@@ -465,6 +462,10 @@ fn main() -> Result<()> {
         .port();
     eprintln!("\n  Chat UI: http://localhost:{bound_port}\n");
 
+    // The server is deliberately single-threaded: requests are handled one at
+    // a time on this loop, so one generation saturates the CPU without a
+    // second request competing for cores, and no synchronization is needed
+    // around the model state.
     for mut request in server.incoming_requests() {
         let url = request.url().to_string();
         let method = request.method().clone();
@@ -543,8 +544,6 @@ fn main() -> Result<()> {
                         continue;
                     }
                 };
-                let _lock = infer_lock.lock().unwrap();
-                let state = Arc::clone(&state);
 
                 match handle_generate(&state, &chat_request) {
                     Ok(json) => {

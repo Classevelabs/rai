@@ -6,16 +6,30 @@
 #![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 
 use anyhow::{Context, Result};
+use clap::Parser;
 use rai_infer::model::{InferenceWork, RaiModel};
+use std::path::PathBuf;
 use std::time::Instant;
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "profile-fwd",
+    about = "Per-operation timing profile of one RaiModel forward pass"
+)]
+struct Args {
+    /// Path to the .raimodel file to profile
+    #[arg(long)]
+    model: PathBuf,
+}
 
 fn main() -> Result<()> {
     rai_infer::gemm::configure_thread_pool();
+    let args = Args::parse();
     ensure_profile_cpu_support()?;
 
-    let model_path = std::path::Path::new("rai-infer/scripts/smollm-135m-q4.raimodel");
-    eprintln!("Loading model...");
-    let model = RaiModel::load(model_path).context("loading model")?;
+    eprintln!("Loading model: {}", args.model.display());
+    let model = RaiModel::load(&args.model)
+        .with_context(|| format!("loading model {}", args.model.display()))?;
 
     let hs = model.config.hidden_size as usize;
     let nh = model.config.num_heads as usize;
@@ -77,16 +91,18 @@ fn main() -> Result<()> {
     let mut t_final_norm_total = 0.0f64;
     let mut t_lm_head_total = 0.0f64;
 
-    let norm_weights: Vec<_> = (0..nl)
-        .map(|i| {
-            let l = file.layer(i).unwrap();
-            (
-                rai_infer::format::read_norm_weights(&l.input_layernorm),
-                rai_infer::format::read_norm_weights(&l.post_attn_layernorm),
-            )
-        })
-        .collect();
-    let final_norm_weights = rai_infer::format::read_norm_weights(&file.final_norm().unwrap());
+    let mut norm_weights = Vec::with_capacity(nl);
+    for i in 0..nl {
+        let l = file
+            .layer(i)
+            .with_context(|| format!("reading layer {i} norm weights"))?;
+        norm_weights.push((
+            rai_infer::format::read_norm_weights(&l.input_layernorm),
+            rai_infer::format::read_norm_weights(&l.post_attn_layernorm),
+        ));
+    }
+    let final_norm_weights =
+        rai_infer::format::read_norm_weights(&file.final_norm().context("reading final norm")?);
 
     for _ in 0..iters {
         model.embed_token(42, &mut hidden)?;
@@ -110,7 +126,7 @@ fn main() -> Result<()> {
             attn_work.k.resize(nkv * hd, 0.0);
             attn_work.v.resize(nkv * hd, 0.0);
             let t = Instant::now();
-            rai_infer::gemm::w4a32_fused_qkv(
+            rai_infer::gemm::w4a8_fused_qkv(
                 &mut attn_work.q,
                 &mut attn_work.k,
                 &mut attn_work.v,
@@ -159,7 +175,7 @@ fn main() -> Result<()> {
             // O_proj
             attn_out.resize(hs, 0.0);
             let t = Instant::now();
-            rai_infer::gemm::w4a32_matvec(
+            rai_infer::gemm::w4a8_matvec(
                 &mut attn_out,
                 layer.o_proj.nibble_data,
                 layer.o_proj.group_params,

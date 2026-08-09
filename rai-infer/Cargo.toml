@@ -17,34 +17,61 @@ categories = ["command-line-utilities", "science"]
 name = "rai_infer"
 path = "src/lib.rs"
 
+[features]
+default = ["cli"]
+# Everything the command-line/server binaries need beyond the core inference
+# library: argument parsing, tokenization, the chat HTTP server, JSON, and
+# mmap benchmarking. Disable default features to build the lean library
+# (format reader, kernels, model, sampling, speculative decoding) with only
+# half + rayon + anyhow + rand. The tokenizer-aware chat-template helpers
+# (`ChatTemplate::auto_detect` / `from_str_arg`) are also gated on this.
+cli = [
+    "dep:clap",
+    "dep:tokenizers",
+    "dep:tiny_http",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:memmap2",
+]
+
 [dependencies]
-memmap2 = "0.9"
 half = "2.4"
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
-tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 rand = "0.8"
 rayon = "1.10"
-tiny_http = "0.12"
-serde = { version = "1", features = ["derive"] }
+clap = { version = "4", features = ["derive"], optional = true }
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"], optional = true }
+tiny_http = { version = "0.12", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+memmap2 = { version = "0.9", optional = true }
+
+[dev-dependencies]
+# The conformance tests read the exporter's .expected.json sidecars regardless
+# of which features the library was built with.
 serde_json = "1"
 
 [[bin]]
 name = "rai-generate"
 path = "src/bin/generate.rs"
+required-features = ["cli"]
 
 [[bin]]
 name = "rai-chat"
 path = "src/bin/chat.rs"
+required-features = ["cli"]
 
 [[bin]]
 name = "profile-fwd"
 path = "src/bin/profile_fwd.rs"
+required-features = ["cli"]
 
 [[bin]]
 name = "gemm-bench"
 path = "src/bin/gemm_bench.rs"
+required-features = ["cli"]
 
 [[bin]]
 name = "bw-bench"
 path = "src/bin/bw_bench.rs"
+required-features = ["cli"]

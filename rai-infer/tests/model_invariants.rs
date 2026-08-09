@@ -23,17 +23,15 @@ fn token_sequence(vocab: usize, len: usize) -> Vec<usize> {
     let mut state = 0x9e3779b97f4a7c15u64;
     (0..len)
         .map(|_| {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((state >> 33) as usize) % vocab
         })
         .collect()
 }
 
-fn sequential_logits(
-    model: &RaiModel,
-    tokens: &[usize],
-    max_ctx: usize,
-) -> Vec<Vec<f32>> {
+fn sequential_logits(model: &RaiModel, tokens: &[usize], max_ctx: usize) -> Vec<Vec<f32>> {
     let hs = model.config.hidden_size as usize;
     let vs = model.config.vocab_size as usize;
     let mut kv = model.create_kv_cache(max_ctx).unwrap();
@@ -77,7 +75,9 @@ fn batched_logits(model: &RaiModel, tokens: &[usize], max_ctx: usize) -> Vec<Vec
     model
         .hidden_to_logits_batch(&hiddens, &mut normed, &mut logits, n)
         .unwrap();
-    (0..n).map(|i| logits[i * vs..(i + 1) * vs].to_vec()).collect()
+    (0..n)
+        .map(|i| logits[i * vs..(i + 1) * vs].to_vec())
+        .collect()
 }
 
 fn argmax(values: &[f32]) -> usize {
