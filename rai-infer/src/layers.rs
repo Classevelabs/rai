@@ -908,6 +908,12 @@ impl AttentionWork {
     }
 }
 
+impl Default for AttentionWork {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SwiGLU MLP
 // ---------------------------------------------------------------------------
@@ -960,6 +966,12 @@ impl MlpWork {
             gate: Vec::new(),
             up: Vec::new(),
         }
+    }
+}
+
+impl Default for MlpWork {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

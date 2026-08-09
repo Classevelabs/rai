@@ -1,5 +1,7 @@
 # RAI
 
+[![Latest release](https://img.shields.io/github/v/release/Classevelabs/rai)](https://github.com/Classevelabs/rai/releases/latest) [![License](https://img.shields.io/github/license/Classevelabs/rai)](LICENSE)
+
 **A CPU-only LLM inference workspace written in Rust.** RAI runs 4-bit quantized
 language models with hand-written AVX2 kernels — no GPU, no Python runtime, no
 PyTorch, no GGML, no BLAS. Load a `.raimodel` file and generate text on any
@@ -7,6 +9,10 @@ supported x86-64 machine. Python is needed only for optional model conversion
 and offline draft-model preparation.
 
 Built by [ClassEve](https://classeve.com). Licensed under Apache-2.0.
+
+> **Official repository.** This is the only official repository for RAI.
+> ClassEve's complete list of official accounts is at [classeve.com/official](https://classeve.com/official).
+> The GitHub account `github.com/ClassEve` is an unrelated third party, not affiliated with ClassEve.
 
 ## Why
 
@@ -69,7 +75,7 @@ The repository and v0.1.0 release are already public, and all five
 `classeve-rai-*` v0.1.0 crates are on crates.io. This checkout contains
 unreleased changes; building it does not change the published v0.1.0 artifacts.
 See [installation](./docs/INSTALL.md) and the
-[release-readiness gate](./docs/RELEASE_READINESS.md). No container image is
+[release procedure](./docs/RELEASE.md). No container image is
 currently published; the Dockerfile builds an MCP stdio image from source.
 
 Development checks:
@@ -256,8 +262,8 @@ Common startup failures are deliberate safeguards: use a loopback
 `openai` provider, and make `RAI_DATA_PATH` a writable file path rather than a
 directory. A model that fails to load should be regenerated and treated as
 untrusted until its header, dimensions, offsets, and file length are verified.
-See [installation](./docs/INSTALL.md), [operations](./docs/OPERATIONS.md), and
-[release readiness](./docs/RELEASE_READINESS.md) for the full runbooks.
+See [installation](./docs/INSTALL.md), [architecture](./docs/ARCHITECTURE.md),
+and the [release procedure](./docs/RELEASE.md) for the full runbooks.
 
 ## The `.raimodel` format
 
@@ -315,7 +321,8 @@ because it is finished. Interfaces may change. Current state:
   prototypes; do not rely on their training, confidence, contradiction, or
   modeled-size outputs as validated product guarantees.
 
-Issues and PRs are welcome.
+Issues and PRs are welcome. See [SECURITY.md](./SECURITY.md),
+[SUPPORT.md](./SUPPORT.md), and [CONTRIBUTING.md](./CONTRIBUTING.md).
 
 ## About
 
