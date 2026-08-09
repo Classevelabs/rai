@@ -3,19 +3,19 @@
 
 Key speedups vs export_raimodel.py:
 - Fewer calibration chunks (16 is enough for good Hessians)
-- Vectorized GPTQ column loop (numpy broadcasting, no Python for-loop per column)
 - GPU-accelerated Hessian collection
-- Streaming: quantize and free each layer immediately
+- Frequent progress output for long-running steps
+
+The quantizers and container writers are shared with the other exporters via
+raimodel.py; see its docstring for the binary layout.
 
 Usage (any recent CUDA GPU):
   PYTHONUNBUFFERED=1 python3 export_fast.py --model mistralai/Mistral-7B-Instruct-v0.3
 """
 
 import argparse
-import struct
 import time
 import sys
-import shutil
 import tempfile
 from pathlib import Path
 
@@ -24,199 +24,7 @@ import torch
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-MIN_F16_SCALE = float(np.nextafter(np.float16(0), np.float16(1)))
-
-
-def validate_export_options(parser, args):
-    if args.bits != 4:
-        parser.error("--bits must be 4; the .raimodel reader supports only 4-bit weights")
-    if args.embed_bits != 8:
-        parser.error("--embed-bits must be 8; the .raimodel reader supports only 8-bit embeddings")
-    for name, value in (
-        ("--group-size", args.group_size),
-        ("--embed-group-size", args.embed_group_size),
-    ):
-        if value < 2 or value > 254 or value % 2:
-            parser.error(f"{name} must be an even integer in 2..=254")
-    if not 1 <= args.max_context <= 1_000_000:
-        parser.error("--max-context must be in 1..=1000000")
-    if args.cal_chunks < 1 or args.seq_len < 1:
-        parser.error("--cal-chunks and --seq-len must be greater than zero")
-
-
-def validate_f16_params(scale, zero_point, label):
-    if (not np.isfinite(scale).all() or not np.isfinite(zero_point).all()
-            or np.any(scale <= 0)):
-        raise ValueError(f"{label} produced non-finite or non-positive FP16 quantization parameters")
-
-
-def gptq_quantize_fast(weight_np, hessian_np, bits=4, block_size=128, group_size=128):
-    """Vectorized GPTQ — same output as original, much faster."""
-    rows, cols = weight_np.shape
-    n_levels = 2 ** bits
-    num_groups = (cols + group_size - 1) // group_size
-
-    W = weight_np.copy().astype(np.float64)
-    H = hessian_np.copy().astype(np.float64)
-
-    damp = 0.01 * np.mean(np.diag(H))
-    H += damp * np.eye(cols)
-
-    try:
-        L = np.linalg.cholesky(H)
-        H_inv = np.linalg.solve(L.T, np.linalg.solve(L, np.eye(cols, dtype=np.float64)))
-    except np.linalg.LinAlgError:
-        H += 0.1 * np.mean(np.diag(H)) * np.eye(cols)
-        L = np.linalg.cholesky(H)
-        H_inv = np.linalg.solve(L.T, np.linalg.solve(L, np.eye(cols, dtype=np.float64)))
-
-    codes = np.zeros((rows, cols), dtype=np.uint8)
-    scales_f16 = np.zeros((rows, num_groups), dtype=np.float16)
-    zeros_f16 = np.zeros((rows, num_groups), dtype=np.float16)
-
-    # Cache group params
-    group_scale = np.zeros(rows, dtype=np.float64)
-    group_zero = np.zeros(rows, dtype=np.float64)
-    cur_gid = -1
-
-    for block_start in range(0, cols, block_size):
-        block_end = min(block_start + block_size, cols)
-        bs = block_end - block_start
-
-        # Extract block of H_inv diagonal and off-diagonal
-        h_diag = np.diag(H_inv)[block_start:block_end].copy()
-
-        err_block = np.zeros((rows, bs), dtype=np.float64)
-
-        for j_rel in range(bs):
-            j = block_start + j_rel
-            gid = j // group_size
-
-            if gid != cur_gid:
-                cur_gid = gid
-                g_start = gid * group_size
-                g_end = min(g_start + group_size, cols)
-                group_slice = W[:, g_start:g_end]
-                row_min = group_slice.min(axis=1)
-                row_max = group_slice.max(axis=1)
-                row_range = row_max - row_min
-                scale = np.maximum(row_range / (n_levels - 1), MIN_F16_SCALE)
-                zero_point = row_min
-                scale_f16 = scale.astype(np.float16)
-                zero_f16 = zero_point.astype(np.float16)
-                validate_f16_params(scale_f16, zero_f16, "GPTQ group")
-                scales_f16[:, gid] = scale_f16
-                zeros_f16[:, gid] = zero_f16
-                group_scale = scale_f16.astype(np.float64)
-                group_zero = zero_f16.astype(np.float64)
-
-            w_col = W[:, j]
-            q_col = np.clip(np.round((w_col - group_zero) / group_scale), 0, n_levels - 1).astype(np.uint8)
-            codes[:, j] = q_col
-            w_hat = q_col.astype(np.float64) * group_scale + group_zero
-
-            err = (w_col - w_hat) / H_inv[j, j]
-            err_block[:, j_rel] = err
-
-            # Update remaining columns in block
-            if j + 1 < block_end:
-                W[:, j+1:block_end] -= np.outer(err, H_inv[j, j+1:block_end])
-
-        # Update remaining columns after block
-        if block_end < cols:
-            W[:, block_end:] -= err_block @ H_inv[block_start:block_end, block_end:]
-
-    # MSE
-    total_sq_err = 0.0
-    for gid in range(num_groups):
-        c_start = gid * group_size
-        c_end = min(c_start + group_size, cols)
-        s = scales_f16[:, gid].astype(np.float64)
-        z = zeros_f16[:, gid].astype(np.float64)
-        recon = codes[:, c_start:c_end].astype(np.float64) * s[:, None] + z[:, None]
-        total_sq_err += np.sum((weight_np[:, c_start:c_end] - recon) ** 2)
-    mse = total_sq_err / (rows * cols)
-
-    return codes, scales_f16, zeros_f16, mse
-
-
-def quantize_embedding_8bit(weight_np, group_size=64):
-    vocab_size, hidden_size = weight_np.shape
-    num_groups = (hidden_size + group_size - 1) // group_size
-
-    codes = np.zeros((vocab_size, hidden_size), dtype=np.uint8)
-    scales = np.zeros((vocab_size, num_groups), dtype=np.float16)
-    zeros = np.zeros((vocab_size, num_groups), dtype=np.float16)
-
-    for gid in range(num_groups):
-        c_start = gid * group_size
-        c_end = min(c_start + group_size, hidden_size)
-        group_data = weight_np[:, c_start:c_end].astype(np.float64)
-
-        row_min = group_data.min(axis=1)
-        row_max = group_data.max(axis=1)
-        scale = np.maximum((row_max - row_min) / 255.0, MIN_F16_SCALE)
-
-        scale_f16 = scale.astype(np.float16)
-        zero_f16 = row_min.astype(np.float16)
-        validate_f16_params(scale_f16, zero_f16, "embedding group")
-        scales[:, gid] = scale_f16
-        zeros[:, gid] = zero_f16
-
-        s64 = scale_f16.astype(np.float64)
-        z64 = zero_f16.astype(np.float64)
-        codes[:, c_start:c_end] = np.clip(
-            np.round((group_data - z64[:, None]) / s64[:, None]), 0, 255
-        ).astype(np.uint8)
-
-    return codes, scales, zeros
-
-
-def pack_nibbles(codes):
-    rows, cols = codes.shape
-    assert cols % 2 == 0
-    even = codes[:, 0::2]
-    odd = codes[:, 1::2]
-    return (even & 0x0F) | ((odd & 0x0F) << 4)
-
-
-def pack_group_params(scales, zeros):
-    rows, num_groups = scales.shape
-    # Interleave scale,zero as f16 pairs
-    params = np.empty((rows, num_groups, 2), dtype=np.float16)
-    params[:, :, 0] = scales
-    params[:, :, 1] = zeros
-    return params.tobytes()
-
-
-def pack_linear_section(codes, scales, zeros, rows, cols):
-    data = bytearray()
-    data.extend(struct.pack('<II', rows, cols))
-    data.extend(pack_group_params(scales, zeros))
-    data.extend(pack_nibbles(codes).tobytes())
-    return bytes(data)
-
-
-def write_header(f, config, num_sections):
-    header = bytearray(64)
-    header[0:4] = b'RAIM'
-    struct.pack_into('<I', header, 4, 1)
-    struct.pack_into('<I', header, 8, config['hidden_size'])
-    struct.pack_into('<I', header, 12, config['num_layers'])
-    struct.pack_into('<I', header, 16, config['num_heads'])
-    struct.pack_into('<I', header, 20, config['num_kv_heads'])
-    struct.pack_into('<I', header, 24, config['head_dim'])
-    struct.pack_into('<I', header, 28, config['intermediate_size'])
-    struct.pack_into('<I', header, 32, config['vocab_size'])
-    struct.pack_into('<I', header, 36, config['max_context'])
-    struct.pack_into('<f', header, 40, config['rope_theta'])
-    struct.pack_into('<f', header, 44, config['norm_eps'])
-    header[48] = config['bits']
-    header[49] = config['group_size']
-    header[50] = config['embed_bits']
-    header[51] = config['embed_group_size']
-    struct.pack_into('<I', header, 52, num_sections)
-    f.write(header)
+import raimodel
 
 
 def main():
@@ -231,7 +39,7 @@ def main():
     parser.add_argument('--seq-len', type=int, default=2048)
     parser.add_argument('--max-context', type=int, default=2048)
     args = parser.parse_args()
-    validate_export_options(parser, args)
+    raimodel.validate_export_options(parser, args)
 
     if args.output is None:
         model_short = args.model.split('/')[-1].lower().replace(' ', '-')
@@ -263,14 +71,28 @@ def main():
     hidden_size = cfg.hidden_size
     num_heads = cfg.num_attention_heads
     num_kv_heads = getattr(cfg, 'num_key_value_heads', num_heads)
-    head_dim = hidden_size // num_heads
+    head_dim = raimodel.resolve_head_dim(getattr(cfg, 'head_dim', None), hidden_size, num_heads)
     intermediate_size = cfg.intermediate_size
     vocab_size = cfg.vocab_size
     rope_theta = getattr(cfg, 'rope_theta', 10000.0)
     norm_eps = getattr(cfg, 'rms_norm_eps', 1e-5)
+    tied = getattr(cfg, 'tie_word_embeddings', True)
+
+    model_config = {
+        'hidden_size': hidden_size, 'num_layers': n_layers,
+        'num_heads': num_heads, 'num_kv_heads': num_kv_heads,
+        'head_dim': head_dim, 'intermediate_size': intermediate_size,
+        'vocab_size': vocab_size, 'max_context': args.max_context,
+        'rope_theta': rope_theta, 'norm_eps': norm_eps,
+        'bits': args.bits, 'group_size': args.group_size,
+        'embed_bits': args.embed_bits, 'embed_group_size': args.embed_group_size,
+    }
+    # Fail fast on anything the Rust reader would reject, BEFORE calibration.
+    raimodel.validate_model_config(model_config)
 
     print(f"Arch: {getattr(cfg, 'model_type', '?')}, {n_layers}L, h={hidden_size}, inter={intermediate_size}")
     print(f"Heads: {num_heads}q/{num_kv_heads}kv, head_dim={head_dim}, vocab={vocab_size}")
+    print(f"Embeddings: {'tied' if tied else 'untied (separate lm_head)'}")
     sys.stdout.flush()
 
     # ---- STEP 1: Calibration ----
@@ -287,6 +109,7 @@ def main():
         if start + args.seq_len > len(tokens):
             break
         chunks.append(tokens[start:start + args.seq_len].unsqueeze(0).to(device))
+    raimodel.require_calibration_chunks(len(chunks), args.seq_len, len(tokens))
     print(f"  {len(chunks)} chunks of {args.seq_len} tokens")
     sys.stdout.flush()
 
@@ -358,8 +181,9 @@ def main():
             w = linear.weight.data.float().cpu().numpy().astype(np.float64)
             H = hessians[hkey].astype(np.float64)
             rows, cols = w.shape
-            codes, scales, zeros, mse = gptq_quantize_fast(
-                w, H, bits=args.bits, group_size=args.group_size
+            codes, scales, zeros, mse = raimodel.gptq_quantize(
+                w, H, bits=args.bits, group_size=args.group_size,
+                label=f"L{li}.{name}"
             )
             linears_packed.append((codes, scales, zeros, rows, cols))
             print(f"  L{li}.{name}: [{rows}x{cols}] mse={mse:.2e}")
@@ -377,78 +201,57 @@ def main():
     print(f"\n  Quantization done in {t_quant:.1f}s ({t_quant/60:.1f} min)")
     sys.stdout.flush()
 
-    # ---- STEP 3: Embedding ----
+    # ---- STEP 3: Embedding (and lm_head when untied) ----
     print(f"\n=== STEP 3: EMBEDDING (8-bit) ===")
     sys.stdout.flush()
     embed_w = model.model.embed_tokens.weight.data.float().cpu().numpy().astype(np.float64)
     t0 = time.time()
-    embed_codes, embed_scales, embed_zeros = quantize_embedding_8bit(embed_w, group_size=args.embed_group_size)
-    print(f"  Embedding [{embed_w.shape[0]}x{embed_w.shape[1]}] done in {time.time()-t0:.1f}s")
+    embed_codes, embed_scales, embed_zeros, embed_mse = raimodel.quantize_embedding_8bit(
+        embed_w, group_size=args.embed_group_size
+    )
+    print(f"  Embedding [{embed_w.shape[0]}x{embed_w.shape[1]}] mse={embed_mse:.2e} done in {time.time()-t0:.1f}s")
     sys.stdout.flush()
 
     final_norm_weight = model.model.norm.weight.data.float().cpu().numpy()
+
+    lm_head_packed = None
+    if not tied:
+        print(f"\n=== STEP 3b: LM_HEAD {args.bits}-BIT (untied) ===")
+        sys.stdout.flush()
+        t0 = time.time()
+        lm_w = model.lm_head.weight.data.float().cpu().numpy().astype(np.float64)
+        lm_rows, lm_cols = lm_w.shape
+        lm_codes, lm_scales, lm_zeros, lm_mse = raimodel.rtn_quantize(
+            lm_w, bits=args.bits, group_size=args.group_size, label="lm_head"
+        )
+        lm_head_packed = (lm_codes, lm_scales, lm_zeros, lm_rows, lm_cols)
+        print(f"  lm_head [{lm_rows}x{lm_cols}] mse={lm_mse:.2e}: {time.time()-t0:.1f}s")
+        sys.stdout.flush()
+    else:
+        print(f"  lm_head: tied to embedding")
+        sys.stdout.flush()
 
     # ---- STEP 4: Write file ----
     print(f"\n=== STEP 4: WRITING .raimodel ===")
     sys.stdout.flush()
 
     output_path = Path(args.output)
-    num_sections = 1 + n_layers + 1
 
     sections_data = []
-
-    # Section 0: Embedding
-    embed_section = bytearray()
-    embed_section.extend(pack_group_params(embed_scales, embed_zeros))
-    embed_section.extend(embed_codes.tobytes())
-    sections_data.append(bytes(embed_section))
-
-    # Sections 1..N: Layers
+    sections_data.append(raimodel.build_embedding_section(embed_codes, embed_scales, embed_zeros))
     for li in range(n_layers):
         linears_packed, input_ln, post_attn_ln = layer_data[li]
-        layer_section = bytearray()
-        for codes, scales, zeros, rows, cols in linears_packed:
-            layer_section.extend(pack_linear_section(codes, scales, zeros, rows, cols))
-        layer_section.extend(input_ln.astype(np.float32).tobytes())
-        layer_section.extend(post_attn_ln.astype(np.float32).tobytes())
-        sections_data.append(bytes(layer_section))
+        sections_data.append(raimodel.build_layer_section(linears_packed, input_ln, post_attn_ln))
         if (li + 1) % 8 == 0:
             print(f"  Packed layer {li+1}/{n_layers}")
             sys.stdout.flush()
+    sections_data.append(raimodel.pack_norm_section(final_norm_weight, "final norm"))
+    if lm_head_packed is not None:
+        codes, scales, zeros, rows, cols = lm_head_packed
+        sections_data.append(raimodel.pack_linear_section(codes, scales, zeros, rows, cols))
 
-    # Final norm
-    sections_data.append(final_norm_weight.astype(np.float32).tobytes())
-
-    # Compute offsets
-    header_size = 64
-    table_size = num_sections * 16
-    data_start = header_size + table_size
-
-    offsets = []
-    current_offset = data_start
-    for data in sections_data:
-        offsets.append(current_offset)
-        current_offset += len(data)
-
-    model_config = {
-        'hidden_size': hidden_size, 'num_layers': n_layers,
-        'num_heads': num_heads, 'num_kv_heads': num_kv_heads,
-        'head_dim': head_dim, 'intermediate_size': intermediate_size,
-        'vocab_size': vocab_size, 'max_context': args.max_context,
-        'rope_theta': rope_theta, 'norm_eps': norm_eps,
-        'bits': args.bits, 'group_size': args.group_size,
-        'embed_bits': args.embed_bits, 'embed_group_size': args.embed_group_size,
-    }
-
-    with open(output_path, 'wb') as f:
-        write_header(f, model_config, num_sections)
-        for i in range(num_sections):
-            f.write(struct.pack('<QQ', offsets[i], len(sections_data[i])))
-        for data in sections_data:
-            f.write(data)
-
-    total_size = output_path.stat().st_size
-    print(f"\n  Wrote: {output_path} ({total_size / 1e6:.1f} MB)")
+    total_size = raimodel.write_raimodel(output_path, model_config, sections_data)
+    print(f"\n  Wrote: {output_path} ({total_size / 1e6:.1f} MB, {len(sections_data)} sections)")
     sys.stdout.flush()
 
     # Copy tokenizer
@@ -456,11 +259,12 @@ def main():
     with tempfile.TemporaryDirectory(prefix="rai_tokenizer_") as tmp_dir:
         tokenizer.save_pretrained(tmp_dir)
         tok_src = Path(tmp_dir) / "tokenizer.json"
-        if tok_src.exists():
-            shutil.copy2(tok_src, tok_dst)
+        if not tok_src.exists():
+            raise RuntimeError("tokenizer export did not produce the required tokenizer.json")
+        if raimodel.copy_tokenizer_json(tok_src, tok_dst):
             print(f"  Tokenizer: {tok_dst}")
         else:
-            raise RuntimeError("tokenizer export did not produce the required tokenizer.json")
+            print(f"  Tokenizer already present (identical): {tok_dst}")
 
     print(f"\n=== DONE ===")
     print(f"  Model: {args.output} ({total_size / 1e6:.1f} MB)")

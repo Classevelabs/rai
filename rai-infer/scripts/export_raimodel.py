@@ -9,25 +9,19 @@ Pipeline:
 3. GPTQ-4bit quantizes each linear layer — returns INTEGER CODES + group params
 4. Packs codes as nibbles (2 per byte), group params as f16
 5. Quantizes embedding at 8-bit uniform (per-row-per-group scale/zero)
-6. Writes .raimodel binary file with header + sections
-7. Copies tokenizer.json alongside
+6. Quantizes lm_head at 4-bit when the model does not tie word embeddings
+7. Writes .raimodel binary file with header + sections
+8. Copies tokenizer.json alongside (refusing to clobber a different one)
 
 CRITICAL: Group params are round-tripped through f16 BEFORE computing final codes,
 so Rust dequant exactly matches Python: weight = code * f16_scale + f16_zero.
 
-File format:
-  [64 bytes]            Header
-  [num_sections * 16]   Section index table
-  [variable]            Section 0: Embedding (8-bit)
-  [variable]            Sections 1..N: Transformer layers (4-bit linears + f32 norms)
-  [variable]            Section N+1: Final RMSNorm (f32)
+The container format, quantizers, and writers live in raimodel.py (shared with
+export_fast.py and export_rtn.py); see its docstring for the binary layout.
 """
 
 import argparse
-import struct
 import time
-import sys
-import shutil
 import tempfile
 from pathlib import Path
 
@@ -36,249 +30,8 @@ import torch
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-MIN_F16_SCALE = float(np.nextafter(np.float16(0), np.float16(1)))
+import raimodel
 
-
-def validate_export_options(parser, args):
-    if args.bits != 4:
-        parser.error("--bits must be 4; the .raimodel reader supports only 4-bit weights")
-    if args.embed_bits != 8:
-        parser.error("--embed-bits must be 8; the .raimodel reader supports only 8-bit embeddings")
-    for name, value in (
-        ("--group-size", args.group_size),
-        ("--embed-group-size", args.embed_group_size),
-    ):
-        if value < 2 or value > 254 or value % 2:
-            parser.error(f"{name} must be an even integer in 2..=254")
-    if not 1 <= args.max_context <= 1_000_000:
-        parser.error("--max-context must be in 1..=1000000")
-    if args.cal_chunks < 1 or args.seq_len < 1:
-        parser.error("--cal-chunks and --seq-len must be greater than zero")
-
-
-def validate_f16_params(scale, zero_point, label):
-    if (not np.isfinite(scale).all() or not np.isfinite(zero_point).all()
-            or np.any(scale <= 0)):
-        raise ValueError(f"{label} produced non-finite or non-positive FP16 quantization parameters")
-
-
-# =============================================================================
-# GPTQ Quantization (returns integer codes, not dequantized weights)
-# =============================================================================
-
-def gptq_quantize_to_codes(weight_np, hessian_np, bits=4, block_size=128, group_size=128):
-    """GPTQ quantization that returns integer codes and f16-rounded group params.
-
-    Returns:
-        codes: np.ndarray[uint8] shape [rows, cols] — integer quantization codes (0..15)
-        scales: np.ndarray[float16] shape [rows, num_groups] — per-row-per-group scales
-        zeros: np.ndarray[float16] shape [rows, num_groups] — per-row-per-group zero points
-        mse: float — weight MSE
-    """
-    rows, cols = weight_np.shape
-    n_levels = 2 ** bits
-    num_groups = (cols + group_size - 1) // group_size
-
-    W = weight_np.copy().astype(np.float64)
-    H = hessian_np.copy().astype(np.float64)
-
-    # Damp the Hessian
-    damp = 0.01 * np.mean(np.diag(H))
-    H += damp * np.eye(cols)
-
-    # Cholesky inversion
-    try:
-        L = np.linalg.cholesky(H)
-        H_inv = np.linalg.solve(L.T, np.linalg.solve(L, np.eye(cols)))
-    except np.linalg.LinAlgError:
-        H += 0.1 * np.mean(np.diag(H)) * np.eye(cols)
-        L = np.linalg.cholesky(H)
-        H_inv = np.linalg.solve(L.T, np.linalg.solve(L, np.eye(cols)))
-
-    codes = np.zeros((rows, cols), dtype=np.uint8)
-    # We'll collect scale/zero per group, round-trip through f16
-    scales_f16 = np.zeros((rows, num_groups), dtype=np.float16)
-    zeros_f16 = np.zeros((rows, num_groups), dtype=np.float16)
-
-    for block_start in range(0, cols, block_size):
-        block_end = min(block_start + block_size, cols)
-        err_block = np.zeros((rows, block_end - block_start))
-
-        for j in range(block_start, block_end):
-            gid = j // group_size
-            g_start = gid * group_size
-            g_end = min(g_start + group_size, cols)
-
-            if j == g_start or j == block_start:
-                # Compute group params from CURRENT (error-compensated) weights
-                group_slice = W[:, g_start:g_end]
-                row_min = group_slice.min(axis=1)
-                row_max = group_slice.max(axis=1)
-                row_range = row_max - row_min
-                scale = np.maximum(row_range / (n_levels - 1), MIN_F16_SCALE)
-                zero_point = row_min
-
-                # CRITICAL: Round-trip through f16 so Rust exactly matches
-                scale_f16 = scale.astype(np.float16)
-                zero_f16 = zero_point.astype(np.float16)
-                validate_f16_params(scale_f16, zero_f16, "GPTQ group")
-                scales_f16[:, gid] = scale_f16
-                zeros_f16[:, gid] = zero_f16
-                # Use f16-rounded values for quantization
-                scale = scale_f16.astype(np.float64)
-                zero_point = zero_f16.astype(np.float64)
-
-            w_col = W[:, j]
-            q_col = np.clip(np.round((w_col - zero_point) / scale), 0, n_levels - 1).astype(np.uint8)
-            codes[:, j] = q_col
-            w_hat = q_col.astype(np.float64) * scale + zero_point
-
-            err = (w_col - w_hat) / H_inv[j, j]
-            err_block[:, j - block_start] = err
-
-            if j + 1 < block_end:
-                W[:, j+1:block_end] -= np.outer(err, H_inv[j, j+1:block_end])
-
-        if block_end < cols:
-            W[:, block_end:] -= err_block @ H_inv[block_start:block_end, block_end:]
-
-    # Compute MSE using f16-rounded params (matches Rust dequant exactly)
-    total_sq_err = 0.0
-    for gid in range(num_groups):
-        c_start = gid * group_size
-        c_end = min(c_start + group_size, cols)
-        s = scales_f16[:, gid].astype(np.float64)
-        z = zeros_f16[:, gid].astype(np.float64)
-        for c in range(c_start, c_end):
-            recon = codes[:, c].astype(np.float64) * s + z
-            total_sq_err += np.sum((weight_np[:, c] - recon) ** 2)
-    mse = total_sq_err / (rows * cols)
-
-    return codes, scales_f16, zeros_f16, mse
-
-
-def quantize_embedding_8bit(weight_np, group_size=64):
-    """8-bit uniform quantization of embedding matrix.
-
-    Returns:
-        codes: np.ndarray[uint8] shape [vocab_size, hidden_size]
-        scales: np.ndarray[float16] shape [vocab_size, num_groups]
-        zeros: np.ndarray[float16] shape [vocab_size, num_groups]
-    """
-    vocab_size, hidden_size = weight_np.shape
-    num_groups = (hidden_size + group_size - 1) // group_size
-    n_levels = 256  # 8-bit
-
-    codes = np.zeros((vocab_size, hidden_size), dtype=np.uint8)
-    scales = np.zeros((vocab_size, num_groups), dtype=np.float16)
-    zeros = np.zeros((vocab_size, num_groups), dtype=np.float16)
-
-    for gid in range(num_groups):
-        c_start = gid * group_size
-        c_end = min(c_start + group_size, hidden_size)
-        group_data = weight_np[:, c_start:c_end].astype(np.float64)
-
-        row_min = group_data.min(axis=1)
-        row_max = group_data.max(axis=1)
-        row_range = row_max - row_min
-        scale = np.maximum(row_range / (n_levels - 1), MIN_F16_SCALE)
-
-        # Round-trip through f16
-        scale_f16 = scale.astype(np.float16)
-        zero_f16 = row_min.astype(np.float16)
-        validate_f16_params(scale_f16, zero_f16, "embedding group")
-        scales[:, gid] = scale_f16
-        zeros[:, gid] = zero_f16
-
-        # Quantize using f16-rounded params
-        scale_64 = scale_f16.astype(np.float64)
-        zero_64 = zero_f16.astype(np.float64)
-
-        for c in range(c_start, c_end):
-            q = np.clip(np.round((weight_np[:, c].astype(np.float64) - zero_64) / scale_64), 0, 255).astype(np.uint8)
-            codes[:, c] = q
-
-    return codes, scales, zeros
-
-
-# =============================================================================
-# Binary format packing
-# =============================================================================
-
-def pack_nibbles(codes):
-    """Pack uint8 codes (0-15) into nibble pairs: low nibble = even col, high = odd."""
-    rows, cols = codes.shape
-    assert cols % 2 == 0, f"cols must be even, got {cols}"
-    packed = np.zeros((rows, cols // 2), dtype=np.uint8)
-    for c in range(0, cols, 2):
-        packed[:, c // 2] = (codes[:, c] & 0x0F) | ((codes[:, c + 1] & 0x0F) << 4)
-    return packed
-
-
-def pack_group_params(scales, zeros):
-    """Pack per-row-per-group f16 scales and zeros into bytes.
-
-    Layout: for each row r, for each group g: [f16_scale, f16_zero] = 4 bytes.
-    """
-    rows, num_groups = scales.shape
-    buf = bytearray(rows * num_groups * 4)
-    for r in range(rows):
-        for g in range(num_groups):
-            off = (r * num_groups + g) * 4
-            s_bytes = np.float16(scales[r, g]).tobytes()
-            z_bytes = np.float16(zeros[r, g]).tobytes()
-            buf[off:off+2] = s_bytes
-            buf[off+2:off+4] = z_bytes
-    return bytes(buf)
-
-
-def pack_linear_section(codes, scales, zeros, rows, cols):
-    """Pack a quantized linear layer: sub-header + group_params + nibble_data."""
-    data = bytearray()
-    # Sub-header: [u32 rows, u32 cols]
-    data.extend(struct.pack('<II', rows, cols))
-    # Group params
-    data.extend(pack_group_params(scales, zeros))
-    # Nibble data
-    packed = pack_nibbles(codes)
-    data.extend(packed.tobytes())
-    return bytes(data)
-
-
-def pack_norm_section(weights_np):
-    """Pack RMSNorm weights as f32."""
-    return weights_np.astype(np.float32).tobytes()
-
-
-def write_header(f, config, num_sections):
-    """Write 64-byte header."""
-    header = bytearray(64)
-    # Magic
-    header[0:4] = b'RAIM'
-    # Version
-    struct.pack_into('<I', header, 4, 1)
-    # Config
-    struct.pack_into('<I', header, 8, config['hidden_size'])
-    struct.pack_into('<I', header, 12, config['num_layers'])
-    struct.pack_into('<I', header, 16, config['num_heads'])
-    struct.pack_into('<I', header, 20, config['num_kv_heads'])
-    struct.pack_into('<I', header, 24, config['head_dim'])
-    struct.pack_into('<I', header, 28, config['intermediate_size'])
-    struct.pack_into('<I', header, 32, config['vocab_size'])
-    struct.pack_into('<I', header, 36, config['max_context'])
-    struct.pack_into('<f', header, 40, config['rope_theta'])
-    struct.pack_into('<f', header, 44, config['norm_eps'])
-    header[48] = config['bits']
-    header[49] = config['group_size']
-    header[50] = config['embed_bits']
-    header[51] = config['embed_group_size']
-    struct.pack_into('<I', header, 52, num_sections)
-    f.write(header)
-
-
-# =============================================================================
-# Main export pipeline
-# =============================================================================
 
 def main():
     parser = argparse.ArgumentParser(description='Export HuggingFace LLM to .raimodel')
@@ -296,7 +49,7 @@ def main():
     parser.add_argument('--hessian-dtype', type=str, default='float64', choices=['float32', 'float64'],
                        help='Hessian accumulation dtype (float32 halves RAM for 7B+)')
     args = parser.parse_args()
-    validate_export_options(parser, args)
+    raimodel.validate_export_options(parser, args)
 
     # Auto-derive output name from model
     if args.output is None:
@@ -330,15 +83,37 @@ def main():
     hidden_size = cfg.hidden_size
     num_heads = cfg.num_attention_heads
     num_kv_heads = getattr(cfg, 'num_key_value_heads', num_heads)
-    head_dim = hidden_size // num_heads
+    head_dim = raimodel.resolve_head_dim(getattr(cfg, 'head_dim', None), hidden_size, num_heads)
     intermediate_size = cfg.intermediate_size
     vocab_size = cfg.vocab_size
     rope_theta = getattr(cfg, 'rope_theta', 10000.0)
     norm_eps = getattr(cfg, 'rms_norm_eps', 1e-5)
+    tied = getattr(cfg, 'tie_word_embeddings', True)
+
+    model_config = {
+        'hidden_size': hidden_size,
+        'num_layers': n_layers,
+        'num_heads': num_heads,
+        'num_kv_heads': num_kv_heads,
+        'head_dim': head_dim,
+        'intermediate_size': intermediate_size,
+        'vocab_size': vocab_size,
+        'max_context': args.max_context,
+        'rope_theta': rope_theta,
+        'norm_eps': norm_eps,
+        'bits': args.bits,
+        'group_size': args.group_size,
+        'embed_bits': args.embed_bits,
+        'embed_group_size': args.embed_group_size,
+    }
+    # Fail fast on anything the Rust reader would reject, BEFORE spending
+    # an hour on calibration.
+    raimodel.validate_model_config(model_config)
 
     print(f"Architecture: {arch}, {n_layers} layers, hidden={hidden_size}, inter={intermediate_size}")
     print(f"Heads: {num_heads} query, {num_kv_heads} KV, head_dim={head_dim}")
     print(f"Vocab: {vocab_size}, RoPE theta={rope_theta}, norm eps={norm_eps}")
+    print(f"Word embeddings: {'tied' if tied else 'untied (separate lm_head section)'}")
     model_params = sum(p.numel() for p in model.parameters())
     fp16_size = model_params * 2 / 1e9
     q4_est = model_params * 0.5 / 1e6  # 4-bit = 0.5 bytes per param
@@ -361,10 +136,10 @@ def main():
         if start + args.seq_len > len(train_tokens):
             break
         chunks.append(train_tokens[start:start + args.seq_len].unsqueeze(0).to(device))
+    raimodel.require_calibration_chunks(len(chunks), args.seq_len, len(train_tokens))
     print(f"Calibration: {len(chunks)} chunks of {args.seq_len} tokens")
 
     hess_dtype_np = np.float32 if args.hessian_dtype == 'float32' else np.float64
-    hess_dtype_torch = torch.float32  # always accumulate in float32 on GPU
     print(f"Hessian dtype: {args.hessian_dtype} (numpy), float32 (GPU accumulation)")
 
     hessians = {}
@@ -407,9 +182,6 @@ def main():
     for key in hessians:
         if hessians[key] is not None:
             hessians[key] = (hessians[key] / n_tokens).numpy().astype(hess_dtype_np)
-            if args.hessian_dtype == 'float32':
-                # GPTQ needs float64 for Cholesky, upcast just before quantization
-                pass
 
     # =========================================================================
     # Step 2: GPTQ quantize all layers
@@ -441,8 +213,9 @@ def main():
         for name, hkey, linear in linear_map:
             w = linear.weight.data.float().cpu().numpy().astype(np.float64)
             H = hessians[hkey].astype(np.float64)  # GPTQ Cholesky needs float64
-            codes, scales, zeros, mse = gptq_quantize_to_codes(
-                w, H, bits=args.bits, group_size=args.group_size
+            codes, scales, zeros, mse = raimodel.gptq_quantize(
+                w, H, bits=args.bits, group_size=args.group_size,
+                label=f"L{layer_idx}.{name}"
             )
             rows, cols = w.shape
             linears_packed.append((codes, scales, zeros, rows, cols))
@@ -460,7 +233,7 @@ def main():
     print(f"\nQuantization done in {t_quant:.1f}s ({t_quant/60:.1f} min)")
 
     # =========================================================================
-    # Step 3: Quantize embedding
+    # Step 3: Quantize embedding (and lm_head when untied)
     # =========================================================================
     print(f"\n{'='*60}")
     print("STEP 3: EMBEDDING QUANTIZATION (8-bit)")
@@ -469,26 +242,31 @@ def main():
     embed_weight = model.model.embed_tokens.weight.data.float().cpu().numpy().astype(np.float64)
     print(f"Embedding shape: {embed_weight.shape}")
     t0 = time.time()
-    embed_codes, embed_scales, embed_zeros = quantize_embedding_8bit(
+    embed_codes, embed_scales, embed_zeros, embed_mse = raimodel.quantize_embedding_8bit(
         embed_weight, group_size=args.embed_group_size
     )
     t_embed = time.time() - t0
-    # Compute embedding MSE
-    num_embed_groups = (hidden_size + args.embed_group_size - 1) // args.embed_group_size
-    embed_mse_sum = 0.0
-    for gid in range(num_embed_groups):
-        c_start = gid * args.embed_group_size
-        c_end = min(c_start + args.embed_group_size, hidden_size)
-        s = embed_scales[:, gid].astype(np.float64)
-        z = embed_zeros[:, gid].astype(np.float64)
-        for c in range(c_start, c_end):
-            recon = embed_codes[:, c].astype(np.float64) * s + z
-            embed_mse_sum += np.sum((embed_weight[:, c] - recon) ** 2)
-    embed_mse = embed_mse_sum / (vocab_size * hidden_size)
     print(f"Embedding 8-bit MSE: {embed_mse:.2e}, time: {t_embed:.1f}s")
 
     # Final norm
     final_norm_weight = model.model.norm.weight.data.float().cpu().numpy()
+
+    # Untied models carry a separate lm_head; the reader expects it as an
+    # extra 4-bit section after the final norm.  Quantized round-to-nearest
+    # (no Hessian is collected for the lm_head input).
+    lm_head_packed = None
+    if not tied:
+        print(f"\nlm_head is untied — quantizing at {args.bits}-bit")
+        t0 = time.time()
+        lm_weight = model.lm_head.weight.data.float().cpu().numpy().astype(np.float64)
+        lm_rows, lm_cols = lm_weight.shape
+        lm_codes, lm_scales, lm_zeros, lm_mse = raimodel.rtn_quantize(
+            lm_weight, bits=args.bits, group_size=args.group_size, label="lm_head"
+        )
+        lm_head_packed = (lm_codes, lm_scales, lm_zeros, lm_rows, lm_cols)
+        print(f"lm_head: [{lm_rows}x{lm_cols}] mse={lm_mse:.2e}, time: {time.time()-t0:.1f}s")
+    else:
+        print(f"\nlm_head: tied to embedding (no extra section)")
 
     # =========================================================================
     # Step 4: Write .raimodel file
@@ -499,81 +277,33 @@ def main():
 
     output_path = Path(args.output)
 
-    # Prepare all section data first
-    num_sections = 1 + n_layers + 1  # embed + layers + final_norm = 32
-
-    # Build section data
+    # Build section data: embed + layers + final norm [+ lm_head if untied]
     sections_data = []
-
-    # Section 0: Embedding
-    embed_section = bytearray()
-    embed_section.extend(pack_group_params(embed_scales, embed_zeros))
-    embed_section.extend(embed_codes.tobytes())
-    sections_data.append(bytes(embed_section))
-
-    # Sections 1..30: Transformer layers
+    sections_data.append(raimodel.build_embedding_section(embed_codes, embed_scales, embed_zeros))
     for layer_idx in range(n_layers):
         linears_packed, input_ln, post_attn_ln = layer_data[layer_idx]
-        layer_section = bytearray()
-        for codes, scales, zeros, rows, cols in linears_packed:
-            layer_section.extend(pack_linear_section(codes, scales, zeros, rows, cols))
-        layer_section.extend(pack_norm_section(input_ln))
-        layer_section.extend(pack_norm_section(post_attn_ln))
-        sections_data.append(bytes(layer_section))
+        sections_data.append(raimodel.build_layer_section(linears_packed, input_ln, post_attn_ln))
+    sections_data.append(raimodel.pack_norm_section(final_norm_weight, "final norm"))
+    if lm_head_packed is not None:
+        codes, scales, zeros, rows, cols = lm_head_packed
+        sections_data.append(raimodel.pack_linear_section(codes, scales, zeros, rows, cols))
 
-    # Section 31: Final RMSNorm
-    sections_data.append(pack_norm_section(final_norm_weight))
-
-    # Compute offsets
-    header_size = 64
-    table_size = num_sections * 16
-    data_start = header_size + table_size
-
-    offsets = []
-    current_offset = data_start
-    for data in sections_data:
-        offsets.append(current_offset)
-        current_offset += len(data)
-
-    model_config = {
-        'hidden_size': hidden_size,
-        'num_layers': n_layers,
-        'num_heads': num_heads,
-        'num_kv_heads': num_kv_heads,
-        'head_dim': head_dim,
-        'intermediate_size': intermediate_size,
-        'vocab_size': vocab_size,
-        'max_context': args.max_context,
-        'rope_theta': rope_theta,
-        'norm_eps': norm_eps,
-        'bits': args.bits,
-        'group_size': args.group_size,
-        'embed_bits': args.embed_bits,
-        'embed_group_size': args.embed_group_size,
-    }
-
-    with open(output_path, 'wb') as f:
-        # Header
-        write_header(f, model_config, num_sections)
-
-        # Section index table
-        for i in range(num_sections):
-            f.write(struct.pack('<QQ', offsets[i], len(sections_data[i])))
-
-        # Section data
-        for data in sections_data:
-            f.write(data)
-
-    total_size = output_path.stat().st_size
-    print(f"\nWrote: {output_path} ({total_size / 1e6:.1f} MB)")
+    num_sections = len(sections_data)
+    total_size = raimodel.write_raimodel(output_path, model_config, sections_data)
+    print(f"\nWrote: {output_path} ({total_size / 1e6:.1f} MB, {num_sections} sections)")
 
     # Section breakdown
+    data_start = raimodel.HEADER_SIZE + num_sections * raimodel.SECTION_ENTRY_SIZE
     print("\nSection sizes:")
     print(f"  Header + index: {data_start / 1024:.1f} KB")
     print(f"  Embedding (8-bit): {len(sections_data[0]) / 1e6:.1f} MB")
     for i in range(n_layers):
         print(f"  Layer {i}: {len(sections_data[1+i]) / 1024:.1f} KB")
-    print(f"  Final norm: {len(sections_data[-1])} bytes")
+    if lm_head_packed is not None:
+        print(f"  Final norm: {len(sections_data[1 + n_layers])} bytes")
+        print(f"  lm_head (4-bit): {len(sections_data[-1]) / 1e6:.1f} MB")
+    else:
+        print(f"  Final norm: {len(sections_data[-1])} bytes")
 
     # =========================================================================
     # Step 5: Copy tokenizer
@@ -582,11 +312,12 @@ def main():
     with tempfile.TemporaryDirectory(prefix="rai_tokenizer_") as tmp_dir:
         tokenizer.save_pretrained(tmp_dir)
         src_json = Path(tmp_dir) / "tokenizer.json"
-        if src_json.exists():
-            shutil.copy2(src_json, tokenizer_dst)
+        if not src_json.exists():
+            raise RuntimeError("tokenizer export did not produce the required tokenizer.json")
+        if raimodel.copy_tokenizer_json(src_json, tokenizer_dst):
             print(f"Tokenizer copied to: {tokenizer_dst}")
         else:
-            raise RuntimeError("tokenizer export did not produce the required tokenizer.json")
+            print(f"Tokenizer already present (identical): {tokenizer_dst}")
 
     # =========================================================================
     # Summary
