@@ -717,7 +717,7 @@ const CHAT_HTML: &str = r##"<!DOCTYPE html>
     <span id="ctl-guidance-val">1.5</span>
   </label>
   <label>Temp
-    <input type="range" id="ctl-temp" min="0" max="1.5" step="0.05" value="0.5">
+    <input type="range" id="ctl-temp" min="0.05" max="2" step="0.05" value="0.5">
     <span id="ctl-temp-val">0.5</span>
   </label>
   <label>Max Tokens

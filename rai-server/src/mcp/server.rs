@@ -195,10 +195,14 @@ async fn handle_request(
             }),
         ),
 
+        // MCP requires receivers to answer ping with an empty result; clients
+        // (e.g. Claude Desktop) health-check with it and may disconnect otherwise.
+        "ping" => JsonRpcResponse::success(id, json!({})),
+
         "tools/list" => {
             let tools = tool_definitions()
                 .into_iter()
-                .filter(|tool| mutations_enabled || tool.name != "rai_store")
+                .filter(|tool| mutations_enabled || tool.annotations.read_only_hint)
                 .collect::<Vec<_>>();
             JsonRpcResponse::success(id, json!({ "tools": tools }))
         }
@@ -214,6 +218,17 @@ async fn handle_request(
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
+
+            // A name that matches no defined tool is a protocol error, not a
+            // tool-execution failure; isError results are reserved for tools
+            // that exist. Disabled-but-defined tools still answer in-band.
+            if !tool_definitions().iter().any(|tool| tool.name == tool_name) {
+                return Some(JsonRpcResponse::error(
+                    id,
+                    -32602,
+                    format!("Unknown tool: {tool_name}"),
+                ));
+            }
 
             let result = handle_tool_call(state, tool_name, arguments, mutations_enabled).await;
             match serde_json::to_value(result) {
