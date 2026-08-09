@@ -12,7 +12,7 @@ use std::io::Read;
 use std::path::Path;
 
 /// Magic bytes: "RAIM"
-const MAGIC: [u8; 4] = [b'R', b'A', b'I', b'M'];
+const MAGIC: [u8; 4] = *b"RAIM";
 const FORMAT_VERSION: u32 = 1;
 const HEADER_SIZE: usize = 64;
 const SECTION_ENTRY_SIZE: usize = 16;
