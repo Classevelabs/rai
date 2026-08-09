@@ -39,7 +39,7 @@ captured in `Cargo.lock`.
 
 | Crate | Purpose |
 | --- | --- |
-| `rai-infer` | The inference engine: `.raimodel` loader, AVX2 W4A8/W4A32 GEMM kernels, transformer layers (RMSNorm, RoPE, GQA, SwiGLU), KV cache, sampling, speculative decoding, CLI + HTTP chat binaries |
+| `rai-infer` | The inference engine: `.raimodel` loader, AVX2 W4A8 GEMM kernels, transformer layers (RMSNorm, RoPE, GQA, SwiGLU), KV cache, sampling, speculative decoding, CLI + HTTP chat binaries (behind the default-on `cli` feature; `--no-default-features` builds the lean library) |
 | `rai-compress` | Experimental quantization/compression algorithms. GPTQ export emits `.raimodel`; RC/HRC/SAC accounting is prototype-only and does not yet serialize an artifact. |
 | `rai-server` | REST + MCP server exposing the RAI memory/reasoning layer to HTTP clients and MCP-capable agents |
 | `rai-core` | Memory, embedding, and reasoning primitives used by `rai-server` |
@@ -75,7 +75,7 @@ The repository and v0.1.0 release are already public, and all five
 `classeve-rai-*` v0.1.0 crates are on crates.io. This checkout contains
 unreleased changes; building it does not change the published v0.1.0 artifacts.
 See [installation](./docs/INSTALL.md) and the
-[release procedure](./docs/RELEASE.md). No container image is
+[release-readiness gate](./docs/RELEASE_READINESS.md). No container image is
 currently published; the Dockerfile builds an MCP stdio image from source.
 
 Development checks:
@@ -291,8 +291,8 @@ Common startup failures are deliberate safeguards: use a loopback
 `openai` provider, and make `RAI_DATA_PATH` a writable file path rather than a
 directory. A model that fails to load should be regenerated and treated as
 untrusted until its header, dimensions, offsets, and file length are verified.
-See [installation](./docs/INSTALL.md), [architecture](./docs/ARCHITECTURE.md),
-and the [release procedure](./docs/RELEASE.md) for the full runbooks.
+See [installation](./docs/INSTALL.md), [operations](./docs/OPERATIONS.md), and
+[release readiness](./docs/RELEASE_READINESS.md) for the full runbooks.
 
 ## The `.raimodel` format
 
