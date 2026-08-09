@@ -435,7 +435,10 @@ fn validate_speculative_config(config: &SpeculativeConfig) -> Result<()> {
 }
 
 /// Softmax probability of a specific token.
-fn softmax_prob_of(logits: &[f32], token_id: usize, temperature: f32) -> f32 {
+///
+/// Shared with self-speculative decoding — this is the NaN/inf-hardened
+/// implementation both acceptance loops must use.
+pub(crate) fn softmax_prob_of(logits: &[f32], token_id: usize, temperature: f32) -> f32 {
     if token_id >= logits.len() {
         return 0.0;
     }
@@ -496,7 +499,10 @@ fn softmax_probabilities(logits: &[f32], temperature: f32) -> Vec<f32> {
 }
 
 /// Sample correction token from max(0, p_target - p_draft).
-fn sample_correction(
+///
+/// Shared with self-speculative decoding (hardened against NaN/inf logits
+/// and degenerate residual distributions).
+pub(crate) fn sample_correction(
     target_logits: &[f32],
     draft_logits: &[f32],
     config: &SamplerConfig,

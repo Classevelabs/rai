@@ -14,6 +14,7 @@ use rand::Rng;
 use crate::kv_cache::KVCache;
 use crate::model::{BatchScratch, RaiModel, Scratch};
 use crate::sampler::{apply_repetition_penalty, sample_token, SamplerConfig};
+use crate::speculative::{sample_correction, softmax_prob_of};
 
 /// Configuration for self-speculative decoding.
 #[derive(Debug, Clone)]
@@ -28,45 +29,52 @@ pub struct SelfSpecConfig {
 
 impl SelfSpecConfig {
     /// Create config using first N layers (simple early exit).
-    pub fn early_exit(num_layers: usize, draft_k: usize, sampler: SamplerConfig) -> Self {
-        assert!(
+    pub fn early_exit(num_layers: usize, draft_k: usize, sampler: SamplerConfig) -> Result<Self> {
+        ensure!(
             num_layers > 0,
             "self-speculative draft must use at least one layer"
         );
-        assert!(draft_k > 0, "self-speculative draft_k must be non-zero");
-        Self {
+        ensure!(draft_k > 0, "self-speculative draft_k must be non-zero");
+        Ok(Self {
             draft_layer_indices: (0..num_layers).collect(),
             draft_k,
             sampler,
-        }
+        })
     }
 
     /// Create config using strided layer selection (covers full model depth).
-    /// Always includes the last layer for better lm_head compatibility.
+    /// Produces exactly `num_draft_layers` indices, spread evenly and always
+    /// ending at the last layer for lm_head compatibility. (The previous
+    /// stride-then-append construction could silently run up to 40% more
+    /// draft layers than requested.)
     pub fn layer_skip(
         total_layers: usize,
         num_draft_layers: usize,
         draft_k: usize,
         sampler: SamplerConfig,
-    ) -> Self {
-        assert!(total_layers > 0, "model must contain at least one layer");
-        assert!(
+    ) -> Result<Self> {
+        ensure!(total_layers > 0, "model must contain at least one layer");
+        ensure!(
             num_draft_layers > 0 && num_draft_layers <= total_layers,
             "draft layer count must be within the model"
         );
-        assert!(draft_k > 0, "self-speculative draft_k must be non-zero");
-        let stride = total_layers / num_draft_layers.max(1);
-        let mut indices: Vec<usize> = (0..total_layers).step_by(stride.max(1)).collect();
-        // Always include the last layer
+        ensure!(draft_k > 0, "self-speculative draft_k must be non-zero");
         let last = total_layers - 1;
-        if indices.last().copied() != Some(last) {
-            indices.push(last);
-        }
-        Self {
+        let indices: Vec<usize> = if num_draft_layers == 1 {
+            vec![last]
+        } else {
+            // i * last / (n-1) is strictly increasing for n <= total_layers,
+            // starts at 0, and ends exactly at the last layer.
+            (0..num_draft_layers)
+                .map(|i| i * last / (num_draft_layers - 1))
+                .collect()
+        };
+        debug_assert_eq!(indices.len(), num_draft_layers);
+        Ok(Self {
             draft_layer_indices: indices,
             draft_k,
             sampler,
-        }
+        })
     }
 }
 
@@ -93,12 +101,12 @@ pub struct SelfSpecDecoder<'a> {
 }
 
 impl<'a> SelfSpecDecoder<'a> {
-    pub fn new(model: &'a RaiModel, max_ctx: usize) -> Self {
+    pub fn new(model: &'a RaiModel, max_ctx: usize) -> Result<Self> {
         let ctx = max_ctx.min(model.config.max_context as usize);
-        assert!(ctx > 0, "self-speculative context must be non-zero");
+        ensure!(ctx > 0, "self-speculative context must be non-zero");
         let hs = model.config.hidden_size as usize;
         let vs = model.config.vocab_size as usize;
-        Self {
+        Ok(Self {
             model,
             kv_cache: model.create_kv_cache(ctx),
             draft_scratch: Scratch::new(),
@@ -108,7 +116,7 @@ impl<'a> SelfSpecDecoder<'a> {
             verify_normed: Vec::new(),
             verify_logits: vec![0.0; vs],
             max_ctx: ctx,
-        }
+        })
     }
 
     /// Prefill all prompt tokens except the final token, which the first decode step consumes.
@@ -418,70 +426,3 @@ impl<'a> SelfSpecDecoder<'a> {
     }
 }
 
-/// Softmax probability of a specific token.
-fn softmax_prob_of(logits: &[f32], token_id: usize, temperature: f32) -> f32 {
-    if token_id >= logits.len() {
-        return 0.0;
-    }
-    let temp = temperature.max(1e-6);
-    let scaled = logits[token_id] / temp;
-    let max_l = logits
-        .iter()
-        .map(|&l| l / temp)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let sum_exp: f32 = logits.iter().map(|&l| (l / temp - max_l).exp()).sum();
-    (scaled - max_l).exp() / sum_exp
-}
-
-/// Sample correction token from max(0, p_target - p_draft).
-fn sample_correction(
-    target_logits: &[f32],
-    draft_logits: &[f32],
-    config: &SamplerConfig,
-    rng: &mut impl Rng,
-) -> usize {
-    let n = target_logits.len().min(draft_logits.len());
-    if n == 0 {
-        return 0;
-    }
-    let temp = config.temperature.max(1e-6);
-
-    let max_t = target_logits
-        .iter()
-        .map(|&l| l / temp)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let max_d = draft_logits
-        .iter()
-        .map(|&l| l / temp)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let sum_t: f32 = target_logits
-        .iter()
-        .map(|&l| (l / temp - max_t).exp())
-        .sum();
-    let sum_d: f32 = draft_logits.iter().map(|&l| (l / temp - max_d).exp()).sum();
-
-    let mut adj_sum = 0.0f64;
-    let mut adjusted = vec![0.0f32; n];
-    for i in 0..n {
-        let p_t = (target_logits[i] / temp - max_t).exp() / sum_t;
-        let p_d = (draft_logits[i] / temp - max_d).exp() / sum_d;
-        let diff = (p_t - p_d).max(0.0);
-        adjusted[i] = diff;
-        adj_sum += f64::from(diff);
-    }
-
-    if !adj_sum.is_finite() || adj_sum <= 0.0 {
-        let mut logits_copy = target_logits.to_vec();
-        return sample_token(&mut logits_copy, config, rng);
-    }
-
-    let u: f64 = rng.gen::<f64>() * adj_sum;
-    let mut cumsum = 0.0f64;
-    for i in 0..n {
-        cumsum += f64::from(adjusted[i]);
-        if cumsum >= u {
-            return i;
-        }
-    }
-    n - 1
-}

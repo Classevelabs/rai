@@ -323,16 +323,16 @@ fn main() -> Result<()> {
                 draft_layers,
                 args.self_spec_k,
                 sampler_config.clone(),
-            )
+            )?
         } else {
             eprintln!(
                 "Self-speculative (early-exit): first {} of {} layers, K={}",
                 draft_layers, total_layers, args.self_spec_k
             );
-            SelfSpecConfig::early_exit(draft_layers, args.self_spec_k, sampler_config.clone())
+            SelfSpecConfig::early_exit(draft_layers, args.self_spec_k, sampler_config.clone())?
         };
         eprintln!("Draft layers: {:?}", spec_config.draft_layer_indices);
-        let mut decoder = SelfSpecDecoder::new(&model, max_ctx);
+        let mut decoder = SelfSpecDecoder::new(&model, max_ctx)?;
 
         // Prefill
         let t_prefill = Instant::now();

@@ -33,3 +33,6 @@ __pycache__/
 Thumbs.db
 
 # Cargo.lock is intentionally tracked (this workspace ships binaries)
+
+# Golden conformance fixtures are test inputs, not exported models
+!rai-infer/tests/fixtures/*.raimodel

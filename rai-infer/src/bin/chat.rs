@@ -188,6 +188,17 @@ fn validate_chat_options(req: &ChatRequest) -> Result<(), ChatHttpError> {
             "ensemble_n must be between 1 and {MAX_ENSEMBLE_SIZE}"
         )));
     }
+    // Ensemble strategies need at least two passes; reject explicitly instead
+    // of silently running a different configuration than requested.
+    if matches!(
+        req.ponder_strategy.as_deref(),
+        Some("ensemble") | Some("cfg-ensemble")
+    ) && req.ensemble_n.is_some_and(|value| value < 2)
+    {
+        return Err(ChatHttpError::bad_request(
+            "ensemble strategies require ensemble_n >= 2",
+        ));
+    }
     validate_optional_f32("noise_sigma", req.noise_sigma, 0.0, 1.0)?;
     validate_optional_f32(
         "entropy_threshold",
