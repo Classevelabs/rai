@@ -1,4 +1,5 @@
 use crate::mcp::schema::{ToolAnnotations, ToolDefinition};
+use crate::validate::{MAX_INTERSECTION_CONCEPTS, MAX_TEXT_BYTES};
 use serde_json::json;
 
 /// Return the 7 MCP tool definitions.
@@ -6,8 +7,9 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "rai_store".to_string(),
-            description: "Store a fact in RAI memory. Returns an experimental score-change \
-                          report; it is not proof that the fact contradicts existing memories."
+            description: "Store a fact in RAI memory. Returns a report of how crowded the \
+                          stored address space became; it does not check the fact against \
+                          existing memories for contradiction."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -15,7 +17,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     "content": {
                         "type": "string",
                         "minLength": 1,
-                        "maxLength": 16384,
+                        "maxLength": MAX_TEXT_BYTES,
                         "description": "The fact or knowledge to store"
                     }
                 },
@@ -26,9 +28,9 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "rai_recall".to_string(),
-            description: "Retrieve the nearest stored memory using the configured embedding \
-                          and current NRA scoring heuristic. Confidence labels are experimental \
-                          diagnostics and are not calibrated probabilities."
+            description: "Retrieve the stored memory whose address has the highest cosine \
+                          similarity to the query. Confidence labels are experimental score \
+                          tiers, not calibrated probabilities."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -36,7 +38,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     "query": {
                         "type": "string",
                         "minLength": 1,
-                        "maxLength": 16384,
+                        "maxLength": MAX_TEXT_BYTES,
                         "description": "The query to recall knowledge about"
                     }
                 },
@@ -58,10 +60,10 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "items": {
                             "type": "string",
                             "minLength": 1,
-                            "maxLength": 16384
+                            "maxLength": MAX_TEXT_BYTES
                         },
                         "minItems": 2,
-                        "maxItems": 32,
+                        "maxItems": MAX_INTERSECTION_CONCEPTS,
                         "description": "List of concepts to intersect (2 or more)"
                     }
                 },
@@ -72,8 +74,11 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "rai_contradict".to_string(),
-            description: "Return an experimental score-change comparison for a candidate fact. \
-                          The current heuristic does not establish logical contradiction."
+            description: "Report how storing a candidate fact would change crowding among the \
+                          stored address vectors. This measures address-space crowding only: \
+                          adding a memory can never push its neighbours apart, so this tool \
+                          cannot detect a semantic contradiction. Do not treat an empty report \
+                          as evidence that the fact is consistent with memory."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -81,7 +86,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     "fact": {
                         "type": "string",
                         "minLength": 1,
-                        "maxLength": 16384,
+                        "maxLength": MAX_TEXT_BYTES,
                         "description": "The fact to check for contradictions"
                     }
                 },
@@ -92,8 +97,9 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "rai_surprise".to_string(),
-            description: "Return an experimental nearest-key REM residual score for content. \
-                          The score is a heuristic, not a calibrated novelty measurement."
+            description: "Return the residual between a candidate value and the value of the \
+                          nearest stored key. The score is a heuristic, not a calibrated \
+                          novelty measurement."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -101,7 +107,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     "content": {
                         "type": "string",
                         "minLength": 1,
-                        "maxLength": 16384,
+                        "maxLength": MAX_TEXT_BYTES,
                         "description": "The content to measure surprise for"
                     }
                 },
@@ -112,8 +118,9 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "rai_explain_confidence".to_string(),
-            description: "Return experimental score and gradient diagnostics for a query. \
-                          These values are heuristic and should not be treated as calibrated confidence."
+            description: "Return the retrieval score for a query and the tier it falls in. \
+                          These values are heuristic and should not be treated as calibrated \
+                          confidence."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -121,7 +128,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     "query": {
                         "type": "string",
                         "minLength": 1,
-                        "maxLength": 16384,
+                        "maxLength": MAX_TEXT_BYTES,
                         "description": "The query to explain confidence for"
                     }
                 },
@@ -132,8 +139,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "rai_memory_health".to_string(),
-            description: "Get system diagnostics: number of memories, NRA/REM MSE, \
-                          prior quality, capacity utilization, and training status."
+            description: "Get system diagnostics: number of stored memories, mean residual \
+                          norm, and capacity utilization."
                 .to_string(),
             input_schema: json!({
                 "type": "object",

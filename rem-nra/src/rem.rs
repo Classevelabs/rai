@@ -1,34 +1,14 @@
 use crate::{MemoryError, Result, Vec64};
-use rand::Rng;
-use rand_distr::StandardNormal;
 use serde::{Deserialize, Serialize};
-
-pub mod encoder {
-    use crate::Vec64;
-    use serde::{Deserialize, Serialize};
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct EncoderParams {
-        pub bias: Vec64,
-    }
-}
-
-pub mod decoder {
-    use crate::Vec64;
-    use serde::{Deserialize, Serialize};
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct DecoderParams {
-        pub bias: Vec64,
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct REMConfig {
+    /// Nominal working dimension carried with the store for snapshot identity.
     pub dim_memory: usize,
+    /// Dimension of the key vectors accepted by `store` and `predict`.
     pub dim_key: usize,
+    /// Dimension of the value vectors accepted by `store` and returned by `predict`.
     pub dim_value: usize,
-    pub train_epochs: usize,
 }
 
 impl Default for REMConfig {
@@ -37,41 +17,27 @@ impl Default for REMConfig {
             dim_memory: 256,
             dim_key: 32,
             dim_value: 64,
-            train_epochs: 200,
         }
     }
 }
 
+/// Key/value table whose prediction is the value of the nearest stored key by cosine similarity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResidualEquilibriumMemory {
     pub config: REMConfig,
-    pub encoder: encoder::EncoderParams,
-    pub decoder: decoder::DecoderParams,
-    pub memory_state: Vec64,
     items: Vec<(Vec64, Vec64)>,
     /// Running sum of the residual norm observed at each `store`. One residual is recorded per
     /// stored item, so the mean is this sum divided by `items.len()`.
     #[serde(default)]
     residual_sum: f64,
-    last_loss: Option<f64>,
 }
 
 impl ResidualEquilibriumMemory {
-    pub fn new(config: REMConfig, rng: &mut impl Rng) -> Self {
-        let encoder_bias = Vec64::from_fn(config.dim_memory, |_, _| {
-            rng.sample::<f64, _>(StandardNormal) * 0.01
-        });
-        let decoder_bias = Vec64::from_fn(config.dim_value, |_, _| {
-            rng.sample::<f64, _>(StandardNormal) * 0.01
-        });
+    pub fn new(config: REMConfig) -> Self {
         Self {
-            memory_state: Vec64::zeros(config.dim_memory),
-            encoder: encoder::EncoderParams { bias: encoder_bias },
-            decoder: decoder::DecoderParams { bias: decoder_bias },
             config,
             items: Vec::new(),
             residual_sum: 0.0,
-            last_loss: None,
         }
     }
 
@@ -81,24 +47,14 @@ impl ResidualEquilibriumMemory {
     /// it and the restored item count.
     pub fn from_snapshot(
         config: REMConfig,
-        encoder: encoder::EncoderParams,
-        decoder: decoder::DecoderParams,
-        memory_state: Vec64,
         items: Vec<(Vec64, Vec64)>,
         residual_norm: f64,
-        last_loss: Option<f64>,
     ) -> Result<Self> {
         if config.dim_memory == 0 || config.dim_key == 0 || config.dim_value == 0 {
             return Err(MemoryError::InvalidData(
                 "memory, key, and value dimensions must be non-zero".to_string(),
             ));
         }
-        ensure_dim(&encoder.bias, config.dim_memory)?;
-        ensure_dim(&decoder.bias, config.dim_value)?;
-        ensure_dim(&memory_state, config.dim_memory)?;
-        ensure_finite(&encoder.bias, "encoder bias")?;
-        ensure_finite(&decoder.bias, "decoder bias")?;
-        ensure_finite(&memory_state, "memory state")?;
         for (key, value) in &items {
             ensure_dim(key, config.dim_key)?;
             ensure_dim(value, config.dim_value)?;
@@ -110,20 +66,11 @@ impl ResidualEquilibriumMemory {
                 "residual norm must be finite and non-negative".to_string(),
             ));
         }
-        if last_loss.is_some_and(|loss| !loss.is_finite() || loss < 0.0) {
-            return Err(MemoryError::InvalidData(
-                "last loss must be finite and non-negative".to_string(),
-            ));
-        }
 
         Ok(Self {
             residual_sum: residual_norm * items.len() as f64,
             config,
-            encoder,
-            decoder,
-            memory_state,
             items,
-            last_loss,
         })
     }
 
@@ -133,11 +80,10 @@ impl ResidualEquilibriumMemory {
         let prediction = self.predict(key);
         self.residual_sum += (value - prediction).norm();
         self.items.push((key.clone(), value.clone()));
-        self.memory_state = rolling_average(&self.memory_state, value);
-        self.last_loss = Some(self.current_mse());
         Ok(())
     }
 
+    /// Value of the stored key with the highest cosine similarity to `key`.
     pub fn predict(&self, key: &Vec64) -> Vec64 {
         if self.items.is_empty() {
             return Vec64::zeros(self.config.dim_value);
@@ -163,35 +109,12 @@ impl ResidualEquilibriumMemory {
         }
     }
 
-    pub fn last_loss(&self) -> Option<f64> {
-        self.last_loss
-    }
-
-    pub fn mse(&self) -> Result<f64> {
-        Ok(self.last_loss.unwrap_or_else(|| self.current_mse()))
-    }
-
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
 
-    pub fn train(&mut self) -> Result<Vec<f64>> {
-        Err(MemoryError::TrainingUnavailable)
-    }
-
     pub fn items(&self) -> &[(Vec64, Vec64)] {
         &self.items
-    }
-
-    fn current_mse(&self) -> f64 {
-        if self.items.is_empty() {
-            return 0.0;
-        }
-        self.items
-            .iter()
-            .map(|(_, value)| value.norm_squared() / value.len().max(1) as f64)
-            .sum::<f64>()
-            / self.items.len() as f64
     }
 }
 
@@ -214,16 +137,12 @@ fn ensure_finite(value: &Vec64, label: &str) -> Result<()> {
     }
 }
 
-fn rolling_average(state: &Vec64, value: &Vec64) -> Vec64 {
-    let mut next = state.clone();
-    let limit = next.len().min(value.len());
-    for i in 0..limit {
-        next[i] = 0.95 * next[i] + 0.05 * value[i];
-    }
-    next
-}
-
+/// Cosine similarity that treats mismatched or degenerate vectors as "no similarity" rather
+/// than panicking, so a hand-edited snapshot cannot abort a prediction scan.
 fn cosine(a: &Vec64, b: &Vec64) -> f64 {
+    if a.len() != b.len() {
+        return 0.0;
+    }
     let denom = a.norm() * b.norm();
     if denom <= 1e-12 {
         0.0
@@ -236,30 +155,17 @@ fn cosine(a: &Vec64, b: &Vec64) -> f64 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn training_reports_unavailable_without_mutating_loss() {
-        let mut memory =
-            ResidualEquilibriumMemory::new(REMConfig::default(), &mut rand::thread_rng());
-        assert!(memory.last_loss.is_none());
-        assert!(matches!(
-            memory.train(),
-            Err(MemoryError::TrainingUnavailable)
-        ));
-        assert!(memory.last_loss.is_none());
-    }
-
     fn two_dimensional() -> REMConfig {
         REMConfig {
             dim_memory: 2,
             dim_key: 2,
             dim_value: 2,
-            ..Default::default()
         }
     }
 
     #[test]
     fn mean_residual_norm_averages_every_store_not_just_the_last() {
-        let mut memory = ResidualEquilibriumMemory::new(two_dimensional(), &mut rand::thread_rng());
+        let mut memory = ResidualEquilibriumMemory::new(two_dimensional());
         assert_eq!(memory.mean_residual_norm(), 0.0);
 
         // First store predicts zeros, so the residual is the value norm: 3.
@@ -299,53 +205,51 @@ mod tests {
                 Vec64::from_row_slice(&[0.0, 4.0]),
             ),
         ];
-        let restored = ResidualEquilibriumMemory::from_snapshot(
-            config.clone(),
-            encoder::EncoderParams {
-                bias: Vec64::zeros(config.dim_memory),
-            },
-            decoder::DecoderParams {
-                bias: Vec64::zeros(config.dim_value),
-            },
-            Vec64::zeros(config.dim_memory),
-            items,
-            4.0,
-            None,
-        )
-        .unwrap();
+        let restored = ResidualEquilibriumMemory::from_snapshot(config, items, 4.0).unwrap();
         assert!((restored.mean_residual_norm() - 4.0).abs() < 1e-12);
     }
 
     #[test]
-    fn snapshot_rejects_non_finite_and_negative_diagnostics() {
-        let config = REMConfig::default();
-        let encoder = encoder::EncoderParams {
-            bias: Vec64::zeros(config.dim_memory),
-        };
-        let decoder = decoder::DecoderParams {
-            bias: Vec64::zeros(config.dim_value),
-        };
-        let state = Vec64::zeros(config.dim_memory);
+    fn snapshot_rejects_non_finite_diagnostics_and_ragged_items() {
+        let config = two_dimensional();
 
-        assert!(ResidualEquilibriumMemory::from_snapshot(
-            config.clone(),
-            encoder.clone(),
-            decoder.clone(),
-            state.clone(),
-            Vec::new(),
-            -1.0,
-            None,
-        )
-        .is_err());
-        assert!(ResidualEquilibriumMemory::from_snapshot(
-            config,
-            encoder,
-            decoder,
-            state,
-            Vec::new(),
-            0.0,
-            Some(f64::NAN),
-        )
-        .is_err());
+        assert!(
+            ResidualEquilibriumMemory::from_snapshot(config.clone(), Vec::new(), -1.0).is_err()
+        );
+        assert!(
+            ResidualEquilibriumMemory::from_snapshot(config.clone(), Vec::new(), f64::NAN).is_err()
+        );
+
+        let ragged = vec![(
+            Vec64::from_row_slice(&[1.0, 0.0, 0.0]),
+            Vec64::from_row_slice(&[1.0, 0.0]),
+        )];
+        assert!(ResidualEquilibriumMemory::from_snapshot(config.clone(), ragged, 0.0).is_err());
+
+        let non_finite = vec![(
+            Vec64::from_row_slice(&[1.0, 0.0]),
+            Vec64::from_row_slice(&[f64::INFINITY, 0.0]),
+        )];
+        assert!(ResidualEquilibriumMemory::from_snapshot(config, non_finite, 0.0).is_err());
+    }
+
+    #[test]
+    fn prediction_returns_the_nearest_key_value() {
+        let mut memory = ResidualEquilibriumMemory::new(two_dimensional());
+        memory
+            .store(
+                &Vec64::from_row_slice(&[1.0, 0.0]),
+                &Vec64::from_row_slice(&[7.0, 0.0]),
+            )
+            .unwrap();
+        memory
+            .store(
+                &Vec64::from_row_slice(&[0.0, 1.0]),
+                &Vec64::from_row_slice(&[0.0, 9.0]),
+            )
+            .unwrap();
+
+        let prediction = memory.predict(&Vec64::from_row_slice(&[0.1, 1.0]));
+        assert_eq!(prediction.as_slice(), &[0.0, 9.0]);
     }
 }

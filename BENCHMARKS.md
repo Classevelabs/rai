@@ -61,9 +61,10 @@ Cumulative effect of the kernel work, same hardware and model throughout:
 
 The table reports a 32.5× improvement over the naive implementation in the
 original development runs. The W4A8 path quantizes f32 activations to i8 and is
-not generally bit-identical to W4A32 or scalar arithmetic. No committed golden
-log supports the earlier bit-identity claim; numerical equivalence must be
-measured with explicit tolerances before it is claimed.
+not generally bit-identical to full-f32 or scalar arithmetic. No committed
+golden log supports the earlier bit-identity claim; numerical equivalence must
+be measured with explicit tolerances before it is claimed. (The GEMM entry
+points are named `w4a8_*` accordingly.)
 
 The exact allocator/OS tuning used for the 175 tok/s stage was not retained,
 and the current loader does not explicitly request transparent huge pages. The

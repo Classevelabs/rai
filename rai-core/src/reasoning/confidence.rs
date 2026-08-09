@@ -1,15 +1,14 @@
 use crate::types::ConfidenceLevel;
 
 /// Thresholds for an experimental, uncalibrated retrieval-score tier.
+///
+/// The only input is the retrieval score (`-5 · max(cosine, 0)` against the best-matching stored
+/// address), so the tiers are a relabelling of cosine similarity and nothing else.
 pub struct ConfidenceGate {
-    /// Below this energy = HIGH confidence.
+    /// Below this score = HIGH tier (cosine above ~0.6 at the default value).
     pub high_threshold: f64,
-    /// Below this energy = MEDIUM confidence.
+    /// Below this score = MEDIUM tier (cosine above ~0.2 at the default value).
     pub medium_threshold: f64,
-    /// Gradient norm multiplier for no-match detection.
-    pub no_match_grad_factor: f64,
-    /// Base ODE tolerance (from NRA config).
-    pub ode_tol: f64,
 }
 
 impl Default for ConfidenceGate {
@@ -17,31 +16,19 @@ impl Default for ConfidenceGate {
         Self {
             high_threshold: -3.0,
             medium_threshold: -1.0,
-            no_match_grad_factor: 100.0,
-            ode_tol: 1e-7,
         }
     }
 }
 
 impl ConfidenceGate {
-    /// Build a gate whose no-match diagnostic uses the NRA configuration's ODE tolerance.
-    ///
-    /// The default tolerance only matches the default NRA config; a manager built with custom
-    /// configuration must pass its own value or the no-match threshold silently ignores it.
-    pub fn with_ode_tol(ode_tol: f64) -> Self {
-        Self {
-            ode_tol,
-            ..Self::default()
-        }
-    }
-
-    /// Determine confidence from energy and gradient norm.
-    pub fn classify(&self, energy: f64, grad_norm: f64) -> ConfidenceLevel {
-        if !energy.is_finite() || !grad_norm.is_finite() {
+    /// Determine the score tier from a retrieval score.
+    pub fn classify(&self, energy: f64) -> ConfidenceLevel {
+        if !energy.is_finite() {
             return ConfidenceLevel::Low;
         }
-        // No match: gradient didn't converge
-        if grad_norm > self.ode_tol * self.no_match_grad_factor {
+        // A score of zero means no stored address had positive similarity with the query,
+        // including the case where nothing is stored at all.
+        if energy >= 0.0 {
             return ConfidenceLevel::NoMatch;
         }
 
@@ -55,36 +42,32 @@ impl ConfidenceGate {
     }
 
     /// Generate a human-readable explanation.
-    pub fn explain(&self, energy: f64, grad_norm: f64, confidence: ConfidenceLevel) -> String {
-        if !energy.is_finite() || !grad_norm.is_finite() {
-            return "Confidence diagnostics are unavailable because the retrieval scores were non-finite."
+    pub fn explain(&self, energy: f64, confidence: ConfidenceLevel) -> String {
+        if !energy.is_finite() {
+            return "Confidence diagnostics are unavailable because the retrieval score was non-finite."
                 .to_string();
         }
         match confidence {
             ConfidenceLevel::High => format!(
-                "HIGH heuristic score tier: energy={energy:.3} is below threshold {:.1}. \
+                "HIGH heuristic score tier: score={energy:.3} is below threshold {:.1}. \
                  This experimental label is not a calibrated confidence probability.",
                 self.high_threshold
             ),
             ConfidenceLevel::Medium => format!(
-                "MEDIUM heuristic score tier: energy={energy:.3} is between {:.1} and {:.1}. \
+                "MEDIUM heuristic score tier: score={energy:.3} is between {:.1} and {:.1}. \
                  This experimental label is not calibrated.",
                 self.high_threshold, self.medium_threshold
             ),
             ConfidenceLevel::Low => format!(
-                "LOW heuristic score tier: energy={energy:.3} is above {:.1}. \
+                "LOW heuristic score tier: score={energy:.3} is above {:.1}. \
                  Treat the retrieval as unverified.",
                 self.medium_threshold
             ),
-            ConfidenceLevel::NoMatch => format!(
-                "NO-MATCH heuristic: gradient diagnostic={grad_norm:.2e} exceeded the configured threshold. \
-                 This does not prove that no relevant memory exists.",
-            ),
-            ConfidenceLevel::Ambiguous => format!(
-                "AMBIGUOUS experimental score: the diagnostic reported multiple candidate states. \
-                 This is not a proven basin-boundary classification. \
-                 Energy={energy:.3}, grad_norm={grad_norm:.2e}.",
-            ),
+            ConfidenceLevel::NoMatch => {
+                "NO-MATCH heuristic: no stored memory scored above zero cosine similarity with \
+                 this query. This does not prove that no relevant memory exists."
+                    .to_string()
+            }
         }
     }
 }
@@ -97,22 +80,19 @@ mod tests {
     fn confidence_classification() {
         let gate = ConfidenceGate::default();
 
-        assert_eq!(gate.classify(-5.0, 1e-10), ConfidenceLevel::High);
-        assert_eq!(gate.classify(-2.0, 1e-10), ConfidenceLevel::Medium);
-        assert_eq!(gate.classify(0.0, 1e-10), ConfidenceLevel::Low);
-        assert_eq!(gate.classify(-5.0, 1e-3), ConfidenceLevel::NoMatch);
-        assert_eq!(gate.classify(f64::NAN, 0.0), ConfidenceLevel::Low);
+        assert_eq!(gate.classify(-5.0), ConfidenceLevel::High);
+        assert_eq!(gate.classify(-2.0), ConfidenceLevel::Medium);
+        assert_eq!(gate.classify(-0.5), ConfidenceLevel::Low);
+        assert_eq!(gate.classify(f64::NAN), ConfidenceLevel::Low);
     }
 
     #[test]
-    fn configured_tolerance_moves_the_no_match_threshold() {
-        let strict = ConfidenceGate::with_ode_tol(1e-7);
-        let loose = ConfidenceGate::with_ode_tol(1e-3);
-
-        assert_eq!(loose.ode_tol, 1e-3);
-        // A gradient of 1e-4 is a no-match under the strict tolerance but converged under
-        // the looser one, so the configured value has to reach `classify`.
-        assert_eq!(strict.classify(-5.0, 1e-4), ConfidenceLevel::NoMatch);
-        assert_eq!(loose.classify(-5.0, 1e-4), ConfidenceLevel::High);
+    fn a_zero_score_is_reported_as_no_match() {
+        // An empty store and a query orthogonal to everything both produce a score of zero.
+        let gate = ConfidenceGate::default();
+        assert_eq!(gate.classify(0.0), ConfidenceLevel::NoMatch);
+        assert!(gate
+            .explain(0.0, ConfidenceLevel::NoMatch)
+            .contains("no stored memory"));
     }
 }

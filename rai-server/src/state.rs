@@ -1,7 +1,7 @@
 use rai_core::{InterferenceReport, MemoryManager, RaiError};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio::sync::Mutex;
 
 /// Shared application state for REST and MCP transports.
 #[derive(Clone)]
@@ -9,7 +9,6 @@ pub struct AppState {
     pub manager: Arc<MemoryManager>,
     persistence_path: Option<Arc<PathBuf>>,
     persistence_lock: Arc<Mutex<()>>,
-    training_lock: Arc<Mutex<()>>,
 }
 
 impl AppState {
@@ -18,7 +17,6 @@ impl AppState {
             manager,
             persistence_path: persistence_path.map(Arc::new),
             persistence_lock: Arc::new(Mutex::new(())),
-            training_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -30,21 +28,6 @@ impl AppState {
 
         let _guard = self.persistence_lock.lock().await;
         sanitize_persistence_error(self.manager.store_and_save(content, path.as_ref()).await)
-    }
-
-    /// Retrain NRA without publishing an undurable trained state.
-    pub async fn train_nra(&self) -> Result<Vec<f64>, RaiError> {
-        let Some(path) = &self.persistence_path else {
-            return self.manager.train_nra().await;
-        };
-
-        let _guard = self.persistence_lock.lock().await;
-        sanitize_persistence_error(self.manager.train_nra_and_save(path.as_ref()).await)
-    }
-
-    /// Return a guard only when no other training request is active.
-    pub fn try_training_lock(&self) -> Option<OwnedMutexGuard<()>> {
-        Arc::clone(&self.training_lock).try_lock_owned().ok()
     }
 }
 

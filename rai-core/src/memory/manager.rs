@@ -1,10 +1,7 @@
-use crate::embedding::bridge::EmbeddingBridge;
+use crate::embedding::bridge::{EmbeddingBridge, TextIndex};
 use crate::memory::persistence::{
-    MemorySnapshot, CURRENT_SNAPSHOT_VERSION, MAX_STORED_ITEMS, MAX_TRAIN_EPOCHS,
-    MAX_VECTOR_DIMENSION,
+    MemorySnapshot, CURRENT_SNAPSHOT_VERSION, MAX_STORED_ITEMS, MAX_VECTOR_DIMENSION,
 };
-use crate::memory::training::TrainingOrchestrator;
-use crate::reasoning::basins::BasinAnalyzer;
 use crate::reasoning::composition::Compositor;
 use crate::reasoning::confidence::ConfidenceGate;
 use crate::reasoning::interference::InterferenceDetector;
@@ -16,100 +13,57 @@ use rem_nra::rem::{REMConfig, ResidualEquilibriumMemory};
 use rem_nra::Vec64;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
-const MAX_TEXT_BYTES: usize = 64 * 1024;
-const MAX_INTERSECTION_CONCEPTS: usize = 32;
+/// Largest text accepted by any memory operation, in bytes.
+///
+/// This is the single limit for the whole stack. Transports (the REST handlers and the MCP
+/// server) reject oversized input up front so a client gets a clear error before an embedding
+/// request is made, and this module enforces the same bound as the last line of defence. The
+/// snapshot validator tolerates a larger historical bound so older files still load.
+pub const MAX_TEXT_BYTES: usize = 16 * 1024;
 
-/// Central memory manager that orchestrates NRA, REM, embedding, and reasoning.
+/// Largest number of concepts accepted by [`MemoryManager::intersect`].
+pub const MAX_INTERSECTION_CONCEPTS: usize = 32;
+
+/// Every structure a mutation has to publish together.
+///
+/// One lock covers all of them: a reader that saw `nra` updated but `texts` stale would report
+/// the wrong label for a memory. The bridge's text index is published inside the same critical
+/// section.
+struct Inner {
+    /// Address/value store.
+    nra: NonlinearResonanceMemory,
+    /// Key/value store.
+    rem: ResidualEquilibriumMemory,
+    /// Text labels for stored memories (parallel to NRA items).
+    texts: Vec<String>,
+}
+
+/// Central memory manager that orchestrates the two stores, embedding, and reasoning.
+///
+/// Reads (recall, health, snapshot, len) take a shared guard and run concurrently; every
+/// mutation takes the exclusive guard, so the service is a single-writer store.
 pub struct MemoryManager {
-    /// NRA memory for nonlinear addressing.
-    nra: Arc<Mutex<NonlinearResonanceMemory>>,
-    /// REM memory for structure-aware storage.
-    rem: Arc<Mutex<ResidualEquilibriumMemory>>,
+    /// Single lock over every structure a mutation publishes together.
+    inner: Arc<RwLock<Inner>>,
     /// Embedding bridge for text <-> vector conversion.
     bridge: Arc<EmbeddingBridge>,
-    /// Confidence gating module.
+    /// Retrieval score tiering.
     confidence_gate: ConfidenceGate,
-    /// Interference detector.
+    /// Address-space crowding reporter.
     interference_detector: InterferenceDetector,
-    /// Basin analyzer.
-    basin_analyzer: BasinAnalyzer,
-    /// Surprise detector.
+    /// Residual-based novelty heuristic.
     surprise_detector: SurpriseDetector,
-    /// Training orchestrator.
-    training: Arc<Mutex<TrainingOrchestrator>>,
-    /// Text labels for stored memories (parallel to NRA items).
-    texts: Arc<Mutex<Vec<String>>>,
-    /// Next memory ID.
-    next_id: Arc<Mutex<usize>>,
-    /// Serialises multi-structure mutations and coherent snapshots.
-    mutation_lock: Arc<Mutex<()>>,
 }
 
 impl MemoryManager {
-    /// Create a new MemoryManager with default configurations.
-    ///
-    /// This infallible constructor is retained for API compatibility and requires bridge
-    /// projection targets of 32 (omega), 32 (key), and 64 (value). New callers should use
-    /// [`MemoryManager::try_new`] so a mismatched or malformed bridge is rejected at the
-    /// construction boundary. Call [`MemoryManager::with_configs`] for non-default dimensions.
-    pub fn new(bridge: Arc<EmbeddingBridge>) -> Self {
-        let nra_config = NRAConfig {
-            dim_state: 64,
-            dim_omega: 32,
-            dim_value: 64,
-            num_units: 512,
-            train_epochs: 300,
-            ..Default::default()
-        };
-        let rem_config = REMConfig {
-            dim_memory: 256,
-            dim_key: 32,
-            dim_value: 64,
-            ..Default::default()
-        };
-
-        let mut rng = rand::thread_rng();
-        let ode_tol = nra_config.ode_tol;
-        let nra = NonlinearResonanceMemory::new(nra_config, &mut rng);
-        let rem = ResidualEquilibriumMemory::new(rem_config, &mut rng);
-
-        Self {
-            nra: Arc::new(Mutex::new(nra)),
-            rem: Arc::new(Mutex::new(rem)),
-            bridge,
-            confidence_gate: ConfidenceGate::with_ode_tol(ode_tol),
-            interference_detector: InterferenceDetector::default(),
-            basin_analyzer: BasinAnalyzer::default(),
-            surprise_detector: SurpriseDetector::default(),
-            training: Arc::new(Mutex::new(TrainingOrchestrator::default())),
-            texts: Arc::new(Mutex::new(Vec::new())),
-            next_id: Arc::new(Mutex::new(0)),
-            mutation_lock: Arc::new(Mutex::new(())),
-        }
-    }
-
     /// Create a new MemoryManager with validated default configurations.
     pub fn try_new(bridge: Arc<EmbeddingBridge>) -> Result<Self, RaiError> {
-        let nra_config = NRAConfig {
-            dim_state: 64,
-            dim_omega: 32,
-            dim_value: 64,
-            num_units: 512,
-            train_epochs: 300,
-            ..Default::default()
-        };
-        let rem_config = REMConfig {
-            dim_memory: 256,
-            dim_key: 32,
-            dim_value: 64,
-            ..Default::default()
-        };
-        Self::with_configs(bridge, nra_config, rem_config)
+        Self::with_configs(bridge, NRAConfig::default(), REMConfig::default())
     }
 
-    /// Create with custom NRA/REM configs.
+    /// Create with custom store configs.
     pub fn with_configs(
         bridge: Arc<EmbeddingBridge>,
         nra_config: NRAConfig,
@@ -117,26 +71,30 @@ impl MemoryManager {
     ) -> Result<Self, RaiError> {
         validate_memory_configs(&bridge, &nra_config, &rem_config)?;
         let mut rng = rand::thread_rng();
-        let ode_tol = nra_config.ode_tol;
         let nra = NonlinearResonanceMemory::new(nra_config, &mut rng);
-        let rem = ResidualEquilibriumMemory::new(rem_config, &mut rng);
+        let rem = ResidualEquilibriumMemory::new(rem_config);
 
-        Ok(Self {
-            nra: Arc::new(Mutex::new(nra)),
-            rem: Arc::new(Mutex::new(rem)),
+        Ok(Self::from_parts(
+            Inner {
+                nra,
+                rem,
+                texts: Vec::new(),
+            },
             bridge,
-            confidence_gate: ConfidenceGate::with_ode_tol(ode_tol),
-            interference_detector: InterferenceDetector::default(),
-            basin_analyzer: BasinAnalyzer::default(),
-            surprise_detector: SurpriseDetector::default(),
-            training: Arc::new(Mutex::new(TrainingOrchestrator::default())),
-            texts: Arc::new(Mutex::new(Vec::new())),
-            next_id: Arc::new(Mutex::new(0)),
-            mutation_lock: Arc::new(Mutex::new(())),
-        })
+        ))
     }
 
-    /// Store a fact and return an interference report.
+    fn from_parts(inner: Inner, bridge: Arc<EmbeddingBridge>) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(inner)),
+            bridge,
+            confidence_gate: ConfidenceGate::default(),
+            interference_detector: InterferenceDetector::default(),
+            surprise_detector: SurpriseDetector::default(),
+        }
+    }
+
+    /// Store a fact and return a crowding report for the existing memories.
     pub async fn store(&self, content: &str) -> Result<InterferenceReport, RaiError> {
         self.store_with_optional_snapshot(content, None).await
     }
@@ -160,27 +118,19 @@ impl MemoryManager {
         validate_text("content", content)?;
 
         let (omega, key, value, embedding) = self.bridge.project_text(content).await?;
-        let mutation = Arc::clone(&self.mutation_lock).lock_owned().await;
+        let mut published = Arc::clone(&self.inner).write_owned().await;
 
         // Stage every parallel structure. Durable callers write this staged state first,
         // so a failed disk operation cannot leak a supposedly failed mutation into memory.
-        let mut staged_nra = self.nra.lock().await.clone();
+        let mut staged_nra = published.nra.clone();
         if staged_nra.len() >= staged_nra.config.num_units {
-            return Err(RaiError::MemoryError(format!(
-                "memory capacity of {} items has been reached",
-                staged_nra.config.num_units
-            )));
+            return Err(RaiError::CapacityExhausted {
+                limit: staged_nra.config.num_units,
+            });
         }
-        let mut staged_rem = self.rem.lock().await.clone();
-        let mut staged_texts = self.texts.lock().await.clone();
+        let mut staged_rem = published.rem.clone();
+        let mut staged_texts = published.texts.clone();
         let mut staged_text_index = self.bridge.text_index().await;
-        let mut staged_training = self.training.lock().await.clone();
-        let staged_next_id = self
-            .next_id
-            .lock()
-            .await
-            .checked_add(1)
-            .ok_or_else(|| RaiError::MemoryError("memory ID space exhausted".into()))?;
         let energy_before = staged_nra.energy_snapshot();
         staged_nra
             .store(&omega, &value)
@@ -198,8 +148,7 @@ impl MemoryManager {
         );
 
         staged_texts.push(content.to_string());
-        staged_training.item_stored();
-        staged_text_index.insert(content.to_string(), embedding);
+        staged_text_index.insert(content.to_string(), embedding, value);
 
         if let Some(path) = snapshot_path {
             let snapshot = self.snapshot_from_parts(
@@ -209,21 +158,14 @@ impl MemoryManager {
                 staged_texts.clone(),
             );
             let path = path.to_path_buf();
-            let nra = Arc::clone(&self.nra);
-            let rem = Arc::clone(&self.rem);
-            let texts = Arc::clone(&self.texts);
-            let next_id = Arc::clone(&self.next_id);
-            let training = Arc::clone(&self.training);
             let bridge = Arc::clone(&self.bridge);
             return tokio::task::spawn_blocking(move || {
-                let _mutation = mutation;
                 snapshot.save(&path)?;
-                *nra.blocking_lock() = staged_nra;
-                *rem.blocking_lock() = staged_rem;
-                *texts.blocking_lock() = staged_texts;
-                *next_id.blocking_lock() = staged_next_id;
-                *training.blocking_lock() = staged_training;
+                published.nra = staged_nra;
+                published.rem = staged_rem;
+                published.texts = staged_texts;
                 bridge.restore_text_index_blocking(staged_text_index);
+                drop(published);
                 Ok(report)
             })
             .await
@@ -232,60 +174,44 @@ impl MemoryManager {
             })?;
         }
 
-        let mut nra = self.nra.lock().await;
-        let mut rem = self.rem.lock().await;
-        let mut texts = self.texts.lock().await;
-        let mut next_id = self.next_id.lock().await;
-        let mut training = self.training.lock().await;
-        let mut text_index = self.bridge.text_index_for_update().await;
-        *nra = staged_nra;
-        *rem = staged_rem;
-        *texts = staged_texts;
-        *next_id = staged_next_id;
-        *training = staged_training;
-        *text_index = staged_text_index;
-        drop(mutation);
+        *self.bridge.text_index_for_update().await = staged_text_index;
+        published.nra = staged_nra;
+        published.rem = staged_rem;
+        published.texts = staged_texts;
+        drop(published);
 
         Ok(report)
     }
 
-    /// Recall a memory with confidence diagnostics.
+    /// Recall a memory with its score diagnostics.
     pub async fn recall(&self, query: &str) -> Result<RetrievalResult, RaiError> {
         validate_text("query", query)?;
         let omega = self.bridge.text_to_omega(query).await?;
-        let _mutation = self.mutation_lock.lock().await;
 
-        let diagnostics = {
-            let nra = self.nra.lock().await;
-            nra.retrieve_with_diagnostics(&omega)
-                .map_err(|e| RaiError::MemoryError(format!("NRA retrieve: {e}")))?
-        };
+        let inner = self.inner.read().await;
+        let diagnostics = inner
+            .nra
+            .retrieve_with_diagnostics(&omega)
+            .map_err(|e| RaiError::MemoryError(format!("NRA retrieve: {e}")))?;
 
-        let confidence = self
-            .confidence_gate
-            .classify(diagnostics.energy, diagnostics.grad_norm);
-        let explanation =
-            self.confidence_gate
-                .explain(diagnostics.energy, diagnostics.grad_norm, confidence);
+        let confidence = self.confidence_gate.classify(diagnostics.energy);
+        let explanation = self.confidence_gate.explain(diagnostics.energy, confidence);
 
-        // Find nearest text
         let content = self
             .bridge
             .nearest_text(&diagnostics.value)
-            .await
+            .await?
             .unwrap_or_else(|| "(no matching text found)".to_string());
 
         Ok(RetrievalResult {
             content,
             confidence,
             energy: diagnostics.energy,
-            steps: diagnostics.steps,
-            grad_norm: diagnostics.grad_norm,
             explanation,
         })
     }
 
-    /// Query at concept intersection using compositional addressing.
+    /// Query at a composed concept address.
     pub async fn intersect(&self, concepts: &[String]) -> Result<IntersectionResult, RaiError> {
         if !(2..=MAX_INTERSECTION_CONCEPTS).contains(&concepts.len()) {
             return Err(RaiError::InvalidInput(format!(
@@ -293,33 +219,26 @@ impl MemoryManager {
             )));
         }
 
-        // Embed each concept to omega
         let mut omegas = Vec::with_capacity(concepts.len());
         for concept in concepts {
             validate_text("concept", concept)?;
             let omega = self.bridge.text_to_omega(concept).await?;
             omegas.push(omega);
         }
-        let _mutation = self.mutation_lock.lock().await;
+        let combined = Compositor::intersect(&omegas)?;
 
-        // Compose omegas
-        let combined = Compositor::intersect(&omegas);
+        let inner = self.inner.read().await;
+        let diagnostics = inner
+            .nra
+            .retrieve_with_diagnostics(&combined)
+            .map_err(|e| RaiError::MemoryError(format!("NRA intersect: {e}")))?;
 
-        // Retrieve at intersection
-        let diagnostics = {
-            let nra = self.nra.lock().await;
-            nra.retrieve_with_diagnostics(&combined)
-                .map_err(|e| RaiError::MemoryError(format!("NRA intersect: {e}")))?
-        };
-
-        let confidence = self
-            .confidence_gate
-            .classify(diagnostics.energy, diagnostics.grad_norm);
+        let confidence = self.confidence_gate.classify(diagnostics.energy);
 
         let content = self
             .bridge
             .nearest_text(&diagnostics.value)
-            .await
+            .await?
             .unwrap_or_else(|| "(no matching text at intersection)".to_string());
 
         Ok(IntersectionResult {
@@ -330,147 +249,97 @@ impl MemoryManager {
         })
     }
 
-    /// Check if a new fact contradicts existing memory.
+    /// Report how storing a candidate fact would change crowding in the address space.
+    ///
+    /// This reports address-space crowding only. Appending an item can never raise another
+    /// item's crowding score, so the report cannot flag a semantic contradiction.
     pub async fn check_contradiction(&self, fact: &str) -> Result<InterferenceReport, RaiError> {
         validate_text("fact", fact)?;
         let (omega, _key, value, _embedding) = self.bridge.project_text(fact).await?;
-        let _mutation = self.mutation_lock.lock().await;
 
-        let (energy_before, mut staged_nra) = {
-            let nra = self.nra.lock().await;
-            (nra.energy_snapshot(), nra.clone())
-        };
+        let inner = self.inner.read().await;
+        let energy_before = inner.nra.energy_snapshot();
+        let mut staged_nra = inner.nra.clone();
         staged_nra
             .store(&omega, &value)
             .map_err(|e| RaiError::MemoryError(format!("NRA contradict: {e}")))?;
         let energy_after = staged_nra.energy_snapshot();
 
-        let texts = self.texts.lock().await;
         let len = energy_before.len();
-        let report =
-            self.interference_detector
-                .detect(&energy_before, &energy_after[..len], &texts[..len]);
+        let report = self.interference_detector.detect(
+            &energy_before,
+            &energy_after[..len],
+            &inner.texts[..len],
+        );
 
         Ok(report)
     }
 
-    /// Measure novelty/surprise of a fact using REM prior.
+    /// Measure novelty/surprise of a fact against the nearest stored key.
     pub async fn measure_surprise(&self, content: &str) -> Result<SurpriseResult, RaiError> {
         validate_text("content", content)?;
         let (_omega, key, value, _embedding) = self.bridge.project_text(content).await?;
-        let _mutation = self.mutation_lock.lock().await;
 
-        let rem = self.rem.lock().await;
-        let prediction = rem.predict(&key);
+        let inner = self.inner.read().await;
+        let prediction = inner.rem.predict(&key);
         Ok(self.surprise_detector.compute(&value, &prediction))
     }
 
-    /// Explain the confidence of a retrieval in detail.
+    /// Explain the score tier of a retrieval in detail.
     pub async fn explain_confidence(&self, query: &str) -> Result<ConfidenceExplanation, RaiError> {
         validate_text("query", query)?;
         let omega = self.bridge.text_to_omega(query).await?;
-        let _mutation = self.mutation_lock.lock().await;
 
-        let nra = self.nra.lock().await;
-        let diagnostics = nra
+        let inner = self.inner.read().await;
+        let diagnostics = inner
+            .nra
             .retrieve_with_diagnostics(&omega)
             .map_err(|e| RaiError::MemoryError(format!("NRA explain: {e}")))?;
 
-        let mut confidence = self
-            .confidence_gate
-            .classify(diagnostics.energy, diagnostics.grad_norm);
-
-        // Basin analysis
-        let mut rng = rand::thread_rng();
-        let basin_result = self
-            .basin_analyzer
-            .analyze(&nra.params, &omega, &nra.config, &mut rng);
-
-        if basin_result.is_ambiguous {
-            confidence = ConfidenceLevel::Ambiguous;
-        }
-
-        let explanation =
-            self.confidence_gate
-                .explain(diagnostics.energy, diagnostics.grad_norm, confidence);
+        let confidence = self.confidence_gate.classify(diagnostics.energy);
+        let explanation = self.confidence_gate.explain(diagnostics.energy, confidence);
 
         Ok(ConfidenceExplanation {
             confidence,
             energy: diagnostics.energy,
-            grad_norm: diagnostics.grad_norm,
-            num_attractors: basin_result.attractors.len(),
-            basin_spread: basin_result.energy_spread,
             explanation,
         })
     }
 
     /// Get system health diagnostics.
     pub async fn health(&self) -> Result<HealthReport, RaiError> {
-        let _mutation = self.mutation_lock.lock().await;
-        let nra = self.nra.lock().await;
-        let rem = self.rem.lock().await;
+        let inner = self.inner.read().await;
 
-        let nra_mse = nra.mse().ok();
-        let rem_mse = rem.mse().ok();
-        let rem_residual_norm = if rem.is_empty() {
+        let mean_residual_norm = if inner.rem.is_empty() {
             None
         } else {
-            Some(rem.mean_residual_norm())
+            Some(inner.rem.mean_residual_norm())
         };
 
-        let num_memories = nra.len();
-        let nra_capacity_ratio = num_memories as f64 / nra.config.num_units as f64;
-
-        let training = self.training.lock().await;
-        let needs_training = training.needs_nra_retrain() || training.needs_rem_retrain();
+        let num_memories = inner.nra.len();
+        let nra_capacity_ratio = num_memories as f64 / inner.nra.config.num_units as f64;
 
         Ok(HealthReport {
             num_memories,
-            nra_mse,
-            rem_mse,
-            rem_residual_norm,
+            mean_residual_norm,
             nra_capacity_ratio,
-            needs_training,
         })
-    }
-
-    /// Trigger NRA retraining.
-    pub async fn train_nra(&self) -> Result<Vec<f64>, RaiError> {
-        Err(training_not_implemented())
-    }
-
-    /// Retrain NRA and publish the trained state only after its snapshot is durable.
-    pub async fn train_nra_and_save(&self, path: &Path) -> Result<Vec<f64>, RaiError> {
-        let _ = path;
-        Err(training_not_implemented())
-    }
-
-    /// Trigger REM retraining.
-    pub async fn train_rem(&self) -> Result<Vec<f64>, RaiError> {
-        Err(training_not_implemented())
-    }
-
-    /// Retrain REM and publish the trained state only after its snapshot is durable.
-    pub async fn train_rem_and_save(&self, path: &Path) -> Result<Vec<f64>, RaiError> {
-        let _ = path;
-        Err(training_not_implemented())
     }
 
     /// Save full state to disk.
     pub async fn save(&self, path: &Path) -> Result<(), RaiError> {
-        let mutation = Arc::clone(&self.mutation_lock).lock_owned().await;
-        let nra = self.nra.lock().await.clone();
-        let rem = self.rem.lock().await.clone();
+        let inner = Arc::clone(&self.inner).read_owned().await;
         let snapshot = self.snapshot_from_parts(
-            &nra,
-            &rem,
+            &inner.nra,
+            &inner.rem,
             self.bridge.text_index().await,
-            self.texts.lock().await.clone(),
+            inner.texts.clone(),
         );
         let path = path.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            let _mutation = mutation;
-            snapshot.save(&path)
+            let result = snapshot.save(&path);
+            drop(inner);
+            result
         })
         .await
         .map_err(|error| RaiError::PersistenceError(format!("snapshot writer failed: {error}")))?
@@ -480,7 +349,7 @@ impl MemoryManager {
         &self,
         nra: &NonlinearResonanceMemory,
         rem: &ResidualEquilibriumMemory,
-        text_index: crate::embedding::bridge::TextIndex,
+        text_index: TextIndex,
         texts: Vec<String>,
     ) -> MemorySnapshot {
         MemorySnapshot {
@@ -489,12 +358,8 @@ impl MemoryManager {
             nra_config: nra.config.clone(),
             nra_items: nra.items().to_vec(),
             rem_config: rem.config.clone(),
-            rem_encoder: rem.encoder.clone(),
-            rem_decoder: rem.decoder.clone(),
-            rem_memory_state: rem.memory_state.clone(),
             rem_items: rem.items().to_vec(),
             rem_residual_norm: rem.mean_residual_norm(),
-            rem_last_loss: rem.last_loss(),
             text_index,
             texts,
             omega_proj: self.bridge.omega_proj.clone(),
@@ -566,15 +431,6 @@ impl MemoryManager {
                 "projection and memory dimensions do not match".to_string(),
             ));
         }
-        if snapshot.nra_params.omega_basis.nrows() != snapshot.nra_config.dim_state
-            || snapshot.nra_params.omega_basis.ncols() != snapshot.nra_config.dim_omega
-            || snapshot.nra_params.value_basis.nrows() != snapshot.nra_config.dim_value
-            || snapshot.nra_params.value_basis.ncols() != snapshot.nra_config.dim_state
-        {
-            return Err(RaiError::PersistenceError(
-                "NRA parameter matrices do not match snapshot configuration".to_string(),
-            ));
-        }
         if snapshot
             .text_index
             .entries
@@ -595,66 +451,42 @@ impl MemoryManager {
             snapshot.value_proj.clone(),
         ));
 
-        // Reconstruct NRA
-        let ode_tol = snapshot.nra_config.ode_tol;
-        let mut nra =
-            NonlinearResonanceMemory::from_params(snapshot.nra_params, snapshot.nra_config);
-        for (omega, value) in &snapshot.nra_items {
-            nra.store(omega, value)
-                .map_err(|e| RaiError::MemoryError(format!("restore NRA: {e}")))?;
-        }
+        // Both stores are restored through their validating constructors: the snapshot is
+        // untrusted input, and replaying items through `store` would recompute derived state.
+        let nra = NonlinearResonanceMemory::from_snapshot(
+            snapshot.nra_config,
+            snapshot.nra_params,
+            snapshot.nra_items,
+        )
+        .map_err(|e| RaiError::MemoryError(format!("restore NRA: {e}")))?;
 
-        // Restore REM directly. Replaying items through `store` would update the persisted
-        // rolling memory state a second time and silently corrupt the snapshot.
         let rem = ResidualEquilibriumMemory::from_snapshot(
             snapshot.rem_config,
-            snapshot.rem_encoder,
-            snapshot.rem_decoder,
-            snapshot.rem_memory_state,
             snapshot.rem_items,
             snapshot.rem_residual_norm,
-            snapshot.rem_last_loss,
         )
         .map_err(|e| RaiError::MemoryError(format!("restore REM: {e}")))?;
 
-        // Restore text index
+        // Cached value projections are derived state and are not persisted; rebuild them here.
         restored_bridge
             .restore_text_index(snapshot.text_index.clone())
-            .await;
+            .await?;
 
-        Ok(Self {
-            nra: Arc::new(Mutex::new(nra)),
-            rem: Arc::new(Mutex::new(rem)),
-            bridge: restored_bridge,
-            confidence_gate: ConfidenceGate::with_ode_tol(ode_tol),
-            interference_detector: InterferenceDetector::default(),
-            basin_analyzer: BasinAnalyzer::default(),
-            surprise_detector: SurpriseDetector::default(),
-            training: Arc::new(Mutex::new(TrainingOrchestrator::default())),
-            texts: Arc::new(Mutex::new(texts)),
-            next_id: Arc::new(Mutex::new(snapshot.total_items)),
-            mutation_lock: Arc::new(Mutex::new(())),
-        })
+        Ok(Self::from_parts(Inner { nra, rem, texts }, restored_bridge))
     }
 
     /// Get number of stored memories.
     pub async fn len(&self) -> usize {
-        let _mutation = self.mutation_lock.lock().await;
-        let nra = self.nra.lock().await;
-        nra.len()
+        self.inner.read().await.nra.len()
     }
 
     pub async fn is_empty(&self) -> bool {
-        let _mutation = self.mutation_lock.lock().await;
-        let nra = self.nra.lock().await;
-        nra.is_empty()
+        self.inner.read().await.nra.is_empty()
     }
 
-    /// Take an NRA energy snapshot for external use.
+    /// Take a crowding snapshot of the stored address space for external use.
     pub async fn energy_snapshot(&self) -> Vec<(Vec64, f64)> {
-        let _mutation = self.mutation_lock.lock().await;
-        let nra = self.nra.lock().await;
-        nra.energy_snapshot()
+        self.inner.read().await.nra.energy_snapshot()
     }
 }
 
@@ -691,27 +523,12 @@ fn validate_memory_configs(
             "memory dimensions are outside supported bounds".into(),
         ));
     }
-    if nra.dim_value != rem.dim_value
-        || nra.num_units == 0
-        || nra.num_units > MAX_STORED_ITEMS
-        || nra.train_epochs > MAX_TRAIN_EPOCHS
-        || rem.train_epochs > MAX_TRAIN_EPOCHS
-        || !nra.ode_tol.is_finite()
-        || nra.ode_tol <= 0.0
-        || nra.ode_tol > 1.0
-    {
+    if nra.dim_value != rem.dim_value || nra.num_units == 0 || nra.num_units > MAX_STORED_ITEMS {
         return Err(RaiError::InvalidInput(
             "memory configuration is outside supported bounds".into(),
         ));
     }
     bridge.validate_memory_dimensions(nra.dim_omega, rem.dim_key, nra.dim_value)
-}
-
-fn training_not_implemented() -> RaiError {
-    RaiError::TrainingError(
-        "training is unavailable because this build does not implement parameter optimization"
-            .into(),
-    )
 }
 
 #[cfg(test)]
@@ -821,8 +638,39 @@ mod persistence_tests {
         }
     }
 
-    /// Leave-one-out energies have to move when neighbours arrive, and their magnitudes have to
-    /// cross the interference detector's tiers.
+    /// Recall has to keep working after a reload, which is the path that rebuilds the cached
+    /// value projections the decode scan compares against.
+    #[tokio::test]
+    async fn recall_survives_a_snapshot_round_trip() {
+        let bridge = Arc::new(EmbeddingBridge::new(
+            Arc::new(MeanBiasedEmbedder { dim: 384 }),
+            32,
+            32,
+            64,
+        ));
+        let manager = MemoryManager::try_new(bridge).unwrap();
+        for fact in &DISTINCT_FACTS[..5] {
+            manager.store(fact).await.unwrap();
+        }
+        let path = unique_temp_path("recall-round-trip.json");
+        manager.save(&path).await.unwrap();
+
+        let fresh_bridge = Arc::new(EmbeddingBridge::new(
+            Arc::new(MeanBiasedEmbedder { dim: 384 }),
+            32,
+            32,
+            64,
+        ));
+        let restored = MemoryManager::load(&path, fresh_bridge).await.unwrap();
+        for fact in &DISTINCT_FACTS[..5] {
+            assert_eq!(restored.recall(fact).await.unwrap().content, *fact);
+        }
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// Leave-one-out crowding scores have to move when neighbours arrive, and their magnitudes
+    /// have to cross the detector's tiers.
     ///
     /// Note the direction: an append-only store can only bring an item's nearest neighbour
     /// closer, so every delta a store produces is non-positive. The detector's positive-delta
@@ -844,20 +692,20 @@ mod persistence_tests {
 
         assert!(
             crowded[0].1 < -4.9,
-            "a coincident neighbour must reach the energy floor: {crowded:?}"
+            "a coincident neighbour must reach the score floor: {crowded:?}"
         );
         assert!(
             crowded.iter().any(|(_, energy)| *energy != crowded[0].1),
-            "energies must vary across items rather than stay constant: {crowded:?}"
+            "scores must vary across items rather than stay constant: {crowded:?}"
         );
         assert!(
             sparse[0].1 - crowded[0].1 > 0.5,
-            "energy must respond to a new neighbour: {} -> {}",
+            "the score must respond to a new neighbour: {} -> {}",
             sparse[0].1,
             crowded[0].1
         );
 
-        let texts = manager.texts.lock().await[..sparse.len()].to_vec();
+        let texts = manager.inner.read().await.texts[..sparse.len()].to_vec();
         let report =
             InterferenceDetector::default().detect(&crowded[..sparse.len()], &sparse, &texts);
         assert!(report.has_interference);
@@ -868,37 +716,29 @@ mod persistence_tests {
             .any(|item| item.content == "alpha fact"));
     }
 
-    /// The gate documents `ode_tol` as coming from the NRA config, so a custom configuration has
-    /// to reach it — on construction and after a reload.
+    /// A store can only lower a neighbour's crowding score, so the report it returns is always
+    /// empty under the current semantics. That has to stay true, or the honest description of
+    /// `/v1/contradict` in the docs is wrong.
     #[tokio::test]
-    async fn confidence_gate_uses_the_configured_ode_tolerance() {
+    async fn storing_never_reports_interference_in_the_store_direction() {
         let bridge = Arc::new(EmbeddingBridge::new(
             Arc::new(MockEmbedder::new(384)),
             32,
             32,
             64,
         ));
-        let nra_config = NRAConfig {
-            ode_tol: 1e-3,
-            ..Default::default()
-        };
-        let manager = MemoryManager::with_configs(bridge, nra_config, REMConfig::default())
-            .expect("valid configuration");
-        assert_eq!(manager.confidence_gate.ode_tol, 1e-3);
+        let manager = MemoryManager::try_new(bridge).unwrap();
+        manager.store("the sky is blue").await.unwrap();
 
-        let path = unique_temp_path("ode-tol.json");
-        manager.store("tolerance survives a reload").await.unwrap();
-        manager.save(&path).await.unwrap();
-        let fresh_bridge = Arc::new(EmbeddingBridge::new(
-            Arc::new(MockEmbedder::new(384)),
-            32,
-            32,
-            64,
-        ));
-        let restored = MemoryManager::load(&path, fresh_bridge).await.unwrap();
-        assert_eq!(restored.confidence_gate.ode_tol, 1e-3);
+        let report = manager.store("the sky is blue").await.unwrap();
+        assert!(!report.has_interference);
+        assert_eq!(report.severity, InterferenceSeverity::None);
 
-        std::fs::remove_file(path).unwrap();
+        let contradiction = manager
+            .check_contradiction("the sky is green")
+            .await
+            .unwrap();
+        assert!(!contradiction.has_interference);
     }
 
     #[test]
@@ -922,25 +762,17 @@ mod persistence_tests {
         let embedder = Arc::new(MockEmbedder::new(384));
         let bridge = Arc::new(EmbeddingBridge::new(embedder, 32, 32, 64));
         let probe: Vec<f64> = (0..384).map(|index| index as f64 / 384.0).collect();
-        let expected_omega = bridge.omega_proj.project(&probe);
-        let expected_key = bridge.key_proj.project(&probe);
-        let expected_value = bridge.value_proj.project(&probe);
+        let expected_omega = bridge.omega_proj.project(&probe).unwrap();
+        let expected_key = bridge.key_proj.project(&probe).unwrap();
+        let expected_value = bridge.value_proj.project(&probe).unwrap();
         let manager = MemoryManager::try_new(bridge).unwrap();
         manager.store("persistent memory").await.unwrap();
 
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("rai-memory-{}-{unique}.json", std::process::id()));
+        let path = unique_temp_path("projection-round-trip.json");
         manager.save(&path).await.unwrap();
         manager.store("second persistent memory").await.unwrap();
         manager.store("persistent memory").await.unwrap();
-        let (expected_rem_state, expected_residual_norm) = {
-            let rem = manager.rem.lock().await;
-            (rem.memory_state.clone(), rem.mean_residual_norm())
-        };
+        let expected_residual_norm = manager.inner.read().await.rem.mean_residual_norm();
         manager.save(&path).await.unwrap();
 
         let fresh_embedder = Arc::new(MockEmbedder::new(384));
@@ -948,26 +780,31 @@ mod persistence_tests {
         let restored = MemoryManager::load(&path, fresh_bridge).await.unwrap();
 
         assert_eq!(restored.len().await, 3);
-        assert_eq!(restored.texts.lock().await.len(), 3);
+        assert_eq!(restored.inner.read().await.texts.len(), 3);
         assert_vectors_close(
-            restored.bridge.omega_proj.project(&probe).as_slice(),
+            restored
+                .bridge
+                .omega_proj
+                .project(&probe)
+                .unwrap()
+                .as_slice(),
             expected_omega.as_slice(),
         );
         assert_vectors_close(
-            restored.bridge.key_proj.project(&probe).as_slice(),
+            restored.bridge.key_proj.project(&probe).unwrap().as_slice(),
             expected_key.as_slice(),
         );
         assert_vectors_close(
-            restored.bridge.value_proj.project(&probe).as_slice(),
+            restored
+                .bridge
+                .value_proj
+                .project(&probe)
+                .unwrap()
+                .as_slice(),
             expected_value.as_slice(),
         );
-        let restored_rem = restored.rem.lock().await;
-        assert_vectors_close(
-            restored_rem.memory_state.as_slice(),
-            expected_rem_state.as_slice(),
-        );
-        assert!((restored_rem.mean_residual_norm() - expected_residual_norm).abs() < 1e-12);
-        drop(restored_rem);
+        let restored_residual = restored.inner.read().await.rem.mean_residual_norm();
+        assert!((restored_residual - expected_residual_norm).abs() < 1e-12);
 
         std::fs::remove_file(path).unwrap();
     }
@@ -995,7 +832,7 @@ mod persistence_tests {
         let manager = MemoryManager::try_new(bridge).unwrap();
         manager.store("known fact").await.unwrap();
         let before_len = manager.len().await;
-        let before_residual = manager.rem.lock().await.mean_residual_norm();
+        let before_residual = manager.inner.read().await.rem.mean_residual_norm();
 
         let known = manager.measure_surprise("known fact").await.unwrap();
         let novel = manager.measure_surprise("different fact").await.unwrap();
@@ -1004,7 +841,7 @@ mod persistence_tests {
         assert!(novel.score > known.score);
         assert_eq!(manager.len().await, before_len);
         assert_eq!(
-            manager.rem.lock().await.mean_residual_norm(),
+            manager.inner.read().await.rem.mean_residual_norm(),
             before_residual
         );
     }
@@ -1026,9 +863,11 @@ mod persistence_tests {
         }
 
         assert_eq!(manager.len().await, 8);
-        assert_eq!(manager.rem.lock().await.items().len(), 8);
-        assert_eq!(manager.texts.lock().await.len(), 8);
-        assert_eq!(*manager.next_id.lock().await, 8);
+        let inner = manager.inner.read().await;
+        assert_eq!(inner.rem.items().len(), 8);
+        assert_eq!(inner.texts.len(), 8);
+        drop(inner);
+        assert_eq!(manager.bridge.text_index().await.entries.len(), 8);
     }
 
     #[tokio::test]
@@ -1043,8 +882,29 @@ mod persistence_tests {
             .await
             .is_err());
         assert_eq!(manager.len().await, 0);
-        assert!(manager.texts.lock().await.is_empty());
+        assert!(manager.inner.read().await.texts.is_empty());
         assert!(manager.bridge.text_index().await.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn durable_store_publishes_only_after_the_snapshot_is_written() {
+        let embedder = Arc::new(MockEmbedder::new(384));
+        let bridge = Arc::new(EmbeddingBridge::new(embedder, 32, 32, 64));
+        let manager = MemoryManager::try_new(bridge).unwrap();
+        let path = unique_temp_path("durable-store.json");
+
+        manager
+            .store_and_save("durable memory", &path)
+            .await
+            .unwrap();
+
+        assert_eq!(manager.len().await, 1);
+        assert_eq!(manager.inner.read().await.texts, vec!["durable memory"]);
+        let persisted = MemorySnapshot::load(&path).unwrap();
+        assert_eq!(persisted.total_items, 1);
+        assert_eq!(persisted.texts, vec!["durable memory"]);
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]
@@ -1066,23 +926,12 @@ mod persistence_tests {
         assert!(manager.intersect(&too_many_concepts).await.is_err());
 
         manager.store("first").await.unwrap();
-        assert!(manager.store("second").await.is_err());
+        let error = manager.store("second").await.unwrap_err();
+        assert!(
+            matches!(error, RaiError::CapacityExhausted { limit } if limit == 1),
+            "capacity exhaustion must be a structured client error, got: {error}"
+        );
         assert_eq!(manager.len().await, 1);
-    }
-
-    #[tokio::test]
-    async fn training_does_not_report_false_success_or_clear_need() {
-        let embedder = Arc::new(MockEmbedder::new(384));
-        let bridge = Arc::new(EmbeddingBridge::new(embedder, 32, 32, 64));
-        let manager = MemoryManager::try_new(bridge).unwrap();
-        for index in 0..5 {
-            manager.store(&format!("fact {index}")).await.unwrap();
-        }
-        assert!(manager.health().await.unwrap().needs_training);
-
-        let error = manager.train_nra().await.unwrap_err();
-        assert!(error.to_string().contains("does not implement"));
-        assert!(manager.health().await.unwrap().needs_training);
     }
 
     #[tokio::test]
@@ -1142,6 +991,79 @@ mod persistence_tests {
         std::fs::remove_file(corrupt_path).unwrap();
     }
 
+    /// A snapshot written before the schema shrank still carries the REM encoder/decoder biases,
+    /// the rolling memory state, the training loss, and the NRA value basis. Those keys are no
+    /// longer part of the schema and must be ignored rather than fail the load.
+    #[tokio::test]
+    async fn snapshots_carrying_retired_fields_still_load() {
+        let embedder = Arc::new(MockEmbedder::new(384));
+        let bridge = Arc::new(EmbeddingBridge::new(embedder, 32, 32, 64));
+        let manager = MemoryManager::try_new(bridge).unwrap();
+        manager.store("legacy shaped memory").await.unwrap();
+        let valid_path = unique_temp_path("valid-retired-fields.json");
+        let legacy_path = unique_temp_path("retired-fields.json");
+        manager.save(&valid_path).await.unwrap();
+
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&valid_path).unwrap()).unwrap();
+        let object = document.as_object_mut().unwrap();
+        object.insert(
+            "rem_encoder".to_string(),
+            serde_json::json!({ "bias": vec![0.0f64; 256] }),
+        );
+        object.insert(
+            "rem_decoder".to_string(),
+            serde_json::json!({ "bias": vec![0.0f64; 64] }),
+        );
+        object.insert(
+            "rem_memory_state".to_string(),
+            serde_json::json!(vec![0.25f64; 256]),
+        );
+        object.insert("rem_last_loss".to_string(), serde_json::json!(1.5));
+        object["nra_params"]["value_basis"] = serde_json::json!({
+            "nrows": 64, "ncols": 64, "data": vec![0.0f64; 64 * 64]
+        });
+        std::fs::write(&legacy_path, serde_json::to_vec(&document).unwrap()).unwrap();
+
+        let fresh_bridge = Arc::new(EmbeddingBridge::new(
+            Arc::new(MockEmbedder::new(384)),
+            32,
+            32,
+            64,
+        ));
+        let restored = MemoryManager::load(&legacy_path, fresh_bridge)
+            .await
+            .unwrap();
+        assert_eq!(restored.len().await, 1);
+        assert_eq!(
+            restored
+                .recall("legacy shaped memory")
+                .await
+                .unwrap()
+                .content,
+            "legacy shaped memory"
+        );
+
+        // What this release writes back no longer contains those keys.
+        let rewritten_path = unique_temp_path("rewritten.json");
+        restored.save(&rewritten_path).await.unwrap();
+        let rewritten: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&rewritten_path).unwrap()).unwrap();
+        for retired in [
+            "rem_encoder",
+            "rem_decoder",
+            "rem_memory_state",
+            "rem_last_loss",
+        ] {
+            assert!(rewritten.get(retired).is_none(), "{retired} was rewritten");
+        }
+        assert!(rewritten["nra_params"].get("value_basis").is_none());
+
+        for path in [valid_path, legacy_path, rewritten_path] {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
     /// Rebuilding labels from the deduplicating text index is only sound when every stored text
     /// was unique, so that remains the one version-0 shape this release still accepts.
     #[tokio::test]
@@ -1169,15 +1091,13 @@ mod persistence_tests {
         let restored = MemoryManager::load(&legacy_path, fresh_bridge)
             .await
             .unwrap();
-        let restored_texts = restored.texts.lock().await;
         assert_eq!(
-            *restored_texts,
+            restored.inner.read().await.texts,
             vec![
                 "legacy memory".to_string(),
                 "another legacy memory".to_string()
             ]
         );
-        drop(restored_texts);
 
         std::fs::remove_file(valid_path).unwrap();
         std::fs::remove_file(legacy_path).unwrap();

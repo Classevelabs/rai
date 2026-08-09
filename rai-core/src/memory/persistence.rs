@@ -18,12 +18,21 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 const MAX_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const MAX_STORED_ITEMS: usize = 100_000;
 pub(crate) const MAX_VECTOR_DIMENSION: usize = 16_384;
-pub(crate) const MAX_TRAIN_EPOCHS: usize = 1_000_000;
-const MAX_TEXT_BYTES: usize = 64 * 1024;
+/// Upper bound on a persisted text label.
+///
+/// This is deliberately larger than [`crate::MAX_TEXT_BYTES`], the limit enforced when new
+/// content enters the store: snapshots written by earlier releases accepted labels up to this
+/// size and must still load. New stores can never exceed the smaller live limit.
+const MAX_SNAPSHOT_TEXT_BYTES: usize = 64 * 1024;
 const MAX_ABS_COMPONENT: f64 = 1.0e100;
 pub(crate) const CURRENT_SNAPSHOT_VERSION: u32 = 1;
 
 /// Serializable snapshot of the full RAI memory state.
+///
+/// The written payload is a strict subset of what earlier 0.1.x builds wrote: the REM encoder
+/// and decoder biases, the REM rolling memory state, the training loss, and the NRA value basis
+/// backed no live behaviour and are no longer emitted. Snapshots that still contain those keys
+/// load unchanged — serde ignores them.
 #[derive(Serialize, Deserialize)]
 pub struct MemorySnapshot {
     /// On-disk schema version. Missing values identify legacy version 0 snapshots.
@@ -37,20 +46,11 @@ pub struct MemorySnapshot {
     pub nra_items: Vec<(Vec64, Vec64)>,
     /// REM config.
     pub rem_config: REMConfig,
-    /// REM encoder params.
-    pub rem_encoder: rem_nra::rem::encoder::EncoderParams,
-    /// REM decoder params.
-    pub rem_decoder: rem_nra::rem::decoder::DecoderParams,
-    /// REM memory state.
-    pub rem_memory_state: Vec64,
     /// REM stored items (key, value).
     pub rem_items: Vec<(Vec64, Vec64)>,
-    /// REM residual metric at snapshot time.
+    /// REM mean residual norm at snapshot time.
     #[serde(default)]
     pub rem_residual_norm: f64,
-    /// REM training loss at snapshot time.
-    #[serde(default)]
-    pub rem_last_loss: Option<f64>,
     /// Text index for text <-> vector mapping.
     pub text_index: TextIndex,
     /// Text labels parallel to NRA/REM items (duplicates preserved).
@@ -168,14 +168,7 @@ impl MemorySnapshot {
         {
             return Err(invalid("snapshot dimensions are outside supported bounds"));
         }
-        if self.nra_config.num_units == 0
-            || self.nra_config.num_units > MAX_STORED_ITEMS
-            || self.nra_config.train_epochs > MAX_TRAIN_EPOCHS
-            || self.rem_config.train_epochs > MAX_TRAIN_EPOCHS
-            || !number_is_valid(self.nra_config.ode_tol)
-            || self.nra_config.ode_tol <= 0.0
-            || self.nra_config.ode_tol > 1.0
-        {
+        if self.nra_config.num_units == 0 || self.nra_config.num_units > MAX_STORED_ITEMS {
             return Err(invalid(
                 "snapshot configuration is outside supported bounds",
             ));
@@ -204,13 +197,10 @@ impl MemorySnapshot {
         }
         if self.nra_params.omega_basis.nrows() != self.nra_config.dim_state
             || self.nra_params.omega_basis.ncols() != self.nra_config.dim_omega
-            || self.nra_params.value_basis.nrows() != self.nra_config.dim_value
-            || self.nra_params.value_basis.ncols() != self.nra_config.dim_state
             || !self
                 .nra_params
                 .omega_basis
                 .iter()
-                .chain(self.nra_params.value_basis.iter())
                 .all(|value| number_is_valid(*value))
         {
             return Err(invalid("snapshot NRA parameters are invalid"));
@@ -221,36 +211,14 @@ impl MemorySnapshot {
         ) || !vectors_are_valid(
             self.nra_items.iter().map(|(_, value)| value.as_slice()),
             self.nra_config.dim_value,
-        ) || self.rem_encoder.bias.len() != self.rem_config.dim_memory
-            || self.rem_decoder.bias.len() != self.rem_config.dim_value
-            || self.rem_memory_state.len() != self.rem_config.dim_memory
-            || !vectors_are_valid(
-                self.rem_items.iter().map(|(key, _)| key.as_slice()),
-                self.rem_config.dim_key,
-            )
-            || !vectors_are_valid(
-                self.rem_items.iter().map(|(_, value)| value.as_slice()),
-                self.rem_config.dim_value,
-            )
-            || !self
-                .rem_encoder
-                .bias
-                .iter()
-                .all(|value| number_is_valid(*value))
-            || !self
-                .rem_decoder
-                .bias
-                .iter()
-                .all(|value| number_is_valid(*value))
-            || !self
-                .rem_memory_state
-                .iter()
-                .all(|value| number_is_valid(*value))
-            || !number_is_valid(self.rem_residual_norm)
+        ) || !vectors_are_valid(
+            self.rem_items.iter().map(|(key, _)| key.as_slice()),
+            self.rem_config.dim_key,
+        ) || !vectors_are_valid(
+            self.rem_items.iter().map(|(_, value)| value.as_slice()),
+            self.rem_config.dim_value,
+        ) || !number_is_valid(self.rem_residual_norm)
             || self.rem_residual_norm < 0.0
-            || self
-                .rem_last_loss
-                .is_some_and(|loss| !number_is_valid(loss) || loss < 0.0)
         {
             return Err(invalid("snapshot REM state or item vectors are invalid"));
         }
@@ -266,7 +234,7 @@ impl MemorySnapshot {
                 .any(|(position, entry)| {
                     entry.id != position
                         || entry.text.trim().is_empty()
-                        || entry.text.len() > MAX_TEXT_BYTES
+                        || entry.text.len() > MAX_SNAPSHOT_TEXT_BYTES
                         || entry.embedding.len() != self.omega_proj.source_dim
                         || entry.embedding.iter().any(|value| !number_is_valid(*value))
                         || !indexed_texts.insert(entry.text.as_str())
@@ -275,7 +243,7 @@ impl MemorySnapshot {
             || self
                 .texts
                 .iter()
-                .any(|text| text.is_empty() || text.len() > MAX_TEXT_BYTES)
+                .any(|text| text.is_empty() || text.len() > MAX_SNAPSHOT_TEXT_BYTES)
         {
             return Err(invalid("snapshot text index is invalid"));
         }
