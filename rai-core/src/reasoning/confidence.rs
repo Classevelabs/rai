@@ -24,6 +24,17 @@ impl Default for ConfidenceGate {
 }
 
 impl ConfidenceGate {
+    /// Build a gate whose no-match diagnostic uses the NRA configuration's ODE tolerance.
+    ///
+    /// The default tolerance only matches the default NRA config; a manager built with custom
+    /// configuration must pass its own value or the no-match threshold silently ignores it.
+    pub fn with_ode_tol(ode_tol: f64) -> Self {
+        Self {
+            ode_tol,
+            ..Self::default()
+        }
+    }
+
     /// Determine confidence from energy and gradient norm.
     pub fn classify(&self, energy: f64, grad_norm: f64) -> ConfidenceLevel {
         if !energy.is_finite() || !grad_norm.is_finite() {
@@ -91,5 +102,17 @@ mod tests {
         assert_eq!(gate.classify(0.0, 1e-10), ConfidenceLevel::Low);
         assert_eq!(gate.classify(-5.0, 1e-3), ConfidenceLevel::NoMatch);
         assert_eq!(gate.classify(f64::NAN, 0.0), ConfidenceLevel::Low);
+    }
+
+    #[test]
+    fn configured_tolerance_moves_the_no_match_threshold() {
+        let strict = ConfidenceGate::with_ode_tol(1e-7);
+        let loose = ConfidenceGate::with_ode_tol(1e-3);
+
+        assert_eq!(loose.ode_tol, 1e-3);
+        // A gradient of 1e-4 is a no-match under the strict tolerance but converged under
+        // the looser one, so the configured value has to reach `classify`.
+        assert_eq!(strict.classify(-5.0, 1e-4), ConfidenceLevel::NoMatch);
+        assert_eq!(loose.classify(-5.0, 1e-4), ConfidenceLevel::High);
     }
 }
