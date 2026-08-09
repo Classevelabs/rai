@@ -1,6 +1,10 @@
 //! RaiModel: load any .raimodel, decomposed forward pass primitives.
 
-use anyhow::{Context, Result};
+// The layer loop indexes model metadata, cache slots, and multiple work buffers in lockstep;
+// retaining explicit indices keeps those coupled invariants visible and avoids iterator churn.
+#![allow(clippy::needless_range_loop)]
+
+use anyhow::{ensure, Context, Result};
 use std::path::Path;
 
 use crate::format::{self, ModelConfig, RaiModelFile};
@@ -63,6 +67,7 @@ impl RaiModel {
     }
 
     pub fn create_kv_cache(&self, max_ctx: usize) -> KVCache {
+        assert!(max_ctx > 0, "KV cache context must be non-zero");
         KVCache::new(
             self.config.num_layers as usize,
             self.config.num_kv_heads as usize,
@@ -77,7 +82,12 @@ impl RaiModel {
         let nkv = self.config.num_kv_heads as usize;
         let hd = self.config.head_dim as usize;
         // 2 (K+V) * layers * kv_heads * max_ctx * head_dim * 4 bytes
-        2 * nl * nkv * max_ctx * hd * std::mem::size_of::<f32>()
+        2usize
+            .saturating_mul(nl)
+            .saturating_mul(nkv)
+            .saturating_mul(max_ctx)
+            .saturating_mul(hd)
+            .saturating_mul(std::mem::size_of::<f32>())
     }
 
     /// Model file size in bytes.
@@ -88,6 +98,14 @@ impl RaiModel {
     /// Look up a token's embedding and dequantize to f32.
     pub fn embed_token(&self, token_id: usize, output: &mut [f32]) -> Result<()> {
         let embed = self.file.embedding()?;
+        ensure!(
+            token_id < embed.vocab_size,
+            "token id is out of model vocabulary"
+        );
+        ensure!(
+            output.len() >= embed.hidden_size,
+            "embedding output buffer is too small"
+        );
         embed_lookup(
             output,
             token_id,
@@ -116,6 +134,11 @@ impl RaiModel {
         let hd = self.config.head_dim as usize;
         let nl = self.config.num_layers as usize;
         let eps = self.config.norm_eps;
+        ensure!(hidden.len() == hs, "hidden state has the wrong size");
+        ensure!(
+            pos < self.config.max_context as usize,
+            "position exceeds model context"
+        );
 
         scratch.resize(hs);
 
@@ -179,6 +202,11 @@ impl RaiModel {
         normed_buf: &mut [f32],
         logits: &mut [f32],
     ) -> Result<()> {
+        let hidden_size = self.config.hidden_size as usize;
+        let vocab_size = self.config.vocab_size as usize;
+        ensure!(hidden.len() >= hidden_size, "hidden buffer is too small");
+        ensure!(normed_buf.len() >= hidden_size, "norm buffer is too small");
+        ensure!(logits.len() >= vocab_size, "logit buffer is too small");
         rms_norm(
             normed_buf,
             hidden,
@@ -255,13 +283,30 @@ impl RaiModel {
         let hd = self.config.head_dim as usize;
         let eps = self.config.norm_eps;
         let nl = self.config.num_layers as usize;
+        ensure!(
+            hidden.len() == hs,
+            "partial hidden buffer has the wrong size"
+        );
+        ensure!(
+            pos < self.config.max_context as usize,
+            "partial forward position exceeds model context"
+        );
+        ensure!(
+            !layer_indices.is_empty(),
+            "partial forward requires at least one layer"
+        );
+        ensure!(
+            layer_indices.iter().all(|&layer| layer < nl),
+            "partial forward layer index is out of range"
+        );
+        ensure!(
+            layer_indices.windows(2).all(|pair| pair[0] < pair[1]),
+            "partial forward layers must be strictly ascending"
+        );
 
         scratch.resize(hs);
 
         for &li in layer_indices {
-            if li >= nl {
-                continue;
-            }
             let layer = self.file.layer(li)?;
 
             rms_norm_with_residual(
@@ -334,6 +379,23 @@ impl RaiModel {
         let eps = self.config.norm_eps;
         let q_dim = nh * hd;
         let kv_dim = nkv * hd;
+        ensure!(batch > 0, "batch must contain at least one token");
+        ensure!(
+            hiddens.len() == batch.checked_mul(hs).context("batch size overflow")?,
+            "batched hidden buffer has the wrong size"
+        );
+        ensure!(
+            positions
+                .iter()
+                .all(|position| *position < self.config.max_context as usize),
+            "batch position exceeds model context"
+        );
+        ensure!(
+            positions
+                .windows(2)
+                .all(|pair| pair[1] == pair[0].saturating_add(1)),
+            "batch positions must be strictly consecutive and ascending"
+        );
 
         bs.resize(batch, hs, q_dim, kv_dim, inter);
 
@@ -491,6 +553,19 @@ impl RaiModel {
     ) -> Result<()> {
         let hs = self.config.hidden_size as usize;
         let vs = self.config.vocab_size as usize;
+        ensure!(batch > 0, "batch must contain at least one token");
+        ensure!(
+            hiddens.len() >= batch.checked_mul(hs).context("batch size overflow")?,
+            "batched hidden buffer is too small"
+        );
+        ensure!(
+            normed.len() >= batch.checked_mul(hs).context("norm size overflow")?,
+            "batched norm buffer is too small"
+        );
+        ensure!(
+            logits.len() >= batch.checked_mul(vs).context("logit size overflow")?,
+            "batched logit buffer is too small"
+        );
 
         for b in 0..batch {
             rms_norm(
@@ -538,6 +613,7 @@ impl RaiModel {
 }
 
 /// Scratch workspace for forward passes (does NOT contain the hidden state).
+#[derive(Default)]
 pub struct Scratch {
     pub normed: Vec<f32>,
     pub attn_out: Vec<f32>,
@@ -574,6 +650,7 @@ impl Scratch {
 }
 
 /// Workspace bundle: hidden state + scratch. Convenience for callers.
+#[derive(Default)]
 pub struct InferenceWork {
     pub hidden: Vec<f32>,
     pub scratch: Scratch,
@@ -589,6 +666,7 @@ impl InferenceWork {
 }
 
 /// Workspace for batched forward passes (self-speculative verification).
+#[derive(Default)]
 pub struct BatchScratch {
     pub normed: Vec<f32>,
     pub residual: Vec<f32>,

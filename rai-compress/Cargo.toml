@@ -2,11 +2,15 @@
 name = "classeve-rai-compress"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 description = "Weight quantization and compression toolkit — GPTQ with calibration, adaptive bit allocation, bit-packing"
+readme = "../README.md"
+keywords = ["quantization", "compression", "gptq", "machine-learning"]
+categories = ["compression", "science"]
 
 # Keep the original crate (import) name: benches do `use rai_compress::...`.
 [lib]

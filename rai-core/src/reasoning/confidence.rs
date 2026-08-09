@@ -1,6 +1,6 @@
 use crate::types::ConfidenceLevel;
 
-/// Energy thresholds for confidence gating.
+/// Thresholds for an experimental, uncalibrated retrieval-score tier.
 pub struct ConfidenceGate {
     /// Below this energy = HIGH confidence.
     pub high_threshold: f64,
@@ -26,6 +26,9 @@ impl Default for ConfidenceGate {
 impl ConfidenceGate {
     /// Determine confidence from energy and gradient norm.
     pub fn classify(&self, energy: f64, grad_norm: f64) -> ConfidenceLevel {
+        if !energy.is_finite() || !grad_norm.is_finite() {
+            return ConfidenceLevel::Low;
+        }
         // No match: gradient didn't converge
         if grad_norm > self.ode_tol * self.no_match_grad_factor {
             return ConfidenceLevel::NoMatch;
@@ -42,29 +45,33 @@ impl ConfidenceGate {
 
     /// Generate a human-readable explanation.
     pub fn explain(&self, energy: f64, grad_norm: f64, confidence: ConfidenceLevel) -> String {
+        if !energy.is_finite() || !grad_norm.is_finite() {
+            return "Confidence diagnostics are unavailable because the retrieval scores were non-finite."
+                .to_string();
+        }
         match confidence {
             ConfidenceLevel::High => format!(
-                "HIGH confidence: energy={energy:.3} is well below threshold {:.1}. \
-                 Strong attractor found — this memory is firmly established.",
+                "HIGH heuristic score tier: energy={energy:.3} is below threshold {:.1}. \
+                 This experimental label is not a calibrated confidence probability.",
                 self.high_threshold
             ),
             ConfidenceLevel::Medium => format!(
-                "MEDIUM confidence: energy={energy:.3} is between {:.1} and {:.1}. \
-                 Moderate attractor — memory exists but is not as firmly anchored.",
+                "MEDIUM heuristic score tier: energy={energy:.3} is between {:.1} and {:.1}. \
+                 This experimental label is not calibrated.",
                 self.high_threshold, self.medium_threshold
             ),
             ConfidenceLevel::Low => format!(
-                "LOW confidence: energy={energy:.3} is above {:.1}. \
-                 Weak or no attractor — this retrieval may be unreliable.",
+                "LOW heuristic score tier: energy={energy:.3} is above {:.1}. \
+                 Treat the retrieval as unverified.",
                 self.medium_threshold
             ),
             ConfidenceLevel::NoMatch => format!(
-                "NO MATCH: gradient norm={grad_norm:.2e} far exceeds convergence tolerance. \
-                 The query is in completely novel territory with no stored memory.",
+                "NO-MATCH heuristic: gradient diagnostic={grad_norm:.2e} exceeded the configured threshold. \
+                 This does not prove that no relevant memory exists.",
             ),
             ConfidenceLevel::Ambiguous => format!(
-                "AMBIGUOUS: multiple attractors found from perturbed starts. \
-                 The query sits near a basin boundary between distinct memories. \
+                "AMBIGUOUS experimental score: the diagnostic reported multiple candidate states. \
+                 This is not a proven basin-boundary classification. \
                  Energy={energy:.3}, grad_norm={grad_norm:.2e}.",
             ),
         }
@@ -83,5 +90,6 @@ mod tests {
         assert_eq!(gate.classify(-2.0, 1e-10), ConfidenceLevel::Medium);
         assert_eq!(gate.classify(0.0, 1e-10), ConfidenceLevel::Low);
         assert_eq!(gate.classify(-5.0, 1e-3), ConfidenceLevel::NoMatch);
+        assert_eq!(gate.classify(f64::NAN, 0.0), ConfidenceLevel::Low);
     }
 }

@@ -5,6 +5,7 @@
 //! and two O(n log n) sorts that the naive implementation required.
 
 use rand::Rng;
+use std::collections::HashSet;
 
 /// Sampling configuration.
 #[derive(Debug, Clone)]
@@ -37,14 +38,17 @@ pub fn sample_token(logits: &mut [f32], config: &SamplerConfig, rng: &mut impl R
         return 0;
     }
 
+    // Treat NaN as an impossible token. Positive infinity is handled explicitly during
+    // normalization so corrupt model output cannot panic comparisons or poison every value.
+    for value in logits.iter_mut() {
+        if value.is_nan() {
+            *value = f32::NEG_INFINITY;
+        }
+    }
+
     // Greedy: return argmax
-    if config.temperature <= 1e-6 {
-        return logits
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-            .unwrap()
-            .0;
+    if !config.temperature.is_finite() || config.temperature <= 1e-6 {
+        return argmax(logits);
     }
 
     // Temperature scaling in-place (no allocation)
@@ -58,11 +62,9 @@ pub fn sample_token(logits: &mut [f32], config: &SamplerConfig, rng: &mut impl R
     if config.top_k > 0 && config.top_k < vocab_size {
         let k = config.top_k;
         // Only allocation: a copy of the values for quickselect (192 KB)
-        let mut vals: Vec<f32> = logits.iter().copied().collect();
+        let mut vals = logits.to_vec();
         // Put the k-th largest value at position k-1 (0-indexed)
-        vals.select_nth_unstable_by(k - 1, |a, b| {
-            b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        vals.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
         // vals[k-1] is the k-th largest value; keep everything >= threshold
         let threshold = vals[k - 1];
         for v in logits.iter_mut() {
@@ -73,22 +75,48 @@ pub fn sample_token(logits: &mut [f32], config: &SamplerConfig, rng: &mut impl R
     }
 
     // Softmax in-place (no allocation — replaces 192 KB probs Vec)
-    let max_val = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let mut sum = 0.0f32;
-    for v in logits.iter_mut() {
-        *v = (*v - max_val).exp();
-        sum += *v;
-    }
-    if sum > 0.0 {
-        let inv = 1.0 / sum;
+    let positive_infinities = logits
+        .iter()
+        .filter(|value| **value == f32::INFINITY)
+        .count();
+    if positive_infinities > 0 {
+        let probability = 1.0 / positive_infinities as f32;
         for v in logits.iter_mut() {
-            *v *= inv;
+            *v = if *v == f32::INFINITY {
+                probability
+            } else {
+                0.0
+            };
+        }
+    } else {
+        let max_val = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        if max_val == f32::NEG_INFINITY {
+            logits.fill(1.0 / vocab_size as f32);
+        } else {
+            let mut sum = 0.0f32;
+            for v in logits.iter_mut() {
+                *v = (*v - max_val).exp();
+                sum += *v;
+            }
+            if sum.is_finite() && sum > 0.0 {
+                let inv = 1.0 / sum;
+                for v in logits.iter_mut() {
+                    *v *= inv;
+                }
+            } else {
+                logits.fill(1.0 / vocab_size as f32);
+            }
         }
     }
 
     // Top-p (nucleus): only collect non-zero probabilities (~k elements after top-k)
     // This replaces a 576 KB allocation + full sort of 49K elements
-    if config.top_p < 1.0 {
+    let top_p = if config.top_p.is_finite() {
+        config.top_p.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    if top_p < 1.0 {
         // After top_k + softmax, at most ~k elements have p > 0
         let mut candidates: Vec<(usize, f32)> = logits
             .iter()
@@ -97,13 +125,13 @@ pub fn sample_token(logits: &mut [f32], config: &SamplerConfig, rng: &mut impl R
             .map(|(i, &p)| (i, p))
             .collect();
         // Sort only the ~k candidates (trivial cost)
-        candidates.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        candidates.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
 
         let mut cumsum = 0.0f32;
         let mut cutoff = candidates.len();
         for (rank, &(_, p)) in candidates.iter().enumerate() {
             cumsum += p;
-            if cumsum >= config.top_p {
+            if cumsum >= top_p {
                 cutoff = rank + 1;
                 break;
             }
@@ -138,21 +166,17 @@ pub fn sample_token(logits: &mut [f32], config: &SamplerConfig, rng: &mut impl R
     }
 
     // Fallback: return the highest probability token
-    logits
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-        .unwrap()
-        .0
+    argmax(logits)
 }
 
 /// Apply repetition penalty to logits for recently generated tokens.
 pub fn apply_repetition_penalty(logits: &mut [f32], recent_tokens: &[usize], penalty: f32) {
-    if (penalty - 1.0).abs() < 1e-6 {
+    if !penalty.is_finite() || penalty <= 0.0 || (penalty - 1.0).abs() < 1e-6 {
         return;
     }
+    let mut seen = HashSet::with_capacity(recent_tokens.len().min(logits.len()));
     for &token in recent_tokens {
-        if token < logits.len() {
+        if token < logits.len() && seen.insert(token) {
             if logits[token] > 0.0 {
                 logits[token] /= penalty;
             } else {
@@ -160,6 +184,15 @@ pub fn apply_repetition_penalty(logits: &mut [f32], recent_tokens: &[usize], pen
             }
         }
     }
+}
+
+fn argmax(values: &[f32]) -> usize {
+    values
+        .iter()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| left.total_cmp(right))
+        .map(|(index, _)| index)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -236,5 +269,49 @@ mod tests {
         assert_eq!(counts[4], 0, "token 4 should never be sampled with top_k=2");
         assert!(counts[1] > 0, "token 1 should be sampled");
         assert!(counts[3] > 0, "token 3 should be sampled");
+    }
+
+    #[test]
+    fn non_finite_logits_never_panic_or_select_nan() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let mut greedy = vec![f32::NAN, 1.0, 2.0];
+        let config = SamplerConfig {
+            temperature: 0.0,
+            ..Default::default()
+        };
+        assert_eq!(sample_token(&mut greedy, &config, &mut rng), 2);
+
+        for _ in 0..32 {
+            let mut logits = vec![f32::INFINITY, f32::INFINITY, 0.0, f32::NAN];
+            let token = sample_token(&mut logits, &SamplerConfig::default(), &mut rng);
+            assert!(token < 2);
+        }
+
+        let mut all_invalid = vec![f32::NAN, f32::NEG_INFINITY];
+        assert!(sample_token(&mut all_invalid, &SamplerConfig::default(), &mut rng) < 2);
+    }
+
+    #[test]
+    fn non_finite_sampler_options_fall_back_safely() {
+        let config = SamplerConfig {
+            temperature: f32::NAN,
+            top_k: usize::MAX,
+            top_p: f32::NAN,
+            repetition_penalty: f32::NAN,
+        };
+        let mut logits = vec![1.0, 3.0, 2.0];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(9);
+        assert_eq!(sample_token(&mut logits, &config, &mut rng), 1);
+    }
+
+    #[test]
+    fn repetition_penalty_is_applied_once_per_token() {
+        let mut logits = vec![1.0, 4.0];
+        apply_repetition_penalty(&mut logits, &[1, 1, 1], 2.0);
+        assert_eq!(logits[1], 2.0);
+
+        let unchanged = logits.clone();
+        apply_repetition_penalty(&mut logits, &[1], f32::NAN);
+        assert_eq!(logits, unchanged);
     }
 }

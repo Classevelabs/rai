@@ -2,11 +2,15 @@
 name = "classeve-rai-server"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 description = "Local REST and MCP server for the RAI memory and reasoning layer"
+readme = "../README.md"
+keywords = ["mcp", "memory", "reasoning", "ai", "server"]
+categories = ["command-line-utilities", "web-programming::http-server"]
 
 # Keep the installed binary named `rai-server` (default would follow the package name).
 [[bin]]
@@ -18,9 +22,12 @@ path = "src/main.rs"
 # `package` points at the published crates.io name.
 rai-core = { path = "../rai-core", version = "0.1.0", package = "classeve-rai-core" }
 axum = "0.8"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tower-http = { version = "0.6", features = ["cors"] }
 log = "0.4"
 env_logger = "0.11"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

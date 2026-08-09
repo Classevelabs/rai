@@ -1,0 +1,13 @@
+.git
+.github
+target
+**/target
+**/__pycache__
+*.pyc
+*.raimodel
+*.safetensors
+*.gguf
+*.npy
+test_weights
+rai-infer/scripts/teacher_data
+rai-infer/scripts/train.log

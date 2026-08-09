@@ -1,14 +1,15 @@
-# Benchmarks
+# Historical benchmark record
 
-All numbers below are real measurements taken during development of the
-engine, on a **4-core / 8-thread laptop-class x86-64 CPU** (AVX2 + FMA + F16C,
-dual-channel DDR4, 8 MB L3). No GPU is used at inference time. Calibration for
-GPTQ export ran once on an entry-level 4 GB GPU; it can also run on CPU.
+The numbers below are historical, author-reported measurements from development
+on a described but not uniquely identified **4-core / 8-thread laptop-class
+x86-64 CPU** (AVX2 + FMA + F16C, dual-channel DDR4, 8 MB L3). No raw output,
+exact CPU model, operating-system image, commit SHA, model/dataset revisions,
+or Python dependency lock was retained in this repository. They therefore must
+not be presented as independently reproduced release evidence.
 
-They are point-in-time measurements, not marketing numbers: your results will
-vary with memory bandwidth, core count, and thermal limits. Everything here is
-reproducible with the tools in this repository (see
-[Reproducing](#reproducing)).
+Results will vary with memory bandwidth, core count, compiler flags, and
+thermal limits. The commands in [Attempting reproduction](#attempting-reproduction)
+exercise the same code paths, but do not recreate the original environment.
 
 Test model: **SmolLM-135M** (30 layers, hidden 576, vocab 49,152), exported to
 `.raimodel` with GPTQ 4-bit linears (group size 128) and an 8-bit embedding
@@ -53,17 +54,25 @@ Cumulative effect of the kernel work, same hardware and model throughout:
 | + W4A8 integer GEMM (PMADDUBSW) | 118 |
 | + Heap weight store (vs mmap) | 148 |
 | + Int8 LM head + software prefetch | 155 |
-| + Pre-allocated buffers + transparent huge pages | 175 |
+| + Pre-allocated buffers + allocator/OS tuning (historical author label) | 175 |
 | + 256-bit PMADDUBSW inner loop | 184 |
 | + Tuned prefetch distance + unchecked parameter reads | 192 |
 | + Dynamic chunk sizing | **195** |
 
-A 32.5× improvement over the naive implementation, with bit-identical model
-output at every stage.
+The table reports a 32.5× improvement over the naive implementation in the
+original development runs. The W4A8 path quantizes f32 activations to i8 and is
+not generally bit-identical to W4A32 or scalar arithmetic. No committed golden
+log supports the earlier bit-identity claim; numerical equivalence must be
+measured with explicit tolerances before it is claimed.
+
+The exact allocator/OS tuning used for the 175 tok/s stage was not retained,
+and the current loader does not explicitly request transparent huge pages. The
+heap-versus-`mmap` comparison is likewise not backed by retained raw results.
 
 ## Model size and compression
 
-SmolLM-135M (134.5M parameters), measured on the real weights:
+SmolLM-135M (134.5M parameters), as reported for the original development
+weights:
 
 | Format | Bits/weight | Size | vs FP16 |
 | --- | --- | --- | --- |
@@ -72,6 +81,14 @@ SmolLM-135M (134.5M parameters), measured on the real weights:
 | Uniform 4-bit (round-to-nearest) | 4.6 | 77.3 MB | 3.5× |
 | GPTQ 4-bit | 4.2 | 71.4 MB | 3.8× |
 | Shipped `.raimodel` (GPTQ-4b linears + 8-bit embedding + f32 norms) | — | **83 MB** | 3.25× |
+
+The RC/HRC/SAC structures in `rai-compress` are research prototypes, not
+serialized model formats. Their size helpers model some prior, channel,
+outlier, scale, and zero-point values as FP16 even though the current in-memory
+structures retain f64 values and perform no FP16 serialization roundtrip. Some
+ratios also compare against an FP64 baseline rather than a typical FP16 source.
+Those byte counts, ratios, and MSE values are theoretical estimates, not emitted
+artifact measurements; FP16 conversion error is not included.
 
 GPTQ calibration used 262,144 tokens of wikitext-2-raw-v1 (128 chunks × 2048
 tokens, ~90 s of calibration). Quantizing all layers of the 135M model takes
@@ -99,8 +116,17 @@ Two honest caveats:
 - We have not yet published end-to-end perplexity sweeps. Quality so far is
   validated through the output-error measurements above plus qualitative
   generation checks. Perplexity benchmarking is planned.
+- Raw calibration outputs and pinned model/dataset revisions are not committed,
+  so the numeric improvement table remains author-reported rather than a
+  release acceptance test.
 
-## Reproducing
+## Attempting reproduction
+
+Before running, record the exact commit, `rustc -Vv`, OS and CPU identity,
+model and dataset revisions, exporter arguments, and `python -m pip freeze`.
+The exporters currently resolve unpinned HuggingFace revisions and Python
+packages, so results can drift even with the same visible command. Retain the
+raw profiler, benchmark, and quality outputs with any new public claim.
 
 ```bash
 # Export the test model (writes rai-infer/scripts/smollm-135m-q4.raimodel)

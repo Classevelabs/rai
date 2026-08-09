@@ -16,12 +16,38 @@ import struct
 import time
 import sys
 import shutil
+import tempfile
 from pathlib import Path
 
 import numpy as np
 import torch
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+MIN_F16_SCALE = float(np.nextafter(np.float16(0), np.float16(1)))
+
+
+def validate_export_options(parser, args):
+    if args.bits != 4:
+        parser.error("--bits must be 4; the .raimodel reader supports only 4-bit weights")
+    if args.embed_bits != 8:
+        parser.error("--embed-bits must be 8; the .raimodel reader supports only 8-bit embeddings")
+    for name, value in (
+        ("--group-size", args.group_size),
+        ("--embed-group-size", args.embed_group_size),
+    ):
+        if value < 2 or value > 254 or value % 2:
+            parser.error(f"{name} must be an even integer in 2..=254")
+    if not 1 <= args.max_context <= 1_000_000:
+        parser.error("--max-context must be in 1..=1000000")
+    if args.cal_chunks < 1 or args.seq_len < 1:
+        parser.error("--cal-chunks and --seq-len must be greater than zero")
+
+
+def validate_f16_params(scale, zero_point, label):
+    if (not np.isfinite(scale).all() or not np.isfinite(zero_point).all()
+            or np.any(scale <= 0)):
+        raise ValueError(f"{label} produced non-finite or non-positive FP16 quantization parameters")
 
 
 def gptq_quantize_fast(weight_np, hessian_np, bits=4, block_size=128, group_size=128):
@@ -74,10 +100,11 @@ def gptq_quantize_fast(weight_np, hessian_np, bits=4, block_size=128, group_size
                 row_min = group_slice.min(axis=1)
                 row_max = group_slice.max(axis=1)
                 row_range = row_max - row_min
-                scale = np.maximum(row_range / (n_levels - 1), 1e-10)
+                scale = np.maximum(row_range / (n_levels - 1), MIN_F16_SCALE)
                 zero_point = row_min
                 scale_f16 = scale.astype(np.float16)
                 zero_f16 = zero_point.astype(np.float16)
+                validate_f16_params(scale_f16, zero_f16, "GPTQ group")
                 scales_f16[:, gid] = scale_f16
                 zeros_f16[:, gid] = zero_f16
                 group_scale = scale_f16.astype(np.float64)
@@ -128,10 +155,11 @@ def quantize_embedding_8bit(weight_np, group_size=64):
 
         row_min = group_data.min(axis=1)
         row_max = group_data.max(axis=1)
-        scale = np.maximum((row_max - row_min) / 255.0, 1e-10)
+        scale = np.maximum((row_max - row_min) / 255.0, MIN_F16_SCALE)
 
         scale_f16 = scale.astype(np.float16)
         zero_f16 = row_min.astype(np.float16)
+        validate_f16_params(scale_f16, zero_f16, "embedding group")
         scales[:, gid] = scale_f16
         zeros[:, gid] = zero_f16
 
@@ -203,6 +231,7 @@ def main():
     parser.add_argument('--seq-len', type=int, default=2048)
     parser.add_argument('--max-context', type=int, default=2048)
     args = parser.parse_args()
+    validate_export_options(parser, args)
 
     if args.output is None:
         model_short = args.model.split('/')[-1].lower().replace(' ', '-')
@@ -219,6 +248,10 @@ def main():
     t0 = time.time()
     model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float16, device_map=device)
     tokenizer = AutoTokenizer.from_pretrained(args.model)
+    if not tokenizer.is_fast:
+        raise RuntimeError(
+            "this exporter requires a fast tokenizer that can emit tokenizer.json"
+        )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     model.eval()
@@ -419,12 +452,15 @@ def main():
     sys.stdout.flush()
 
     # Copy tokenizer
-    tokenizer.save_pretrained("/tmp/rai_tok")
-    tok_src = Path("/tmp/rai_tok/tokenizer.json")
     tok_dst = output_path.parent / "tokenizer.json"
-    if tok_src.exists():
-        shutil.copy2(tok_src, tok_dst)
-        print(f"  Tokenizer: {tok_dst}")
+    with tempfile.TemporaryDirectory(prefix="rai_tokenizer_") as tmp_dir:
+        tokenizer.save_pretrained(tmp_dir)
+        tok_src = Path(tmp_dir) / "tokenizer.json"
+        if tok_src.exists():
+            shutil.copy2(tok_src, tok_dst)
+            print(f"  Tokenizer: {tok_dst}")
+        else:
+            raise RuntimeError("tokenizer export did not produce the required tokenizer.json")
 
     print(f"\n=== DONE ===")
     print(f"  Model: {args.output} ({total_size / 1e6:.1f} MB)")

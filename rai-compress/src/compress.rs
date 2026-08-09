@@ -1,6 +1,60 @@
-use crate::prior::WeightPrior;
-use crate::quantize::{choose_bits, dequantize, quantize_kmeans, quantize_uniform, QuantizedBlock};
+use crate::prior::{PriorError, WeightPrior};
+use crate::quantize::{choose_bits, dequantize, quantize_uniform, QuantizeError, QuantizedBlock};
+use crate::{channel::ChannelError, sparse::SparseError};
 use nalgebra::DMatrix;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompressionError {
+    InvalidRepresentation(&'static str),
+    SizeOverflow,
+    AllocationFailed,
+    Prior(PriorError),
+    QuantizedBlock(QuantizeError),
+    Channel(ChannelError),
+    Sparse(SparseError),
+}
+
+impl std::fmt::Display for CompressionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidRepresentation(message) => {
+                write!(formatter, "invalid compressed representation: {message}")
+            }
+            Self::SizeOverflow => formatter.write_str("compressed dimensions overflow"),
+            Self::AllocationFailed => formatter.write_str("unable to allocate decompressed matrix"),
+            Self::Prior(error) => write!(formatter, "{error}"),
+            Self::QuantizedBlock(error) => write!(formatter, "{error}"),
+            Self::Channel(error) => write!(formatter, "{error}"),
+            Self::Sparse(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for CompressionError {}
+
+impl From<PriorError> for CompressionError {
+    fn from(error: PriorError) -> Self {
+        Self::Prior(error)
+    }
+}
+
+impl From<QuantizeError> for CompressionError {
+    fn from(error: QuantizeError) -> Self {
+        Self::QuantizedBlock(error)
+    }
+}
+
+impl From<ChannelError> for CompressionError {
+    fn from(error: ChannelError) -> Self {
+        Self::Channel(error)
+    }
+}
+
+impl From<SparseError> for CompressionError {
+    fn from(error: SparseError) -> Self {
+        Self::Sparse(error)
+    }
+}
 
 /// Compressed weight matrix using Resonance Compression.
 ///
@@ -30,7 +84,8 @@ pub struct CompressedMatrix {
     pub stats: CompressionStats,
 }
 
-/// Statistics about the compression.
+/// Modeled compression statistics. Byte counts assume future FP16 metadata/prior storage;
+/// the current in-memory f64 representation is larger and is not a serialized roundtrip.
 #[derive(Debug, Clone)]
 pub struct CompressionStats {
     /// Original size in bytes (FP64).
@@ -63,10 +118,6 @@ pub struct RCConfig {
     /// Absolute error tolerance per element for adaptive bit allocation.
     /// Smaller = more bits = higher accuracy. Typical: 0.001 - 0.01.
     pub abs_tol: f64,
-    /// Use k-means quantization instead of uniform.
-    pub use_kmeans: bool,
-    /// K-means iterations (if enabled).
-    pub kmeans_iters: usize,
 }
 
 impl Default for RCConfig {
@@ -75,8 +126,6 @@ impl Default for RCConfig {
             block_size: 128,
             rank: 0, // auto
             abs_tol: 0.005,
-            use_kmeans: false,
-            kmeans_iters: 10,
         }
     }
 }
@@ -85,19 +134,39 @@ impl Default for RCConfig {
 pub fn compress(weights: &DMatrix<f64>, config: &RCConfig) -> CompressedMatrix {
     let rows = weights.nrows();
     let cols = weights.ncols();
-    let total = rows * cols;
+    assert!(rows > 0 && cols > 0, "weight matrix must not be empty");
+    assert!(config.block_size > 0, "block_size must be non-zero");
+    assert!(
+        config.abs_tol.is_finite() && config.abs_tol > 0.0,
+        "abs_tol must be finite and positive"
+    );
+    assert!(
+        weights.iter().all(|value| value.is_finite()),
+        "weights must be finite"
+    );
+    let total = rows.checked_mul(cols).expect("weight dimensions overflow");
 
     // Step 1: Learn prior (low-rank approximation)
     let rank = if config.rank == 0 {
         WeightPrior::optimal_rank(weights, config.block_size, 4.0)
+            .expect("validated weights must produce a prior rank")
     } else {
+        assert!(
+            config.rank <= rows.min(cols),
+            "rank must not exceed a matrix dimension"
+        );
         config.rank
     };
-    let prior = WeightPrior::from_weights(weights, rank);
-    let variance_explained = prior.variance_explained(weights);
+    let prior = WeightPrior::from_weights(weights, rank)
+        .expect("validated weights and rank must produce a prior");
+    let variance_explained = prior
+        .variance_explained(weights)
+        .expect("validated prior must support its source matrix");
 
     // Step 2: Compute residual
-    let residual = prior.residual(weights);
+    let residual = prior
+        .residual(weights)
+        .expect("validated prior must support its source matrix");
     let residual_flat: Vec<f64> = residual.iter().cloned().collect();
 
     // Step 3: Adaptive block-wise quantization
@@ -107,18 +176,16 @@ pub fn compress(weights: &DMatrix<f64>, config: &RCConfig) -> CompressedMatrix {
     for chunk in residual_flat.chunks(config.block_size) {
         let bits = choose_bits(chunk, config.abs_tol);
 
-        let block = if config.use_kmeans {
-            quantize_kmeans(chunk, bits, config.kmeans_iters)
-        } else {
-            quantize_uniform(chunk, bits)
-        };
+        let block = quantize_uniform(chunk, bits);
 
         total_residual_bits += chunk.len() * bits as usize;
         blocks.push(block);
     }
 
     // Step 4: Compute statistics
-    let prior_bytes = prior.prior_size_bytes();
+    let prior_bytes = prior
+        .prior_size_bytes()
+        .expect("validated prior size must fit in memory");
     let residual_bytes = blocks.iter().map(|b| b.packed.size_bytes()).sum::<usize>();
     let block_metadata_bytes = blocks.len() * 5; // scale(2, FP16) + zero(2, FP16) + bits(1)
     let compressed_bytes = prior_bytes + residual_bytes + block_metadata_bytes;
@@ -142,7 +209,8 @@ pub fn compress(weights: &DMatrix<f64>, config: &RCConfig) -> CompressedMatrix {
             max_error: 0.0,
             mse: 0.0,
         },
-    });
+    })
+    .expect("freshly compressed matrix must be internally consistent");
 
     let errors: Vec<f64> = weights
         .iter()
@@ -175,33 +243,77 @@ pub fn compress(weights: &DMatrix<f64>, config: &RCConfig) -> CompressedMatrix {
 }
 
 /// Decompress a matrix back to full precision.
-pub fn decompress_matrix(compressed: &CompressedMatrix) -> DMatrix<f64> {
+pub fn decompress_matrix(compressed: &CompressedMatrix) -> Result<DMatrix<f64>, CompressionError> {
+    if compressed.rows == 0 || compressed.cols == 0 {
+        return Err(CompressionError::InvalidRepresentation(
+            "matrix shape must be non-zero",
+        ));
+    }
+    if compressed.block_size == 0 {
+        return Err(CompressionError::InvalidRepresentation(
+            "block_size must be non-zero",
+        ));
+    }
+    let total = compressed
+        .rows
+        .checked_mul(compressed.cols)
+        .ok_or(CompressionError::SizeOverflow)?;
     // Reconstruct prior
-    let mut result = compressed.prior.predict();
+    let mut result = compressed.prior.predict()?;
+    if result.shape() != (compressed.rows, compressed.cols) {
+        return Err(CompressionError::InvalidRepresentation(
+            "matrix shape does not match the prior",
+        ));
+    }
 
     // Add dequantized residuals
-    let mut flat_residual = Vec::with_capacity(compressed.rows * compressed.cols);
+    let mut flat_residual = Vec::new();
+    flat_residual
+        .try_reserve_exact(total)
+        .map_err(|_| CompressionError::AllocationFailed)?;
     for block in &compressed.blocks {
-        flat_residual.extend(dequantize(block));
+        let decoded = dequantize(block)?;
+        let remaining = total.saturating_sub(flat_residual.len());
+        let expected_len = compressed.block_size.min(remaining);
+        if decoded.len() != expected_len {
+            return Err(CompressionError::InvalidRepresentation(
+                "residual block length does not match block_size or matrix shape",
+            ));
+        }
+        flat_residual.extend(decoded);
     }
-    flat_residual.truncate(compressed.rows * compressed.cols);
+    if flat_residual.len() != total {
+        return Err(CompressionError::InvalidRepresentation(
+            "residual length does not match matrix shape",
+        ));
+    }
 
     for (i, val) in flat_residual.iter().enumerate() {
         let row = i % compressed.rows;
         let col = i / compressed.rows;
-        if row < result.nrows() && col < result.ncols() {
-            result[(row, col)] += val;
+        let value = result[(row, col)] + val;
+        if !value.is_finite() {
+            return Err(CompressionError::InvalidRepresentation(
+                "reconstruction contains non-finite values",
+            ));
         }
+        result[(row, col)] = value;
     }
 
-    result
+    Ok(result)
 }
 
 /// Standard 4-bit uniform quantization (baseline for comparison).
 pub fn compress_uniform_4bit(weights: &DMatrix<f64>, block_size: usize) -> CompressionStats {
     let rows = weights.nrows();
     let cols = weights.ncols();
-    let total = rows * cols;
+    assert!(rows > 0 && cols > 0, "weight matrix must not be empty");
+    assert!(block_size > 0, "block_size must be non-zero");
+    assert!(
+        weights.iter().all(|value| value.is_finite()),
+        "weights must be finite"
+    );
+    let total = rows.checked_mul(cols).expect("weight dimensions overflow");
     let flat: Vec<f64> = weights.iter().cloned().collect();
 
     let mut total_error = 0.0f64;
@@ -210,7 +322,8 @@ pub fn compress_uniform_4bit(weights: &DMatrix<f64>, block_size: usize) -> Compr
 
     for chunk in flat.chunks(block_size) {
         let block = quantize_uniform(chunk, 4);
-        let recovered = dequantize(&block);
+        let recovered =
+            dequantize(&block).expect("freshly quantized block must be internally consistent");
         compressed_bytes += block.packed.size_bytes() + 5; // data + metadata (scale+zero FP16 + bits)
 
         for (a, b) in chunk.iter().zip(recovered.iter()) {
@@ -390,6 +503,17 @@ mod tests {
             report.rc_stats.mse < report.baseline_stats.mse * 5.0,
             "RC shouldn't be much worse even on random data"
         );
+    }
+
+    #[test]
+    fn malformed_compressed_shape_is_rejected() {
+        let weights = DMatrix::from_element(2, 2, 1.0);
+        let mut compressed = compress(&weights, &RCConfig::default());
+        compressed.rows = 3;
+        assert!(matches!(
+            decompress_matrix(&compressed),
+            Err(CompressionError::InvalidRepresentation(_)) | Err(CompressionError::Prior(_))
+        ));
     }
 
     /// Test: simulate realistic LLM weight distribution.

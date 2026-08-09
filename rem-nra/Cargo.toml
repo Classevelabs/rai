@@ -2,11 +2,15 @@
 name = "classeve-rai-rem-nra"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 description = "Local resonance memory backend used by the RAI workspace"
+readme = "../README.md"
+keywords = ["memory", "associative-memory", "ai"]
+categories = ["science"]
 
 # Keep the original crate (import) name: code does `use rem_nra::...`.
 [lib]

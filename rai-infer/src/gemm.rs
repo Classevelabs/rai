@@ -7,6 +7,15 @@
 //! 4. **Factored dequant** — w*x = scale*dot(codes,x) + zero*sum(x_group).
 //! 5. **Rayon par_chunks_mut** for large matrices, single-thread for small.
 
+// These kernels deliberately use numeric indexing and fixed, explicit argument lists so the
+// scalar and SIMD implementations stay structurally comparable. Rewriting them as iterators or
+// parameter objects would obscure bounds reasoning and can change hot-loop code generation.
+#![allow(
+    clippy::manual_clamp,
+    clippy::needless_range_loop,
+    clippy::too_many_arguments
+)]
+
 use half::f16;
 use rayon::prelude::*;
 
@@ -103,12 +112,12 @@ fn read_f16_le(data: &[u8], offset: usize) -> f32 {
 /// Compute per-group input sums for the factored dequant formula.
 #[inline]
 fn compute_input_sums(input: &[f32], cols: usize, group_size: usize) -> [f32; MAX_GROUPS] {
-    let num_groups = (cols + group_size - 1) / group_size;
+    let num_groups = cols.div_ceil(group_size);
     let mut sums = [0.0f32; MAX_GROUPS];
 
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if has_avx2() {
             unsafe {
                 compute_input_sums_avx2(input, &mut sums, cols, group_size, num_groups);
             }
@@ -178,7 +187,7 @@ fn quantize_input_split(
 ) {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if has_avx2() {
             unsafe {
                 quantize_input_split_avx2(
                     input,
@@ -553,7 +562,7 @@ unsafe fn matvec_chunk_i8(
                 let combined = _mm_add_epi16(prod_e, prod_o);
                 let sums = _mm_madd_epi16(combined, ones128);
                 let tail_f = _mm_mul_ps(_mm_cvtepi32_ps(sums), _mm_set1_ps(combined_scale));
-                let tail_256 = _mm256_castps128_ps256(tail_f);
+                let tail_256 = _mm256_insertf128_ps(_mm256_setzero_ps(), tail_f, 0);
                 float_acc = _mm256_add_ps(float_acc, tail_256);
             }
 
@@ -853,7 +862,7 @@ fn quantize_hidden_i8(
 ) {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if has_avx2() {
             unsafe {
                 quantize_hidden_i8_avx2(
                     hidden,
@@ -1050,6 +1059,65 @@ fn chunk_rows_for(cols: usize) -> usize {
 /// Maximum number of groups per GEMM (7B MLP: 14336/128 = 112, so 128 is safe).
 pub const MAX_GROUPS: usize = 128;
 
+fn validate_weight_buffers(
+    output_len: usize,
+    nibble_len: usize,
+    parameter_len: usize,
+    input_len: usize,
+    rows: usize,
+    cols: usize,
+    num_tokens: usize,
+    group_size: usize,
+) {
+    assert!(rows > 0, "rows must be non-zero");
+    assert!(
+        cols > 0 && cols.is_multiple_of(2),
+        "cols must be non-zero and even"
+    );
+    assert!(
+        group_size > 0 && group_size.is_multiple_of(2),
+        "group_size must be non-zero and even"
+    );
+    assert!(num_tokens > 0, "num_tokens must be non-zero");
+    let num_groups = cols.div_ceil(group_size);
+    assert!(
+        num_groups <= MAX_GROUPS,
+        "quantization group count exceeds kernel capacity"
+    );
+    let elements = rows.checked_mul(cols).expect("weight dimensions overflow");
+    let required_nibbles = elements.div_ceil(2);
+    let required_parameters = rows
+        .checked_mul(num_groups)
+        .and_then(|value| value.checked_mul(4))
+        .expect("weight parameter dimensions overflow");
+    let required_input = num_tokens
+        .checked_mul(cols)
+        .expect("input dimensions overflow");
+    let required_output = num_tokens
+        .checked_mul(rows)
+        .expect("output dimensions overflow");
+    assert!(nibble_len >= required_nibbles, "weight data is truncated");
+    assert!(
+        parameter_len >= required_parameters,
+        "weight parameters are truncated"
+    );
+    assert!(input_len >= required_input, "input buffer is too small");
+    assert!(output_len >= required_output, "output buffer is too small");
+}
+
+fn validate_projection(output: &[f32], projection: &QuantizedLinear<'_>, input: &[f32]) {
+    validate_weight_buffers(
+        output.len(),
+        projection.nibble_data.len(),
+        projection.group_params.len(),
+        input.len(),
+        projection.rows,
+        projection.cols,
+        1,
+        projection.group_size,
+    );
+}
+
 /// Inner dispatch with pre-computed input data. Uses W4A8 integer GEMM when available.
 /// Uses dynamic chunk sizing: exactly num_threads chunks for optimal load balance
 /// and minimal atomic overhead.
@@ -1069,11 +1137,11 @@ fn w4a32_matvec_inner(
 ) {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if has_avx2() {
             if rows >= PAR_THRESHOLD {
                 // Adaptive chunk sizing: keeps per-chunk weight data in L1 (32KB).
                 let cr = chunk_rows_for(cols);
-                let num_chunks = (rows + cr - 1) / cr;
+                let num_chunks = rows.div_ceil(cr);
                 let out_ptr = SendPtr(output.as_mut_ptr());
                 let nib_ptr = SyncU8Ptr(nibble_data.as_ptr());
                 let inp_f32_ptr = SyncF32Ptr(input.as_ptr());
@@ -1152,8 +1220,17 @@ pub fn w4a32_matvec(
     cols: usize,
     group_size: usize,
 ) {
-    let num_groups = (cols + group_size - 1) / group_size;
-    debug_assert!(num_groups <= MAX_GROUPS);
+    validate_weight_buffers(
+        output.len(),
+        nibble_data.len(),
+        group_params.len(),
+        input.len(),
+        rows,
+        cols,
+        1,
+        group_size,
+    );
+    let num_groups = cols.div_ceil(group_size);
     let input_sums = compute_input_sums(input, cols, group_size);
     let half_cols = cols / 2;
     let mut input_even = vec![0i8; half_cols];
@@ -1196,9 +1273,16 @@ pub fn w4a32_fused_qkv(
     v_proj: &QuantizedLinear<'_>,
     input: &[f32],
 ) {
+    validate_projection(q_out, q_proj, input);
+    validate_projection(k_out, k_proj, input);
+    validate_projection(v_out, v_proj, input);
+    assert_eq!(q_proj.cols, k_proj.cols, "Q/K column mismatch");
+    assert_eq!(q_proj.cols, v_proj.cols, "Q/V column mismatch");
+    assert_eq!(q_proj.group_size, k_proj.group_size, "Q/K group mismatch");
+    assert_eq!(q_proj.group_size, v_proj.group_size, "Q/V group mismatch");
     let cols = q_proj.cols;
     let group_size = q_proj.group_size;
-    let num_groups = (cols + group_size - 1) / group_size;
+    let num_groups = cols.div_ceil(group_size);
     let input_sums = compute_input_sums(input, cols, group_size);
     let half_cols = cols / 2;
     let mut input_even = vec![0i8; half_cols];
@@ -1216,11 +1300,11 @@ pub fn w4a32_fused_qkv(
 
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if has_avx2() {
             let cr = chunk_rows_for(cols);
-            let q_chunks = (q_proj.rows + cr - 1) / cr;
-            let k_chunks = (k_proj.rows + cr - 1) / cr;
-            let v_chunks = (v_proj.rows + cr - 1) / cr;
+            let q_chunks = q_proj.rows.div_ceil(cr);
+            let k_chunks = k_proj.rows.div_ceil(cr);
+            let v_chunks = v_proj.rows.div_ceil(cr);
             let total_chunks = q_chunks + k_chunks + v_chunks;
 
             let q_ptr = SendPtr(q_out.as_mut_ptr());
@@ -1327,9 +1411,16 @@ pub fn w4a32_fused_gate_up(
     up_proj: &QuantizedLinear<'_>,
     input: &[f32],
 ) {
+    validate_projection(gate_out, gate_proj, input);
+    validate_projection(up_out, up_proj, input);
+    assert_eq!(gate_proj.cols, up_proj.cols, "gate/up column mismatch");
+    assert_eq!(
+        gate_proj.group_size, up_proj.group_size,
+        "gate/up group mismatch"
+    );
     let cols = gate_proj.cols;
     let group_size = gate_proj.group_size;
-    let num_groups = (cols + group_size - 1) / group_size;
+    let num_groups = cols.div_ceil(group_size);
     let input_sums = compute_input_sums(input, cols, group_size);
     let half_cols = cols / 2;
     let mut input_even = vec![0i8; half_cols];
@@ -1347,10 +1438,10 @@ pub fn w4a32_fused_gate_up(
 
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if has_avx2() {
             let cr = chunk_rows_for(cols);
-            let g_chunks = (gate_proj.rows + cr - 1) / cr;
-            let u_chunks = (up_proj.rows + cr - 1) / cr;
+            let g_chunks = gate_proj.rows.div_ceil(cr);
+            let u_chunks = up_proj.rows.div_ceil(cr);
             let total_chunks = g_chunks + u_chunks;
 
             let g_ptr = SendPtr(gate_out.as_mut_ptr());
@@ -1457,12 +1548,33 @@ pub struct QuantizedBatchInput {
     pub scales: Vec<[f32; MAX_GROUPS]>,
     pub num_tokens: usize,
     pub cols: usize,
+    pub group_size: usize,
 }
 
 impl QuantizedBatchInput {
     /// Quantize a batch of float inputs into int8 even/odd split format.
     pub fn quantize(input: &[f32], cols: usize, num_tokens: usize, group_size: usize) -> Self {
-        let num_groups = (cols + group_size - 1) / group_size;
+        assert!(
+            cols > 0 && cols.is_multiple_of(2),
+            "cols must be non-zero and even"
+        );
+        assert!(
+            group_size > 0 && group_size.is_multiple_of(2),
+            "group_size must be non-zero and even"
+        );
+        assert!(num_tokens > 0, "num_tokens must be non-zero");
+        assert!(
+            cols.div_ceil(group_size) <= MAX_GROUPS,
+            "quantization group count exceeds kernel capacity"
+        );
+        assert!(
+            input.len()
+                >= num_tokens
+                    .checked_mul(cols)
+                    .expect("input dimensions overflow"),
+            "input buffer is too small"
+        );
+        let num_groups = cols.div_ceil(group_size);
         let half_cols = cols / 2;
         let mut sums = Vec::with_capacity(num_tokens);
         let mut even_flat = vec![0i8; num_tokens * half_cols];
@@ -1484,6 +1596,7 @@ impl QuantizedBatchInput {
             scales: scales_vec,
             num_tokens,
             cols,
+            group_size,
         }
     }
 }
@@ -1500,7 +1613,25 @@ pub fn w4a32_matmul_preq(
 ) {
     let num_tokens = preq.num_tokens;
     let cols = preq.cols;
+    assert_eq!(preq.group_size, group_size, "prequantized group mismatch");
+    validate_weight_buffers(
+        output.len(),
+        nibble_data.len(),
+        group_params.len(),
+        input.len(),
+        rows,
+        cols,
+        num_tokens,
+        group_size,
+    );
     let half_cols = cols / 2;
+    let quantized_len = num_tokens
+        .checked_mul(half_cols)
+        .expect("quantized input dimensions overflow");
+    assert!(preq.even_flat.len() >= quantized_len);
+    assert!(preq.odd_flat.len() >= quantized_len);
+    assert!(preq.sums.len() >= num_tokens);
+    assert!(preq.scales.len() >= num_tokens);
 
     if num_tokens == 1 {
         return w4a32_matvec(
@@ -1516,9 +1647,9 @@ pub fn w4a32_matmul_preq(
 
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if has_avx2() {
             let cr = chunk_rows_for(cols);
-            let num_chunks = (rows + cr - 1) / cr;
+            let num_chunks = rows.div_ceil(cr);
 
             let out_ptr = SendPtr(output.as_mut_ptr());
             let nib_ptr = SyncU8Ptr(nibble_data.as_ptr());
@@ -1551,7 +1682,7 @@ pub fn w4a32_matmul_preq(
                             len,
                             cols,
                             group_size,
-                            (cols + group_size - 1) / group_size,
+                            cols.div_ceil(group_size),
                         );
                     }
                 }
@@ -1575,7 +1706,7 @@ pub fn w4a32_matmul_preq(
                 row,
                 cols,
                 group_size,
-                (cols + group_size - 1) / group_size,
+                cols.div_ceil(group_size),
             );
         }
     }
@@ -1598,6 +1729,16 @@ pub fn w4a32_matmul(
     num_tokens: usize,
     group_size: usize,
 ) {
+    validate_weight_buffers(
+        output.len(),
+        nibble_data.len(),
+        group_params.len(),
+        input.len(),
+        rows,
+        cols,
+        num_tokens,
+        group_size,
+    );
     if num_tokens == 1 {
         return w4a32_matvec(
             output,
@@ -1610,7 +1751,7 @@ pub fn w4a32_matmul(
         );
     }
 
-    let num_groups = (cols + group_size - 1) / group_size;
+    let num_groups = cols.div_ceil(group_size);
     let half_cols = cols / 2;
 
     // Pre-quantize all token inputs into flat contiguous buffers (2 allocs, not 2*num_tokens)
@@ -1631,9 +1772,9 @@ pub fn w4a32_matmul(
 
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if has_avx2() {
             let cr = chunk_rows_for(cols);
-            let num_chunks = (rows + cr - 1) / cr;
+            let num_chunks = rows.div_ceil(cr);
 
             let out_ptr = SendPtr(output.as_mut_ptr());
             let nib_ptr = SyncU8Ptr(nibble_data.as_ptr());
@@ -1711,8 +1852,25 @@ pub fn embed_lookup(
     hidden_size: usize,
     group_size: usize,
 ) {
-    debug_assert!(token_id < vocab_size);
-    let num_groups = (hidden_size + group_size - 1) / group_size;
+    assert!(group_size > 0, "group_size must be non-zero");
+    assert!(token_id < vocab_size, "token id is out of range");
+    assert!(output.len() >= hidden_size, "embedding output is too small");
+    let num_groups = hidden_size.div_ceil(group_size);
+    assert!(
+        embed_data.len()
+            >= vocab_size
+                .checked_mul(hidden_size)
+                .expect("embedding dimensions overflow"),
+        "embedding data is truncated"
+    );
+    assert!(
+        embed_params.len()
+            >= vocab_size
+                .checked_mul(num_groups)
+                .and_then(|value| value.checked_mul(4))
+                .expect("embedding parameter dimensions overflow"),
+        "embedding parameters are truncated"
+    );
     let row_data_start = token_id * hidden_size;
     let row_param_start = token_id * num_groups * 4;
 
@@ -1740,14 +1898,36 @@ pub fn tied_lm_head(
     hidden_size: usize,
     group_size: usize,
 ) {
-    let num_groups = (hidden_size + group_size - 1) / group_size;
-    debug_assert!(num_groups <= MAX_GROUPS);
+    assert!(group_size > 0, "group_size must be non-zero");
+    assert!(
+        hidden_size > 0 && hidden_size.is_multiple_of(2),
+        "hidden_size must be non-zero and even"
+    );
+    assert!(hidden.len() >= hidden_size, "hidden buffer is too small");
+    assert!(logits.len() >= vocab_size, "logit buffer is too small");
+    let num_groups = hidden_size.div_ceil(group_size);
+    assert!(num_groups <= MAX_GROUPS);
+    assert!(
+        embed_data.len()
+            >= vocab_size
+                .checked_mul(hidden_size)
+                .expect("embedding dimensions overflow"),
+        "embedding data is truncated"
+    );
+    assert!(
+        embed_params.len()
+            >= vocab_size
+                .checked_mul(num_groups)
+                .and_then(|value| value.checked_mul(4))
+                .expect("embedding parameter dimensions overflow"),
+        "embedding parameters are truncated"
+    );
 
     let hidden_sums = compute_input_sums(hidden, hidden_size, group_size);
 
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if has_avx2() {
             // Quantize hidden state to i8 for integer PMADDUBSW path
             let mut hidden_i8 = vec![0i8; hidden_size];
             let mut hidden_scales = [0.0f32; MAX_GROUPS];
@@ -1760,7 +1940,7 @@ pub fn tied_lm_head(
                 num_groups,
             );
 
-            let num_chunks = (vocab_size + LM_CHUNK - 1) / LM_CHUNK;
+            let num_chunks = vocab_size.div_ceil(LM_CHUNK);
             let out_ptr = SendPtr(logits.as_mut_ptr());
             let emb_ptr = SyncU8Ptr(embed_data.as_ptr());
             let hid_i8_ptr = SyncU8Ptr(hidden_i8.as_ptr() as *const u8);
@@ -1818,7 +1998,7 @@ mod _speculative_lm_head {
         hidden_size: usize,
         group_size: usize,
     ) {
-        let num_groups = (hidden_size + group_size - 1) / group_size;
+        let num_groups = hidden_size.div_ceil(group_size);
         debug_assert!(num_groups <= MAX_GROUPS);
 
         // Only use speculative path for large vocabs with enough groups to split
@@ -1838,7 +2018,7 @@ mod _speculative_lm_head {
 
         #[cfg(target_arch = "x86_64")]
         {
-            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            if has_avx2() {
                 let mut hidden_i8 = vec![0i8; hidden_size];
                 let mut hidden_scales = [0.0f32; MAX_GROUPS];
                 quantize_hidden_i8(
@@ -1861,7 +2041,7 @@ mod _speculative_lm_head {
                 let hscales = hidden_scales;
 
                 // Phase 1: parallel partial evaluation
-                let num_chunks = (vocab_size + LM_CHUNK - 1) / LM_CHUNK;
+                let num_chunks = vocab_size.div_ceil(LM_CHUNK);
                 (0..num_chunks).into_par_iter().for_each(|ci| {
                     let start = ci * LM_CHUNK;
                     let len = LM_CHUNK.min(vocab_size - start);
@@ -1886,7 +2066,7 @@ mod _speculative_lm_head {
 
                 // Find top-K threshold using partial sort
                 let mut partial_copy: Vec<f32> = logits[..vocab_size].to_vec();
-                partial_copy.select_nth_unstable_by(top_k, |a, b| b.partial_cmp(a).unwrap());
+                partial_copy.select_nth_unstable_by(top_k, |a, b| b.total_cmp(a));
                 let threshold = partial_copy[top_k];
 
                 // Phase 2: Complete remaining groups for rows above threshold
@@ -2278,7 +2458,7 @@ mod tests {
         let num_groups = 2;
 
         let mut embed_params = vec![0u8; vocab * num_groups * 4];
-        let off = 1 * num_groups * 4;
+        let off = num_groups * 4;
         embed_params[off..off + 2].copy_from_slice(&f16::from_f32(0.1).to_le_bytes());
         embed_params[off + 2..off + 4].copy_from_slice(&f16::from_f32(-0.5).to_le_bytes());
         let off2 = off + 4;
@@ -2286,10 +2466,10 @@ mod tests {
         embed_params[off2 + 2..off2 + 4].copy_from_slice(&f16::from_f32(-1.0).to_le_bytes());
 
         let mut embed_data = vec![0u8; vocab * hidden];
-        embed_data[1 * hidden + 0] = 10;
-        embed_data[1 * hidden + 1] = 20;
-        embed_data[1 * hidden + 2] = 30;
-        embed_data[1 * hidden + 3] = 40;
+        embed_data[hidden] = 10;
+        embed_data[hidden + 1] = 20;
+        embed_data[hidden + 2] = 30;
+        embed_data[hidden + 3] = 40;
 
         let mut output = vec![0.0f32; hidden];
         embed_lookup(
@@ -2369,5 +2549,24 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "weight data is truncated")]
+    fn truncated_weights_are_rejected_before_kernel_dispatch() {
+        let mut output = vec![0.0; 4];
+        let input = vec![1.0; 8];
+        let params = vec![0_u8; 16];
+        w4a32_matvec(&mut output, &[], &params, &input, 4, 8, 8);
+    }
+
+    #[test]
+    #[should_panic(expected = "cols must be non-zero and even")]
+    fn odd_dimensions_are_rejected_before_kernel_dispatch() {
+        let mut output = vec![0.0; 1];
+        let input = vec![1.0; 3];
+        let params = vec![0_u8; 4];
+        let weights = vec![0_u8; 2];
+        w4a32_matvec(&mut output, &weights, &params, &input, 1, 3, 3);
     }
 }

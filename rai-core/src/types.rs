@@ -1,18 +1,18 @@
 use rem_nra::Vec64;
 use serde::{Deserialize, Serialize};
 
-/// Confidence level derived from NRA energy at the attractor.
+/// Experimental, uncalibrated tier derived from the current retrieval score.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConfidenceLevel {
-    /// Energy < -3.0: strong attractor, inject directly
+    /// Experimental score below the configured high-tier threshold.
     High,
-    /// Energy in [-3, -1]: moderate attractor, inject with caveat
+    /// Experimental score in the configured medium tier.
     Medium,
-    /// Energy > -1.0: weak/no attractor, do NOT inject
+    /// Experimental score in the low tier; treat retrieval as unverified.
     Low,
-    /// Gradient norm >> tolerance: no convergence, completely novel
+    /// Experimental gradient diagnostic exceeded its configured threshold.
     NoMatch,
-    /// Multiple attractors found from perturbations
+    /// Experimental perturbation diagnostic reported multiple candidate states.
     Ambiguous,
 }
 
@@ -64,9 +64,9 @@ pub enum InterferenceSeverity {
     None,
     /// Minor perturbation, memories still stable.
     Minor,
-    /// Significant energy shift — possible contradiction.
+    /// Significant score shift; not proof of contradiction.
     Major,
-    /// Attractor destroyed — definite contradiction.
+    /// Largest configured score-change tier; not proof of logical contradiction.
     Critical,
 }
 

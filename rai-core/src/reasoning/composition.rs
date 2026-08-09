@@ -1,11 +1,11 @@
 use rem_nra::Vec64;
 
-/// Compositional addressing: combine omega vectors to query at concept intersections.
+/// Experimental compositional addressing over omega vectors.
 pub struct Compositor;
 
 impl Compositor {
     /// Combine multiple omega vectors via normalized averaging.
-    /// This queries at the "intersection" of concepts in NRA's energy landscape.
+    /// The result is a heuristic composite query, not a proven concept intersection.
     pub fn intersect(omegas: &[Vec64]) -> Vec64 {
         if omegas.is_empty() {
             panic!("cannot compose zero omega vectors");
@@ -84,7 +84,7 @@ mod tests {
     #[test]
     fn single_omega_returns_same() {
         let a = DVector::from_vec(vec![0.5, 0.5, 0.0, 0.0]);
-        let result = Compositor::intersect(&[a.clone()]);
+        let result = Compositor::intersect(std::slice::from_ref(&a));
         assert_eq!(result, a);
     }
 }

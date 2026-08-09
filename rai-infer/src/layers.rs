@@ -3,9 +3,15 @@
 //! All operations are pure f32, hand-written with AVX2 SIMD acceleration.
 //! No external linear algebra dependencies.
 
+// Attention kernels intentionally mirror scalar/SIMD index arithmetic, and their explicit
+// dimension arguments document and validate each buffer contract at the call boundary.
+#![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
+
 use crate::format::QuantizedLinear;
 use crate::gemm::{has_avx2, w4a32_fused_gate_up, w4a32_fused_qkv, w4a32_matvec};
 use crate::kv_cache::KVCache;
+
+const MAX_ROPE_TABLE_BYTES: usize = 512 * 1024 * 1024;
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -17,8 +23,13 @@ use std::arch::x86_64::*;
 /// RMSNorm: `out[i] = (x[i] / sqrt(mean(x^2) + eps)) * weight[i]`
 pub fn rms_norm(output: &mut [f32], input: &[f32], weight: &[f32], eps: f32) {
     let n = input.len();
-    debug_assert_eq!(n, weight.len());
-    debug_assert_eq!(n, output.len());
+    assert!(n > 0, "RMSNorm input must not be empty");
+    assert_eq!(n, weight.len(), "RMSNorm weight length mismatch");
+    assert_eq!(n, output.len(), "RMSNorm output length mismatch");
+    assert!(
+        eps.is_finite() && eps > 0.0,
+        "RMSNorm epsilon must be finite and positive"
+    );
 
     #[cfg(target_arch = "x86_64")]
     {
@@ -107,9 +118,14 @@ pub fn rms_norm_with_residual(
     eps: f32,
 ) {
     let n = hidden.len();
-    debug_assert_eq!(n, weight.len());
-    debug_assert_eq!(n, normed.len());
-    debug_assert_eq!(n, residual.len());
+    assert!(n > 0, "RMSNorm input must not be empty");
+    assert_eq!(n, weight.len(), "RMSNorm weight length mismatch");
+    assert_eq!(n, normed.len(), "RMSNorm output length mismatch");
+    assert_eq!(n, residual.len(), "residual output length mismatch");
+    assert!(
+        eps.is_finite() && eps > 0.0,
+        "RMSNorm epsilon must be finite and positive"
+    );
 
     #[cfg(target_arch = "x86_64")]
     {
@@ -206,6 +222,12 @@ unsafe fn rms_norm_with_residual_avx2(
 /// In-place RMSNorm.
 pub fn rms_norm_inplace(x: &mut [f32], weight: &[f32], eps: f32) {
     let n = x.len();
+    assert!(n > 0, "RMSNorm input must not be empty");
+    assert_eq!(n, weight.len(), "RMSNorm weight length mismatch");
+    assert!(
+        eps.is_finite() && eps > 0.0,
+        "RMSNorm epsilon must be finite and positive"
+    );
     let mut sum_sq = 0.0f32;
     for &v in x.iter() {
         sum_sq += v * v;
@@ -219,6 +241,8 @@ pub fn rms_norm_inplace(x: &mut [f32], weight: &[f32], eps: f32) {
 /// SIMD vector add: hidden[i] = residual[i] + addition[i]
 pub fn vec_add(hidden: &mut [f32], residual: &[f32], addition: &[f32]) {
     let n = hidden.len();
+    assert_eq!(n, residual.len(), "residual length mismatch");
+    assert_eq!(n, addition.len(), "addition length mismatch");
     #[cfg(target_arch = "x86_64")]
     {
         if has_avx2() {
@@ -262,9 +286,35 @@ pub struct RoPETable {
 impl RoPETable {
     /// Build RoPE tables with the given theta and maximum context length.
     pub fn new(head_dim: usize, max_ctx: usize, theta: f32) -> Self {
+        assert!(
+            head_dim > 0 && head_dim.is_multiple_of(2),
+            "RoPE head_dim must be positive and even"
+        );
+        assert!(max_ctx > 0, "RoPE context must be non-zero");
+        assert!(
+            theta.is_finite() && theta > 0.0,
+            "RoPE theta must be finite and positive"
+        );
         let half_dim = head_dim / 2;
-        let mut cos = vec![0.0f32; max_ctx * half_dim];
-        let mut sin = vec![0.0f32; max_ctx * half_dim];
+        let elements = max_ctx
+            .checked_mul(half_dim)
+            .expect("RoPE table dimensions overflow");
+        let bytes = elements
+            .checked_mul(2)
+            .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+            .expect("RoPE table byte size overflows");
+        assert!(
+            bytes <= MAX_ROPE_TABLE_BYTES,
+            "RoPE table exceeds the memory budget"
+        );
+        let mut cos = Vec::new();
+        cos.try_reserve_exact(elements)
+            .expect("unable to allocate RoPE cosine table");
+        cos.resize(elements, 0.0);
+        let mut sin = Vec::new();
+        sin.try_reserve_exact(elements)
+            .expect("unable to allocate RoPE sine table");
+        sin.resize(elements, 0.0);
 
         for pos in 0..max_ctx {
             for i in 0..half_dim {
@@ -290,15 +340,21 @@ impl RoPETable {
     pub fn apply(&self, heads: &mut [f32], num_heads: usize, pos: usize) {
         let hd = self.head_dim;
         let half = hd / 2;
-        debug_assert!(pos < self.max_ctx);
-        debug_assert_eq!(heads.len(), num_heads * hd);
+        assert!(
+            pos < self.max_ctx,
+            "RoPE position is outside the context window"
+        );
+        let expected = num_heads
+            .checked_mul(hd)
+            .expect("RoPE head dimensions overflow");
+        assert_eq!(heads.len(), expected, "RoPE head buffer length mismatch");
 
         let cos_row = &self.cos[pos * half..(pos + 1) * half];
         let sin_row = &self.sin[pos * half..(pos + 1) * half];
 
         #[cfg(target_arch = "x86_64")]
         {
-            if has_avx2() {
+            if has_avx2() && self.head_dim.is_multiple_of(8) {
                 unsafe {
                     self.apply_avx2(heads, num_heads, cos_row, sin_row);
                 }
@@ -380,6 +436,8 @@ pub fn silu_inplace(x: &mut [f32]) {
 
 /// Fused SiLU(gate) * up, result written to gate. SIMD-accelerated.
 pub fn silu_mul_inplace(gate: &mut [f32], up: &[f32], n: usize) {
+    assert!(n <= gate.len(), "SiLU gate buffer is too small");
+    assert!(n <= up.len(), "SiLU up buffer is too small");
     #[cfg(target_arch = "x86_64")]
     {
         if has_avx2() {
@@ -463,8 +521,34 @@ pub fn gqa_attention_decode(
     work: &mut AttentionWork,
     store_kv: bool, // false = probe pass, don't write K,V to cache
 ) {
-    let hidden = num_heads * head_dim;
-    let kv_dim = num_kv_heads * head_dim;
+    assert!(
+        num_heads > 0 && num_kv_heads > 0 && head_dim > 0,
+        "attention dimensions must be non-zero"
+    );
+    assert!(
+        num_heads.is_multiple_of(num_kv_heads),
+        "query heads must be divisible by KV heads"
+    );
+    let hidden = num_heads
+        .checked_mul(head_dim)
+        .expect("attention dimensions overflow");
+    let kv_dim = num_kv_heads
+        .checked_mul(head_dim)
+        .expect("KV dimensions overflow");
+    assert_eq!(input.len(), hidden, "attention input length mismatch");
+    assert_eq!(output.len(), hidden, "attention output length mismatch");
+    assert_eq!(
+        rope.head_dim, head_dim,
+        "RoPE and attention head_dim mismatch"
+    );
+    assert!(
+        pos < rope.max_ctx,
+        "attention position exceeds RoPE context"
+    );
+    assert!(
+        kv_cache.supports_attention(layer_idx, num_kv_heads, pos, head_dim),
+        "KV cache dimensions do not match attention"
+    );
 
     // 1. Projections: Q, K, V via W4A32 matvec
     work.q.resize(hidden, 0.0);
@@ -475,8 +559,9 @@ pub fn gqa_attention_decode(
     #[cfg(target_arch = "x86_64")]
     unsafe {
         let ptr = o_proj.nibble_data.as_ptr();
-        for i in 0..4 {
-            _mm_prefetch(ptr.add(i * 64) as *const i8, _MM_HINT_T1);
+        for offset in (0..o_proj.nibble_data.len()).step_by(64).take(4) {
+            // `offset` is proven in-bounds above; prefetch does not dereference the pointer.
+            _mm_prefetch(ptr.add(offset) as *const i8, _MM_HINT_T1);
         }
     }
 
@@ -513,7 +598,7 @@ pub fn gqa_attention_decode(
         let out_head = &mut work.attn_out[qh * head_dim..(qh + 1) * head_dim];
         #[cfg(target_arch = "x86_64")]
         {
-            if has_avx2() {
+            if has_avx2() && head_dim.is_multiple_of(8) {
                 unsafe {
                     attention_head_avx2(
                         q_head,
@@ -707,6 +792,36 @@ pub fn compute_attention(
     head_dim: usize,
     scores: &mut Vec<f32>,
 ) {
+    assert!(
+        num_heads > 0 && num_kv_heads > 0 && head_dim > 0,
+        "attention dimensions must be non-zero"
+    );
+    assert!(
+        num_heads.is_multiple_of(num_kv_heads),
+        "query heads must be divisible by KV heads"
+    );
+    let hidden = num_heads
+        .checked_mul(head_dim)
+        .expect("attention dimensions overflow");
+    let kv_dim = num_kv_heads
+        .checked_mul(head_dim)
+        .expect("KV dimensions overflow");
+    assert_eq!(attn_out.len(), hidden, "attention output length mismatch");
+    assert_eq!(q.len(), hidden, "query length mismatch");
+    assert_eq!(k.len(), kv_dim, "key length mismatch");
+    assert_eq!(v.len(), kv_dim, "value length mismatch");
+    assert_eq!(
+        rope.head_dim, head_dim,
+        "RoPE and attention head_dim mismatch"
+    );
+    assert!(
+        pos < rope.max_ctx,
+        "attention position exceeds RoPE context"
+    );
+    assert!(
+        kv_cache.supports_attention(layer_idx, num_kv_heads, pos, head_dim),
+        "KV cache dimensions do not match attention"
+    );
     // Apply RoPE
     rope.apply(q, num_heads, pos);
     rope.apply(k, num_kv_heads, pos);
@@ -726,7 +841,7 @@ pub fn compute_attention(
 
         #[cfg(target_arch = "x86_64")]
         {
-            if has_avx2() {
+            if has_avx2() && head_dim.is_multiple_of(8) {
                 unsafe {
                     attention_head_avx2(
                         q_head, out_head, scores, kv_cache, layer_idx, kvh, pos, head_dim, scale,
@@ -772,6 +887,7 @@ pub fn compute_attention(
 }
 
 /// Reusable workspace for attention to avoid per-call allocations.
+#[derive(Default)]
 pub struct AttentionWork {
     pub q: Vec<f32>,
     pub k: Vec<f32>,
@@ -832,6 +948,7 @@ pub fn swiglu_mlp(
 }
 
 /// Reusable workspace for MLP.
+#[derive(Default)]
 pub struct MlpWork {
     pub gate: Vec<f32>,
     pub up: Vec<f32>,
@@ -901,5 +1018,80 @@ mod tests {
             .zip(orig.iter())
             .any(|(a, b)| (a - b).abs() > 0.01);
         assert!(changed, "RoPE at pos=5 should rotate values");
+    }
+
+    #[test]
+    #[should_panic(expected = "RMSNorm weight length mismatch")]
+    fn rms_norm_rejects_mismatched_buffers_before_simd() {
+        let mut output = [0.0; 8];
+        rms_norm(&mut output, &[1.0; 8], &[1.0; 7], 1e-5);
+    }
+
+    #[test]
+    #[should_panic(expected = "residual length mismatch")]
+    fn vec_add_rejects_mismatched_buffers_before_simd() {
+        let mut hidden = [0.0; 8];
+        vec_add(&mut hidden, &[1.0; 7], &[1.0; 8]);
+    }
+
+    #[test]
+    #[should_panic(expected = "SiLU up buffer is too small")]
+    fn silu_mul_rejects_mismatched_buffers_before_simd() {
+        silu_mul_inplace(&mut [1.0; 8], &[1.0; 7], 8);
+    }
+
+    #[test]
+    #[should_panic(expected = "RoPE head buffer length mismatch")]
+    fn rope_rejects_mismatched_head_buffer_before_simd() {
+        let rope = RoPETable::new(8, 4, 10_000.0);
+        rope.apply(&mut [0.0; 7], 1, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "KV cache dimensions do not match attention")]
+    fn attention_rejects_mismatched_cache_before_simd() {
+        let rope = RoPETable::new(16, 4, 10_000.0);
+        let mut cache = KVCache::new(1, 1, 4, 8);
+        let mut output = [0.0; 16];
+        let mut q = [0.0; 16];
+        let mut k = [0.0; 16];
+        compute_attention(
+            &mut output,
+            &mut q,
+            &mut k,
+            &[0.0; 16],
+            &rope,
+            &mut cache,
+            0,
+            0,
+            1,
+            1,
+            16,
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
+    fn attention_uses_scalar_tail_for_non_multiple_of_eight_head_dim() {
+        let rope = RoPETable::new(6, 2, 10_000.0);
+        let mut cache = KVCache::new(1, 1, 2, 6);
+        let mut output = [99.0; 6];
+        let mut q = [1.0; 6];
+        let mut k = [1.0; 6];
+        compute_attention(
+            &mut output,
+            &mut q,
+            &mut k,
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            &rope,
+            &mut cache,
+            0,
+            0,
+            1,
+            1,
+            6,
+            &mut Vec::new(),
+        );
+        assert_eq!(output, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     }
 }

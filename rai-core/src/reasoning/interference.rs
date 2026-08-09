@@ -3,11 +3,11 @@ use rem_nra::Vec64;
 
 /// Thresholds for interference detection.
 pub struct InterferenceDetector {
-    /// Energy change above this = minor interference.
+    /// Positive score change above this enters the minor tier.
     pub minor_threshold: f64,
-    /// Energy change above this = major interference.
+    /// Positive score change above this enters the major tier.
     pub major_threshold: f64,
-    /// Energy change above this = critical (attractor destroyed).
+    /// Positive score change above this enters the critical tier.
     pub critical_threshold: f64,
 }
 
@@ -38,7 +38,9 @@ impl InterferenceDetector {
 
         for (i, ((_, e_before), (_, e_after))) in before.iter().zip(after.iter()).enumerate() {
             let delta = e_after - e_before;
-            if delta.abs() > self.minor_threshold {
+            // Only worsening (positive) score changes are interference. A lower energy is an
+            // improvement and must not be mislabeled as damage.
+            if delta > self.minor_threshold {
                 let text = texts.get(i).cloned().unwrap_or_else(|| format!("item_{i}"));
                 affected_items.push(AffectedItem {
                     content: text,
@@ -97,5 +99,18 @@ mod tests {
         let report = detector.detect(&before, &after, &texts);
         assert!(report.has_interference);
         assert_eq!(report.severity, InterferenceSeverity::Major);
+    }
+
+    #[test]
+    fn score_improvements_are_not_labeled_interference() {
+        let detector = InterferenceDetector::default();
+        let omega = DVector::from_vec(vec![1.0, 0.0]);
+        let report = detector.detect(
+            &[(omega.clone(), 0.0)],
+            &[(omega, -10.0)],
+            &["test".to_string()],
+        );
+        assert!(!report.has_interference);
+        assert_eq!(report.severity, InterferenceSeverity::None);
     }
 }

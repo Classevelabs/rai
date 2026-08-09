@@ -5,38 +5,138 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
 jobs:
-  build-and-test:
-    name: Build & test (stable)
-    runs-on: ubuntu-latest
+  msrv:
+    name: Minimum Rust 1.87
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
-      - name: Set up Rust (stable)
-        run: |
-          rustup update stable
-          rustup default stable
-          rustc --version
-          cargo --version
+      - name: Install declared minimum Rust
+        run: rustup toolchain install 1.87.0 --profile minimal
 
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - name: Cache Cargo registry
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-cargo-msrv-1.87.0-${{ hashFiles('Cargo.lock') }}
 
-      - name: Build
-        run: cargo build --workspace
+      - name: Check locked workspace at declared minimum
+        run: cargo +1.87.0 check --workspace --all-targets --locked
+
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025, macos-15-intel]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Show pinned Rust toolchain
+        run: |
+          rustc --version --verbose
+          cargo --version --verbose
+
+      - name: Cache Cargo registry
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-1.95.0-${{ hashFiles('Cargo.lock') }}
+
+      - name: Verify locked dependency graph
+        run: cargo metadata --locked --format-version 1 --no-deps
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Documentation tests
+        run: cargo test --workspace --doc --locked
+
+      - name: Release build
+        run: cargo build --workspace --release --locked
+
+      - name: Validate Python exporter syntax
+        run: python -m compileall -q rai-infer/scripts
+
+  supply-chain:
+    name: Advisory and package gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Cache Cargo registry
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-audit-1.95.0-${{ hashFiles('Cargo.lock') }}
+
+      - name: Audit RustSec advisories
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked --no-default-features
+          cargo audit --deny warnings
+
+      - name: Verify publishable crate archives
+        run: cargo package --workspace --locked
+
+  container:
+    name: Container build and MCP smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Build pinned image
+        run: docker build --tag rai-audit:local .
+
+      - name: Smoke-test MCP initialization
+        run: |
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}' \
+            | docker run --rm -i rai-audit:local mcp \
+            | tee /tmp/rai-mcp-response.json
+          grep -q '"name":"rai-server"' /tmp/rai-mcp-response.json

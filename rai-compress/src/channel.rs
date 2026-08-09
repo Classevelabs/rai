@@ -1,5 +1,30 @@
 use nalgebra::DMatrix;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChannelError {
+    InvalidInput(&'static str),
+    InvalidRepresentation(&'static str),
+    SizeOverflow,
+    NumericalFailure,
+}
+
+impl std::fmt::Display for ChannelError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidInput(message) => write!(formatter, "invalid channel input: {message}"),
+            Self::InvalidRepresentation(message) => {
+                write!(formatter, "invalid channel representation: {message}")
+            }
+            Self::SizeOverflow => formatter.write_str("channel dimensions overflow"),
+            Self::NumericalFailure => {
+                formatter.write_str("channel operation produced non-finite values")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ChannelError {}
+
 /// Per-channel (per-row) normalization.
 ///
 /// Stage 0 of the pipeline: remove per-row mean and scale.
@@ -22,9 +47,16 @@ pub struct ChannelNorm {
 
 impl ChannelNorm {
     /// Compute and apply channel normalization.
-    pub fn normalize(weights: &DMatrix<f64>) -> (Self, DMatrix<f64>) {
+    pub fn normalize(weights: &DMatrix<f64>) -> Result<(Self, DMatrix<f64>), ChannelError> {
         let rows = weights.nrows();
         let cols = weights.ncols();
+        if rows == 0 || cols == 0 {
+            return Err(ChannelError::InvalidInput("weights must not be empty"));
+        }
+        rows.checked_mul(cols).ok_or(ChannelError::SizeOverflow)?;
+        if weights.iter().any(|value| !value.is_finite()) {
+            return Err(ChannelError::InvalidInput("weights must be finite"));
+        }
         let mut means = Vec::with_capacity(rows);
         let mut scales = Vec::with_capacity(rows);
         let mut normalized = weights.clone();
@@ -43,7 +75,7 @@ impl ChannelNorm {
             }
         }
 
-        (
+        Ok((
             Self {
                 means,
                 scales,
@@ -51,23 +83,65 @@ impl ChannelNorm {
                 cols,
             },
             normalized,
-        )
+        ))
     }
 
     /// Denormalize: restore original scale.
-    pub fn denormalize(&self, normalized: &DMatrix<f64>) -> DMatrix<f64> {
+    pub fn denormalize(&self, normalized: &DMatrix<f64>) -> Result<DMatrix<f64>, ChannelError> {
+        self.validate()?;
+        if normalized.shape() != (self.rows, self.cols) {
+            return Err(ChannelError::InvalidInput(
+                "normalized matrix shape does not match channel metadata",
+            ));
+        }
+        if normalized.iter().any(|value| !value.is_finite()) {
+            return Err(ChannelError::InvalidInput(
+                "normalized matrix must be finite",
+            ));
+        }
         let mut result = normalized.clone();
         for i in 0..self.rows {
             for j in 0..self.cols {
                 result[(i, j)] = normalized[(i, j)] * self.scales[i] + self.means[i];
             }
         }
-        result
+        if result.iter().any(|value| !value.is_finite()) {
+            return Err(ChannelError::NumericalFailure);
+        }
+        Ok(result)
     }
 
     /// Storage cost in bytes (FP16 per value).
-    pub fn size_bytes(&self) -> usize {
-        self.rows * 4 // 2 bytes mean + 2 bytes scale per row
+    pub fn size_bytes(&self) -> Result<usize, ChannelError> {
+        self.validate()?;
+        self.rows.checked_mul(4).ok_or(ChannelError::SizeOverflow)
+    }
+
+    fn validate(&self) -> Result<(), ChannelError> {
+        if self.rows == 0 || self.cols == 0 {
+            return Err(ChannelError::InvalidRepresentation(
+                "matrix shape must be non-zero",
+            ));
+        }
+        self.rows
+            .checked_mul(self.cols)
+            .ok_or(ChannelError::SizeOverflow)?;
+        if self.means.len() != self.rows || self.scales.len() != self.rows {
+            return Err(ChannelError::InvalidRepresentation(
+                "parameter lengths do not match row count",
+            ));
+        }
+        if self.means.iter().any(|value| !value.is_finite())
+            || self
+                .scales
+                .iter()
+                .any(|value| !value.is_finite() || *value <= 0.0)
+        {
+            return Err(ChannelError::InvalidRepresentation(
+                "parameters must be finite with positive scales",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -85,8 +159,8 @@ mod tests {
             ],
         );
 
-        let (norm, normalized) = ChannelNorm::normalize(&w);
-        let recovered = norm.denormalize(&normalized);
+        let (norm, normalized) = ChannelNorm::normalize(&w).unwrap();
+        let recovered = norm.denormalize(&normalized).unwrap();
 
         for i in 0..3 {
             for j in 0..4 {
@@ -102,7 +176,7 @@ mod tests {
     fn normalized_rows_have_unit_variance() {
         let w = DMatrix::from_row_slice(2, 4, &[10.0, 20.0, 30.0, 40.0, -5.0, -10.0, -15.0, -20.0]);
 
-        let (_norm, normalized) = ChannelNorm::normalize(&w);
+        let (_norm, normalized) = ChannelNorm::normalize(&w).unwrap();
 
         for i in 0..2 {
             let row = normalized.row(i);
@@ -117,5 +191,20 @@ mod tests {
                 "row {i} var should be ~1, got {var}"
             );
         }
+    }
+
+    #[test]
+    fn malformed_channel_inputs_are_rejected() {
+        assert!(ChannelNorm::normalize(&DMatrix::zeros(0, 0)).is_err());
+        let malformed = ChannelNorm {
+            means: vec![],
+            scales: vec![1.0],
+            rows: 1,
+            cols: 1,
+        };
+        assert!(matches!(
+            malformed.denormalize(&DMatrix::zeros(1, 1)),
+            Err(ChannelError::InvalidRepresentation(_))
+        ));
     }
 }

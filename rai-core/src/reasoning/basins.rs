@@ -3,10 +3,10 @@ use rand_distr::StandardNormal;
 use rem_nra::nra::{energy, find_attractor, NRAConfig, NRAParams};
 use rem_nra::Vec64;
 
-/// Basin boundary detection via perturbed ODE starts.
+/// Experimental perturbation diagnostic over ODE starting states.
 ///
-/// If perturbed starting points converge to different attractors,
-/// the query sits near a basin boundary — this signals ambiguity.
+/// Distinct returned states are reported as heuristic ambiguity. They are not
+/// proof that a query lies on a basin boundary.
 pub struct BasinAnalyzer {
     /// Number of perturbed starting points to test.
     pub num_perturbations: usize,
@@ -33,14 +33,14 @@ pub struct BasinResult {
     pub attractors: Vec<Vec64>,
     /// Energies at each distinct attractor.
     pub energies: Vec<f64>,
-    /// Whether the query is near a basin boundary (ambiguous).
+    /// Whether the diagnostic returned more than one distinct state.
     pub is_ambiguous: bool,
     /// Spread of energies (max - min).
     pub energy_spread: f64,
 }
 
 impl BasinAnalyzer {
-    /// Analyze the basin structure around an omega query.
+    /// Run the perturbation diagnostic around an omega query.
     pub fn analyze(
         &self,
         params: &NRAParams,

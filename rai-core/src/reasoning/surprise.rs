@@ -1,6 +1,6 @@
 use crate::types::SurpriseResult;
 
-/// Novelty detection via REM prior residual norm.
+/// Experimental residual-score heuristic using the current REM nearest-key prediction.
 ///
 /// When REM stores a value, the residual = value - prior.predict(key).
 /// High residual norm means the prior couldn't predict this value — it's surprising/novel.
@@ -20,17 +20,25 @@ impl Default for SurpriseDetector {
 impl SurpriseDetector {
     /// Compute surprise score from a residual norm.
     pub fn score(&self, residual_norm: f64) -> SurpriseResult {
+        if !residual_norm.is_finite() || residual_norm < 0.0 {
+            return SurpriseResult {
+                score: 0.0,
+                is_novel: false,
+                explanation: "Residual heuristic is unavailable because its input was invalid."
+                    .to_string(),
+            };
+        }
         let is_novel = residual_norm > self.novelty_threshold;
         let explanation = if is_novel {
             format!(
-                "NOVEL: residual norm {residual_norm:.3} exceeds threshold {:.1}. \
-                 The prior model could not predict this — it contains genuinely new information.",
+                "HIGH residual heuristic: norm {residual_norm:.3} exceeds threshold {:.1}. \
+                 This experimental score is not a calibrated novelty judgment.",
                 self.novelty_threshold
             )
         } else {
             format!(
-                "EXPECTED: residual norm {residual_norm:.3} is within threshold {:.1}. \
-                 The prior model already captures this pattern — this is consistent with existing knowledge.",
+                "LOW residual heuristic: norm {residual_norm:.3} is within threshold {:.1}. \
+                 This experimental score does not establish that the content is already known.",
                 self.novelty_threshold
             )
         };
@@ -50,5 +58,18 @@ impl SurpriseDetector {
     ) -> SurpriseResult {
         let residual_norm = (value - prior_prediction).norm();
         self.score(residual_norm)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_residual_is_not_reported_as_novel() {
+        let result = SurpriseDetector::default().score(f64::NAN);
+        assert!(!result.is_novel);
+        assert!(result.score.is_finite());
+        assert!(result.explanation.contains("unavailable"));
     }
 }

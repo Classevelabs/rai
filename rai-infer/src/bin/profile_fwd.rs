@@ -1,12 +1,17 @@
 //! Per-operation timing profiler for RaiModel forward pass.
 //! Measures time spent in each operation across all layers.
 
+// The profiler indexes per-layer timing inputs deliberately and keeps its AVX wrapper's explicit
+// dimensions so the measured operation and safety contract remain visible at the call site.
+#![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
+
 use anyhow::{Context, Result};
 use rai_infer::model::{InferenceWork, RaiModel};
 use std::time::Instant;
 
 fn main() -> Result<()> {
     rai_infer::gemm::configure_thread_pool();
+    ensure_profile_cpu_support()?;
 
     let model_path = std::path::Path::new("rai-infer/scripts/smollm-135m-q4.raimodel");
     eprintln!("Loading model...");
@@ -68,8 +73,6 @@ fn main() -> Result<()> {
     let mut t_residual1_total = 0.0f64;
     let mut t_norm2_total = 0.0f64;
     let mut t_gate_up_total = 0.0f64;
-    let mut t_silu_total = 0.0f64;
-    let mut t_down_total = 0.0f64;
     let mut t_residual2_total = 0.0f64;
     let mut t_final_norm_total = 0.0f64;
     let mut t_lm_head_total = 0.0f64;
@@ -139,20 +142,17 @@ fn main() -> Result<()> {
                 let kvh = qh / heads_per_kv;
                 let q_head = &attn_work.q[qh * hd..(qh + 1) * hd];
                 let out_head = &mut attn_work.attn_out[qh * hd..(qh + 1) * hd];
-                // AVX2 path
-                unsafe {
-                    attention_head_wrapper(
-                        q_head,
-                        out_head,
-                        &mut attn_work.scores,
-                        &kv_cache,
-                        li,
-                        kvh,
-                        pos,
-                        hd,
-                        scale,
-                    );
-                }
+                attention_head_wrapper(
+                    q_head,
+                    out_head,
+                    &mut attn_work.scores,
+                    &kv_cache,
+                    li,
+                    kvh,
+                    pos,
+                    hd,
+                    scale,
+                )?;
             }
             t_attn_total += t.elapsed().as_secs_f64();
 
@@ -292,9 +292,51 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Wrapper to call the AVX2 attention from layers module.
-/// This mimics what gqa_attention_decode does internally.
-unsafe fn attention_head_wrapper(
+fn ensure_profile_cpu_support() -> Result<()> {
+    if !rai_infer::gemm::has_avx2() {
+        anyhow::bail!("profile_fwd requires an x86_64 CPU with AVX2, FMA, and F16C support");
+    }
+    Ok(())
+}
+
+/// Runtime-checked wrapper for the profiler-only AVX2 attention kernel.
+fn attention_head_wrapper(
+    q_head: &[f32],
+    out_head: &mut [f32],
+    scores: &mut [f32],
+    kv_cache: &rai_infer::kv_cache::KVCache,
+    layer_idx: usize,
+    kvh: usize,
+    pos: usize,
+    head_dim: usize,
+    scale: f32,
+) -> Result<()> {
+    if !rai_infer::gemm::has_avx2() {
+        anyhow::bail!(
+            "profile_fwd attention requires an x86_64 CPU with AVX2, FMA, and F16C support"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        attention_head_avx2(
+            q_head, out_head, scores, kv_cache, layer_idx, kvh, pos, head_dim, scale,
+        );
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (
+            q_head, out_head, scores, kv_cache, layer_idx, kvh, pos, head_dim, scale,
+        );
+        anyhow::bail!("profile_fwd attention is only available on x86_64")
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn attention_head_avx2(
     q_head: &[f32],
     out_head: &mut [f32],
     scores: &mut [f32],
