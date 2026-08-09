@@ -9,6 +9,118 @@
 //! Generative Pre-trained Transformers" (2022).
 
 use nalgebra::DMatrix;
+use std::fmt;
+
+/// Errors returned when caller input or a serialized GPTQ representation is invalid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GptqError {
+    InvalidInput(&'static str),
+    InvalidRepresentation(&'static str),
+    SizeOverflow,
+    AllocationFailed,
+    HessianNotPositiveDefinite,
+    NumericalFailure(&'static str),
+}
+
+impl fmt::Display for GptqError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidInput(message) => write!(formatter, "invalid GPTQ input: {message}"),
+            Self::InvalidRepresentation(message) => {
+                write!(formatter, "invalid GPTQ representation: {message}")
+            }
+            Self::SizeOverflow => formatter.write_str("GPTQ dimensions overflow"),
+            Self::AllocationFailed => formatter.write_str("unable to allocate GPTQ output"),
+            Self::HessianNotPositiveDefinite => {
+                formatter.write_str("damped Hessian is not positive definite")
+            }
+            Self::NumericalFailure(message) => {
+                write!(formatter, "GPTQ numerical failure: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for GptqError {}
+
+fn checked_num_groups(cols: usize, group_size: usize) -> Result<usize, GptqError> {
+    if group_size == 0 {
+        return Err(GptqError::InvalidInput("group_size must be non-zero"));
+    }
+    Ok(cols / group_size + usize::from(!cols.is_multiple_of(group_size)))
+}
+
+fn modeled_compressed_bytes(
+    rows: usize,
+    cols: usize,
+    bits: u8,
+    group_size: usize,
+) -> Result<usize, GptqError> {
+    if rows == 0 || cols == 0 {
+        return Err(GptqError::InvalidRepresentation(
+            "matrix shape must be non-zero",
+        ));
+    }
+    if !(2..=8).contains(&bits) {
+        return Err(GptqError::InvalidRepresentation("bits must be 2-8"));
+    }
+    let data_bits = rows
+        .checked_mul(cols)
+        .and_then(|value| value.checked_mul(bits as usize))
+        .ok_or(GptqError::SizeOverflow)?;
+    let data_bytes = data_bits.checked_add(7).ok_or(GptqError::SizeOverflow)? / 8;
+    let num_groups = checked_num_groups(cols, group_size)?;
+    let meta_bytes = rows
+        .checked_mul(num_groups)
+        .and_then(|value| value.checked_mul(4))
+        .ok_or(GptqError::SizeOverflow)?;
+    data_bytes
+        .checked_add(meta_bytes)
+        .ok_or(GptqError::SizeOverflow)
+}
+
+fn validate_result(result: &GptqResult) -> Result<(), GptqError> {
+    let elements = result
+        .rows
+        .checked_mul(result.cols)
+        .ok_or(GptqError::SizeOverflow)?;
+    if result.rows == 0 || result.cols == 0 {
+        return Err(GptqError::InvalidRepresentation(
+            "matrix shape must be non-zero",
+        ));
+    }
+    if !(2..=8).contains(&result.bits) {
+        return Err(GptqError::InvalidRepresentation("bits must be 2-8"));
+    }
+    let groups = checked_num_groups(result.cols, result.group_size)
+        .map_err(|_| GptqError::InvalidRepresentation("group_size must be non-zero"))?;
+    if result.quantized_codes.len() != elements {
+        return Err(GptqError::InvalidRepresentation("code length mismatch"));
+    }
+    let parameter_count = result
+        .rows
+        .checked_mul(groups)
+        .ok_or(GptqError::SizeOverflow)?;
+    if result.group_params.len() != parameter_count {
+        return Err(GptqError::InvalidRepresentation(
+            "parameter length mismatch",
+        ));
+    }
+    let max_code = (1u32 << result.bits) - 1;
+    if result.quantized_codes.iter().any(|&code| code > max_code) {
+        return Err(GptqError::InvalidRepresentation(
+            "quantized code exceeds configured bit width",
+        ));
+    }
+    if result.group_params.iter().any(|params| {
+        !params.scale.is_finite() || params.scale <= 0.0 || !params.zero_point.is_finite()
+    }) {
+        return Err(GptqError::InvalidRepresentation(
+            "parameters must be finite with positive scales",
+        ));
+    }
+    Ok(())
+}
 
 /// Parameters for a quantization group (per-row, per group of columns).
 #[derive(Debug, Clone)]
@@ -17,7 +129,8 @@ pub struct GroupParams {
     pub zero_point: f64,
 }
 
-/// Statistics from GPTQ quantization.
+/// Modeled GPTQ statistics. Byte counts assume future bit-packing and FP16 metadata;
+/// `GptqResult` currently stores unpacked u32 codes and f64 parameters.
 #[derive(Debug, Clone)]
 pub struct GptqStats {
     pub mse: f64,
@@ -50,12 +163,9 @@ impl GptqResult {
     /// Data: rows * cols * bits / 8
     /// Metadata: rows * num_groups * 4 bytes (FP16 scale + FP16 zero per row per group)
     /// At 4-bit, group_size=128: metadata overhead ~ 0.25 bpw
-    pub fn compressed_bytes(&self) -> usize {
-        let data_bits = self.rows * self.cols * self.bits as usize;
-        let data_bytes = (data_bits + 7) / 8;
-        let num_groups = (self.cols + self.group_size - 1) / self.group_size;
-        let meta_bytes = self.rows * num_groups * 4;
-        data_bytes + meta_bytes
+    pub fn compressed_bytes(&self) -> Result<usize, GptqError> {
+        validate_result(self)?;
+        modeled_compressed_bytes(self.rows, self.cols, self.bits, self.group_size)
     }
 }
 
@@ -73,29 +183,61 @@ pub fn gptq_quantize(
     bits: u8,
     block_size: usize,
     group_size: usize,
-) -> GptqResult {
+) -> Result<GptqResult, GptqError> {
     let rows = weights.nrows();
     let cols = weights.ncols();
-    assert_eq!(hessian.nrows(), cols, "Hessian rows must match weight cols");
-    assert_eq!(hessian.ncols(), cols, "Hessian must be square");
-    assert!(bits >= 2 && bits <= 8, "bits must be 2-8");
+    if rows == 0 || cols == 0 {
+        return Err(GptqError::InvalidInput("weights must not be empty"));
+    }
+    if block_size == 0 {
+        return Err(GptqError::InvalidInput("block_size must be non-zero"));
+    }
+    if group_size == 0 {
+        return Err(GptqError::InvalidInput("group_size must be non-zero"));
+    }
+    if hessian.shape() != (cols, cols) {
+        return Err(GptqError::InvalidInput(
+            "Hessian shape must match the weight columns",
+        ));
+    }
+    if !(2..=8).contains(&bits) {
+        return Err(GptqError::InvalidInput("bits must be 2-8"));
+    }
+    if weights.iter().any(|value| !value.is_finite()) {
+        return Err(GptqError::InvalidInput("weights must be finite"));
+    }
+    if hessian.iter().any(|value| !value.is_finite()) {
+        return Err(GptqError::InvalidInput("Hessian must be finite"));
+    }
+    if !(0..cols)
+        .all(|row| (0..cols).all(|col| (hessian[(row, col)] - hessian[(col, row)]).abs() <= 1e-10))
+    {
+        return Err(GptqError::InvalidInput("Hessian must be symmetric"));
+    }
 
     let levels = (1u32 << bits) as f64;
 
     // Working copy of weights (modified during error propagation)
     let mut w = weights.clone();
 
-    let num_groups = (cols + group_size - 1) / group_size;
+    let num_groups = checked_num_groups(cols, group_size)?;
+    let group_param_count = num_groups
+        .checked_mul(rows)
+        .ok_or(GptqError::SizeOverflow)?;
 
     // Group params will be computed lazily from current (error-compensated) weights
     // at the start of each group. Indexed as group_params[gid * rows + r].
-    let mut group_params = vec![
+    let mut group_params = Vec::new();
+    group_params
+        .try_reserve_exact(group_param_count)
+        .map_err(|_| GptqError::AllocationFailed)?;
+    group_params.resize(
+        group_param_count,
         GroupParams {
             scale: 1.0,
-            zero_point: 0.0
-        };
-        num_groups * rows
-    ];
+            zero_point: 0.0,
+        },
+    );
 
     // Damp the Hessian: H += 0.01 * mean(diag(H)) * I
     let mut h = hessian.clone();
@@ -106,18 +248,26 @@ pub fn gptq_quantize(
     }
 
     // Cholesky decomposition and inverse
-    let chol = h
-        .cholesky()
-        .expect("Damped Hessian must be positive definite");
+    let chol = h.cholesky().ok_or(GptqError::HessianNotPositiveDefinite)?;
     let h_inv = chol.inverse();
+    if h_inv.iter().any(|value| !value.is_finite()) {
+        return Err(GptqError::NumericalFailure(
+            "inverse Hessian contains non-finite values",
+        ));
+    }
 
     // Output quantized codes
-    let mut codes = vec![0u32; rows * cols];
+    let code_count = rows.checked_mul(cols).ok_or(GptqError::SizeOverflow)?;
+    let mut codes = Vec::new();
+    codes
+        .try_reserve_exact(code_count)
+        .map_err(|_| GptqError::AllocationFailed)?;
+    codes.resize(code_count, 0u32);
 
     // Process columns in blocks
     let mut block_start = 0;
     while block_start < cols {
-        let block_end = (block_start + block_size).min(cols);
+        let block_end = block_start.saturating_add(block_size).min(cols);
         let bsize = block_end - block_start;
 
         // Error accumulator for inter-block update: [rows, bsize]
@@ -127,13 +277,18 @@ pub fn gptq_quantize(
             let col = block_start + j;
             let gid = col / group_size;
             let d = h_inv[(col, col)];
+            if !d.is_finite() || d <= 0.0 {
+                return Err(GptqError::NumericalFailure(
+                    "inverse Hessian diagonal is not positive and finite",
+                ));
+            }
 
             // At the start of each group, compute scale/zero from CURRENT
             // (error-compensated) weight values. This is critical: after error
             // propagation, values may drift from original range. Using current
             // values avoids clipping waste and matches AutoGPTQ behavior.
             if col % group_size == 0 {
-                let g_end = (col + group_size).min(cols);
+                let g_end = col.saturating_add(group_size).min(cols);
                 for r in 0..rows {
                     let mut min_val = f64::INFINITY;
                     let mut max_val = f64::NEG_INFINITY;
@@ -171,11 +326,22 @@ pub fn gptq_quantize(
 
                 // Error divided by diagonal Hessian inverse element
                 let err = (val - w_hat) / d;
+                if !err.is_finite() {
+                    return Err(GptqError::NumericalFailure(
+                        "error propagation produced a non-finite value",
+                    ));
+                }
                 err_block[(r, j)] = err;
 
                 // Propagate error to remaining columns within this block
                 for k in (j + 1)..bsize {
-                    w[(r, block_start + k)] -= err * h_inv[(col, block_start + k)];
+                    let next = w[(r, block_start + k)] - err * h_inv[(col, block_start + k)];
+                    if !next.is_finite() {
+                        return Err(GptqError::NumericalFailure(
+                            "error propagation produced a non-finite weight",
+                        ));
+                    }
+                    w[(r, block_start + k)] = next;
                 }
             }
         }
@@ -185,10 +351,16 @@ pub fn gptq_quantize(
         if block_end < cols {
             let remaining = cols - block_end;
             let h_inv_cross = h_inv.view((block_start, block_end), (bsize, remaining));
-            let update = &err_block * &h_inv_cross;
+            let update = &err_block * h_inv_cross;
             for r in 0..rows {
                 for c in 0..remaining {
-                    w[(r, block_end + c)] -= update[(r, c)];
+                    let next = w[(r, block_end + c)] - update[(r, c)];
+                    if !next.is_finite() {
+                        return Err(GptqError::NumericalFailure(
+                            "block update produced a non-finite weight",
+                        ));
+                    }
+                    w[(r, block_end + c)] = next;
                 }
             }
         }
@@ -211,18 +383,18 @@ pub fn gptq_quantize(
             max_err = max_err.max(e);
         }
     }
-    let n = (rows * cols) as f64;
+    if !total_sq_err.is_finite() || !max_err.is_finite() {
+        return Err(GptqError::NumericalFailure(
+            "quantization error statistics are non-finite",
+        ));
+    }
+    let n = code_count as f64;
     let mse = total_sq_err / n;
 
-    let compressed_bytes = {
-        let data_bits = rows * cols * bits as usize;
-        let data_bytes = (data_bits + 7) / 8;
-        let meta_bytes = rows * num_groups * 4;
-        data_bytes + meta_bytes
-    };
-    let bits_per_weight = (compressed_bytes * 8) as f64 / n;
+    let compressed_bytes = modeled_compressed_bytes(rows, cols, bits, group_size)?;
+    let bits_per_weight = compressed_bytes as f64 * 8.0 / n;
 
-    GptqResult {
+    Ok(GptqResult {
         quantized_codes: codes,
         group_params,
         bits,
@@ -235,7 +407,7 @@ pub fn gptq_quantize(
             bits_per_weight,
             compressed_bytes,
         },
-    }
+    })
 }
 
 /// Compute Hessian-weighted MSE: trace((W - Q)^T @ (W - Q) @ H) / (rows * cols).
@@ -247,9 +419,27 @@ pub fn hessian_weighted_mse(
     original: &DMatrix<f64>,
     quantized: &DMatrix<f64>,
     hessian: &DMatrix<f64>,
-) -> f64 {
+) -> Result<f64, GptqError> {
     let rows = original.nrows();
     let cols = original.ncols();
+    if rows == 0 || cols == 0 {
+        return Err(GptqError::InvalidInput("matrices must not be empty"));
+    }
+    if quantized.shape() != original.shape() {
+        return Err(GptqError::InvalidInput("quantized shape mismatch"));
+    }
+    if hessian.shape() != (cols, cols) {
+        return Err(GptqError::InvalidInput("Hessian shape mismatch"));
+    }
+    if original.iter().any(|value| !value.is_finite()) {
+        return Err(GptqError::InvalidInput("original values must be finite"));
+    }
+    if quantized.iter().any(|value| !value.is_finite()) {
+        return Err(GptqError::InvalidInput("quantized values must be finite"));
+    }
+    if hessian.iter().any(|value| !value.is_finite()) {
+        return Err(GptqError::InvalidInput("Hessian values must be finite"));
+    }
     let mut total = 0.0f64;
     for r in 0..rows {
         // Error vector for this row
@@ -263,21 +453,33 @@ pub fn hessian_weighted_mse(
             }
         }
     }
-    total / (rows * cols) as f64
+    let elements = rows.checked_mul(cols).ok_or(GptqError::SizeOverflow)?;
+    let value = total / elements as f64;
+    if !value.is_finite() {
+        return Err(GptqError::NumericalFailure("weighted error is non-finite"));
+    }
+    Ok(value)
 }
 
 /// Decompress a GPTQ result back to a dense matrix.
-pub fn gptq_decompress(result: &GptqResult) -> DMatrix<f64> {
+pub fn gptq_decompress(result: &GptqResult) -> Result<DMatrix<f64>, GptqError> {
+    validate_result(result)?;
     let mut out = DMatrix::zeros(result.rows, result.cols);
     for c in 0..result.cols {
         let gid = c / result.group_size;
         for r in 0..result.rows {
             let gp = &result.group_params[gid * result.rows + r];
             let q = result.quantized_codes[r * result.cols + c];
-            out[(r, c)] = q as f64 * gp.scale + gp.zero_point;
+            let value = q as f64 * gp.scale + gp.zero_point;
+            if !value.is_finite() {
+                return Err(GptqError::NumericalFailure(
+                    "decompression produced a non-finite value",
+                ));
+            }
+            out[(r, c)] = value;
         }
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -296,7 +498,7 @@ mod tests {
         let weights = DMatrix::from_fn(rows, cols, |_, _| rng.gen_range(-1.0..1.0));
         let hessian = DMatrix::identity(cols, cols);
 
-        let result = gptq_quantize(&weights, &hessian, 4, 128, 128);
+        let result = gptq_quantize(&weights, &hessian, 4, 128, 128).unwrap();
 
         assert!(
             result.stats.mse < 0.1,
@@ -348,15 +550,15 @@ mod tests {
                 + ((i * 7 + j * 13) as f64 * 0.001).sin() * 0.05
         });
 
-        let gptq_result = gptq_quantize(&weights, &hessian, 4, 128, 128);
-        let gptq_decompressed = gptq_decompress(&gptq_result);
+        let gptq_result = gptq_quantize(&weights, &hessian, 4, 128, 128).unwrap();
+        let gptq_decompressed = gptq_decompress(&gptq_result).unwrap();
 
         // Reconstruct uniform quantized matrix for weighted comparison
         let flat: Vec<f64> = weights.iter().cloned().collect();
         let mut uniform_recon = vec![0.0f64; rows * cols];
         for (i, chunk) in flat.chunks(128).enumerate() {
             let block = crate::quantize::quantize_uniform(chunk, 4);
-            let recovered = crate::quantize::dequantize(&block);
+            let recovered = crate::quantize::dequantize(&block).unwrap();
             let start = i * 128;
             for (j, &v) in recovered.iter().enumerate() {
                 if start + j < uniform_recon.len() {
@@ -366,8 +568,8 @@ mod tests {
         }
         let uniform_mat = DMatrix::from_iterator(rows, cols, uniform_recon.iter().cloned());
 
-        let gptq_wmse = hessian_weighted_mse(&weights, &gptq_decompressed, &hessian);
-        let uniform_wmse = hessian_weighted_mse(&weights, &uniform_mat, &hessian);
+        let gptq_wmse = hessian_weighted_mse(&weights, &gptq_decompressed, &hessian).unwrap();
+        let uniform_wmse = hessian_weighted_mse(&weights, &uniform_mat, &hessian).unwrap();
         let improvement = uniform_wmse / gptq_wmse;
 
         println!(
@@ -402,7 +604,7 @@ mod tests {
         let weights = DMatrix::from_fn(rows, cols, |_, _| rng.gen_range(-1.0..1.0));
         let hessian = DMatrix::identity(cols, cols);
 
-        let result = gptq_quantize(&weights, &hessian, 3, 128, 128);
+        let result = gptq_quantize(&weights, &hessian, 3, 128, 128).unwrap();
 
         assert_eq!(result.bits, 3);
         assert!(
@@ -424,8 +626,8 @@ mod tests {
         let weights = DMatrix::from_fn(rows, cols, |_, _| rng.gen_range(-2.0..2.0));
         let hessian = DMatrix::identity(cols, cols);
 
-        let result = gptq_quantize(&weights, &hessian, 4, 64, 64);
-        let decompressed = gptq_decompress(&result);
+        let result = gptq_quantize(&weights, &hessian, 4, 64, 64).unwrap();
+        let decompressed = gptq_decompress(&result).unwrap();
 
         // Decompressed should exactly match quantized/dequantized values
         let mut max_diff = 0.0f64;
@@ -441,5 +643,45 @@ mod tests {
         }
 
         assert!(max_diff < 1e-12, "Decompress roundtrip error: {max_diff}");
+    }
+
+    #[test]
+    fn rejects_non_positive_definite_hessian() {
+        let weights = DMatrix::from_element(1, 2, 0.5);
+        let hessian = DMatrix::from_row_slice(2, 2, &[-10.0, 0.0, 0.0, -10.0]);
+        assert_eq!(
+            gptq_quantize(&weights, &hessian, 4, 2, 2).unwrap_err(),
+            GptqError::HessianNotPositiveDefinite
+        );
+    }
+
+    #[test]
+    fn malformed_representation_is_rejected_without_panicking() {
+        let malformed = GptqResult {
+            quantized_codes: vec![16],
+            group_params: vec![GroupParams {
+                scale: 1.0,
+                zero_point: 0.0,
+            }],
+            bits: 4,
+            rows: 1,
+            cols: 1,
+            group_size: 1,
+            stats: GptqStats {
+                mse: 0.0,
+                max_error: 0.0,
+                bits_per_weight: 0.0,
+                compressed_bytes: 0,
+            },
+        };
+
+        assert!(matches!(
+            gptq_decompress(&malformed),
+            Err(GptqError::InvalidRepresentation(_))
+        ));
+        assert!(matches!(
+            malformed.compressed_bytes(),
+            Err(GptqError::InvalidRepresentation(_))
+        ));
     }
 }

@@ -7,19 +7,19 @@ fn main() {
     rai_infer::gemm::configure_thread_pool();
 
     // Simulate SmolLM-135M dimensions
-    let scenarios = [
+    let scenarios: [(&str, usize, usize); 4] = [
         ("q_proj  (576×576)", 576, 576),
         ("gate_proj(1536×576)", 1536, 576),
         ("down_proj(576×1536)", 576, 1536),
         ("lm_head  (49152×576)", 49152, 576),
     ];
 
-    let group_size = 128;
+    let group_size: usize = 128;
 
     for (name, rows, cols) in &scenarios {
         let rows = *rows;
         let cols = *cols;
-        let num_groups = (cols + group_size - 1) / group_size;
+        let num_groups = cols.div_ceil(group_size);
 
         // Allocate synthetic data
         let nibble_data: Vec<u8> = (0..rows * cols / 2)
@@ -78,7 +78,7 @@ fn main() {
 
     // Simulate full forward pass: 30 layers × 7 GEMMs
     eprintln!("\n--- Simulated forward pass (30 layers) ---");
-    let layer_shapes = [
+    let layer_shapes: [(usize, usize); 7] = [
         (576, 576),  // q_proj
         (192, 576),  // k_proj
         (192, 576),  // v_proj
@@ -90,7 +90,7 @@ fn main() {
 
     let mut total_us = 0.0f64;
     for &(rows, cols) in &layer_shapes {
-        let num_groups = (cols + group_size - 1) / group_size;
+        let num_groups = cols.div_ceil(group_size);
         let nibble_data: Vec<u8> = vec![0x55; rows * cols / 2];
         let mut group_params = vec![0u8; rows * num_groups * 4];
         for r in 0..rows {
@@ -133,10 +133,10 @@ fn main() {
     }
 
     // LM head (8-bit)
-    let lm_rows = 49152;
-    let lm_cols = 576;
-    let lm_gs = 128;
-    let lm_num_groups = (lm_cols + lm_gs - 1) / lm_gs;
+    let lm_rows: usize = 49152;
+    let lm_cols: usize = 576;
+    let lm_gs: usize = 128;
+    let lm_num_groups = lm_cols.div_ceil(lm_gs);
     let embed_data: Vec<u8> = vec![128; lm_rows * lm_cols];
     let mut embed_params = vec![0u8; lm_rows * lm_num_groups * 4];
     for v in 0..lm_rows {

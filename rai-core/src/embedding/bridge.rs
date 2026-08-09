@@ -5,7 +5,7 @@ use rem_nra::Vec64;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, RwLockWriteGuard};
 
 /// Bridges text to NRA/REM vector space via external embeddings + projection.
 pub struct EmbeddingBridge {
@@ -112,43 +112,80 @@ impl EmbeddingBridge {
         }
     }
 
+    /// Clone the provider so persisted bridges can be reconstructed with saved projections.
+    pub(crate) fn embedder(&self) -> Arc<dyn Embedder> {
+        Arc::clone(&self.embedder)
+    }
+
+    pub(crate) fn validate_memory_dimensions(
+        &self,
+        dim_omega: usize,
+        dim_key: usize,
+        dim_value: usize,
+    ) -> Result<(), RaiError> {
+        self.validate_projection("omega", &self.omega_proj)?;
+        self.validate_projection("key", &self.key_proj)?;
+        self.validate_projection("value", &self.value_proj)?;
+        if self.omega_proj.target_dim != dim_omega
+            || self.key_proj.target_dim != dim_key
+            || self.value_proj.target_dim != dim_value
+        {
+            return Err(RaiError::InvalidInput(
+                "embedding projection and memory dimensions do not match".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Convert text to omega vector (NRA address).
     pub async fn text_to_omega(&self, text: &str) -> Result<Vec64, RaiError> {
-        let embedding = self.embedder.embed(text).await?;
+        self.validate_projection("omega", &self.omega_proj)?;
+        let embedding = self.embed_validated(text).await?;
         let omega = self.omega_proj.project_normalized(&embedding);
-        // Store in text index
-        let mut index = self.text_index.write().await;
-        index.insert(text.to_string(), embedding);
+        validate_projected("omega", &omega)?;
         Ok(omega)
     }
 
     /// Convert text to key vector (REM key).
     pub async fn text_to_key(&self, text: &str) -> Result<Vec64, RaiError> {
-        let embedding = self.embedder.embed(text).await?;
+        self.validate_projection("key", &self.key_proj)?;
+        let embedding = self.embed_validated(text).await?;
         let key = self.key_proj.project_normalized(&embedding);
-        let mut index = self.text_index.write().await;
-        index.insert(text.to_string(), embedding);
+        validate_projected("key", &key)?;
         Ok(key)
     }
 
     /// Convert text to value vector.
     pub async fn text_to_value(&self, text: &str) -> Result<Vec64, RaiError> {
-        let embedding = self.embedder.embed(text).await?;
+        self.validate_projection("value", &self.value_proj)?;
+        let embedding = self.embed_validated(text).await?;
         let value = self.value_proj.project(&embedding);
-        let mut index = self.text_index.write().await;
-        index.insert(text.to_string(), embedding);
+        validate_projected("value", &value)?;
         Ok(value)
     }
 
     /// Embed text and return all three projections (omega, key, value).
     pub async fn embed_text(&self, text: &str) -> Result<(Vec64, Vec64, Vec64), RaiError> {
-        let embedding = self.embedder.embed(text).await?;
+        let (omega, key, value, _embedding) = self.project_text(text).await?;
+        Ok((omega, key, value))
+    }
+
+    /// Project text without mutating the durable text index.
+    pub(crate) async fn project_text(
+        &self,
+        text: &str,
+    ) -> Result<(Vec64, Vec64, Vec64, Vec<f64>), RaiError> {
+        self.validate_projection("omega", &self.omega_proj)?;
+        self.validate_projection("key", &self.key_proj)?;
+        self.validate_projection("value", &self.value_proj)?;
+        let embedding = self.embed_validated(text).await?;
         let omega = self.omega_proj.project_normalized(&embedding);
         let key = self.key_proj.project_normalized(&embedding);
         let value = self.value_proj.project(&embedding);
-        let mut index = self.text_index.write().await;
-        index.insert(text.to_string(), embedding);
-        Ok((omega, key, value))
+        validate_projected("omega", &omega)?;
+        validate_projected("key", &key)?;
+        validate_projected("value", &value)?;
+        Ok((omega, key, value, embedding))
     }
 
     /// Find the nearest stored text to a retrieved value vector.
@@ -172,12 +209,61 @@ impl EmbeddingBridge {
     }
 
     /// Get the text index (for persistence).
-    pub async fn text_index(&self) -> TextIndex {
+    pub(crate) async fn text_index(&self) -> TextIndex {
         self.text_index.read().await.clone()
     }
 
     /// Restore text index from persistence.
-    pub async fn restore_text_index(&self, index: TextIndex) {
+    pub(crate) async fn restore_text_index(&self, index: TextIndex) {
         *self.text_index.write().await = index;
     }
+
+    pub(crate) async fn text_index_for_update(&self) -> RwLockWriteGuard<'_, TextIndex> {
+        self.text_index.write().await
+    }
+
+    pub(crate) fn restore_text_index_blocking(&self, index: TextIndex) {
+        *self.text_index.blocking_write() = index;
+    }
+
+    fn validate_projection(&self, name: &str, projection: &Projection) -> Result<(), RaiError> {
+        if projection.source_dim != self.embedder.embedding_dim() || !projection.validate_shape() {
+            return Err(RaiError::EmbeddingError(format!(
+                "invalid {name} projection dimensions"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn embed_validated(&self, text: &str) -> Result<Vec<f64>, RaiError> {
+        let embedding = self.embedder.embed(text).await?;
+        let expected = self.embedder.embedding_dim();
+        if embedding.len() != expected {
+            return Err(RaiError::EmbeddingError(format!(
+                "provider returned dimension {}; expected {expected}",
+                embedding.len()
+            )));
+        }
+        if embedding
+            .iter()
+            .any(|value| !value.is_finite() || value.abs() > 1.0e100)
+        {
+            return Err(RaiError::EmbeddingError(
+                "provider returned non-finite embedding values".into(),
+            ));
+        }
+        Ok(embedding)
+    }
+}
+
+fn validate_projected(name: &str, vector: &Vec64) -> Result<(), RaiError> {
+    if vector
+        .iter()
+        .any(|value| !value.is_finite() || value.abs() > 1.0e100)
+    {
+        return Err(RaiError::EmbeddingError(format!(
+            "{name} projection produced non-finite values"
+        )));
+    }
+    Ok(())
 }

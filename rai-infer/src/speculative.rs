@@ -1,16 +1,20 @@
 //! Speculative decoding: use a fast draft model to generate candidates,
 //! verify them in a single batched forward pass through the target model.
 //!
-//! The output is mathematically identical to pure target-model decoding —
-//! no quality loss, only speed gain.
+//! Exact target-model sampling is supported only for positive-temperature softmax with
+//! top-k/top-p/repetition filtering disabled; other sampler configurations are rejected.
 //!
-//! Key requirement: draft and target must share the SAME TOKENIZER (same vocab_size).
-//! Different tokenizers → 0% acceptance → slower than baseline.
+//! Key requirement: draft and target must share the exact same token-to-ID mapping. Matching
+//! vocabulary sizes alone cannot prove this, so callers must supply both models with one tokenizer.
 //!
 //! Performance model (typical dual-channel DDR4, ~25 GB/s):
 //!   Draft (50MB, K=8): 8 × 2ms = 16ms
 //!   Verify (3.7GB, 1 batched pass): 150ms
 //!   Accept ~4-5 tokens → 24-30 tok/s (vs 6 tok/s baseline)
+
+// Draft/verification loops intentionally index parallel token, probability, logit, and cache
+// sequences. Explicit counters keep acceptance positions aligned with KV-cache positions.
+#![allow(clippy::explicit_counter_loop, clippy::needless_range_loop)]
 
 use anyhow::{bail, Result};
 use rand::Rng;
@@ -34,9 +38,9 @@ impl Default for SpeculativeConfig {
             draft_k: 6,
             sampler: SamplerConfig {
                 temperature: 0.7,
-                top_k: 40,
-                top_p: 0.9,
-                repetition_penalty: 1.1,
+                top_k: 0,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
             },
         }
     }
@@ -65,6 +69,7 @@ pub struct SpeculativeDecoder<'a> {
     target_batch_scratch: BatchScratch,
     draft_logits_buf: Vec<f32>, // FIX BUG 4: clear naming
     vocab_size: usize,          // shared vocab size (validated at construction)
+    max_ctx: usize,
 }
 
 impl<'a> SpeculativeDecoder<'a> {
@@ -82,6 +87,10 @@ impl<'a> SpeculativeDecoder<'a> {
 
         let draft_ctx = max_ctx.min(draft.config.max_context as usize);
         let target_ctx = max_ctx.min(target.config.max_context as usize);
+        let shared_ctx = draft_ctx.min(target_ctx);
+        if shared_ctx == 0 {
+            bail!("speculative decoding context must be non-zero");
+        }
         Ok(Self {
             draft,
             target,
@@ -92,6 +101,7 @@ impl<'a> SpeculativeDecoder<'a> {
             target_batch_scratch: BatchScratch::new(),
             draft_logits_buf: vec![0.0; dvs],
             vocab_size: dvs,
+            max_ctx: shared_ctx,
         })
     }
 
@@ -106,9 +116,12 @@ impl<'a> SpeculativeDecoder<'a> {
     pub fn prefill(&mut self, prompt_tokens: &[usize]) -> Result<usize> {
         let dhs = self.draft.config.hidden_size as usize;
         let ths = self.target.config.hidden_size as usize;
-        let draft_max = self.draft.config.max_context as usize;
-        let target_max = self.target.config.max_context as usize;
-        let max_pos = draft_max.min(target_max);
+        if prompt_tokens.is_empty() {
+            bail!("prompt must contain at least one token");
+        }
+        if prompt_tokens.len() > self.max_ctx {
+            bail!("prompt exceeds the speculative context window");
+        }
         let mut pos = 0;
 
         // FIX BUG 2: process tokens 0..N-2, leave last for step()
@@ -122,10 +135,6 @@ impl<'a> SpeculativeDecoder<'a> {
         let mut target_hidden = vec![0.0f32; ths];
 
         for &token_id in &prompt_tokens[..n_to_prefill] {
-            if pos >= max_pos {
-                break;
-            }
-
             // Prefill draft
             self.draft.embed_token(token_id, &mut draft_hidden)?;
             self.draft.forward_from_hidden(
@@ -170,9 +179,43 @@ impl<'a> SpeculativeDecoder<'a> {
         let dhs = self.draft.config.hidden_size as usize;
         let ths = self.target.config.hidden_size as usize;
         let vs = self.vocab_size;
-        let draft_max = self.draft.config.max_context as usize;
-        let target_max = self.target.config.max_context as usize;
-        let k = config.draft_k;
+        validate_speculative_config(config)?;
+        if pos >= self.max_ctx {
+            bail!("decode position exceeds the speculative context window");
+        }
+        let k = config
+            .draft_k
+            .min(self.max_ctx.saturating_sub(pos).saturating_sub(1));
+
+        if k == 0 {
+            let mut target_hidden = vec![0.0f32; ths];
+            self.target.embed_token(last_token, &mut target_hidden)?;
+            self.target.forward_from_hidden(
+                &mut target_hidden,
+                pos,
+                &mut self.target_kv,
+                true,
+                &mut self.target_scratch,
+            )?;
+            self.target_scratch.normed.resize(ths, 0.0);
+            let mut logits = vec![0.0; vs];
+            self.target.hidden_to_logits_into(
+                &target_hidden,
+                &mut self.target_scratch.normed,
+                &mut logits,
+            )?;
+            apply_repetition_penalty(&mut logits, all_tokens, config.sampler.repetition_penalty);
+            let token = sample_token(&mut logits, &config.sampler, rng);
+            return Ok((
+                vec![token],
+                SpeculativeMetrics {
+                    accepted: 0,
+                    drafted: 0,
+                    produced: 1,
+                    accept_rate: 0.0,
+                },
+            ));
+        }
 
         // ================================================================
         // Phase 1: Draft generates K candidate tokens (autoregressive)
@@ -184,10 +227,6 @@ impl<'a> SpeculativeDecoder<'a> {
         let mut draft_hidden = vec![0.0f32; dhs];
 
         for _ in 0..k {
-            if draft_pos >= draft_max || draft_pos >= target_max {
-                break;
-            }
-
             // Draft forward: embed + full forward
             self.draft.embed_token(current_token, &mut draft_hidden)?;
             self.draft.forward_from_hidden(
@@ -304,9 +343,9 @@ impl<'a> SpeculativeDecoder<'a> {
                 config.sampler.temperature,
             );
 
-            let accept_prob = if p_draft > 1e-10 {
+            let accept_prob = if p_draft > 0.0 {
                 (p_target / p_draft).min(1.0)
-            } else if p_target > 1e-10 {
+            } else if p_target > 0.0 {
                 1.0
             } else {
                 0.0
@@ -339,6 +378,18 @@ impl<'a> SpeculativeDecoder<'a> {
                 );
                 let bonus = sample_token(target_logits_last, &config.sampler, rng);
                 accepted_tokens.push(bonus);
+
+                // The draft loop proposed the last draft token but did not yet process it as
+                // input. Advance its KV cache so the next step has no missing context position.
+                self.draft
+                    .embed_token(draft_tokens[n_drafted - 1], &mut draft_hidden)?;
+                self.draft.forward_from_hidden(
+                    &mut draft_hidden,
+                    pos + n_drafted,
+                    &mut self.draft_kv,
+                    true,
+                    &mut self.draft_scratch,
+                )?;
             }
         }
 
@@ -367,19 +418,81 @@ impl<'a> SpeculativeDecoder<'a> {
     }
 }
 
+fn validate_speculative_config(config: &SpeculativeConfig) -> Result<()> {
+    if config.draft_k == 0 {
+        bail!("speculative draft_k must be non-zero");
+    }
+    if !config.sampler.temperature.is_finite() || config.sampler.temperature <= 1e-6 {
+        bail!("speculative decoding requires a finite positive temperature");
+    }
+    if config.sampler.top_k != 0
+        || config.sampler.top_p != 1.0
+        || config.sampler.repetition_penalty != 1.0
+    {
+        bail!("speculative decoding requires top_k=0, top_p=1, and repetition_penalty=1");
+    }
+    Ok(())
+}
+
 /// Softmax probability of a specific token.
 fn softmax_prob_of(logits: &[f32], token_id: usize, temperature: f32) -> f32 {
     if token_id >= logits.len() {
         return 0.0;
     }
-    let temp = temperature.max(1e-6);
-    let scaled = logits[token_id] / temp;
-    let max_l = logits
+    softmax_probabilities(logits, temperature)[token_id]
+}
+
+fn softmax_probabilities(logits: &[f32], temperature: f32) -> Vec<f32> {
+    if logits.is_empty() {
+        return Vec::new();
+    }
+    let temp = if temperature.is_finite() && temperature > 1e-6 {
+        temperature
+    } else {
+        1.0
+    };
+    let mut scaled: Vec<f32> = logits
         .iter()
-        .map(|&l| l / temp)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let sum_exp: f32 = logits.iter().map(|&l| (l / temp - max_l).exp()).sum();
-    (scaled - max_l).exp() / sum_exp
+        .map(|&value| {
+            let value = value / temp;
+            if value.is_nan() {
+                f32::NEG_INFINITY
+            } else {
+                value
+            }
+        })
+        .collect();
+    let positive_infinities = scaled
+        .iter()
+        .filter(|value| **value == f32::INFINITY)
+        .count();
+    if positive_infinities > 0 {
+        let probability = 1.0 / positive_infinities as f32;
+        for value in &mut scaled {
+            *value = if *value == f32::INFINITY {
+                probability
+            } else {
+                0.0
+            };
+        }
+        return scaled;
+    }
+    let max = scaled.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if max == f32::NEG_INFINITY {
+        return vec![1.0 / scaled.len() as f32; scaled.len()];
+    }
+    let mut sum = 0.0;
+    for value in &mut scaled {
+        *value = (*value - max).exp();
+        sum += *value;
+    }
+    if !sum.is_finite() || sum <= 0.0 {
+        return vec![1.0 / scaled.len() as f32; scaled.len()];
+    }
+    for value in &mut scaled {
+        *value /= sum;
+    }
+    scaled
 }
 
 /// Sample correction token from max(0, p_target - p_draft).
@@ -390,44 +503,58 @@ fn sample_correction(
     rng: &mut impl Rng,
 ) -> usize {
     let n = target_logits.len().min(draft_logits.len());
-    let temp = config.temperature.max(1e-6);
+    if n == 0 {
+        return 0;
+    }
+    let target_probs = softmax_probabilities(&target_logits[..n], config.temperature);
+    let draft_probs = softmax_probabilities(&draft_logits[..n], config.temperature);
 
-    let max_t = target_logits
-        .iter()
-        .map(|&l| l / temp)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let max_d = draft_logits
-        .iter()
-        .map(|&l| l / temp)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let sum_t: f32 = target_logits
-        .iter()
-        .map(|&l| (l / temp - max_t).exp())
-        .sum();
-    let sum_d: f32 = draft_logits.iter().map(|&l| (l / temp - max_d).exp()).sum();
-
-    let mut adj_sum = 0.0f32;
+    let mut adj_sum = 0.0f64;
     let mut adjusted = vec![0.0f32; n];
     for i in 0..n {
-        let p_t = (target_logits[i] / temp - max_t).exp() / sum_t;
-        let p_d = (draft_logits[i] / temp - max_d).exp() / sum_d;
-        let diff = (p_t - p_d).max(0.0);
+        let diff = (target_probs[i] - draft_probs[i]).max(0.0);
         adjusted[i] = diff;
-        adj_sum += diff;
+        adj_sum += f64::from(diff);
     }
 
-    if adj_sum < 1e-10 {
+    if !adj_sum.is_finite() || adj_sum <= 0.0 {
         let mut logits_copy = target_logits.to_vec();
         return sample_token(&mut logits_copy, config, rng);
     }
 
-    let u: f32 = rng.gen::<f32>() * adj_sum;
-    let mut cumsum = 0.0f32;
+    let u: f64 = rng.gen::<f64>() * adj_sum;
+    let mut cumsum = 0.0f64;
     for i in 0..n {
-        cumsum += adjusted[i];
+        cumsum += f64::from(adjusted[i]);
         if cumsum >= u {
             return i;
         }
     }
     n - 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_mode_rejects_filtered_or_zero_progress_configuration() {
+        let mut config = SpeculativeConfig::default();
+        assert!(validate_speculative_config(&config).is_ok());
+        config.draft_k = 0;
+        assert!(validate_speculative_config(&config).is_err());
+
+        config.draft_k = 4;
+        config.sampler.top_k = 40;
+        assert!(validate_speculative_config(&config).is_err());
+    }
+
+    #[test]
+    fn probability_helper_handles_non_finite_logits() {
+        let probabilities = softmax_probabilities(&[f32::NAN, f32::INFINITY, f32::INFINITY], 1.0);
+        assert_eq!(probabilities, vec![0.0, 0.5, 0.5]);
+
+        let probabilities = softmax_probabilities(&[f32::NAN, f32::NEG_INFINITY], 1.0);
+        assert_eq!(probabilities, vec![0.5, 0.5]);
+    }
 }

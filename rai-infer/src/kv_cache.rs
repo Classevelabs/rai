@@ -19,7 +19,14 @@ pub struct LayerKVCache {
 
 impl LayerKVCache {
     pub fn new(num_kv_heads: usize, max_ctx: usize, head_dim: usize) -> Self {
-        let total = num_kv_heads * max_ctx * head_dim;
+        assert!(
+            num_kv_heads > 0 && max_ctx > 0 && head_dim > 0,
+            "KV cache dimensions must be non-zero"
+        );
+        let total = num_kv_heads
+            .checked_mul(max_ctx)
+            .and_then(|value| value.checked_mul(head_dim))
+            .expect("KV cache dimensions overflow");
         Self {
             k: vec![0.0; total],
             v: vec![0.0; total],
@@ -34,9 +41,13 @@ impl LayerKVCache {
     /// `k_vec` is `[num_kv_heads * head_dim]`, `v_vec` is `[num_kv_heads * head_dim]`.
     /// Overwrites any existing data at `pos` — this is intentional for pondering iterations.
     pub fn store(&mut self, pos: usize, k_vec: &[f32], v_vec: &[f32]) {
-        debug_assert!(pos < self.max_ctx);
-        debug_assert_eq!(k_vec.len(), self.num_kv_heads * self.head_dim);
-        debug_assert_eq!(v_vec.len(), self.num_kv_heads * self.head_dim);
+        assert!(pos < self.max_ctx, "KV cache position is out of range");
+        let expected = self
+            .num_kv_heads
+            .checked_mul(self.head_dim)
+            .expect("KV cache vector dimensions overflow");
+        assert_eq!(k_vec.len(), expected, "KV key vector length mismatch");
+        assert_eq!(v_vec.len(), expected, "KV value vector length mismatch");
 
         for h in 0..self.num_kv_heads {
             let src_start = h * self.head_dim;
@@ -82,6 +93,7 @@ pub struct KVCache {
 impl KVCache {
     /// Allocate cache for all layers.
     pub fn new(num_layers: usize, num_kv_heads: usize, max_ctx: usize, head_dim: usize) -> Self {
+        assert!(num_layers > 0, "KV cache must contain at least one layer");
         let layers = (0..num_layers)
             .map(|_| LayerKVCache::new(num_kv_heads, max_ctx, head_dim))
             .collect();
@@ -95,12 +107,33 @@ impl KVCache {
 
     /// Get cached K for a head at a position in a layer.
     pub fn get_k(&self, layer: usize, head: usize, pos: usize, _head_dim: usize) -> &[f32] {
+        assert_eq!(
+            self.layers[layer].head_dim, _head_dim,
+            "KV cache head_dim mismatch"
+        );
         self.layers[layer].get_k(head, pos)
     }
 
     /// Get cached V for a head at a position in a layer.
     pub fn get_v(&self, layer: usize, head: usize, pos: usize, _head_dim: usize) -> &[f32] {
+        assert_eq!(
+            self.layers[layer].head_dim, _head_dim,
+            "KV cache head_dim mismatch"
+        );
         self.layers[layer].get_v(head, pos)
+    }
+
+    /// Validate the dimensions used by an attention call before entering SIMD code.
+    pub fn supports_attention(
+        &self,
+        layer: usize,
+        num_kv_heads: usize,
+        pos: usize,
+        head_dim: usize,
+    ) -> bool {
+        self.layers.get(layer).is_some_and(|cache| {
+            cache.num_kv_heads == num_kv_heads && pos < cache.max_ctx && cache.head_dim == head_dim
+        })
     }
 
     /// Clear all layers.

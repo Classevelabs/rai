@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 /// Orchestrates background retraining of NRA and REM.
+#[derive(Clone)]
 pub struct TrainingOrchestrator {
     /// Minimum items before triggering NRA retrain.
     pub nra_retrain_threshold: usize,

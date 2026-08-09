@@ -2,10 +2,10 @@ use half::f16;
 use std::time::Instant;
 
 fn main() {
-    let rows = 1536;
-    let cols = 576;
-    let gs = 128;
-    let num_groups = (cols + gs - 1) / gs;
+    let rows: usize = 1536;
+    let cols: usize = 576;
+    let gs: usize = 128;
+    let num_groups = cols.div_ceil(gs);
 
     let scale = f16::from_f32(0.1);
     let zero = f16::from_f32(-0.5);
@@ -43,13 +43,14 @@ fn main() {
     );
 
     // Also benchmark all layer sizes for accurate per-token estimate
-    for &(r, c, label) in &[
+    let layer_shapes: [(usize, usize, &str); 4] = [
         (576, 576, "q/o_proj (576x576)"),
         (192, 576, "k/v_proj (192x576)"),
         (1536, 576, "gate/up (1536x576)"),
         (576, 1536, "down (576x1536)"),
-    ] {
-        let ng = (c + gs - 1) / gs;
+    ];
+    for &(r, c, label) in &layer_shapes {
+        let ng = c.div_ceil(gs);
         let mut gp2 = vec![0u8; r * ng * 4];
         for row in 0..r {
             for g in 0..ng {
@@ -79,10 +80,10 @@ fn main() {
     // (uses last benchmarks)
 
     // LM Head benchmark
-    let vocab = 49152;
-    let hidden = 576;
-    let embed_gs = 64;
-    let embed_ng = (hidden + embed_gs - 1) / embed_gs;
+    let vocab: usize = 49152;
+    let hidden: usize = 576;
+    let embed_gs: usize = 64;
+    let embed_ng = hidden.div_ceil(embed_gs);
     let mut ep = vec![0u8; vocab * embed_ng * 4];
     for v in 0..vocab {
         for g in 0..embed_ng {

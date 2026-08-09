@@ -2,11 +2,15 @@
 name = "classeve-rai-infer"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 description = "CPU inference engine for 4-bit quantized LLMs — hand-written AVX2 GEMM kernels, .raimodel format, speculative decoding"
+readme = "../README.md"
+keywords = ["llm", "inference", "quantization", "cpu", "simd"]
+categories = ["command-line-utilities", "science"]
 
 # Keep the original crate (import) name: bins and examples do `use rai_infer::...`.
 [lib]
@@ -18,7 +22,7 @@ memmap2 = "0.9"
 half = "2.4"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-tokenizers = "0.21"
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 rand = "0.8"
 rayon = "1.10"
 tiny_http = "0.12"

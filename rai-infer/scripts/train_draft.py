@@ -9,14 +9,11 @@ Architecture: 2-layer MistralForCausalLM (same arch, just smaller)
   - Embedding: 32768 × 1024 → 33.5M params
   - 2 transformer layers → 33M params
   - lm_head: 32768 × 1024 → 33.5M params
-  - Total: ~100M params → ~50MB at 4-bit
-  - CPU inference: ~2ms/token → 500 tok/s
+  - Total: ~100M parameters before quantization
 
-Expected speculative decoding performance on a 4-core laptop-class CPU:
-  - Draft K=8: 16ms, Verify: 150ms → total 166ms
-  - With 50% acceptance: 4 tokens/step → 24 tok/s
-  - With 60% acceptance: 4.8 tokens/step → 29 tok/s
-  - With 70% acceptance: 5.6 tokens/step → 34 tok/s
+Runtime size, latency, acceptance rate, and speculative-decoding throughput depend on
+the exported representation, target model, hardware, prompt distribution, and sampler.
+Measure them on the intended deployment; this script does not guarantee a speedup.
 
 Usage (any recent CUDA GPU):
   python3 train_draft.py --teacher mistralai/Mistral-7B-Instruct-v0.3 --epochs 2

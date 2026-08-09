@@ -151,13 +151,15 @@ impl NonlinearResonanceMemory {
     }
 
     pub fn train_two_phase(&mut self) -> Result<Vec<f64>> {
-        let loss = self.current_mse();
-        self.last_loss = Some(loss);
-        Ok(vec![loss])
+        Err(MemoryError::TrainingUnavailable)
     }
 
     pub fn len(&self) -> usize {
         self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
     }
 
     pub fn items(&self) -> &[(Vec64, Vec64)] {
@@ -236,4 +238,21 @@ fn softmax_weights(scores: Vec<f64>) -> Vec<f64> {
         *value /= sum;
     }
     exp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn training_reports_unavailable_without_mutating_loss() {
+        let mut memory =
+            NonlinearResonanceMemory::new(NRAConfig::default(), &mut rand::thread_rng());
+        assert!(memory.last_loss.is_none());
+        assert!(matches!(
+            memory.train_two_phase(),
+            Err(MemoryError::TrainingUnavailable)
+        ));
+        assert!(memory.last_loss.is_none());
+    }
 }

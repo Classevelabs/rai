@@ -28,12 +28,38 @@ import struct
 import time
 import sys
 import shutil
+import tempfile
 from pathlib import Path
 
 import numpy as np
 import torch
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+MIN_F16_SCALE = float(np.nextafter(np.float16(0), np.float16(1)))
+
+
+def validate_export_options(parser, args):
+    if args.bits != 4:
+        parser.error("--bits must be 4; the .raimodel reader supports only 4-bit weights")
+    if args.embed_bits != 8:
+        parser.error("--embed-bits must be 8; the .raimodel reader supports only 8-bit embeddings")
+    for name, value in (
+        ("--group-size", args.group_size),
+        ("--embed-group-size", args.embed_group_size),
+    ):
+        if value < 2 or value > 254 or value % 2:
+            parser.error(f"{name} must be an even integer in 2..=254")
+    if not 1 <= args.max_context <= 1_000_000:
+        parser.error("--max-context must be in 1..=1000000")
+    if args.cal_chunks < 1 or args.seq_len < 1:
+        parser.error("--cal-chunks and --seq-len must be greater than zero")
+
+
+def validate_f16_params(scale, zero_point, label):
+    if (not np.isfinite(scale).all() or not np.isfinite(zero_point).all()
+            or np.any(scale <= 0)):
+        raise ValueError(f"{label} produced non-finite or non-positive FP16 quantization parameters")
 
 
 # =============================================================================
@@ -89,12 +115,13 @@ def gptq_quantize_to_codes(weight_np, hessian_np, bits=4, block_size=128, group_
                 row_min = group_slice.min(axis=1)
                 row_max = group_slice.max(axis=1)
                 row_range = row_max - row_min
-                scale = np.maximum(row_range / (n_levels - 1), 1e-10)
+                scale = np.maximum(row_range / (n_levels - 1), MIN_F16_SCALE)
                 zero_point = row_min
 
                 # CRITICAL: Round-trip through f16 so Rust exactly matches
                 scale_f16 = scale.astype(np.float16)
                 zero_f16 = zero_point.astype(np.float16)
+                validate_f16_params(scale_f16, zero_f16, "GPTQ group")
                 scales_f16[:, gid] = scale_f16
                 zeros_f16[:, gid] = zero_f16
                 # Use f16-rounded values for quantization
@@ -154,11 +181,12 @@ def quantize_embedding_8bit(weight_np, group_size=64):
         row_min = group_data.min(axis=1)
         row_max = group_data.max(axis=1)
         row_range = row_max - row_min
-        scale = np.maximum(row_range / (n_levels - 1), 1e-10)
+        scale = np.maximum(row_range / (n_levels - 1), MIN_F16_SCALE)
 
         # Round-trip through f16
         scale_f16 = scale.astype(np.float16)
         zero_f16 = row_min.astype(np.float16)
+        validate_f16_params(scale_f16, zero_f16, "embedding group")
         scales[:, gid] = scale_f16
         zeros[:, gid] = zero_f16
 
@@ -268,6 +296,7 @@ def main():
     parser.add_argument('--hessian-dtype', type=str, default='float64', choices=['float32', 'float64'],
                        help='Hessian accumulation dtype (float32 halves RAM for 7B+)')
     args = parser.parse_args()
+    validate_export_options(parser, args)
 
     # Auto-derive output name from model
     if args.output is None:
@@ -282,6 +311,10 @@ def main():
     print(f"\nLoading {model_name}...")
     model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16).to(device)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if not tokenizer.is_fast:
+        raise RuntimeError(
+            "this exporter requires a fast tokenizer that can emit tokenizer.json"
+        )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     model.eval()
@@ -545,17 +578,15 @@ def main():
     # =========================================================================
     # Step 5: Copy tokenizer
     # =========================================================================
-    tokenizer_src = tokenizer.save_pretrained("/tmp/rai_tokenizer")
     tokenizer_dst = output_path.parent / "tokenizer.json"
-    # The tokenizer is saved as a directory; we want tokenizer.json
-    src_json = Path("/tmp/rai_tokenizer/tokenizer.json")
-    if src_json.exists():
-        shutil.copy2(src_json, tokenizer_dst)
-        print(f"Tokenizer copied to: {tokenizer_dst}")
-    else:
-        # Fallback: save directly
-        tokenizer.save_pretrained(str(output_path.parent))
-        print(f"Tokenizer saved to: {output_path.parent}")
+    with tempfile.TemporaryDirectory(prefix="rai_tokenizer_") as tmp_dir:
+        tokenizer.save_pretrained(tmp_dir)
+        src_json = Path(tmp_dir) / "tokenizer.json"
+        if src_json.exists():
+            shutil.copy2(src_json, tokenizer_dst)
+            print(f"Tokenizer copied to: {tokenizer_dst}")
+        else:
+            raise RuntimeError("tokenizer export did not produce the required tokenizer.json")
 
     # =========================================================================
     # Summary

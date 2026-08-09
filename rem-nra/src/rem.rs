@@ -72,6 +72,55 @@ impl ResidualEquilibriumMemory {
         }
     }
 
+    /// Restore an exact persisted state without replaying items through `store`.
+    pub fn from_snapshot(
+        config: REMConfig,
+        encoder: encoder::EncoderParams,
+        decoder: decoder::DecoderParams,
+        memory_state: Vec64,
+        items: Vec<(Vec64, Vec64)>,
+        residual_norm: f64,
+        last_loss: Option<f64>,
+    ) -> Result<Self> {
+        if config.dim_memory == 0 || config.dim_key == 0 || config.dim_value == 0 {
+            return Err(MemoryError::InvalidData(
+                "memory, key, and value dimensions must be non-zero".to_string(),
+            ));
+        }
+        ensure_dim(&encoder.bias, config.dim_memory)?;
+        ensure_dim(&decoder.bias, config.dim_value)?;
+        ensure_dim(&memory_state, config.dim_memory)?;
+        ensure_finite(&encoder.bias, "encoder bias")?;
+        ensure_finite(&decoder.bias, "decoder bias")?;
+        ensure_finite(&memory_state, "memory state")?;
+        for (key, value) in &items {
+            ensure_dim(key, config.dim_key)?;
+            ensure_dim(value, config.dim_value)?;
+            ensure_finite(key, "stored key")?;
+            ensure_finite(value, "stored value")?;
+        }
+        if !residual_norm.is_finite() || residual_norm < 0.0 {
+            return Err(MemoryError::InvalidData(
+                "residual norm must be finite and non-negative".to_string(),
+            ));
+        }
+        if last_loss.is_some_and(|loss| !loss.is_finite() || loss < 0.0) {
+            return Err(MemoryError::InvalidData(
+                "last loss must be finite and non-negative".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            config,
+            encoder,
+            decoder,
+            memory_state,
+            items,
+            residual_norm,
+            last_loss,
+        })
+    }
+
     pub fn store(&mut self, key: &Vec64, value: &Vec64) -> Result<()> {
         ensure_dim(key, self.config.dim_key)?;
         ensure_dim(value, self.config.dim_value)?;
@@ -103,6 +152,10 @@ impl ResidualEquilibriumMemory {
         self.residual_norm
     }
 
+    pub fn last_loss(&self) -> Option<f64> {
+        self.last_loss
+    }
+
     pub fn mse(&self) -> Result<f64> {
         Ok(self.last_loss.unwrap_or_else(|| self.current_mse()))
     }
@@ -112,9 +165,7 @@ impl ResidualEquilibriumMemory {
     }
 
     pub fn train(&mut self) -> Result<Vec<f64>> {
-        let loss = self.current_mse();
-        self.last_loss = Some(loss);
-        Ok(vec![loss])
+        Err(MemoryError::TrainingUnavailable)
     }
 
     pub fn items(&self) -> &[(Vec64, Vec64)] {
@@ -144,6 +195,14 @@ fn ensure_dim(value: &Vec64, expected: usize) -> Result<()> {
     }
 }
 
+fn ensure_finite(value: &Vec64, label: &str) -> Result<()> {
+    if value.iter().all(|entry| entry.is_finite()) {
+        Ok(())
+    } else {
+        Err(MemoryError::InvalidData(format!("{label} must be finite")))
+    }
+}
+
 fn rolling_average(state: &Vec64, value: &Vec64) -> Vec64 {
     let mut next = state.clone();
     let limit = next.len().min(value.len());
@@ -159,5 +218,55 @@ fn cosine(a: &Vec64, b: &Vec64) -> f64 {
         0.0
     } else {
         a.dot(b) / denom
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn training_reports_unavailable_without_mutating_loss() {
+        let mut memory =
+            ResidualEquilibriumMemory::new(REMConfig::default(), &mut rand::thread_rng());
+        assert!(memory.last_loss.is_none());
+        assert!(matches!(
+            memory.train(),
+            Err(MemoryError::TrainingUnavailable)
+        ));
+        assert!(memory.last_loss.is_none());
+    }
+
+    #[test]
+    fn snapshot_rejects_non_finite_and_negative_diagnostics() {
+        let config = REMConfig::default();
+        let encoder = encoder::EncoderParams {
+            bias: Vec64::zeros(config.dim_memory),
+        };
+        let decoder = decoder::DecoderParams {
+            bias: Vec64::zeros(config.dim_value),
+        };
+        let state = Vec64::zeros(config.dim_memory);
+
+        assert!(ResidualEquilibriumMemory::from_snapshot(
+            config.clone(),
+            encoder.clone(),
+            decoder.clone(),
+            state.clone(),
+            Vec::new(),
+            -1.0,
+            None,
+        )
+        .is_err());
+        assert!(ResidualEquilibriumMemory::from_snapshot(
+            config,
+            encoder,
+            decoder,
+            state,
+            Vec::new(),
+            0.0,
+            Some(f64::NAN),
+        )
+        .is_err());
     }
 }

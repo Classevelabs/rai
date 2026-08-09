@@ -3,6 +3,13 @@
 use rayon::prelude::*;
 use std::time::Instant;
 
+fn read_prefix_u64(bytes: &[u8]) -> u64 {
+    let mut word = [0_u8; 8];
+    let copied = bytes.len().min(word.len());
+    word[..copied].copy_from_slice(&bytes[..copied]);
+    u64::from_ne_bytes(word)
+}
+
 fn main() {
     rai_infer::gemm::configure_thread_pool();
 
@@ -13,7 +20,7 @@ fn main() {
 
     // Warmup
     for chunk in data.chunks(64) {
-        sink = sink.wrapping_add(unsafe { *(chunk.as_ptr() as *const u64) });
+        sink = sink.wrapping_add(read_prefix_u64(chunk));
     }
 
     let iters = 10;
@@ -21,7 +28,7 @@ fn main() {
     for _ in 0..iters {
         let mut s = 0u64;
         for chunk in data.chunks(64) {
-            s = s.wrapping_add(unsafe { *(chunk.as_ptr() as *const u64) });
+            s = s.wrapping_add(read_prefix_u64(chunk));
         }
         sink = sink.wrapping_add(s);
     }
@@ -37,7 +44,7 @@ fn main() {
             .map(|chunk| {
                 let mut s = 0u64;
                 for c in chunk.chunks(64) {
-                    s = s.wrapping_add(unsafe { *(c.as_ptr() as *const u64) });
+                    s = s.wrapping_add(read_prefix_u64(c));
                 }
                 s
             })
@@ -71,7 +78,7 @@ fn main() {
             let end = (start + chunk_size).min(small_data.len());
             let mut s = 0u64;
             for c in small_data[start..end].chunks(64) {
-                s = s.wrapping_add(unsafe { *(c.as_ptr() as *const u64) });
+                s = s.wrapping_add(read_prefix_u64(c));
             }
             std::hint::black_box(s);
         });
@@ -86,7 +93,7 @@ fn main() {
     for _ in 0..iters2 {
         let mut s = 0u64;
         for c in small_data.chunks(64) {
-            s = s.wrapping_add(unsafe { *(c.as_ptr() as *const u64) });
+            s = s.wrapping_add(read_prefix_u64(c));
         }
         std::hint::black_box(s);
     }
@@ -104,7 +111,7 @@ fn main() {
         // Warmup
         let mut s = 0u64;
         for c in mmap.chunks(64) {
-            s = s.wrapping_add(unsafe { *(c.as_ptr() as *const u64) });
+            s = s.wrapping_add(read_prefix_u64(c));
         }
         sink = sink.wrapping_add(s);
 
@@ -116,7 +123,7 @@ fn main() {
                 .map(|chunk| {
                     let mut s = 0u64;
                     for c in chunk.chunks(64) {
-                        s = s.wrapping_add(unsafe { *(c.as_ptr() as *const u64) });
+                        s = s.wrapping_add(read_prefix_u64(c));
                     }
                     s
                 })

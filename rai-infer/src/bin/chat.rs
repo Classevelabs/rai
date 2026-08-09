@@ -1,5 +1,7 @@
 //! rai-chat: Web-based chat UI with pondering strategies.
 
+use std::fmt;
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -14,6 +16,61 @@ use rai_infer::chat_template::ChatTemplate;
 use rai_infer::model::{InferenceWork, RaiModel};
 use rai_infer::ponder::{pondered_forward, PonderConfig};
 use rai_infer::sampler::{apply_repetition_penalty, sample_token, SamplerConfig};
+
+const MAX_CHAT_REQUEST_BYTES: usize = 64 * 1024;
+const MAX_CHAT_GENERATION_TOKENS: usize = 512;
+const MAX_ENSEMBLE_SIZE: usize = 8;
+const MAX_ENTROPY_THRESHOLD: f32 = 32.0;
+
+#[derive(Debug)]
+struct ChatHttpError {
+    status: u16,
+    message: String,
+}
+
+impl ChatHttpError {
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: 400,
+            message: message.into(),
+        }
+    }
+
+    fn payload_too_large() -> Self {
+        Self {
+            status: 413,
+            message: format!("request body exceeds the {MAX_CHAT_REQUEST_BYTES}-byte limit"),
+        }
+    }
+
+    fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: 403,
+            message: message.into(),
+        }
+    }
+
+    fn unsupported_media_type() -> Self {
+        Self {
+            status: 415,
+            message: "Content-Type must be application/json".to_string(),
+        }
+    }
+
+    fn internal(error: impl fmt::Display) -> Self {
+        eprintln!("chat request failed: {error}");
+        Self {
+            status: 500,
+            message: "internal server error".to_string(),
+        }
+    }
+}
+
+impl fmt::Display for ChatHttpError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -41,7 +98,7 @@ struct AppState {
     template: ChatTemplate,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct ChatRequest {
     message: String,
     temperature: Option<f32>,
@@ -53,28 +110,142 @@ struct ChatRequest {
     entropy_threshold: Option<f32>,
 }
 
-fn build_ponder(req: &ChatRequest) -> PonderConfig {
+fn parse_chat_request(req_body: &str) -> Result<ChatRequest, ChatHttpError> {
+    let request: ChatRequest = serde_json::from_str(req_body)
+        .map_err(|error| ChatHttpError::bad_request(format!("invalid JSON request: {error}")))?;
+
+    if request.message.trim().is_empty() {
+        return Err(ChatHttpError::bad_request(
+            "message must contain at least one non-whitespace character",
+        ));
+    }
+
+    validate_chat_options(&request)?;
+
+    Ok(request)
+}
+
+fn read_request_body(reader: &mut dyn Read) -> Result<String, ChatHttpError> {
+    let mut bytes = Vec::new();
+    reader
+        .take((MAX_CHAT_REQUEST_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(ChatHttpError::internal)?;
+
+    if bytes.len() > MAX_CHAT_REQUEST_BYTES {
+        return Err(ChatHttpError::payload_too_large());
+    }
+
+    String::from_utf8(bytes)
+        .map_err(|_| ChatHttpError::bad_request("request body must be valid UTF-8"))
+}
+
+fn build_ponder(req: &ChatRequest) -> Result<PonderConfig, ChatHttpError> {
+    validate_chat_options(req)?;
     let strat = req.ponder_strategy.as_deref().unwrap_or("none");
     let gs = req.guidance_scale.unwrap_or(1.5);
     let en = req.ensemble_n.unwrap_or(3);
     let ns = req.noise_sigma.unwrap_or(0.05);
     let et = req.entropy_threshold.unwrap_or(3.0);
 
-    match strat {
+    let config = match strat {
         "none" => PonderConfig::none(),
         "cfg" => PonderConfig::cfg(gs),
         "ensemble" => PonderConfig::ensemble(en, ns),
         "cfg-ensemble" => PonderConfig::cfg_ensemble(gs, en, ns),
         "adaptive" => PonderConfig::adaptive(gs, et),
-        _ => PonderConfig::none(),
-    }
+        _ => unreachable!("strategy was validated"),
+    };
+    Ok(config)
 }
 
-fn handle_generate(state: &AppState, req_body: &str) -> Result<String> {
-    let chat_req: ChatRequest = serde_json::from_str(req_body)?;
+fn validate_chat_options(req: &ChatRequest) -> Result<(), ChatHttpError> {
+    validate_optional_f32("temperature", req.temperature, 0.01, 2.0)?;
+    if req
+        .max_tokens
+        .is_some_and(|value| !(1..=MAX_CHAT_GENERATION_TOKENS).contains(&value))
+    {
+        return Err(ChatHttpError::bad_request(format!(
+            "max_tokens must be between 1 and {MAX_CHAT_GENERATION_TOKENS}"
+        )));
+    }
+    if req.ponder_strategy.as_deref().is_some_and(|strategy| {
+        !matches!(
+            strategy,
+            "none" | "cfg" | "ensemble" | "cfg-ensemble" | "adaptive"
+        )
+    }) {
+        return Err(ChatHttpError::bad_request(
+            "ponder_strategy must be one of: none, cfg, ensemble, cfg-ensemble, adaptive",
+        ));
+    }
+    validate_optional_f32("guidance_scale", req.guidance_scale, 0.0, 4.0)?;
+    if req
+        .ensemble_n
+        .is_some_and(|value| !(1..=MAX_ENSEMBLE_SIZE).contains(&value))
+    {
+        return Err(ChatHttpError::bad_request(format!(
+            "ensemble_n must be between 1 and {MAX_ENSEMBLE_SIZE}"
+        )));
+    }
+    validate_optional_f32("noise_sigma", req.noise_sigma, 0.0, 1.0)?;
+    validate_optional_f32(
+        "entropy_threshold",
+        req.entropy_threshold,
+        0.0,
+        MAX_ENTROPY_THRESHOLD,
+    )?;
+    Ok(())
+}
+
+fn validate_optional_f32(
+    name: &str,
+    value: Option<f32>,
+    minimum: f32,
+    maximum: f32,
+) -> Result<(), ChatHttpError> {
+    if value.is_some_and(|value| !value.is_finite() || value < minimum || value > maximum) {
+        return Err(ChatHttpError::bad_request(format!(
+            "{name} must be a finite number between {minimum} and {maximum}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_prompt_tokens(
+    prompt_tokens: &[usize],
+    max_context: usize,
+    vocab_size: usize,
+) -> Result<(), ChatHttpError> {
+    if prompt_tokens.is_empty() {
+        return Err(ChatHttpError::bad_request(
+            "message produced no tokens with the configured tokenizer",
+        ));
+    }
+    if max_context == 0 {
+        return Err(ChatHttpError::internal(
+            "model has no usable context window",
+        ));
+    }
+    if prompt_tokens.len() > max_context {
+        return Err(ChatHttpError::bad_request(format!(
+            "message is too long: {} tokens exceeds the {max_context}-token context window",
+            prompt_tokens.len()
+        )));
+    }
+    if prompt_tokens.iter().any(|&token| token >= vocab_size) {
+        return Err(ChatHttpError::bad_request(
+            "configured tokenizer produced a token outside the model vocabulary",
+        ));
+    }
+    Ok(())
+}
+
+fn handle_generate(state: &AppState, chat_req: &ChatRequest) -> Result<String, ChatHttpError> {
+    validate_chat_options(chat_req)?;
     let temperature = chat_req.temperature.unwrap_or(0.7);
     let max_tokens = chat_req.max_tokens.unwrap_or(200);
-    let ponder_config = build_ponder(&chat_req);
+    let ponder_config = build_ponder(chat_req)?;
 
     let sampler_config = SamplerConfig {
         temperature,
@@ -88,12 +259,17 @@ fn handle_generate(state: &AppState, req_body: &str) -> Result<String> {
     let encoding = state
         .tokenizer
         .encode(prompt.as_str(), false)
-        .map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+        .map_err(|_| ChatHttpError::bad_request("message could not be tokenized"))?;
     let prompt_tokens: Vec<usize> = encoding.get_ids().iter().map(|&id| id as usize).collect();
 
     let max_ctx = state
         .max_context
         .min(state.model.config.max_context as usize);
+    validate_prompt_tokens(
+        &prompt_tokens,
+        max_ctx,
+        state.model.config.vocab_size as usize,
+    )?;
     let mut kv_cache = state.model.create_kv_cache(max_ctx);
     let mut work = InferenceWork::new();
     let mut work2 = InferenceWork::new();
@@ -103,10 +279,9 @@ fn handle_generate(state: &AppState, req_body: &str) -> Result<String> {
 
     // Prefill
     let t_prefill = Instant::now();
-    for &token_id in &prompt_tokens {
-        if pos >= max_ctx {
-            break;
-        }
+    // Leave the final prompt token for the first decode pass. Processing every prompt token
+    // here and then processing the last one again at the next position duplicates it.
+    for &token_id in &prompt_tokens[..prompt_tokens.len() - 1] {
         let _ = pondered_forward(
             &state.model,
             token_id,
@@ -116,7 +291,8 @@ fn handle_generate(state: &AppState, req_body: &str) -> Result<String> {
             &mut work,
             &mut work2,
             &mut rng,
-        )?;
+        )
+        .map_err(ChatHttpError::internal)?;
         pos += 1;
     }
     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
@@ -132,7 +308,9 @@ fn handle_generate(state: &AppState, req_body: &str) -> Result<String> {
         if pos >= max_ctx {
             break;
         }
-        let last_token = *all_tokens.last().unwrap();
+        let last_token = all_tokens.last().copied().ok_or_else(|| {
+            ChatHttpError::bad_request("message produced no usable prompt tokens")
+        })?;
         let (mut logits, metrics) = pondered_forward(
             &state.model,
             last_token,
@@ -142,7 +320,8 @@ fn handle_generate(state: &AppState, req_body: &str) -> Result<String> {
             &mut work,
             &mut work2,
             &mut rng,
-        )?;
+        )
+        .map_err(ChatHttpError::internal)?;
         total_passes += metrics.forward_passes;
         if metrics.was_hard_token {
             hard_tokens += 1;
@@ -158,7 +337,7 @@ fn handle_generate(state: &AppState, req_body: &str) -> Result<String> {
                 state
                     .tokenizer
                     .token_to_id(tok)
-                    .map_or(false, |id| next_token == id as usize)
+                    .is_some_and(|id| next_token == id as usize)
             });
         if is_eos {
             break;
@@ -226,6 +405,10 @@ fn main() -> Result<()> {
 
     eprintln!("Loading model: {}", args.model.display());
     let model = RaiModel::load(&args.model)?;
+    if args.max_context == 0 {
+        anyhow::bail!("--max-context must be greater than zero");
+    }
+    let max_context = args.max_context.min(model.config.max_context as usize);
     let cfg = &model.config;
     eprintln!(
         "Model loaded (hidden={}, layers={}, heads={}/{}kv, inter={}, vocab={})",
@@ -239,8 +422,8 @@ fn main() -> Result<()> {
     eprintln!(
         "Weights: {:.1} MB, KV cache: {:.1} MB (max_ctx={})",
         model.file_size() as f64 / (1024.0 * 1024.0),
-        model.kv_cache_bytes(args.max_context) as f64 / (1024.0 * 1024.0),
-        args.max_context
+        model.kv_cache_bytes(max_context) as f64 / (1024.0 * 1024.0),
+        max_context
     );
 
     eprintln!("Loading tokenizer: {}", args.tokenizer.display());
@@ -253,49 +436,110 @@ fn main() -> Result<()> {
     let state = Arc::new(AppState {
         model,
         tokenizer,
-        max_context: args.max_context,
+        max_context,
         template,
     });
 
     let infer_lock = Arc::new(Mutex::new(()));
 
-    let addr = format!("0.0.0.0:{}", args.port);
+    let addr = format!("127.0.0.1:{}", args.port);
     let server = Server::http(&addr).map_err(|e| anyhow::anyhow!("bind: {e}"))?;
-    eprintln!("\n  Chat UI: http://localhost:{}\n", args.port);
+    let bound_port = server
+        .server_addr()
+        .to_ip()
+        .ok_or_else(|| anyhow::anyhow!("server did not bind an IP socket"))?
+        .port();
+    eprintln!("\n  Chat UI: http://localhost:{bound_port}\n");
 
     for mut request in server.incoming_requests() {
         let url = request.url().to_string();
         let method = request.method().clone();
 
+        let host = request
+            .headers()
+            .iter()
+            .find(|header| header.field.equiv("Host"))
+            .map(|header| header.value.as_str());
+        if !host.is_some_and(|host| is_allowed_host(host, bound_port)) {
+            respond_json_error(request, &ChatHttpError::forbidden("invalid Host header"));
+            continue;
+        }
+
+        if method == Method::Post && url == "/api/chat" {
+            let origin = request
+                .headers()
+                .iter()
+                .find(|header| header.field.equiv("Origin"))
+                .map(|header| header.value.as_str());
+            if origin.is_some_and(|origin| !is_allowed_origin(origin, bound_port)) {
+                respond_json_error(
+                    request,
+                    &ChatHttpError::forbidden("cross-origin requests are not allowed"),
+                );
+                continue;
+            }
+
+            let is_json = request
+                .headers()
+                .iter()
+                .find(|header| header.field.equiv("Content-Type"))
+                .map(|header| header.value.as_str())
+                .is_some_and(|value| {
+                    value
+                        .split(';')
+                        .next()
+                        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+                });
+            if !is_json {
+                respond_json_error(request, &ChatHttpError::unsupported_media_type());
+                continue;
+            }
+        }
+
         match (method, url.as_str()) {
             (Method::Get, "/") | (Method::Get, "/index.html") => {
-                let resp = Response::from_data(CHAT_HTML.as_bytes().to_vec()).with_header(
-                    Header::from_bytes("Content-Type", "text/html; charset=utf-8").unwrap(),
-                );
+                let resp = Response::from_data(CHAT_HTML.as_bytes().to_vec())
+                    .with_header(
+                        Header::from_bytes("Content-Type", "text/html; charset=utf-8").unwrap(),
+                    )
+                    .with_header(
+                        Header::from_bytes(
+                            "Content-Security-Policy",
+                            "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+                        )
+                        .unwrap(),
+                    )
+                    .with_header(
+                        Header::from_bytes("X-Content-Type-Options", "nosniff").unwrap(),
+                    );
                 let _ = request.respond(resp);
             }
             (Method::Post, "/api/chat") => {
-                let mut body = String::new();
-                let _ = std::io::Read::read_to_string(&mut request.as_reader(), &mut body);
+                let body = match read_request_body(request.as_reader()) {
+                    Ok(body) => body,
+                    Err(error) => {
+                        respond_json_error(request, &error);
+                        continue;
+                    }
+                };
+                let chat_request = match parse_chat_request(&body) {
+                    Ok(chat_request) => chat_request,
+                    Err(error) => {
+                        respond_json_error(request, &error);
+                        continue;
+                    }
+                };
                 let _lock = infer_lock.lock().unwrap();
                 let state = Arc::clone(&state);
 
-                match handle_generate(&state, &body) {
+                match handle_generate(&state, &chat_request) {
                     Ok(json) => {
                         let resp = Response::from_data(json.into_bytes()).with_header(
                             Header::from_bytes("Content-Type", "application/json").unwrap(),
                         );
                         let _ = request.respond(resp);
                     }
-                    Err(e) => {
-                        let err = serde_json::json!({"error": e.to_string()}).to_string();
-                        let resp = Response::from_data(err.into_bytes())
-                            .with_status_code(StatusCode(500))
-                            .with_header(
-                                Header::from_bytes("Content-Type", "application/json").unwrap(),
-                            );
-                        let _ = request.respond(resp);
-                    }
+                    Err(error) => respond_json_error(request, &error),
                 }
             }
             (Method::Get, "/api/info") => {
@@ -314,18 +558,10 @@ fn main() -> Result<()> {
                     .with_header(Header::from_bytes("Content-Type", "application/json").unwrap());
                 let _ = request.respond(resp);
             }
-            (Method::Options, _) => {
-                let resp = Response::from_data(Vec::new())
-                    .with_header(Header::from_bytes("Access-Control-Allow-Origin", "*").unwrap())
-                    .with_header(
-                        Header::from_bytes("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-                            .unwrap(),
-                    )
-                    .with_header(
-                        Header::from_bytes("Access-Control-Allow-Headers", "Content-Type").unwrap(),
-                    );
-                let _ = request.respond(resp);
-            }
+            (Method::Options, _) => respond_json_error(
+                request,
+                &ChatHttpError::forbidden("cross-origin preflight is not allowed"),
+            ),
             _ => {
                 let _ = request.respond(
                     Response::from_data(b"404".to_vec()).with_status_code(StatusCode(404)),
@@ -334,6 +570,23 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn respond_json_error(request: tiny_http::Request, error: &ChatHttpError) {
+    let body = serde_json::json!({"error": error.to_string()}).to_string();
+    let response = Response::from_data(body.into_bytes())
+        .with_status_code(StatusCode(error.status))
+        .with_header(Header::from_bytes("Content-Type", "application/json").unwrap());
+    let _ = request.respond(response);
+}
+
+fn is_allowed_host(host: &str, port: u16) -> bool {
+    host.eq_ignore_ascii_case(&format!("localhost:{port}")) || host == format!("127.0.0.1:{port}")
+}
+
+fn is_allowed_origin(origin: &str, port: u16) -> bool {
+    origin.eq_ignore_ascii_case(&format!("http://localhost:{port}"))
+        || origin == format!("http://127.0.0.1:{port}")
 }
 
 const CHAT_HTML: &str = r##"<!DOCTYPE html>
@@ -554,3 +807,93 @@ function addMessage(text,role,meta){
 </body>
 </html>
 "##;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn empty_prompt_returns_bad_request_instead_of_panicking() {
+        let error = parse_chat_request(r#"{"message":"   "}"#).unwrap_err();
+        assert_eq!(error.status, 400);
+        assert!(error.message.contains("non-whitespace"));
+    }
+
+    #[test]
+    fn malformed_json_returns_bad_request() {
+        let error = parse_chat_request("not-json").unwrap_err();
+        assert_eq!(error.status, 400);
+    }
+
+    #[test]
+    fn oversized_body_returns_payload_too_large() {
+        let mut body = Cursor::new(vec![b'x'; MAX_CHAT_REQUEST_BYTES + 1]);
+        let error = read_request_body(&mut body).unwrap_err();
+        assert_eq!(error.status, 413);
+    }
+
+    #[test]
+    fn host_and_origin_checks_reject_dns_rebinding() {
+        assert!(is_allowed_host("localhost:8090", 8090));
+        assert!(is_allowed_origin("http://127.0.0.1:8090", 8090));
+        assert!(!is_allowed_host("attacker.example:8090", 8090));
+        assert!(!is_allowed_origin("https://attacker.example", 8090));
+    }
+
+    #[test]
+    fn expensive_request_values_are_clamped() {
+        let request = ChatRequest {
+            message: "hello".to_string(),
+            temperature: Some(100.0),
+            max_tokens: Some(usize::MAX),
+            ponder_strategy: Some("ensemble".to_string()),
+            guidance_scale: Some(100.0),
+            ensemble_n: Some(usize::MAX),
+            noise_sigma: Some(100.0),
+            entropy_threshold: None,
+        };
+        let error = build_ponder(&request).unwrap_err();
+        assert_eq!(error.status, 400);
+    }
+
+    #[test]
+    fn unknown_ponder_strategy_is_rejected() {
+        let error =
+            parse_chat_request(r#"{"message":"hello","ponder_strategy":"typo"}"#).unwrap_err();
+        assert_eq!(error.status, 400);
+        assert!(error.message.contains("ponder_strategy"));
+    }
+
+    #[test]
+    fn invalid_numeric_options_are_rejected() {
+        for body in [
+            r#"{"message":"hello","temperature":0}"#,
+            r#"{"message":"hello","max_tokens":0}"#,
+            r#"{"message":"hello","guidance_scale":5}"#,
+            r#"{"message":"hello","ensemble_n":9}"#,
+            r#"{"message":"hello","noise_sigma":-1}"#,
+            r#"{"message":"hello","entropy_threshold":33}"#,
+        ] {
+            assert_eq!(parse_chat_request(body).unwrap_err().status, 400, "{body}");
+        }
+    }
+
+    #[test]
+    fn over_context_and_out_of_vocabulary_prompts_are_rejected() {
+        let error = validate_prompt_tokens(&[1, 2, 3], 2, 10).unwrap_err();
+        assert_eq!(error.status, 400);
+        assert!(error.message.contains("context window"));
+
+        let error = validate_prompt_tokens(&[1, 10], 2, 10).unwrap_err();
+        assert_eq!(error.status, 400);
+        assert!(error.message.contains("vocabulary"));
+    }
+
+    #[test]
+    fn internal_failures_are_sanitized() {
+        let error = ChatHttpError::internal(r#"failed to open C:\\secret\\model.raimodel"#);
+        assert_eq!(error.status, 500);
+        assert_eq!(error.message, "internal server error");
+    }
+}

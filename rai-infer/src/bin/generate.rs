@@ -4,11 +4,12 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use clap::Parser;
 use rand::SeedableRng;
 use tokenizers::Tokenizer;
 
+use rai_infer::chat_template::ChatTemplate;
 use rai_infer::model::{BatchScratch, InferenceWork, RaiModel};
 use rai_infer::ponder::{pondered_forward, PonderConfig, PonderStrategy};
 use rai_infer::sampler::{apply_repetition_penalty, sample_token, SamplerConfig};
@@ -75,8 +76,12 @@ struct Args {
     self_spec_skip: bool,
 }
 
-fn build_ponder_config(args: &Args) -> PonderConfig {
-    match args.ponder_strategy.as_str() {
+const MAX_ENSEMBLE_SIZE: usize = 8;
+const MAX_SPECULATIVE_TOKENS: usize = 32;
+
+fn build_ponder_config(args: &Args) -> Result<PonderConfig> {
+    validate_args(args)?;
+    Ok(match args.ponder_strategy.as_str() {
         "none" => PonderConfig::none(),
         "cfg" => PonderConfig::cfg(args.guidance_scale),
         "ensemble" => PonderConfig::ensemble(args.ensemble_n, args.noise_sigma),
@@ -84,16 +89,103 @@ fn build_ponder_config(args: &Args) -> PonderConfig {
             PonderConfig::cfg_ensemble(args.guidance_scale, args.ensemble_n, args.noise_sigma)
         }
         "adaptive" => PonderConfig::adaptive(args.guidance_scale, args.entropy_threshold),
-        other => {
-            eprintln!("Warning: unknown strategy '{other}', using 'none'");
-            PonderConfig::none()
-        }
+        _ => unreachable!("ponder strategy was validated"),
+    })
+}
+
+fn validate_args(args: &Args) -> Result<()> {
+    ensure!(!args.prompt.trim().is_empty(), "--prompt must not be empty");
+    ensure!(
+        args.max_tokens > 0,
+        "--max-tokens must be greater than zero"
+    );
+    ensure!(
+        args.max_context > 0,
+        "--max-context must be greater than zero"
+    );
+    validate_f32("--temperature", args.temperature, 0.0, 2.0)?;
+    validate_f32("--top-p", args.top_p, f32::MIN_POSITIVE, 1.0)?;
+    validate_f32("--repetition-penalty", args.repetition_penalty, 0.01, 4.0)?;
+    validate_f32("--guidance-scale", args.guidance_scale, 0.0, 4.0)?;
+    validate_f32("--noise-sigma", args.noise_sigma, 0.0, 1.0)?;
+    validate_f32("--entropy-threshold", args.entropy_threshold, 0.0, 32.0)?;
+    ensure!(
+        matches!(
+            args.ponder_strategy.as_str(),
+            "none" | "cfg" | "ensemble" | "cfg-ensemble" | "adaptive"
+        ),
+        "unknown --ponder-strategy '{}'; expected none, cfg, ensemble, cfg-ensemble, or adaptive",
+        args.ponder_strategy
+    );
+    ensure!(
+        matches!(
+            args.chat_template.as_str(),
+            "auto" | "none" | "few-shot" | "mistral" | "llama3"
+        ),
+        "unknown --chat-template '{}'; expected auto, none, few-shot, mistral, or llama3",
+        args.chat_template
+    );
+    ensure!(
+        (1..=MAX_ENSEMBLE_SIZE).contains(&args.ensemble_n),
+        "--ensemble-n must be between 1 and {MAX_ENSEMBLE_SIZE}"
+    );
+    if matches!(args.ponder_strategy.as_str(), "ensemble" | "cfg-ensemble") {
+        ensure!(
+            args.ensemble_n >= 2,
+            "ensemble strategies require --ensemble-n >= 2"
+        );
     }
+    ensure!(
+        !(args.draft.is_some() && args.self_spec_layers > 0),
+        "--draft and --self-spec-layers cannot be used together"
+    );
+    if args.draft.is_some() {
+        ensure!(
+            (1..=MAX_SPECULATIVE_TOKENS).contains(&args.draft_k),
+            "--draft-k must be between 1 and {MAX_SPECULATIVE_TOKENS}"
+        );
+    }
+    if args.self_spec_layers > 0 {
+        ensure!(
+            (1..=MAX_SPECULATIVE_TOKENS).contains(&args.self_spec_k),
+            "--self-spec-k must be between 1 and {MAX_SPECULATIVE_TOKENS}"
+        );
+    }
+    if args.draft.is_some() || args.self_spec_layers > 0 {
+        ensure!(
+            args.temperature > 1e-6
+                && args.top_k == 0
+                && args.top_p == 1.0
+                && (args.repetition_penalty - 1.0).abs() < f32::EPSILON,
+            "speculative decoding currently requires --temperature > 0, --top-k 0, --top-p 1, and --repetition-penalty 1 so verification uses the exact sampled distribution"
+        );
+    }
+    Ok(())
+}
+
+fn validate_f32(name: &str, value: f32, minimum: f32, maximum: f32) -> Result<()> {
+    ensure!(
+        value.is_finite() && value >= minimum && value <= maximum,
+        "{name} must be a finite number between {minimum} and {maximum}"
+    );
+    Ok(())
+}
+
+fn incremental_suffix<'a>(previous: &str, current: &'a str) -> &'a str {
+    let mut common_bytes = 0usize;
+    for (before, after) in previous.chars().zip(current.chars()) {
+        if before != after {
+            break;
+        }
+        common_bytes += after.len_utf8();
+    }
+    &current[common_bytes..]
 }
 
 fn main() -> Result<()> {
     rai_infer::gemm::configure_thread_pool();
     let args = Args::parse();
+    validate_args(&args)?;
 
     eprintln!("Loading model: {}", args.model.display());
     let t_load = Instant::now();
@@ -118,13 +210,15 @@ fn main() -> Result<()> {
     let tokenizer = Tokenizer::from_file(&args.tokenizer)
         .map_err(|e| anyhow::anyhow!("tokenizer error: {e}"))?;
 
+    let template = ChatTemplate::from_str_arg(&args.chat_template, &tokenizer);
+    let formatted_prompt = template.format_prompt(&args.prompt);
     let encoding = tokenizer
-        .encode(args.prompt.as_str(), false)
+        .encode(formatted_prompt.as_str(), false)
         .map_err(|e| anyhow::anyhow!("encode error: {e}"))?;
     let prompt_tokens: Vec<usize> = encoding.get_ids().iter().map(|&id| id as usize).collect();
     eprintln!("Prompt: {} tokens", prompt_tokens.len());
 
-    let ponder_config = build_ponder_config(&args);
+    let ponder_config = build_ponder_config(&args)?;
     let sampler_config = SamplerConfig {
         temperature: args.temperature,
         top_k: args.top_k,
@@ -133,6 +227,21 @@ fn main() -> Result<()> {
     };
 
     let max_ctx = args.max_context.min(model.config.max_context as usize);
+    ensure!(
+        !prompt_tokens.is_empty(),
+        "prompt produced no tokenizer tokens"
+    );
+    ensure!(
+        prompt_tokens.len() <= max_ctx,
+        "prompt has {} tokens but the context window is {max_ctx}",
+        prompt_tokens.len()
+    );
+    ensure!(
+        prompt_tokens
+            .iter()
+            .all(|&token| token < model.config.vocab_size as usize),
+        "tokenizer produced a token outside the model vocabulary"
+    );
     let kv_bytes = model.kv_cache_bytes(max_ctx);
     eprintln!(
         "KV cache: {:.1} MB (max_ctx={})",
@@ -152,30 +261,33 @@ fn main() -> Result<()> {
             .any(|s| {
                 tokenizer
                     .token_to_id(s)
-                    .map_or(false, |id| tok == id as usize)
+                    .is_some_and(|id| tok == id as usize)
             })
     };
 
     // Helper: print newly generated text with correct spacing
     let print_new_text = |all_tokens: &[usize],
                           prompt_len: usize,
-                          prev_text_len: usize,
-                          tokenizer: &Tokenizer|
-     -> usize {
+                          previous_text: &mut String,
+                          tokenizer: &Tokenizer| {
         let gen_ids: Vec<u32> = all_tokens[prompt_len..].iter().map(|&t| t as u32).collect();
         let full_text = tokenizer.decode(&gen_ids, false).unwrap_or_default();
-        let new_chars = full_text.len().saturating_sub(prev_text_len);
-        if new_chars > 0 {
-            print!("{}", &full_text[full_text.len() - new_chars..]);
+        let suffix = incremental_suffix(previous_text, &full_text);
+        if !suffix.is_empty() {
+            print!("{suffix}");
             let _ = io::stdout().flush();
         }
-        full_text.len()
+        *previous_text = full_text;
     };
 
     if args.self_spec_layers > 0 {
         // === SELF-SPECULATIVE DECODING ===
         let total_layers = model.config.num_layers as usize;
-        let draft_layers = args.self_spec_layers.min(total_layers);
+        ensure!(
+            args.self_spec_layers < total_layers,
+            "--self-spec-layers must be smaller than the model's {total_layers} layers"
+        );
+        let draft_layers = args.self_spec_layers;
 
         let spec_config = if args.self_spec_skip {
             eprintln!(
@@ -214,18 +326,23 @@ fn main() -> Result<()> {
         let mut tokens_generated = 0;
         let mut total_drafted = 0;
         let mut total_accepted = 0;
-        let mut prev_text_len = 0;
+        let mut previous_text = String::new();
 
         while tokens_generated < args.max_tokens && pos < max_ctx {
             let last_token = *all_tokens.last().unwrap();
             let (new_tokens, metrics) =
                 decoder.step(pos, last_token, &spec_config, &all_tokens, &mut rng)?;
+            ensure!(
+                !new_tokens.is_empty(),
+                "self-speculative decoder made no progress"
+            );
 
             total_drafted += metrics.drafted;
             total_accepted += metrics.accepted;
 
             let mut hit_eos = false;
-            for &tok in &new_tokens {
+            let remaining = (max_ctx - pos).min(args.max_tokens - tokens_generated);
+            for &tok in new_tokens.iter().take(remaining) {
                 if is_eos(tok) {
                     hit_eos = true;
                     break;
@@ -238,8 +355,12 @@ fn main() -> Result<()> {
                 }
             }
 
-            prev_text_len =
-                print_new_text(&all_tokens, prompt_tokens.len(), prev_text_len, &tokenizer);
+            print_new_text(
+                &all_tokens,
+                prompt_tokens.len(),
+                &mut previous_text,
+                &tokenizer,
+            );
 
             if args.verbose {
                 eprint!("[self:{}d/{}a]", metrics.drafted, metrics.accepted);
@@ -282,6 +403,12 @@ fn main() -> Result<()> {
         // === SPECULATIVE DECODING ===
         eprintln!("Loading draft model: {}", draft_path.display());
         let draft = RaiModel::load(draft_path).context("loading draft model")?;
+        ensure!(
+            prompt_tokens
+                .iter()
+                .all(|&token| token < draft.config.vocab_size as usize),
+            "tokenizer produced a token outside the draft model vocabulary"
+        );
         eprintln!(
             "Draft: hidden={}, layers={}, {:.1} MB",
             draft.config.hidden_size,
@@ -311,18 +438,23 @@ fn main() -> Result<()> {
         let mut tokens_generated = 0;
         let mut total_drafted = 0;
         let mut total_accepted = 0;
-        let mut prev_text_len = 0;
+        let mut previous_text = String::new();
 
         while tokens_generated < args.max_tokens && pos < max_ctx {
             let last_token = *all_tokens.last().unwrap();
             let (new_tokens, metrics) =
                 decoder.step(pos, last_token, &spec_config, &all_tokens, &mut rng)?;
+            ensure!(
+                !new_tokens.is_empty(),
+                "speculative decoder made no progress"
+            );
 
             total_drafted += metrics.drafted;
             total_accepted += metrics.accepted;
 
             let mut hit_eos = false;
-            for &tok in &new_tokens {
+            let remaining = (max_ctx - pos).min(args.max_tokens - tokens_generated);
+            for &tok in new_tokens.iter().take(remaining) {
                 if is_eos(tok) {
                     hit_eos = true;
                     break;
@@ -335,8 +467,12 @@ fn main() -> Result<()> {
                 }
             }
 
-            prev_text_len =
-                print_new_text(&all_tokens, prompt_tokens.len(), prev_text_len, &tokenizer);
+            print_new_text(
+                &all_tokens,
+                prompt_tokens.len(),
+                &mut previous_text,
+                &tokenizer,
+            );
 
             if args.verbose {
                 eprint!("[spec:{}d/{}a]", metrics.drafted, metrics.accepted);
@@ -424,7 +560,7 @@ fn main() -> Result<()> {
         let mut tokens_generated = 0;
         let mut total_passes = 0;
         let mut hard_tokens = 0;
-        let mut prev_text_len = 0;
+        let mut previous_text = String::new();
 
         for _ in 0..args.max_tokens {
             if pos >= max_ctx {
@@ -467,8 +603,12 @@ fn main() -> Result<()> {
             all_tokens.push(next_token);
             pos += 1;
             tokens_generated += 1;
-            prev_text_len =
-                print_new_text(&all_tokens, prompt_tokens.len(), prev_text_len, &tokenizer);
+            print_new_text(
+                &all_tokens,
+                prompt_tokens.len(),
+                &mut previous_text,
+                &tokenizer,
+            );
         }
 
         let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
@@ -492,4 +632,74 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_args() -> Args {
+        Args {
+            model: PathBuf::from("model.raimodel"),
+            tokenizer: PathBuf::from("tokenizer.json"),
+            prompt: "hello".to_string(),
+            max_tokens: 16,
+            temperature: 0.7,
+            top_k: 40,
+            top_p: 0.9,
+            repetition_penalty: 1.1,
+            ponder_strategy: "none".to_string(),
+            guidance_scale: 1.5,
+            ensemble_n: 3,
+            noise_sigma: 0.05,
+            entropy_threshold: 3.0,
+            max_context: 512,
+            seed: 42,
+            verbose: false,
+            chat_template: "none".to_string(),
+            draft: None,
+            draft_k: 6,
+            self_spec_layers: 0,
+            self_spec_k: 8,
+            self_spec_skip: false,
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_and_non_finite_options() {
+        let mut args = valid_args();
+        args.ponder_strategy = "typo".to_string();
+        assert!(validate_args(&args).is_err());
+
+        let mut args = valid_args();
+        args.temperature = f32::NAN;
+        assert!(validate_args(&args).is_err());
+
+        let mut args = valid_args();
+        args.repetition_penalty = 0.0;
+        assert!(validate_args(&args).is_err());
+    }
+
+    #[test]
+    fn speculative_mode_rejects_zero_k_and_filtered_sampling() {
+        let mut args = valid_args();
+        args.draft = Some(PathBuf::from("draft.raimodel"));
+        args.draft_k = 0;
+        assert!(validate_args(&args).is_err());
+
+        args.draft_k = 4;
+        assert!(validate_args(&args).is_err());
+
+        args.top_k = 0;
+        args.top_p = 1.0;
+        args.repetition_penalty = 1.0;
+        assert!(validate_args(&args).is_ok());
+    }
+
+    #[test]
+    fn incremental_unicode_suffix_is_always_on_a_character_boundary() {
+        assert_eq!(incremental_suffix("é", "é🙂"), "🙂");
+        assert_eq!(incremental_suffix("é", "a🙂"), "a🙂");
+        assert_eq!(incremental_suffix("same", "same"), "");
+    }
 }

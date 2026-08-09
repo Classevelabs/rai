@@ -9,11 +9,28 @@ Usage:
   PYTHONUNBUFFERED=1 python3 export_rtn.py --model mistralai/Mistral-7B-Instruct-v0.3
 """
 
-import argparse, struct, time, sys, shutil
+import argparse, struct, time, sys, shutil, tempfile
 from pathlib import Path
 import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+MIN_F16_SCALE = float(np.nextafter(np.float16(0), np.float16(1)))
+
+
+def validate_export_options(parser, args):
+    if args.bits != 4:
+        parser.error("--bits must be 4; the .raimodel reader supports only 4-bit weights")
+    if args.group_size < 2 or args.group_size > 254 or args.group_size % 2:
+        parser.error("--group-size must be an even integer in 2..=254")
+    if not 1 <= args.max_context <= 1_000_000:
+        parser.error("--max-context must be in 1..=1000000")
+
+
+def validate_f16_params(scale, zero_point, label):
+    if (not np.isfinite(scale).all() or not np.isfinite(zero_point).all()
+            or np.any(scale <= 0)):
+        raise ValueError(f"{label} produced non-finite or non-positive FP16 quantization parameters")
 
 
 def rtn_quantize(weight_np, bits=4, group_size=128):
@@ -33,10 +50,11 @@ def rtn_quantize(weight_np, bits=4, group_size=128):
 
         row_min = group.min(axis=1)
         row_max = group.max(axis=1)
-        scale = np.maximum((row_max - row_min) / (n_levels - 1), 1e-10)
+        scale = np.maximum((row_max - row_min) / (n_levels - 1), MIN_F16_SCALE)
 
         sf16 = scale.astype(np.float16)
         zf16 = row_min.astype(np.float16)
+        validate_f16_params(sf16, zf16, "RTN group")
         scales_f16[:, gid] = sf16
         zeros_f16[:, gid] = zf16
 
@@ -73,9 +91,10 @@ def quantize_embedding_8bit(weight_np, group_size=64):
         group = weight_np[:, c_start:c_end].astype(np.float64)
         row_min = group.min(axis=1)
         row_max = group.max(axis=1)
-        scale = np.maximum((row_max - row_min) / 255.0, 1e-10)
+        scale = np.maximum((row_max - row_min) / 255.0, MIN_F16_SCALE)
         sf16 = scale.astype(np.float16)
         zf16 = row_min.astype(np.float16)
+        validate_f16_params(sf16, zf16, "embedding group")
         scales[:, gid] = sf16
         zeros[:, gid] = zf16
         s64 = sf16.astype(np.float64)
@@ -136,6 +155,7 @@ def main():
     parser.add_argument('--group-size', type=int, default=128)
     parser.add_argument('--max-context', type=int, default=2048)
     args = parser.parse_args()
+    validate_export_options(parser, args)
 
     if args.output is None:
         args.output = f"{args.model.split('/')[-1].lower()}-q{args.bits}.raimodel"
@@ -147,6 +167,10 @@ def main():
     t0 = time.time()
     model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float16, device_map=device)
     tokenizer = AutoTokenizer.from_pretrained(args.model)
+    if not tokenizer.is_fast:
+        raise RuntimeError(
+            "this exporter requires a fast tokenizer that can emit tokenizer.json"
+        )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     model.eval()
@@ -287,12 +311,15 @@ def main():
     print(f"\nWrote: {outpath} ({sz/1e6:.1f} MB)"); sys.stdout.flush()
 
     # Tokenizer
-    tokenizer.save_pretrained("/tmp/rai_tok")
-    ts = Path("/tmp/rai_tok/tokenizer.json")
     td = outpath.parent / "tokenizer.json"
-    if ts.exists():
-        shutil.copy2(ts, td)
-        print(f"Tokenizer: {td}")
+    with tempfile.TemporaryDirectory(prefix="rai_tokenizer_") as tmp_dir:
+        tokenizer.save_pretrained(tmp_dir)
+        ts = Path(tmp_dir) / "tokenizer.json"
+        if ts.exists():
+            shutil.copy2(ts, td)
+            print(f"Tokenizer: {td}")
+        else:
+            raise RuntimeError("tokenizer export did not produce the required tokenizer.json")
 
     total = time.time() - t_start
     print(f"\n=== DONE in {total:.1f}s ({total/60:.1f} min) ===")

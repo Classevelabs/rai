@@ -1,3 +1,4 @@
+use crate::RaiError;
 use nalgebra::{DMatrix, DVector};
 use rand::Rng;
 use rand_distr::StandardNormal;
@@ -33,14 +34,31 @@ impl Projection {
     }
 
     /// Learn a PCA-based projection from a set of embeddings.
-    pub fn from_pca(embeddings: &[Vec<f64>], target_dim: usize) -> Self {
+    pub fn from_pca(embeddings: &[Vec<f64>], target_dim: usize) -> Result<Self, RaiError> {
+        let Some(first) = embeddings.first() else {
+            return Err(RaiError::InvalidInput(
+                "PCA requires at least one embedding".into(),
+            ));
+        };
         let n = embeddings.len();
-        let source_dim = embeddings[0].len();
+        let source_dim = first.len();
+        if target_dim == 0
+            || source_dim == 0
+            || source_dim > 4_096
+            || embeddings.len() > 100_000
+            || embeddings.iter().any(|embedding| {
+                embedding.len() != source_dim || embedding.iter().any(|value| !value.is_finite())
+            })
+        {
+            return Err(RaiError::InvalidInput(
+                "PCA embedding dimensions or values are invalid".into(),
+            ));
+        }
 
-        if n < target_dim || source_dim < target_dim {
+        if n < 2 || n < target_dim || source_dim < target_dim {
             // Not enough data for PCA, fall back to random
             let mut rng = rand::thread_rng();
-            return Self::random_gaussian(source_dim, target_dim, &mut rng);
+            return Ok(Self::random_gaussian(source_dim, target_dim, &mut rng));
         }
 
         // Center the data
@@ -77,11 +95,11 @@ impl Projection {
             }
         }
 
-        Self {
+        Ok(Self {
             matrix,
             source_dim,
             target_dim,
-        }
+        })
     }
 
     /// Project an embedding vector to target dimension.
@@ -98,6 +116,18 @@ impl Projection {
             result /= norm;
         }
         result
+    }
+
+    /// Validate serialized metadata against the actual matrix payload.
+    pub(crate) fn validate_shape(&self) -> bool {
+        self.source_dim > 0
+            && self.target_dim > 0
+            && self.matrix.nrows() == self.target_dim
+            && self.matrix.ncols() == self.source_dim
+            && self
+                .matrix
+                .iter()
+                .all(|value| value.is_finite() && value.abs() <= 1.0e100)
     }
 }
 
@@ -128,7 +158,7 @@ mod tests {
                     .collect()
             })
             .collect();
-        let proj = Projection::from_pca(&embeddings, 8);
+        let proj = Projection::from_pca(&embeddings, 8).unwrap();
         assert_eq!(proj.target_dim, 8);
         assert_eq!(proj.source_dim, 64);
 

@@ -1,4 +1,33 @@
-use crate::bitpack::BitPacker;
+use crate::bitpack::{BitPackError, BitPacker};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuantizeError {
+    InvalidRepresentation(&'static str),
+    BitPack(BitPackError),
+    NumericalFailure,
+}
+
+impl std::fmt::Display for QuantizeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidRepresentation(message) => {
+                write!(formatter, "invalid quantized block: {message}")
+            }
+            Self::BitPack(error) => write!(formatter, "{error}"),
+            Self::NumericalFailure => {
+                formatter.write_str("dequantization produced a non-finite value")
+            }
+        }
+    }
+}
+
+impl std::error::Error for QuantizeError {}
+
+impl From<BitPackError> for QuantizeError {
+    fn from(error: BitPackError) -> Self {
+        Self::BitPack(error)
+    }
+}
 
 /// Quantization parameters for a block of residual values.
 #[derive(Debug, Clone)]
@@ -25,6 +54,11 @@ pub struct QuantizedBlock {
 /// the range is much smaller → same bits give better precision.
 pub fn quantize_uniform(values: &[f64], bits: u8) -> QuantizedBlock {
     assert!(bits > 0 && bits <= 8);
+    assert!(!values.is_empty(), "cannot quantize an empty block");
+    assert!(
+        values.iter().all(|value| value.is_finite()),
+        "quantization values must be finite"
+    );
     let levels = (1u32 << bits) as f64;
 
     let min = values.iter().cloned().fold(f64::INFINITY, f64::min);
@@ -57,12 +91,31 @@ pub fn quantize_uniform(values: &[f64], bits: u8) -> QuantizedBlock {
 }
 
 /// Dequantize a block back to floats.
-pub fn dequantize(block: &QuantizedBlock) -> Vec<f64> {
-    let values = block.packed.unpack();
-    values
+pub fn dequantize(block: &QuantizedBlock) -> Result<Vec<f64>, QuantizeError> {
+    if block.params.bits != block.packed.bits_per_value {
+        return Err(QuantizeError::InvalidRepresentation(
+            "bit width metadata mismatch",
+        ));
+    }
+    if !block.params.scale.is_finite() || block.params.scale <= 0.0 {
+        return Err(QuantizeError::InvalidRepresentation(
+            "scale must be finite and positive",
+        ));
+    }
+    if !block.params.zero_point.is_finite() {
+        return Err(QuantizeError::InvalidRepresentation(
+            "zero point must be finite",
+        ));
+    }
+    let values = block.packed.unpack()?;
+    let decoded: Vec<f64> = values
         .iter()
         .map(|&q| q as f64 * block.params.scale + block.params.zero_point)
-        .collect()
+        .collect();
+    if decoded.iter().any(|value| !value.is_finite()) {
+        return Err(QuantizeError::NumericalFailure);
+    }
+    Ok(decoded)
 }
 
 /// Adaptive quantization: choose bits per block based on residual magnitude.
@@ -78,6 +131,18 @@ pub fn dequantize(block: &QuantizedBlock) -> Vec<f64> {
 /// `abs_tol` is the maximum acceptable quantization error per element.
 /// For LLM weights, typical values: 0.001 to 0.01.
 pub fn choose_bits(residual_block: &[f64], abs_tol: f64) -> u8 {
+    assert!(
+        !residual_block.is_empty(),
+        "cannot choose bits for an empty block"
+    );
+    assert!(
+        residual_block.iter().all(|value| value.is_finite()),
+        "residual values must be finite"
+    );
+    assert!(
+        abs_tol.is_finite() && abs_tol > 0.0,
+        "absolute tolerance must be finite and positive"
+    );
     let min = residual_block.iter().cloned().fold(f64::INFINITY, f64::min);
     let max = residual_block
         .iter()
@@ -94,103 +159,7 @@ pub fn choose_bits(residual_block: &[f64], abs_tol: f64) -> u8 {
     // This gives enough quantization levels to cover the range with abs_tol precision
     let bits_needed = (range / abs_tol).log2().ceil() as i32;
 
-    (bits_needed.max(1).min(8)) as u8
-}
-
-/// Non-uniform quantization using learned centroids.
-///
-/// Instead of uniform grid, use k-means to find optimal quantization points.
-/// This is like NRA attractors — each centroid is a "stable point" that
-/// nearby values snap to.
-pub fn quantize_kmeans(values: &[f64], bits: u8, max_iter: usize) -> QuantizedBlock {
-    let k = 1usize << bits;
-    if values.is_empty() || k == 0 {
-        return quantize_uniform(values, bits);
-    }
-
-    // Initialize centroids uniformly across range
-    let min = values.iter().cloned().fold(f64::INFINITY, f64::min);
-    let max = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-
-    if (max - min).abs() < 1e-15 {
-        return quantize_uniform(values, bits);
-    }
-
-    let mut centroids: Vec<f64> = (0..k)
-        .map(|i| min + (max - min) * (i as f64 + 0.5) / k as f64)
-        .collect();
-
-    // K-means iterations
-    for _ in 0..max_iter {
-        // Assign each value to nearest centroid
-        let assignments: Vec<usize> = values
-            .iter()
-            .map(|&v| {
-                centroids
-                    .iter()
-                    .enumerate()
-                    .min_by(|(_, a), (_, b)| (v - *a).abs().partial_cmp(&(v - *b).abs()).unwrap())
-                    .unwrap()
-                    .0
-            })
-            .collect();
-
-        // Update centroids
-        let mut sums = vec![0.0f64; k];
-        let mut counts = vec![0usize; k];
-        for (&v, &a) in values.iter().zip(assignments.iter()) {
-            sums[a] += v;
-            counts[a] += 1;
-        }
-        let mut changed = false;
-        for i in 0..k {
-            if counts[i] > 0 {
-                let new_c = sums[i] / counts[i] as f64;
-                if (new_c - centroids[i]).abs() > 1e-10 {
-                    changed = true;
-                }
-                centroids[i] = new_c;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-
-    // Sort centroids for consistent encoding
-    centroids.sort_by(|a, b| a.partial_cmp(b).unwrap());
-
-    // Quantize: assign to nearest centroid
-    let quantized: Vec<u32> = values
-        .iter()
-        .map(|&v| {
-            centroids
-                .iter()
-                .enumerate()
-                .min_by(|(_, a), (_, b)| (v - *a).abs().partial_cmp(&(v - *b).abs()).unwrap())
-                .unwrap()
-                .0 as u32
-        })
-        .collect();
-
-    // Store centroids as scale/zero_point approximation
-    // For full k-means decode, we'd store the centroid table separately
-    // Here we use a lookup approach
-    let scale = if centroids.len() >= 2 {
-        (centroids.last().unwrap() - centroids[0]) / (k as f64 - 1.0)
-    } else {
-        1.0
-    };
-    let zero_point = centroids[0];
-
-    QuantizedBlock {
-        params: BlockParams {
-            scale,
-            zero_point,
-            bits,
-        },
-        packed: BitPacker::pack(&quantized, bits),
-    }
+    bits_needed.clamp(1, 8) as u8
 }
 
 #[cfg(test)]
@@ -201,7 +170,7 @@ mod tests {
     fn uniform_roundtrip_4bit() {
         let values: Vec<f64> = (0..64).map(|i| (i as f64 - 32.0) * 0.1).collect();
         let block = quantize_uniform(&values, 4);
-        let recovered = dequantize(&block);
+        let recovered = dequantize(&block).unwrap();
 
         let mse: f64 = values
             .iter()

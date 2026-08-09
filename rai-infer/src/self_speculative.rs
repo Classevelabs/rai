@@ -1,12 +1,14 @@
 //! Self-speculative decoding: use the model's own first N layers as a fast draft.
 //!
-//! No separate draft model needed — the same tokenizer is guaranteed.
-//! Draft: first N layers (~N/32 of model bandwidth) → fast token proposals.
-//! Verify: all 32 layers via batched GEMM (read weights once for K tokens) → exact quality.
-//!
-//! Expected speedup: 2-4× over standard decode, depending on draft quality.
+//! No separate draft model is needed because the target model proposes its own drafts.
+//! This path is experimental. Exact sampling requires unfiltered positive-temperature
+//! softmax; unsupported sampler configurations are rejected.
 
-use anyhow::Result;
+// Draft/verification loops intentionally index parallel token, probability, logit, and cache
+// sequences. Explicit counters keep acceptance positions aligned with KV-cache positions.
+#![allow(clippy::explicit_counter_loop, clippy::needless_range_loop)]
+
+use anyhow::{ensure, Result};
 use rand::Rng;
 
 use crate::kv_cache::KVCache;
@@ -27,6 +29,11 @@ pub struct SelfSpecConfig {
 impl SelfSpecConfig {
     /// Create config using first N layers (simple early exit).
     pub fn early_exit(num_layers: usize, draft_k: usize, sampler: SamplerConfig) -> Self {
+        assert!(
+            num_layers > 0,
+            "self-speculative draft must use at least one layer"
+        );
+        assert!(draft_k > 0, "self-speculative draft_k must be non-zero");
         Self {
             draft_layer_indices: (0..num_layers).collect(),
             draft_k,
@@ -42,6 +49,12 @@ impl SelfSpecConfig {
         draft_k: usize,
         sampler: SamplerConfig,
     ) -> Self {
+        assert!(total_layers > 0, "model must contain at least one layer");
+        assert!(
+            num_draft_layers > 0 && num_draft_layers <= total_layers,
+            "draft layer count must be within the model"
+        );
+        assert!(draft_k > 0, "self-speculative draft_k must be non-zero");
         let stride = total_layers / num_draft_layers.max(1);
         let mut indices: Vec<usize> = (0..total_layers).step_by(stride.max(1)).collect();
         // Always include the last layer
@@ -76,11 +89,13 @@ pub struct SelfSpecDecoder<'a> {
     verify_hiddens: Vec<f32>,
     verify_normed: Vec<f32>,
     verify_logits: Vec<f32>,
+    max_ctx: usize,
 }
 
 impl<'a> SelfSpecDecoder<'a> {
     pub fn new(model: &'a RaiModel, max_ctx: usize) -> Self {
         let ctx = max_ctx.min(model.config.max_context as usize);
+        assert!(ctx > 0, "self-speculative context must be non-zero");
         let hs = model.config.hidden_size as usize;
         let vs = model.config.vocab_size as usize;
         Self {
@@ -92,19 +107,24 @@ impl<'a> SelfSpecDecoder<'a> {
             verify_hiddens: Vec::new(),
             verify_normed: Vec::new(),
             verify_logits: vec![0.0; vs],
+            max_ctx: ctx,
         }
     }
 
-    /// Prefill the full model with prompt tokens using standard forward.
+    /// Prefill all prompt tokens except the final token, which the first decode step consumes.
     pub fn prefill(&mut self, prompt_tokens: &[usize]) -> Result<usize> {
         let hs = self.model.config.hidden_size as usize;
-        let max_ctx = self.model.config.max_context as usize;
+        ensure!(
+            !prompt_tokens.is_empty(),
+            "prompt must contain at least one token"
+        );
+        ensure!(
+            prompt_tokens.len() <= self.max_ctx,
+            "prompt exceeds the self-speculative context window"
+        );
         let mut pos = 0;
 
-        for &token_id in prompt_tokens {
-            if pos >= max_ctx {
-                break;
-            }
+        for &token_id in &prompt_tokens[..prompt_tokens.len() - 1] {
             self.draft_hidden.resize(hs, 0.0);
             self.model.embed_token(token_id, &mut self.draft_hidden)?;
             self.model.forward_from_hidden(
@@ -134,8 +154,69 @@ impl<'a> SelfSpecDecoder<'a> {
     ) -> Result<(Vec<usize>, SelfSpecMetrics)> {
         let hs = self.model.config.hidden_size as usize;
         let vs = self.model.config.vocab_size as usize;
-        let max_ctx = self.model.config.max_context as usize;
-        let k = config.draft_k;
+        ensure!(
+            pos < self.max_ctx,
+            "decode position exceeds the context window"
+        );
+        ensure!(
+            config.draft_k > 0,
+            "self-speculative draft_k must be non-zero"
+        );
+        ensure!(
+            config.sampler.temperature.is_finite()
+                && config.sampler.temperature > 1e-6
+                && config.sampler.top_k == 0
+                && config.sampler.top_p == 1.0
+                && config.sampler.repetition_penalty == 1.0,
+            "self-speculative decoding requires finite temperature > 0, top_k=0, top_p=1, and repetition_penalty=1"
+        );
+        ensure!(
+            !config.draft_layer_indices.is_empty()
+                && config
+                    .draft_layer_indices
+                    .iter()
+                    .all(|&layer| layer < self.model.config.num_layers as usize),
+            "self-speculative draft layers are invalid"
+        );
+        // Keep one verification position for the last drafted token. At the final context
+        // position there is no draft budget, so fall back to one exact target-model step.
+        let k = config
+            .draft_k
+            .min(self.max_ctx.saturating_sub(pos).saturating_sub(1));
+
+        if k == 0 {
+            self.draft_hidden.resize(hs, 0.0);
+            self.model.embed_token(last_token, &mut self.draft_hidden)?;
+            self.model.forward_from_hidden(
+                &mut self.draft_hidden,
+                pos,
+                &mut self.kv_cache,
+                true,
+                &mut self.draft_scratch,
+            )?;
+            self.draft_scratch.normed.resize(hs, 0.0);
+            self.verify_logits.resize(vs, 0.0);
+            self.model.hidden_to_logits_into(
+                &self.draft_hidden,
+                &mut self.draft_scratch.normed,
+                &mut self.verify_logits,
+            )?;
+            apply_repetition_penalty(
+                &mut self.verify_logits,
+                all_tokens,
+                config.sampler.repetition_penalty,
+            );
+            let token = sample_token(&mut self.verify_logits, &config.sampler, rng);
+            return Ok((
+                vec![token],
+                SelfSpecMetrics {
+                    accepted: 0,
+                    drafted: 0,
+                    produced: 1,
+                    accept_rate: 0.0,
+                },
+            ));
+        }
 
         // ================================================================
         // Phase 1: Draft K tokens using first N layers
@@ -146,10 +227,6 @@ impl<'a> SelfSpecDecoder<'a> {
         let mut draft_pos = pos;
 
         for _ in 0..k {
-            if draft_pos >= max_ctx {
-                break;
-            }
-
             // Embed + partial forward (selected draft layers)
             self.draft_hidden.resize(hs, 0.0);
             self.model
@@ -277,9 +354,9 @@ impl<'a> SelfSpecDecoder<'a> {
                 softmax_prob_of(target_logits_i, draft_token, config.sampler.temperature);
             let p_draft = draft_probs[i].1;
 
-            let accept_prob = if p_draft > 1e-10 {
+            let accept_prob = if p_draft > 0.0 {
                 (p_target / p_draft).min(1.0)
-            } else if p_target > 1e-10 {
+            } else if p_target > 0.0 {
                 1.0
             } else {
                 0.0
@@ -357,6 +434,9 @@ fn sample_correction(
     rng: &mut impl Rng,
 ) -> usize {
     let n = target_logits.len().min(draft_logits.len());
+    if n == 0 {
+        return 0;
+    }
     let temp = config.temperature.max(1e-6);
 
     let max_t = target_logits
@@ -373,25 +453,25 @@ fn sample_correction(
         .sum();
     let sum_d: f32 = draft_logits.iter().map(|&l| (l / temp - max_d).exp()).sum();
 
-    let mut adj_sum = 0.0f32;
+    let mut adj_sum = 0.0f64;
     let mut adjusted = vec![0.0f32; n];
     for i in 0..n {
         let p_t = (target_logits[i] / temp - max_t).exp() / sum_t;
         let p_d = (draft_logits[i] / temp - max_d).exp() / sum_d;
         let diff = (p_t - p_d).max(0.0);
         adjusted[i] = diff;
-        adj_sum += diff;
+        adj_sum += f64::from(diff);
     }
 
-    if adj_sum < 1e-10 {
+    if !adj_sum.is_finite() || adj_sum <= 0.0 {
         let mut logits_copy = target_logits.to_vec();
         return sample_token(&mut logits_copy, config, rng);
     }
 
-    let u: f32 = rng.gen::<f32>() * adj_sum;
-    let mut cumsum = 0.0f32;
+    let u: f64 = rng.gen::<f64>() * adj_sum;
+    let mut cumsum = 0.0f64;
     for i in 0..n {
-        cumsum += adjusted[i];
+        cumsum += f64::from(adjusted[i]);
         if cumsum >= u {
             return i;
         }
