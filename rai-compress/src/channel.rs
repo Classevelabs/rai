@@ -1,29 +1,16 @@
 use nalgebra::DMatrix;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ChannelError {
+    #[error("invalid channel input: {0}")]
     InvalidInput(&'static str),
+    #[error("invalid channel representation: {0}")]
     InvalidRepresentation(&'static str),
+    #[error("channel dimensions overflow")]
     SizeOverflow,
+    #[error("channel operation produced non-finite values")]
     NumericalFailure,
 }
-
-impl std::fmt::Display for ChannelError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidInput(message) => write!(formatter, "invalid channel input: {message}"),
-            Self::InvalidRepresentation(message) => {
-                write!(formatter, "invalid channel representation: {message}")
-            }
-            Self::SizeOverflow => formatter.write_str("channel dimensions overflow"),
-            Self::NumericalFailure => {
-                formatter.write_str("channel operation produced non-finite values")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ChannelError {}
 
 /// Per-channel (per-row) normalization.
 ///
@@ -32,7 +19,7 @@ impl std::error::Error for ChannelError {}
 /// magnitudes than others, and removing this before SVD lets the
 /// SVD focus on the actual correlation structure.
 ///
-/// Cost: 2 values per row (mean + scale) = 16 bits/row = negligible.
+/// Cost: 2 values per row (mean + scale) at FP16 = 32 bits/row = negligible.
 #[derive(Debug, Clone)]
 pub struct ChannelNorm {
     /// Per-row means.
@@ -117,7 +104,9 @@ impl ChannelNorm {
         self.rows.checked_mul(4).ok_or(ChannelError::SizeOverflow)
     }
 
-    fn validate(&self) -> Result<(), ChannelError> {
+    /// Check internal consistency of the normalization metadata (shape,
+    /// parameter lengths, finiteness, positive scales).
+    pub(crate) fn validate(&self) -> Result<(), ChannelError> {
         if self.rows == 0 || self.cols == 0 {
             return Err(ChannelError::InvalidRepresentation(
                 "matrix shape must be non-zero",

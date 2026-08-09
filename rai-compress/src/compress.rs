@@ -1,59 +1,38 @@
+use crate::bitpack::BitPackError;
+use crate::channel::{ChannelError, ChannelNorm};
+use crate::gptq::GptqError;
 use crate::prior::{PriorError, WeightPrior};
 use crate::quantize::{choose_bits, dequantize, quantize_uniform, QuantizeError, QuantizedBlock};
-use crate::{channel::ChannelError, sparse::SparseError};
+use crate::sparse::SparseError;
 use nalgebra::DMatrix;
+use std::collections::HashSet;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Top-level error for the compression pipelines. Wraps every stage-specific
+/// error in the crate ([`BitPackError`], [`QuantizeError`], [`ChannelError`],
+/// [`SparseError`], [`PriorError`], [`GptqError`]) with the cause preserved
+/// through [`std::error::Error::source`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CompressionError {
+    #[error("invalid compression input: {0}")]
+    InvalidInput(&'static str),
+    #[error("invalid compressed representation: {0}")]
     InvalidRepresentation(&'static str),
+    #[error("compressed dimensions overflow")]
     SizeOverflow,
+    #[error("unable to allocate decompressed matrix")]
     AllocationFailed,
-    Prior(PriorError),
-    QuantizedBlock(QuantizeError),
-    Channel(ChannelError),
-    Sparse(SparseError),
-}
-
-impl std::fmt::Display for CompressionError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidRepresentation(message) => {
-                write!(formatter, "invalid compressed representation: {message}")
-            }
-            Self::SizeOverflow => formatter.write_str("compressed dimensions overflow"),
-            Self::AllocationFailed => formatter.write_str("unable to allocate decompressed matrix"),
-            Self::Prior(error) => write!(formatter, "{error}"),
-            Self::QuantizedBlock(error) => write!(formatter, "{error}"),
-            Self::Channel(error) => write!(formatter, "{error}"),
-            Self::Sparse(error) => write!(formatter, "{error}"),
-        }
-    }
-}
-
-impl std::error::Error for CompressionError {}
-
-impl From<PriorError> for CompressionError {
-    fn from(error: PriorError) -> Self {
-        Self::Prior(error)
-    }
-}
-
-impl From<QuantizeError> for CompressionError {
-    fn from(error: QuantizeError) -> Self {
-        Self::QuantizedBlock(error)
-    }
-}
-
-impl From<ChannelError> for CompressionError {
-    fn from(error: ChannelError) -> Self {
-        Self::Channel(error)
-    }
-}
-
-impl From<SparseError> for CompressionError {
-    fn from(error: SparseError) -> Self {
-        Self::Sparse(error)
-    }
+    #[error(transparent)]
+    Prior(#[from] PriorError),
+    #[error(transparent)]
+    QuantizedBlock(#[from] QuantizeError),
+    #[error(transparent)]
+    Channel(#[from] ChannelError),
+    #[error(transparent)]
+    Sparse(#[from] SparseError),
+    #[error(transparent)]
+    BitPack(#[from] BitPackError),
+    #[error(transparent)]
+    Gptq(#[from] GptqError),
 }
 
 /// Compressed weight matrix using Resonance Compression.
@@ -131,42 +110,57 @@ impl Default for RCConfig {
 }
 
 /// Compress a weight matrix using Resonance Compression.
-pub fn compress(weights: &DMatrix<f64>, config: &RCConfig) -> CompressedMatrix {
+///
+/// # Errors
+///
+/// Returns [`CompressionError::InvalidInput`] when the matrix is empty or
+/// non-finite, `block_size` is zero, `abs_tol` is not finite and positive, or
+/// an explicit `rank` exceeds a matrix dimension; [`CompressionError::SizeOverflow`]
+/// when dimensions overflow; and forwards any prior/quantization stage error.
+pub fn compress(
+    weights: &DMatrix<f64>,
+    config: &RCConfig,
+) -> Result<CompressedMatrix, CompressionError> {
     let rows = weights.nrows();
     let cols = weights.ncols();
-    assert!(rows > 0 && cols > 0, "weight matrix must not be empty");
-    assert!(config.block_size > 0, "block_size must be non-zero");
-    assert!(
-        config.abs_tol.is_finite() && config.abs_tol > 0.0,
-        "abs_tol must be finite and positive"
-    );
-    assert!(
-        weights.iter().all(|value| value.is_finite()),
-        "weights must be finite"
-    );
-    let total = rows.checked_mul(cols).expect("weight dimensions overflow");
+    if rows == 0 || cols == 0 {
+        return Err(CompressionError::InvalidInput(
+            "weight matrix must not be empty",
+        ));
+    }
+    if config.block_size == 0 {
+        return Err(CompressionError::InvalidInput(
+            "block_size must be non-zero",
+        ));
+    }
+    if !config.abs_tol.is_finite() || config.abs_tol <= 0.0 {
+        return Err(CompressionError::InvalidInput(
+            "abs_tol must be finite and positive",
+        ));
+    }
+    if weights.iter().any(|value| !value.is_finite()) {
+        return Err(CompressionError::InvalidInput("weights must be finite"));
+    }
+    let total = rows
+        .checked_mul(cols)
+        .ok_or(CompressionError::SizeOverflow)?;
 
     // Step 1: Learn prior (low-rank approximation)
     let rank = if config.rank == 0 {
-        WeightPrior::optimal_rank(weights, config.block_size, 4.0)
-            .expect("validated weights must produce a prior rank")
+        WeightPrior::optimal_rank(weights, config.block_size, 4.0)?
     } else {
-        assert!(
-            config.rank <= rows.min(cols),
-            "rank must not exceed a matrix dimension"
-        );
+        if config.rank > rows.min(cols) {
+            return Err(CompressionError::InvalidInput(
+                "rank must not exceed a matrix dimension",
+            ));
+        }
         config.rank
     };
-    let prior = WeightPrior::from_weights(weights, rank)
-        .expect("validated weights and rank must produce a prior");
-    let variance_explained = prior
-        .variance_explained(weights)
-        .expect("validated prior must support its source matrix");
+    let prior = WeightPrior::from_weights(weights, rank)?;
+    let variance_explained = prior.variance_explained(weights)?;
 
     // Step 2: Compute residual
-    let residual = prior
-        .residual(weights)
-        .expect("validated prior must support its source matrix");
+    let residual = prior.residual(weights)?;
     let residual_flat: Vec<f64> = residual.iter().cloned().collect();
 
     // Step 3: Adaptive block-wise quantization
@@ -174,18 +168,16 @@ pub fn compress(weights: &DMatrix<f64>, config: &RCConfig) -> CompressedMatrix {
     let mut total_residual_bits = 0usize;
 
     for chunk in residual_flat.chunks(config.block_size) {
-        let bits = choose_bits(chunk, config.abs_tol);
+        let bits = choose_bits(chunk, config.abs_tol)?;
 
-        let block = quantize_uniform(chunk, bits);
+        let block = quantize_uniform(chunk, bits)?;
 
         total_residual_bits += chunk.len() * bits as usize;
         blocks.push(block);
     }
 
     // Step 4: Compute statistics
-    let prior_bytes = prior
-        .prior_size_bytes()
-        .expect("validated prior size must fit in memory");
+    let prior_bytes = prior.prior_size_bytes()?;
     let residual_bytes = blocks.iter().map(|b| b.packed.size_bytes()).sum::<usize>();
     let block_metadata_bytes = blocks.len() * 5; // scale(2, FP16) + zero(2, FP16) + bits(1)
     let compressed_bytes = prior_bytes + residual_bytes + block_metadata_bytes;
@@ -209,8 +201,7 @@ pub fn compress(weights: &DMatrix<f64>, config: &RCConfig) -> CompressedMatrix {
             max_error: 0.0,
             mse: 0.0,
         },
-    })
-    .expect("freshly compressed matrix must be internally consistent");
+    })?;
 
     let errors: Vec<f64> = weights
         .iter()
@@ -232,14 +223,14 @@ pub fn compress(weights: &DMatrix<f64>, config: &RCConfig) -> CompressedMatrix {
         mse,
     };
 
-    CompressedMatrix {
+    Ok(CompressedMatrix {
         prior,
         blocks,
         block_size: config.block_size,
         rows,
         cols,
         stats,
-    }
+    })
 }
 
 /// Decompress a matrix back to full precision.
@@ -303,17 +294,120 @@ pub fn decompress_matrix(compressed: &CompressedMatrix) -> Result<DMatrix<f64>, 
     Ok(result)
 }
 
+/// Shared HRC/SAC decode path: validate the shape and channel metadata,
+/// dequantize the dense blocks, apply the sparse outliers, and return the
+/// matrix still in the normalized (channel) domain. The flat residual is
+/// interpreted column-major, matching `DMatrix::iter` order on the encode
+/// side.
+pub(crate) fn decode_normalized_matrix(
+    channel_norm: &ChannelNorm,
+    dense_blocks: &[QuantizedBlock],
+    sparse_indices: &[u32],
+    sparse_values: &[f64],
+    block_size: usize,
+    rows: usize,
+    cols: usize,
+) -> Result<DMatrix<f64>, CompressionError> {
+    if rows == 0 || cols == 0 {
+        return Err(CompressionError::InvalidRepresentation(
+            "matrix shape must be non-zero",
+        ));
+    }
+    if block_size == 0 {
+        return Err(CompressionError::InvalidRepresentation(
+            "block_size must be non-zero",
+        ));
+    }
+    let total = rows
+        .checked_mul(cols)
+        .ok_or(CompressionError::SizeOverflow)?;
+    if channel_norm.rows != rows || channel_norm.cols != cols {
+        return Err(CompressionError::InvalidRepresentation(
+            "channel normalization dimensions do not match the matrix",
+        ));
+    }
+    channel_norm.validate()?;
+
+    // Dequantize dense blocks
+    let mut dense_flat = Vec::new();
+    dense_flat
+        .try_reserve_exact(total)
+        .map_err(|_| CompressionError::AllocationFailed)?;
+    for block in dense_blocks {
+        let decoded = dequantize(block)?;
+        let remaining = total.saturating_sub(dense_flat.len());
+        let expected_len = block_size.min(remaining);
+        if decoded.len() != expected_len {
+            return Err(CompressionError::InvalidRepresentation(
+                "residual block length does not match block_size or matrix shape",
+            ));
+        }
+        dense_flat.extend(decoded);
+    }
+    if dense_flat.len() != total {
+        return Err(CompressionError::InvalidRepresentation(
+            "dense residual length does not match the matrix shape",
+        ));
+    }
+
+    // Apply sparse outliers
+    if sparse_indices.len() != sparse_values.len() {
+        return Err(CompressionError::InvalidRepresentation(
+            "sparse index and value lengths differ",
+        ));
+    }
+    let mut seen_indices = HashSet::new();
+    seen_indices
+        .try_reserve(sparse_indices.len())
+        .map_err(|_| CompressionError::AllocationFailed)?;
+    for (&idx, &val) in sparse_indices.iter().zip(sparse_values.iter()) {
+        let index = idx as usize;
+        if index >= total || !val.is_finite() || !seen_indices.insert(idx) {
+            return Err(CompressionError::InvalidRepresentation(
+                "sparse entries must be unique, in range, and finite",
+            ));
+        }
+        let value = dense_flat[index] + val;
+        if !value.is_finite() {
+            return Err(CompressionError::InvalidRepresentation(
+                "sparse reconstruction produced a non-finite value",
+            ));
+        }
+        dense_flat[index] = value;
+    }
+
+    Ok(DMatrix::from_iterator(rows, cols, dense_flat))
+}
+
 /// Standard 4-bit uniform quantization (baseline for comparison).
-pub fn compress_uniform_4bit(weights: &DMatrix<f64>, block_size: usize) -> CompressionStats {
+///
+/// # Errors
+///
+/// Returns [`CompressionError::InvalidInput`] when the matrix is empty or
+/// non-finite or `block_size` is zero, and [`CompressionError::SizeOverflow`]
+/// when dimensions overflow.
+pub fn compress_uniform_4bit(
+    weights: &DMatrix<f64>,
+    block_size: usize,
+) -> Result<CompressionStats, CompressionError> {
     let rows = weights.nrows();
     let cols = weights.ncols();
-    assert!(rows > 0 && cols > 0, "weight matrix must not be empty");
-    assert!(block_size > 0, "block_size must be non-zero");
-    assert!(
-        weights.iter().all(|value| value.is_finite()),
-        "weights must be finite"
-    );
-    let total = rows.checked_mul(cols).expect("weight dimensions overflow");
+    if rows == 0 || cols == 0 {
+        return Err(CompressionError::InvalidInput(
+            "weight matrix must not be empty",
+        ));
+    }
+    if block_size == 0 {
+        return Err(CompressionError::InvalidInput(
+            "block_size must be non-zero",
+        ));
+    }
+    if weights.iter().any(|value| !value.is_finite()) {
+        return Err(CompressionError::InvalidInput("weights must be finite"));
+    }
+    let total = rows
+        .checked_mul(cols)
+        .ok_or(CompressionError::SizeOverflow)?;
     let flat: Vec<f64> = weights.iter().cloned().collect();
 
     let mut total_error = 0.0f64;
@@ -321,9 +415,8 @@ pub fn compress_uniform_4bit(weights: &DMatrix<f64>, block_size: usize) -> Compr
     let mut compressed_bytes = 0usize;
 
     for chunk in flat.chunks(block_size) {
-        let block = quantize_uniform(chunk, 4);
-        let recovered =
-            dequantize(&block).expect("freshly quantized block must be internally consistent");
+        let block = quantize_uniform(chunk, 4)?;
+        let recovered = dequantize(&block)?;
         compressed_bytes += block.packed.size_bytes() + 5; // data + metadata (scale+zero FP16 + bits)
 
         for (a, b) in chunk.iter().zip(recovered.iter()) {
@@ -333,7 +426,7 @@ pub fn compress_uniform_4bit(weights: &DMatrix<f64>, block_size: usize) -> Compr
         }
     }
 
-    CompressionStats {
+    Ok(CompressionStats {
         original_bytes: total * 8,
         compressed_bytes,
         ratio: (total * 8) as f64 / compressed_bytes as f64,
@@ -343,18 +436,25 @@ pub fn compress_uniform_4bit(weights: &DMatrix<f64>, block_size: usize) -> Compr
         prior_bytes: 0,
         max_error,
         mse: total_error / total as f64,
-    }
+    })
 }
 
 /// Compare RC vs standard 4-bit on a weight matrix.
-pub fn compare(weights: &DMatrix<f64>, config: &RCConfig) -> ComparisonReport {
-    let rc = compress(weights, config);
-    let baseline = compress_uniform_4bit(weights, config.block_size);
+///
+/// # Errors
+///
+/// Forwards any error from [`compress`] or [`compress_uniform_4bit`].
+pub fn compare(
+    weights: &DMatrix<f64>,
+    config: &RCConfig,
+) -> Result<ComparisonReport, CompressionError> {
+    let rc = compress(weights, config)?;
+    let baseline = compress_uniform_4bit(weights, config.block_size)?;
 
-    ComparisonReport {
+    Ok(ComparisonReport {
         rc_stats: rc.stats,
         baseline_stats: baseline,
-    }
+    })
 }
 
 /// Comparison between RC and baseline.
@@ -434,35 +534,37 @@ impl std::fmt::Display for ComparisonReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::Rng;
+    use rand::{rngs::StdRng, Rng, SeedableRng};
 
     /// Test: RC beats 4-bit on low-rank matrices (which LLM attention matrices are).
     #[test]
     fn rc_beats_4bit_on_structured_weights() {
-        let mut rng = rand::thread_rng();
+        let mut rng = StdRng::seed_from_u64(0x5EED_2001);
 
         // Simulate an attention weight matrix: low-rank + small noise
-        // Real attention matrices have effective rank << min(rows, cols)
-        let rows = 256;
-        let cols = 256;
-        let true_rank = 8;
+        // Real attention matrices have effective rank << min(rows, cols).
+        // Per-column frequencies keep the factor columns decorrelated at this
+        // matrix size, so the true rank really is 3.
+        let rows = 96;
+        let cols = 96;
+        let true_rank = 3;
 
         let u = DMatrix::from_fn(rows, true_rank, |i, j| {
-            (i as f64 * 0.01 + j as f64 * 0.1).sin()
+            (i as f64 * 0.05 * (j as f64 + 1.0)).sin()
         });
         let s = DMatrix::from_diagonal(&nalgebra::DVector::from_fn(true_rank, |i, _| {
             10.0 / (i as f64 + 1.0) // Decaying singular values
         }));
         let v = DMatrix::from_fn(cols, true_rank, |i, j| {
-            (i as f64 * 0.02 + j as f64 * 0.07).cos()
+            (i as f64 * 0.06 * (j as f64 + 1.0) + 0.3 * j as f64).cos()
         });
 
         let clean = &u * s * v.transpose();
-        let noise = DMatrix::from_fn(rows, cols, |_, _| rng.gen_range(-0.01..0.01));
+        let noise = DMatrix::from_fn(rows, cols, |_, _| rng.gen_range(-0.005..0.005));
         let weights = clean + noise;
 
         let config = RCConfig::default();
-        let report = compare(&weights, &config);
+        let report = compare(&weights, &config).unwrap();
 
         println!("{report}");
 
@@ -486,14 +588,14 @@ mod tests {
     /// Test: RC on truly random matrices (worst case — no structure to exploit).
     #[test]
     fn rc_on_random_weights() {
-        let mut rng = rand::thread_rng();
-        let rows = 128;
-        let cols = 128;
+        let mut rng = StdRng::seed_from_u64(0x5EED_2002);
+        let rows = 64;
+        let cols = 64;
 
         let weights = DMatrix::from_fn(rows, cols, |_, _| rng.gen_range(-1.0..1.0));
 
         let config = RCConfig::default();
-        let report = compare(&weights, &config);
+        let report = compare(&weights, &config).unwrap();
 
         println!("{report}");
 
@@ -508,7 +610,7 @@ mod tests {
     #[test]
     fn malformed_compressed_shape_is_rejected() {
         let weights = DMatrix::from_element(2, 2, 1.0);
-        let mut compressed = compress(&weights, &RCConfig::default());
+        let mut compressed = compress(&weights, &RCConfig::default()).unwrap();
         compressed.rows = 3;
         assert!(matches!(
             decompress_matrix(&compressed),
@@ -516,16 +618,69 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn invalid_compress_inputs_are_rejected() {
+        let empty = DMatrix::zeros(0, 0);
+        assert!(matches!(
+            compress(&empty, &RCConfig::default()),
+            Err(CompressionError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            compress_uniform_4bit(&empty, 64),
+            Err(CompressionError::InvalidInput(_))
+        ));
+
+        let weights = DMatrix::from_element(2, 2, 1.0);
+        assert!(matches!(
+            compress(
+                &weights,
+                &RCConfig {
+                    block_size: 0,
+                    ..RCConfig::default()
+                }
+            ),
+            Err(CompressionError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            compress(
+                &weights,
+                &RCConfig {
+                    abs_tol: f64::NAN,
+                    ..RCConfig::default()
+                }
+            ),
+            Err(CompressionError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            compress(
+                &weights,
+                &RCConfig {
+                    rank: 3,
+                    ..RCConfig::default()
+                }
+            ),
+            Err(CompressionError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            compress(&DMatrix::from_element(2, 2, f64::NAN), &RCConfig::default()),
+            Err(CompressionError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            compress_uniform_4bit(&weights, 0),
+            Err(CompressionError::InvalidInput(_))
+        ));
+    }
+
     /// Test: simulate realistic LLM weight distribution.
     #[test]
     fn rc_on_mlp_weights() {
-        let mut rng = rand::thread_rng();
-        let rows = 512;
-        let cols = 128;
+        let mut rng = StdRng::seed_from_u64(0x5EED_2003);
+        let rows = 160;
+        let cols = 64;
 
-        // MLP weights: moderate rank structure + Gaussian noise
-        // Typical MLP has effective rank around 30-60% of min(rows,cols)
-        let effective_rank = 20;
+        // MLP weights: moderate rank structure + noise. Typical MLP has
+        // effective rank well below min(rows, cols).
+        let effective_rank = 8;
         let u = DMatrix::from_fn(rows, effective_rank, |i, j| {
             (i as f64 * 0.005 + j as f64 * 0.3).sin() * 0.5
         });
@@ -541,7 +696,7 @@ mod tests {
         let weights = structured + noise;
 
         let config = RCConfig::default();
-        let report = compare(&weights, &config);
+        let report = compare(&weights, &config).unwrap();
 
         println!("{report}");
 

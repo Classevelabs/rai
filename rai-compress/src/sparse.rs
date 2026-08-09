@@ -8,32 +8,19 @@
 /// This is the single biggest accuracy win in the pipeline.
 use std::collections::HashSet;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SparseError {
+    #[error("invalid sparse input: {0}")]
     InvalidInput(&'static str),
+    #[error("invalid sparse representation: {0}")]
     InvalidRepresentation(&'static str),
+    #[error("sparse size overflows")]
     SizeOverflow,
+    #[error("unable to allocate sparse output")]
     AllocationFailed,
+    #[error("sparse operation produced a non-finite value")]
     NumericalFailure,
 }
-
-impl std::fmt::Display for SparseError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidInput(message) => write!(formatter, "invalid sparse input: {message}"),
-            Self::InvalidRepresentation(message) => {
-                write!(formatter, "invalid sparse representation: {message}")
-            }
-            Self::SizeOverflow => formatter.write_str("sparse size overflows"),
-            Self::AllocationFailed => formatter.write_str("unable to allocate sparse output"),
-            Self::NumericalFailure => {
-                formatter.write_str("sparse operation produced a non-finite value")
-            }
-        }
-    }
-}
-
-impl std::error::Error for SparseError {}
 
 /// Sparse + Dense decomposition of a residual vector.
 #[derive(Debug, Clone)]
@@ -46,7 +33,8 @@ pub struct SparseDenseDecomp {
     pub dense: Vec<f64>,
     /// Total number of elements.
     pub len: usize,
-    /// Outlier threshold used.
+    /// Outlier threshold used (inclusive: values with `|v| >= threshold`
+    /// among the top-k are extracted).
     pub threshold: f64,
 }
 
@@ -92,8 +80,11 @@ impl SparseDenseDecomp {
         let mut sparse_values = Vec::new();
         let mut dense = values.to_vec();
 
+        // Inclusive comparison: every one of the top-k entries satisfies
+        // `abs_val >= threshold` by construction of the sort, so ties at the
+        // threshold are extracted too and `fraction` is honored exactly.
         for &(idx, abs_val) in abs_values.iter().take(k) {
-            if abs_val > threshold {
+            if abs_val >= threshold {
                 sparse_indices.push(idx as u32);
                 sparse_values.push(values[idx]);
                 dense[idx] = 0.0; // Zero out the outlier in dense
@@ -238,6 +229,31 @@ mod tests {
             reduction > 0.5,
             "removing outliers should significantly reduce range, got {reduction}"
         );
+    }
+
+    #[test]
+    fn tied_outliers_are_extracted_and_fraction_is_honored() {
+        // FIVE values share the outlier magnitude while the requested
+        // fraction asks for the top 4 (20% of 20). The threshold (the 5th
+        // largest magnitude) then ties with all top-4 entries; a strict `>`
+        // comparison would extract nothing, so the inclusive comparison is
+        // what honors `fraction`.
+        let mut values = vec![0.01; 20];
+        for idx in [3, 7, 11, 15, 19] {
+            values[idx] = if idx == 7 { -2.0 } else { 2.0 };
+        }
+
+        let decomp = SparseDenseDecomp::from_residual(&values, 0.2).unwrap();
+        assert_eq!(
+            decomp.sparse_indices.len(),
+            4,
+            "ties at the threshold must be extracted so the fraction is honored"
+        );
+        assert!(decomp.sparse_values.iter().all(|v| v.abs() == 2.0));
+        let reconstructed = decomp.reconstruct(&decomp.dense).unwrap();
+        for (a, b) in values.iter().zip(reconstructed.iter()) {
+            assert!((a - b).abs() < 1e-10);
+        }
     }
 
     #[test]

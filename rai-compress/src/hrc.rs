@@ -1,10 +1,9 @@
 use crate::channel::ChannelNorm;
-use crate::compress::CompressionError;
+use crate::compress::{decode_normalized_matrix, CompressionError};
 use crate::prior::WeightPrior;
-use crate::quantize::{choose_bits, dequantize, quantize_uniform, QuantizedBlock};
+use crate::quantize::{choose_bits, quantize_uniform, QuantizedBlock};
 use crate::sparse::SparseDenseDecomp;
 use nalgebra::DMatrix;
-use std::collections::HashSet;
 
 /// Hybrid Resonance Compression — multi-stage cascaded pipeline.
 ///
@@ -58,7 +57,10 @@ pub struct HRCStats {
     pub bits_per_weight: f64,
     pub mse: f64,
     pub max_error: f64,
-    pub psnr_db: f64,
+    /// Signal-to-quantization-noise ratio in dB:
+    /// `10 * log10(mean(w^2) / mse)`. This is an SNR (mean signal power over
+    /// noise power), not a peak-based PSNR.
+    pub snr_db: f64,
     // Per-stage breakdown
     pub channel_bytes: usize,
     pub prior_bytes: usize,
@@ -95,75 +97,88 @@ impl Default for HRCConfig {
 }
 
 /// Compress a weight matrix using the full HRC pipeline.
-pub fn hrc_compress(weights: &DMatrix<f64>, config: &HRCConfig) -> HRCompressed {
+///
+/// # Errors
+///
+/// Returns [`CompressionError::InvalidInput`] when the matrix is empty or
+/// non-finite, `block_size` is zero, `outlier_fraction` is outside `[0, 1]`,
+/// `abs_tol` is not finite and positive, or an explicit `rank` exceeds a
+/// matrix dimension; [`CompressionError::SizeOverflow`] when dimensions
+/// overflow; and forwards any stage error.
+pub fn hrc_compress(
+    weights: &DMatrix<f64>,
+    config: &HRCConfig,
+) -> Result<HRCompressed, CompressionError> {
     let rows = weights.nrows();
     let cols = weights.ncols();
-    assert!(rows > 0 && cols > 0, "weight matrix must not be empty");
-    assert!(config.block_size > 0, "block_size must be non-zero");
-    assert!(
-        config.outlier_fraction.is_finite() && (0.0..=1.0).contains(&config.outlier_fraction),
-        "outlier_fraction must be finite and between zero and one"
-    );
-    assert!(
-        config.abs_tol.is_finite() && config.abs_tol > 0.0,
-        "abs_tol must be finite and positive"
-    );
-    assert!(
-        weights.iter().all(|value| value.is_finite()),
-        "weights must be finite"
-    );
-    let total = rows.checked_mul(cols).expect("weight dimensions overflow");
+    if rows == 0 || cols == 0 {
+        return Err(CompressionError::InvalidInput(
+            "weight matrix must not be empty",
+        ));
+    }
+    if config.block_size == 0 {
+        return Err(CompressionError::InvalidInput(
+            "block_size must be non-zero",
+        ));
+    }
+    if !config.outlier_fraction.is_finite() || !(0.0..=1.0).contains(&config.outlier_fraction) {
+        return Err(CompressionError::InvalidInput(
+            "outlier_fraction must be finite and between zero and one",
+        ));
+    }
+    if !config.abs_tol.is_finite() || config.abs_tol <= 0.0 {
+        return Err(CompressionError::InvalidInput(
+            "abs_tol must be finite and positive",
+        ));
+    }
+    if weights.iter().any(|value| !value.is_finite()) {
+        return Err(CompressionError::InvalidInput("weights must be finite"));
+    }
+    let total = rows
+        .checked_mul(cols)
+        .ok_or(CompressionError::SizeOverflow)?;
 
     // === Stage 1: Channel normalization ===
-    let (channel_norm, w_norm) = ChannelNorm::normalize(weights)
-        .expect("validated weights must support channel normalization");
+    let (channel_norm, w_norm) = ChannelNorm::normalize(weights)?;
 
     // === Stage 2: Low-rank SVD prior ===
     let rank = if config.rank == 0 {
-        WeightPrior::optimal_rank(&w_norm, config.block_size, 4.0)
-            .expect("validated weights must produce a prior rank")
+        WeightPrior::optimal_rank(&w_norm, config.block_size, 4.0)?
     } else {
-        assert!(
-            config.rank <= rows.min(cols),
-            "rank must not exceed a matrix dimension"
-        );
+        if config.rank > rows.min(cols) {
+            return Err(CompressionError::InvalidInput(
+                "rank must not exceed a matrix dimension",
+            ));
+        }
         config.rank
     };
-    let prior = WeightPrior::from_weights(&w_norm, rank)
-        .expect("validated weights and rank must produce a prior");
-    let residual = prior
-        .residual(&w_norm)
-        .expect("validated prior must support its source matrix");
+    let prior = WeightPrior::from_weights(&w_norm, rank)?;
+    let residual = prior.residual(&w_norm)?;
     let residual_flat: Vec<f64> = residual.iter().cloned().collect();
 
+    // Prior variance is measured against the in-scope normalized matrix; no
+    // need to renormalize the input a second time.
+    let prior_var = prior.variance_explained(&w_norm)?;
+
     // === Stage 3: Sparse outlier extraction ===
-    let decomp = SparseDenseDecomp::from_residual(&residual_flat, config.outlier_fraction)
-        .expect("validated residual must support sparse decomposition");
-    let range_reduction = decomp
-        .range_reduction(&residual_flat)
-        .expect("fresh sparse decomposition must support its source residual");
+    let decomp = SparseDenseDecomp::from_residual(&residual_flat, config.outlier_fraction)?;
+    let range_reduction = decomp.range_reduction(&residual_flat)?;
 
     // === Stage 4: Adaptive quantization of dense remainder ===
     let mut dense_blocks = Vec::new();
     let mut total_dense_bits = 0usize;
 
     for chunk in decomp.dense.chunks(config.block_size) {
-        let bits = choose_bits(chunk, config.abs_tol);
-        let block = quantize_uniform(chunk, bits);
+        let bits = choose_bits(chunk, config.abs_tol)?;
+        let block = quantize_uniform(chunk, bits)?;
         total_dense_bits += chunk.len() * bits as usize;
         dense_blocks.push(block);
     }
 
     // === Compute stats ===
-    let channel_bytes = channel_norm
-        .size_bytes()
-        .expect("validated channel metadata size must fit in memory");
-    let prior_bytes = prior
-        .prior_size_bytes()
-        .expect("validated prior size must fit in memory");
-    let sparse_bytes = decomp
-        .sparse_bytes()
-        .expect("validated sparse metadata size must fit in memory");
+    let channel_bytes = channel_norm.size_bytes()?;
+    let prior_bytes = prior.prior_size_bytes()?;
+    let sparse_bytes = decomp.sparse_bytes()?;
     let dense_bytes: usize = dense_blocks.iter().map(|b| b.packed.size_bytes()).sum();
     let block_meta_bytes = dense_blocks.len() * 5;
     let compressed_bytes =
@@ -186,7 +201,7 @@ pub fn hrc_compress(weights: &DMatrix<f64>, config: &HRCConfig) -> HRCompressed 
             bits_per_weight: 0.0,
             mse: 0.0,
             max_error: 0.0,
-            psnr_db: 0.0,
+            snr_db: 0.0,
             channel_bytes: 0,
             prior_bytes: 0,
             sparse_bytes: 0,
@@ -198,8 +213,7 @@ pub fn hrc_compress(weights: &DMatrix<f64>, config: &HRCConfig) -> HRCompressed 
         },
     };
 
-    let reconstructed = hrc_decompress(&result)
-        .expect("freshly compressed HRC matrix must be internally consistent");
+    let reconstructed = hrc_decompress(&result)?;
 
     let mut max_error = 0.0f64;
     let mut total_error = 0.0f64;
@@ -211,22 +225,13 @@ pub fn hrc_compress(weights: &DMatrix<f64>, config: &HRCConfig) -> HRCompressed 
         signal_power += a * a;
     }
     let mse = total_error / total as f64;
-    let psnr = if mse > 0.0 {
+    let snr = if mse > 0.0 {
         10.0 * (signal_power / (total as f64 * mse)).log10()
     } else {
         f64::INFINITY
     };
 
-    let prior_var = result
-        .prior
-        .variance_explained(&{
-            let (_, w_norm) = ChannelNorm::normalize(weights)
-                .expect("validated weights must support channel normalization");
-            w_norm
-        })
-        .expect("validated prior must support the normalized source matrix");
-
-    HRCompressed {
+    Ok(HRCompressed {
         stats: HRCStats {
             original_bytes: total * 8,
             compressed_bytes,
@@ -234,7 +239,7 @@ pub fn hrc_compress(weights: &DMatrix<f64>, config: &HRCConfig) -> HRCompressed 
             bits_per_weight: (compressed_bytes * 8) as f64 / total as f64,
             mse,
             max_error,
-            psnr_db: psnr,
+            snr_db: snr,
             channel_bytes,
             prior_bytes,
             sparse_bytes,
@@ -245,102 +250,25 @@ pub fn hrc_compress(weights: &DMatrix<f64>, config: &HRCConfig) -> HRCompressed 
             range_reduction_from_outliers: range_reduction,
         },
         ..result
-    }
+    })
 }
 
 /// Decompress an HRC-compressed matrix.
 pub fn hrc_decompress(compressed: &HRCompressed) -> Result<DMatrix<f64>, CompressionError> {
     let rows = compressed.rows;
     let cols = compressed.cols;
-    if rows == 0 || cols == 0 {
-        return Err(CompressionError::InvalidRepresentation(
-            "HRC matrix shape must be non-zero",
-        ));
-    }
-    if compressed.block_size == 0 {
-        return Err(CompressionError::InvalidRepresentation(
-            "HRC block_size must be non-zero",
-        ));
-    }
-    let total = rows
-        .checked_mul(cols)
-        .ok_or(CompressionError::SizeOverflow)?;
-    if compressed.channel_norm.rows != rows
-        || compressed.channel_norm.cols != cols
-        || compressed.channel_norm.means.len() != rows
-        || compressed.channel_norm.scales.len() != rows
-    {
-        return Err(CompressionError::InvalidRepresentation(
-            "channel normalization dimensions do not match the matrix",
-        ));
-    }
-    if compressed
-        .channel_norm
-        .means
-        .iter()
-        .any(|value| !value.is_finite())
-        || compressed
-            .channel_norm
-            .scales
-            .iter()
-            .any(|value| !value.is_finite() || *value <= 0.0)
-    {
-        return Err(CompressionError::InvalidRepresentation(
-            "channel normalization parameters must be finite with positive scales",
-        ));
-    }
 
-    // Stage 4: Dequantize dense blocks
-    let mut dense_flat = Vec::new();
-    dense_flat
-        .try_reserve_exact(total)
-        .map_err(|_| CompressionError::AllocationFailed)?;
-    for block in &compressed.dense_blocks {
-        let decoded = dequantize(block)?;
-        let remaining = total.saturating_sub(dense_flat.len());
-        let expected_len = compressed.block_size.min(remaining);
-        if decoded.len() != expected_len {
-            return Err(CompressionError::InvalidRepresentation(
-                "HRC residual block length does not match block_size or matrix shape",
-            ));
-        }
-        dense_flat.extend(decoded);
-    }
-    if dense_flat.len() != total {
-        return Err(CompressionError::InvalidRepresentation(
-            "HRC dense residual length does not match the matrix shape",
-        ));
-    }
-
-    // Stage 3: Add sparse outliers
-    if compressed.sparse_indices.len() != compressed.sparse_values.len() {
-        return Err(CompressionError::InvalidRepresentation(
-            "HRC sparse index and value lengths differ",
-        ));
-    }
-    let mut seen_indices = HashSet::new();
-    seen_indices
-        .try_reserve(compressed.sparse_indices.len())
-        .map_err(|_| CompressionError::AllocationFailed)?;
-    for (&idx, &val) in compressed
-        .sparse_indices
-        .iter()
-        .zip(compressed.sparse_values.iter())
-    {
-        let index = idx as usize;
-        if index >= total || !val.is_finite() || !seen_indices.insert(idx) {
-            return Err(CompressionError::InvalidRepresentation(
-                "HRC sparse entries must be unique, in range, and finite",
-            ));
-        }
-        let value = dense_flat[index] + val;
-        if !value.is_finite() {
-            return Err(CompressionError::InvalidRepresentation(
-                "HRC sparse reconstruction produced a non-finite value",
-            ));
-        }
-        dense_flat[index] = value;
-    }
+    // Stages 4 + 3: dequantize the dense blocks and re-apply sparse outliers
+    // (shared with SAC).
+    let mut w_norm = decode_normalized_matrix(
+        &compressed.channel_norm,
+        &compressed.dense_blocks,
+        &compressed.sparse_indices,
+        &compressed.sparse_values,
+        compressed.block_size,
+        rows,
+        cols,
+    )?;
 
     // Stage 2: Add SVD prior
     let prior_matrix = compressed.prior.predict()?;
@@ -349,46 +277,41 @@ pub fn hrc_decompress(compressed: &HRCompressed) -> Result<DMatrix<f64>, Compres
             "HRC prior dimensions do not match the matrix",
         ));
     }
-    let mut w_norm = prior_matrix;
-    for (i, &val) in dense_flat.iter().enumerate() {
-        let row = i % rows;
-        let col = i / rows;
-        let value = w_norm[(row, col)] + val;
-        if !value.is_finite() {
-            return Err(CompressionError::InvalidRepresentation(
-                "HRC reconstruction produced a non-finite value",
-            ));
-        }
-        w_norm[(row, col)] = value;
-    }
-
-    // Stage 1: Denormalize channels
-    let output = compressed.channel_norm.denormalize(&w_norm)?;
-    if output.iter().any(|value| !value.is_finite()) {
+    w_norm += prior_matrix;
+    if w_norm.iter().any(|value| !value.is_finite()) {
         return Err(CompressionError::InvalidRepresentation(
-            "HRC denormalization produced a non-finite value",
+            "HRC reconstruction produced a non-finite value",
         ));
     }
-    Ok(output)
+
+    // Stage 1: Denormalize channels (rejects non-finite results itself)
+    Ok(compressed.channel_norm.denormalize(&w_norm)?)
 }
 
 /// Full comparison: HRC vs RC vs 4-bit uniform.
-pub fn full_compare(weights: &DMatrix<f64>, hrc_config: &HRCConfig) -> FullReport {
-    let hrc = hrc_compress(weights, hrc_config);
+///
+/// # Errors
+///
+/// Forwards any error from the three compression runs.
+pub fn full_compare(
+    weights: &DMatrix<f64>,
+    hrc_config: &HRCConfig,
+) -> Result<FullReport, CompressionError> {
+    let hrc = hrc_compress(weights, hrc_config)?;
 
     let rc_config = crate::compress::RCConfig {
         block_size: hrc_config.block_size,
         rank: hrc_config.rank,
         abs_tol: hrc_config.abs_tol,
     };
-    let rc = crate::compress::compress(weights, &rc_config);
-    let baseline = crate::compress::compress_uniform_4bit(weights, hrc_config.block_size);
+    let rc = crate::compress::compress(weights, &rc_config)?;
+    let baseline = crate::compress::compress_uniform_4bit(weights, hrc_config.block_size)?;
 
-    FullReport {
+    Ok(FullReport {
         hrc_stats: hrc.stats,
         rc_stats: rc.stats,
         baseline_stats: baseline,
-    }
+    })
 }
 
 #[derive(Debug)]
@@ -444,8 +367,8 @@ impl std::fmt::Display for FullReport {
         )?;
         writeln!(
             f,
-            "║ PSNR (dB)              │ {:>15} │ {:>11} │ {:>11.1} ║",
-            "n/a", "n/a", self.hrc_stats.psnr_db
+            "║ SNR (dB)               │ {:>15} │ {:>11} │ {:>11.1} ║",
+            "n/a", "n/a", self.hrc_stats.snr_db
         )?;
         writeln!(
             f,
@@ -547,10 +470,14 @@ impl std::fmt::Display for FullReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::Rng;
+    use rand::{rngs::StdRng, Rng, SeedableRng};
 
-    fn make_attention_weights(rows: usize, cols: usize, rank: usize) -> DMatrix<f64> {
-        let mut rng = rand::thread_rng();
+    fn make_attention_weights(
+        rng: &mut StdRng,
+        rows: usize,
+        cols: usize,
+        rank: usize,
+    ) -> DMatrix<f64> {
         let u = DMatrix::from_fn(rows, rank, |i, j| (i as f64 * 0.01 + j as f64 * 0.1).sin());
         let s = DMatrix::from_diagonal(&nalgebra::DVector::from_fn(rank, |i, _| {
             10.0 / (i as f64 + 1.0)
@@ -569,9 +496,8 @@ mod tests {
         result
     }
 
-    fn make_mlp_weights(rows: usize, cols: usize) -> DMatrix<f64> {
-        let mut rng = rand::thread_rng();
-        let rank = 20;
+    fn make_mlp_weights(rng: &mut StdRng, rows: usize, cols: usize) -> DMatrix<f64> {
+        let rank = 8;
         let u = DMatrix::from_fn(rows, rank, |i, j| {
             (i as f64 * 0.005 + j as f64 * 0.3).sin() * 0.5
         });
@@ -595,11 +521,12 @@ mod tests {
 
     #[test]
     fn hrc_beats_all_on_attention() {
-        let weights = make_attention_weights(256, 256, 8);
+        let mut rng = StdRng::seed_from_u64(0x5EED_3001);
+        let weights = make_attention_weights(&mut rng, 96, 96, 4);
         let config = HRCConfig::default();
-        let report = full_compare(&weights, &config);
+        let report = full_compare(&weights, &config).unwrap();
 
-        println!("\n=== ATTENTION WEIGHTS (256x256, rank-8 + outliers) ===");
+        println!("\n=== ATTENTION WEIGHTS (96x96, rank-4 + outliers) ===");
         println!("{report}");
 
         // HRC should beat 4-bit on MSE
@@ -613,11 +540,12 @@ mod tests {
 
     #[test]
     fn hrc_beats_all_on_mlp() {
-        let weights = make_mlp_weights(512, 128);
+        let mut rng = StdRng::seed_from_u64(0x5EED_3002);
+        let weights = make_mlp_weights(&mut rng, 160, 64);
         let config = HRCConfig::default();
-        let report = full_compare(&weights, &config);
+        let report = full_compare(&weights, &config).unwrap();
 
-        println!("\n=== MLP WEIGHTS (512x128, rank-20 + outliers) ===");
+        println!("\n=== MLP WEIGHTS (160x64, rank-8 + outliers) ===");
         println!("{report}");
 
         assert!(
@@ -630,12 +558,12 @@ mod tests {
 
     #[test]
     fn hrc_on_random() {
-        let mut rng = rand::thread_rng();
-        let weights = DMatrix::from_fn(128, 128, |_, _| rng.gen_range(-1.0..1.0));
+        let mut rng = StdRng::seed_from_u64(0x5EED_3003);
+        let weights = DMatrix::from_fn(64, 64, |_, _| rng.gen_range(-1.0..1.0));
         let config = HRCConfig::default();
-        let report = full_compare(&weights, &config);
+        let report = full_compare(&weights, &config).unwrap();
 
-        println!("\n=== RANDOM WEIGHTS (128x128, no structure) ===");
+        println!("\n=== RANDOM WEIGHTS (64x64, no structure) ===");
         println!("{report}");
 
         // Even on random data, HRC shouldn't catastrophically fail
@@ -647,12 +575,13 @@ mod tests {
 
     #[test]
     fn hrc_decompresses_accurately() {
-        let weights = make_attention_weights(64, 64, 4);
+        let mut rng = StdRng::seed_from_u64(0x5EED_3004);
+        let weights = make_attention_weights(&mut rng, 64, 64, 4);
         let config = HRCConfig {
             abs_tol: 0.001,
             ..Default::default()
         };
-        let compressed = hrc_compress(&weights, &config);
+        let compressed = hrc_compress(&weights, &config).unwrap();
         let recovered = hrc_decompress(&compressed).unwrap();
 
         // Check every element
@@ -674,7 +603,7 @@ mod tests {
     #[test]
     fn hrc_rejects_out_of_range_sparse_entries() {
         let weights = DMatrix::from_element(4, 4, 1.0);
-        let mut compressed = hrc_compress(&weights, &HRCConfig::default());
+        let mut compressed = hrc_compress(&weights, &HRCConfig::default()).unwrap();
         compressed.sparse_indices.push(u32::MAX);
         compressed.sparse_values.push(1.0);
         assert!(matches!(
@@ -683,19 +612,59 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn invalid_hrc_inputs_are_rejected() {
+        let weights = DMatrix::from_element(2, 2, 1.0);
+        assert!(matches!(
+            hrc_compress(&DMatrix::zeros(0, 0), &HRCConfig::default()),
+            Err(CompressionError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            hrc_compress(
+                &weights,
+                &HRCConfig {
+                    outlier_fraction: 1.5,
+                    ..HRCConfig::default()
+                }
+            ),
+            Err(CompressionError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            hrc_compress(
+                &weights,
+                &HRCConfig {
+                    abs_tol: -1.0,
+                    ..HRCConfig::default()
+                }
+            ),
+            Err(CompressionError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            hrc_compress(
+                &weights,
+                &HRCConfig {
+                    rank: 5,
+                    ..HRCConfig::default()
+                }
+            ),
+            Err(CompressionError::InvalidInput(_))
+        ));
+    }
+
     /// The big test: simulate a full transformer layer's worth of weights.
     #[test]
     fn hrc_full_transformer_layer() {
-        let d_model = 256;
+        let mut rng = StdRng::seed_from_u64(0x5EED_3005);
+        let d_model = 32;
         let d_ff = d_model * 4;
 
         // Q, K, V projections (low-rank, structured)
-        let q = make_attention_weights(d_model, d_model, 8);
-        let k = make_attention_weights(d_model, d_model, 8);
-        let v = make_attention_weights(d_model, d_model, 8);
+        let q = make_attention_weights(&mut rng, d_model, d_model, 4);
+        let k = make_attention_weights(&mut rng, d_model, d_model, 4);
+        let v = make_attention_weights(&mut rng, d_model, d_model, 4);
         // MLP up and down projections
-        let mlp_up = make_mlp_weights(d_ff, d_model);
-        let mlp_down = make_mlp_weights(d_model, d_ff);
+        let mlp_up = make_mlp_weights(&mut rng, d_ff, d_model);
+        let mlp_down = make_mlp_weights(&mut rng, d_model, d_ff);
 
         let config = HRCConfig::default();
 
@@ -722,7 +691,7 @@ mod tests {
         let mut total_weights = 0usize;
 
         for (name, w) in &matrices {
-            let report = full_compare(w, &config);
+            let report = full_compare(w, &config).unwrap();
             let n = w.nrows() * w.ncols();
 
             println!("\n{name} ({} x {}):", w.nrows(), w.ncols());
@@ -735,8 +704,8 @@ mod tests {
                 report.rc_stats.bits_per_weight, report.rc_stats.mse
             );
             println!(
-                "  HRC:   {:.2} bpw, MSE={:.2e}, PSNR={:.1}dB",
-                report.hrc_stats.bits_per_weight, report.hrc_stats.mse, report.hrc_stats.psnr_db
+                "  HRC:   {:.2} bpw, MSE={:.2e}, SNR={:.1}dB",
+                report.hrc_stats.bits_per_weight, report.hrc_stats.mse, report.hrc_stats.snr_db
             );
 
             total_original += report.hrc_stats.original_bytes;

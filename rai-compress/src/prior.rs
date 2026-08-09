@@ -1,31 +1,35 @@
-use nalgebra::{DMatrix, DVector};
-use std::fmt;
+use nalgebra::{DMatrix, DVector, Dyn, SVD};
+
+/// SVD with an explicit iteration cap that surfaces non-convergence as an
+/// error. nalgebra's `svd()` unwraps its own `try_svd` internally (panicking
+/// on failure), and its `max_niter = 0` mode iterates without bound, so a
+/// finite cap is the only way to turn a non-converging decomposition into a
+/// recoverable error instead of a panic or a hang. Convergence typically
+/// takes a small multiple of the number of singular values; the cap below is
+/// an order of magnitude beyond that, with a generous floor for tiny inputs.
+fn checked_svd(weights: &DMatrix<f64>) -> Result<SVD<f64, Dyn, Dyn>, PriorError> {
+    let min_dim = weights.nrows().min(weights.ncols());
+    let max_niter = min_dim.saturating_mul(30).max(1024);
+    weights
+        .clone()
+        .try_svd(true, true, f64::EPSILON, max_niter)
+        .ok_or(PriorError::NumericalFailure(
+            "SVD did not converge within the iteration limit",
+        ))
+}
 
 /// Errors returned for invalid low-rank-prior inputs or representations.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PriorError {
+    #[error("invalid prior input: {0}")]
     InvalidInput(&'static str),
+    #[error("invalid prior representation: {0}")]
     InvalidRepresentation(&'static str),
+    #[error("prior dimensions overflow")]
     SizeOverflow,
+    #[error("prior numerical failure: {0}")]
     NumericalFailure(&'static str),
 }
-
-impl fmt::Display for PriorError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidInput(message) => write!(formatter, "invalid prior input: {message}"),
-            Self::InvalidRepresentation(message) => {
-                write!(formatter, "invalid prior representation: {message}")
-            }
-            Self::SizeOverflow => formatter.write_str("prior dimensions overflow"),
-            Self::NumericalFailure(message) => {
-                write!(formatter, "prior numerical failure: {message}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for PriorError {}
 
 /// Low-rank prior that captures weight matrix structure.
 ///
@@ -75,7 +79,7 @@ impl WeightPrior {
         }
         rows.checked_mul(cols).ok_or(PriorError::SizeOverflow)?;
 
-        let svd = weights.clone().svd(true, true);
+        let svd = checked_svd(weights)?;
         let u_full = svd
             .u
             .ok_or(PriorError::NumericalFailure("SVD did not return U"))?;
@@ -204,7 +208,7 @@ impl WeightPrior {
         let max_rank = rows.min(cols);
         let total_weights = rows.checked_mul(cols).ok_or(PriorError::SizeOverflow)?;
 
-        let svd = weights.clone().svd(true, true);
+        let svd = checked_svd(weights)?;
         let s = svd.singular_values;
         if s.iter().any(|value| !value.is_finite()) {
             return Err(PriorError::NumericalFailure(
@@ -317,7 +321,8 @@ mod tests {
 
     #[test]
     fn variance_explained_increases_with_rank() {
-        let mut rng = rand::thread_rng();
+        use rand::{rngs::StdRng, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(0x5EED_0001);
         let w = DMatrix::from_fn(32, 16, |i, j| {
             // Low-rank + noise
             (i as f64 * 0.1).sin() * (j as f64 * 0.2).cos()
