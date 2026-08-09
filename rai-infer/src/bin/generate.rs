@@ -265,11 +265,35 @@ fn main() -> Result<()> {
             })
     };
 
-    // Helper: print newly generated text with correct spacing
+    // Helper: print newly generated text with correct spacing. A trailing
+    // U+FFFD usually means a multi-byte codepoint is split across tokens;
+    // hold it back so the resolved character prints on a later call instead
+    // of replacement-garbage reaching the terminal.
     let print_new_text = |all_tokens: &[usize],
                           prompt_len: usize,
                           previous_text: &mut String,
                           tokenizer: &Tokenizer| {
+        let gen_ids: Vec<u32> = all_tokens[prompt_len..].iter().map(|&t| t as u32).collect();
+        let full_text = tokenizer.decode(&gen_ids, false).unwrap_or_default();
+        let mut suffix = incremental_suffix(previous_text, &full_text);
+        let mut held_bytes = 0usize;
+        while suffix.ends_with('\u{FFFD}') {
+            suffix = &suffix[..suffix.len() - '\u{FFFD}'.len_utf8()];
+            held_bytes += '\u{FFFD}'.len_utf8();
+        }
+        if !suffix.is_empty() {
+            print!("{suffix}");
+            let _ = io::stdout().flush();
+        }
+        *previous_text = full_text[..full_text.len() - held_bytes].to_string();
+    };
+
+    // Helper: once decoding ends, print anything the U+FFFD holdback withheld
+    // (a final replacement character is genuine and should be shown).
+    let flush_held_text = |all_tokens: &[usize],
+                           prompt_len: usize,
+                           previous_text: &mut String,
+                           tokenizer: &Tokenizer| {
         let gen_ids: Vec<u32> = all_tokens[prompt_len..].iter().map(|&t| t as u32).collect();
         let full_text = tokenizer.decode(&gen_ids, false).unwrap_or_default();
         let suffix = incremental_suffix(previous_text, &full_text);
@@ -379,6 +403,12 @@ fn main() -> Result<()> {
             0.0
         };
 
+        flush_held_text(
+            &all_tokens,
+            prompt_tokens.len(),
+            &mut previous_text,
+            &tokenizer,
+        );
         println!();
         eprintln!("\n--- Self-Speculative Stats ---");
         eprintln!("Tokens: {tokens_generated}, {decode_tps:.2} tok/s");
@@ -491,6 +521,12 @@ fn main() -> Result<()> {
             0.0
         };
 
+        flush_held_text(
+            &all_tokens,
+            prompt_tokens.len(),
+            &mut previous_text,
+            &tokenizer,
+        );
         println!();
         eprintln!("\n--- Speculative Stats ---");
         eprintln!("Tokens: {tokens_generated}, {decode_tps:.2} tok/s");
@@ -615,6 +651,12 @@ fn main() -> Result<()> {
         let decode_tps = tokens_generated as f64 / (decode_ms / 1000.0);
         let avg_passes = total_passes as f64 / tokens_generated.max(1) as f64;
 
+        flush_held_text(
+            &all_tokens,
+            prompt_tokens.len(),
+            &mut previous_text,
+            &tokenizer,
+        );
         println!();
         eprintln!("\n--- Stats ---");
         eprintln!("Tokens: {tokens_generated}, {decode_tps:.2} tok/s");
