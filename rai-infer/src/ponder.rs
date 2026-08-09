@@ -105,21 +105,25 @@ impl PonderConfig {
     }
 
     /// Embedding noise ensemble with N passes.
+    /// `n` must be at least 2; `pondered_forward` rejects smaller values
+    /// instead of silently adjusting them.
     pub fn ensemble(n: usize, sigma: f32) -> Self {
         Self {
             strategy: PonderStrategy::Ensemble,
-            ensemble_n: n.max(2),
+            ensemble_n: n,
             noise_sigma: sigma,
             ..Default::default()
         }
     }
 
     /// CFG + Ensemble combined.
+    /// `n` must be at least 2; `pondered_forward` rejects smaller values
+    /// instead of silently adjusting them.
     pub fn cfg_ensemble(guidance_scale: f32, n: usize, sigma: f32) -> Self {
         Self {
             strategy: PonderStrategy::CFGEnsemble,
             guidance_scale,
-            ensemble_n: n.max(2),
+            ensemble_n: n,
             noise_sigma: sigma,
             ..Default::default()
         }
@@ -151,8 +155,9 @@ pub struct PonderMetrics {
 
 /// Run a pondered forward pass: embed token → run strategy → return logits.
 ///
-/// `logits_buf` is a reusable buffer that will contain the output logits.
-/// It is resized to vocab_size automatically. This avoids 192 KB allocation per token.
+/// Returns an owned logits vector. Callers in a decode loop should recycle
+/// it back into their scratch (`work.scratch.logits = logits`) so the next
+/// call reuses the allocation instead of paying vocab_size per token.
 pub fn pondered_forward(
     model: &RaiModel,
     token_id: usize,
@@ -163,6 +168,16 @@ pub fn pondered_forward(
     work2: &mut InferenceWork,
     rng: &mut impl Rng,
 ) -> anyhow::Result<(Vec<f32>, PonderMetrics)> {
+    if matches!(
+        config.strategy,
+        PonderStrategy::Ensemble | PonderStrategy::CFGEnsemble
+    ) {
+        anyhow::ensure!(
+            config.ensemble_n >= 2,
+            "ensemble strategies require ensemble_n >= 2 (got {})",
+            config.ensemble_n
+        );
+    }
     match config.strategy {
         PonderStrategy::None => {
             let logits = forward_standard(model, token_id, pos, kv_cache, work)?;
@@ -185,7 +200,7 @@ pub fn pondered_forward(
                     forward_passes: passes,
                     strategy_used: "cfg",
                     entropy: None,
-                    was_hard_token: true,
+                    was_hard_token: false,
                 },
             ))
         }
@@ -198,7 +213,7 @@ pub fn pondered_forward(
                     forward_passes: passes,
                     strategy_used: "ensemble",
                     entropy: None,
-                    was_hard_token: true,
+                    was_hard_token: false,
                 },
             ))
         }
@@ -211,7 +226,7 @@ pub fn pondered_forward(
                     forward_passes: passes,
                     strategy_used: "cfg+ensemble",
                     entropy: None,
-                    was_hard_token: true,
+                    was_hard_token: false,
                 },
             ))
         }
