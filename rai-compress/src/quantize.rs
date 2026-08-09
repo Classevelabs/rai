@@ -1,32 +1,15 @@
 use crate::bitpack::{BitPackError, BitPacker};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum QuantizeError {
+    #[error("invalid quantization input: {0}")]
+    InvalidInput(&'static str),
+    #[error("invalid quantized block: {0}")]
     InvalidRepresentation(&'static str),
-    BitPack(BitPackError),
+    #[error(transparent)]
+    BitPack(#[from] BitPackError),
+    #[error("dequantization produced a non-finite value")]
     NumericalFailure,
-}
-
-impl std::fmt::Display for QuantizeError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidRepresentation(message) => {
-                write!(formatter, "invalid quantized block: {message}")
-            }
-            Self::BitPack(error) => write!(formatter, "{error}"),
-            Self::NumericalFailure => {
-                formatter.write_str("dequantization produced a non-finite value")
-            }
-        }
-    }
-}
-
-impl std::error::Error for QuantizeError {}
-
-impl From<BitPackError> for QuantizeError {
-    fn from(error: BitPackError) -> Self {
-        Self::BitPack(error)
-    }
 }
 
 /// Quantization parameters for a block of residual values.
@@ -52,13 +35,26 @@ pub struct QuantizedBlock {
 /// Standard approach: map float range to integer grid.
 /// Our advantage: because we operate on RESIDUALS (not raw weights),
 /// the range is much smaller → same bits give better precision.
-pub fn quantize_uniform(values: &[f64], bits: u8) -> QuantizedBlock {
-    assert!(bits > 0 && bits <= 8);
-    assert!(!values.is_empty(), "cannot quantize an empty block");
-    assert!(
-        values.iter().all(|value| value.is_finite()),
-        "quantization values must be finite"
-    );
+///
+/// # Errors
+///
+/// Returns [`QuantizeError::InvalidInput`] when `values` is empty or contains
+/// non-finite values, and [`QuantizeError::BitPack`] when `bits` is outside
+/// 1-8 or packing fails.
+pub fn quantize_uniform(values: &[f64], bits: u8) -> Result<QuantizedBlock, QuantizeError> {
+    if !(1..=8).contains(&bits) {
+        return Err(QuantizeError::BitPack(BitPackError::InvalidBitWidth));
+    }
+    if values.is_empty() {
+        return Err(QuantizeError::InvalidInput(
+            "cannot quantize an empty block",
+        ));
+    }
+    if values.iter().any(|value| !value.is_finite()) {
+        return Err(QuantizeError::InvalidInput(
+            "quantization values must be finite",
+        ));
+    }
     let levels = (1u32 << bits) as f64;
 
     let min = values.iter().cloned().fold(f64::INFINITY, f64::min);
@@ -80,14 +76,14 @@ pub fn quantize_uniform(values: &[f64], bits: u8) -> QuantizedBlock {
         })
         .collect();
 
-    QuantizedBlock {
+    Ok(QuantizedBlock {
         params: BlockParams {
             scale,
             zero_point,
             bits,
         },
-        packed: BitPacker::pack(&quantized, bits),
-    }
+        packed: BitPacker::pack(&quantized, bits)?,
+    })
 }
 
 /// Dequantize a block back to floats.
@@ -130,19 +126,27 @@ pub fn dequantize(block: &QuantizedBlock) -> Result<Vec<f64>, QuantizeError> {
 ///
 /// `abs_tol` is the maximum acceptable quantization error per element.
 /// For LLM weights, typical values: 0.001 to 0.01.
-pub fn choose_bits(residual_block: &[f64], abs_tol: f64) -> u8 {
-    assert!(
-        !residual_block.is_empty(),
-        "cannot choose bits for an empty block"
-    );
-    assert!(
-        residual_block.iter().all(|value| value.is_finite()),
-        "residual values must be finite"
-    );
-    assert!(
-        abs_tol.is_finite() && abs_tol > 0.0,
-        "absolute tolerance must be finite and positive"
-    );
+///
+/// # Errors
+///
+/// Returns [`QuantizeError::InvalidInput`] when the block is empty, contains
+/// non-finite values, or `abs_tol` is not finite and positive.
+pub fn choose_bits(residual_block: &[f64], abs_tol: f64) -> Result<u8, QuantizeError> {
+    if residual_block.is_empty() {
+        return Err(QuantizeError::InvalidInput(
+            "cannot choose bits for an empty block",
+        ));
+    }
+    if residual_block.iter().any(|value| !value.is_finite()) {
+        return Err(QuantizeError::InvalidInput(
+            "residual values must be finite",
+        ));
+    }
+    if !abs_tol.is_finite() || abs_tol <= 0.0 {
+        return Err(QuantizeError::InvalidInput(
+            "absolute tolerance must be finite and positive",
+        ));
+    }
     let min = residual_block.iter().cloned().fold(f64::INFINITY, f64::min);
     let max = residual_block
         .iter()
@@ -152,14 +156,14 @@ pub fn choose_bits(residual_block: &[f64], abs_tol: f64) -> u8 {
 
     // If range is within tolerance, 1 bit suffices (just encodes above/below midpoint)
     if range < abs_tol * 2.0 {
-        return 1;
+        return Ok(1);
     }
 
     // bits needed = ceil(log2(range / abs_tol))
     // This gives enough quantization levels to cover the range with abs_tol precision
     let bits_needed = (range / abs_tol).log2().ceil() as i32;
 
-    bits_needed.clamp(1, 8) as u8
+    Ok(bits_needed.clamp(1, 8) as u8)
 }
 
 #[cfg(test)]
@@ -169,7 +173,7 @@ mod tests {
     #[test]
     fn uniform_roundtrip_4bit() {
         let values: Vec<f64> = (0..64).map(|i| (i as f64 - 32.0) * 0.1).collect();
-        let block = quantize_uniform(&values, 4);
+        let block = quantize_uniform(&values, 4).unwrap();
         let recovered = dequantize(&block).unwrap();
 
         let mse: f64 = values
@@ -187,7 +191,7 @@ mod tests {
     fn adaptive_bits_small_residual() {
         // Range = 0.0063, with abs_tol = 0.005 → range < 2*tol → 1 bit
         let values: Vec<f64> = (0..64).map(|i| (i as f64) * 0.0001).collect();
-        let bits = choose_bits(&values, 0.005);
+        let bits = choose_bits(&values, 0.005).unwrap();
         assert!(bits <= 2, "tiny residual should need few bits, got {bits}");
     }
 
@@ -195,10 +199,34 @@ mod tests {
     fn adaptive_bits_large_residual() {
         // Range = 63, with abs_tol = 0.005 → log2(63/0.005) = log2(12600) ≈ 13.6 → 8 (clamped)
         let values: Vec<f64> = (0..64).map(|i| (i as f64 - 32.0) * 1.0).collect();
-        let bits = choose_bits(&values, 0.005);
+        let bits = choose_bits(&values, 0.005).unwrap();
         assert!(
             bits >= 4,
             "large residual should need more bits, got {bits}"
         );
+    }
+
+    #[test]
+    fn invalid_inputs_are_rejected() {
+        assert!(matches!(
+            quantize_uniform(&[], 4).unwrap_err(),
+            QuantizeError::InvalidInput(_)
+        ));
+        assert!(matches!(
+            quantize_uniform(&[1.0], 0).unwrap_err(),
+            QuantizeError::BitPack(BitPackError::InvalidBitWidth)
+        ));
+        assert!(matches!(
+            quantize_uniform(&[f64::NAN], 4).unwrap_err(),
+            QuantizeError::InvalidInput(_)
+        ));
+        assert!(matches!(
+            choose_bits(&[], 0.01).unwrap_err(),
+            QuantizeError::InvalidInput(_)
+        ));
+        assert!(matches!(
+            choose_bits(&[1.0], 0.0).unwrap_err(),
+            QuantizeError::InvalidInput(_)
+        ));
     }
 }

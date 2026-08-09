@@ -23,11 +23,10 @@
 /// - Smaller blocks (64 vs 128) for more fine-grained bit allocation
 /// - Per-row normalization handles the channel magnitude variation that SVD tries to capture
 use crate::channel::ChannelNorm;
-use crate::compress::CompressionError;
-use crate::quantize::{choose_bits, dequantize, quantize_uniform, QuantizedBlock};
+use crate::compress::{decode_normalized_matrix, CompressionError};
+use crate::quantize::{choose_bits, quantize_uniform, QuantizedBlock};
 use crate::sparse::SparseDenseDecomp;
 use nalgebra::DMatrix;
-use std::collections::HashSet;
 
 /// SAC compressed representation.
 #[derive(Debug, Clone)]
@@ -50,13 +49,19 @@ pub struct SACCompressed {
 
 #[derive(Debug, Clone)]
 pub struct SACStats {
+    /// Original size in bytes against the same FP64 in-memory baseline used
+    /// by the RC and HRC stats (8 bytes per element), so ratios are
+    /// comparable across the three pipelines.
     pub original_bytes: usize,
     pub compressed_bytes: usize,
     pub ratio: f64,
     pub bits_per_weight: f64,
     pub mse: f64,
     pub max_error: f64,
-    pub psnr_db: f64,
+    /// Signal-to-quantization-noise ratio in dB:
+    /// `10 * log10(mean(w^2) / mse)`. This is an SNR (mean signal power over
+    /// noise power), not a peak-based PSNR.
+    pub snr_db: f64,
     pub channel_bytes: usize,
     pub sparse_bytes: usize,
     pub dense_bytes: usize,
@@ -88,55 +93,68 @@ impl Default for SACConfig {
 }
 
 /// Compress using SAC pipeline.
-pub fn sac_compress(weights: &DMatrix<f64>, config: &SACConfig) -> SACCompressed {
+///
+/// # Errors
+///
+/// Returns [`CompressionError::InvalidInput`] when the matrix is empty or
+/// non-finite, `block_size` is zero, `outlier_fraction` is outside `[0, 1]`,
+/// or `abs_tol` is not finite and positive; [`CompressionError::SizeOverflow`]
+/// when dimensions overflow; and forwards any stage error.
+pub fn sac_compress(
+    weights: &DMatrix<f64>,
+    config: &SACConfig,
+) -> Result<SACCompressed, CompressionError> {
     let rows = weights.nrows();
     let cols = weights.ncols();
-    assert!(rows > 0 && cols > 0, "weight matrix must not be empty");
-    assert!(config.block_size > 0, "block_size must be non-zero");
-    assert!(
-        config.outlier_fraction.is_finite() && (0.0..=1.0).contains(&config.outlier_fraction),
-        "outlier_fraction must be finite and between zero and one"
-    );
-    assert!(
-        config.abs_tol.is_finite() && config.abs_tol > 0.0,
-        "abs_tol must be finite and positive"
-    );
-    assert!(
-        weights.iter().all(|value| value.is_finite()),
-        "weights must be finite"
-    );
-    let total = rows.checked_mul(cols).expect("weight dimensions overflow");
+    if rows == 0 || cols == 0 {
+        return Err(CompressionError::InvalidInput(
+            "weight matrix must not be empty",
+        ));
+    }
+    if config.block_size == 0 {
+        return Err(CompressionError::InvalidInput(
+            "block_size must be non-zero",
+        ));
+    }
+    if !config.outlier_fraction.is_finite() || !(0.0..=1.0).contains(&config.outlier_fraction) {
+        return Err(CompressionError::InvalidInput(
+            "outlier_fraction must be finite and between zero and one",
+        ));
+    }
+    if !config.abs_tol.is_finite() || config.abs_tol <= 0.0 {
+        return Err(CompressionError::InvalidInput(
+            "abs_tol must be finite and positive",
+        ));
+    }
+    if weights.iter().any(|value| !value.is_finite()) {
+        return Err(CompressionError::InvalidInput("weights must be finite"));
+    }
+    let total = rows
+        .checked_mul(cols)
+        .ok_or(CompressionError::SizeOverflow)?;
 
     // === Stage 1: Channel normalization ===
-    let (channel_norm, w_norm) = ChannelNorm::normalize(weights)
-        .expect("validated weights must support channel normalization");
+    let (channel_norm, w_norm) = ChannelNorm::normalize(weights)?;
     let w_flat: Vec<f64> = w_norm.iter().cloned().collect();
 
     // === Stage 2: Sparse outlier extraction ===
-    let decomp = SparseDenseDecomp::from_residual(&w_flat, config.outlier_fraction)
-        .expect("validated residual must support sparse decomposition");
-    let range_reduction = decomp
-        .range_reduction(&w_flat)
-        .expect("fresh sparse decomposition must support its source residual");
+    let decomp = SparseDenseDecomp::from_residual(&w_flat, config.outlier_fraction)?;
+    let range_reduction = decomp.range_reduction(&w_flat)?;
 
     // === Stage 3: Adaptive block quantization ===
     let mut dense_blocks = Vec::new();
     let mut total_dense_bits = 0usize;
 
     for chunk in decomp.dense.chunks(config.block_size) {
-        let bits = choose_bits(chunk, config.abs_tol);
-        let block = quantize_uniform(chunk, bits);
+        let bits = choose_bits(chunk, config.abs_tol)?;
+        let block = quantize_uniform(chunk, bits)?;
         total_dense_bits += chunk.len() * bits as usize;
         dense_blocks.push(block);
     }
 
     // === Compute sizes ===
-    let channel_bytes = channel_norm
-        .size_bytes()
-        .expect("validated channel metadata size must fit in memory");
-    let sparse_bytes = decomp
-        .sparse_bytes()
-        .expect("validated sparse metadata size must fit in memory");
+    let channel_bytes = channel_norm.size_bytes()?;
+    let sparse_bytes = decomp.sparse_bytes()?;
     let dense_data_bytes: usize = dense_blocks.iter().map(|b| b.packed.size_bytes()).sum();
     let block_meta_bytes = dense_blocks.len() * 5; // scale(2) + zero(2) + bits(1)
     let dense_bytes = dense_data_bytes + block_meta_bytes;
@@ -158,7 +176,7 @@ pub fn sac_compress(weights: &DMatrix<f64>, config: &SACConfig) -> SACCompressed
             bits_per_weight: 0.0,
             mse: 0.0,
             max_error: 0.0,
-            psnr_db: 0.0,
+            snr_db: 0.0,
             channel_bytes: 0,
             sparse_bytes: 0,
             dense_bytes: 0,
@@ -169,8 +187,7 @@ pub fn sac_compress(weights: &DMatrix<f64>, config: &SACConfig) -> SACCompressed
         },
     };
 
-    let reconstructed = sac_decompress(&result)
-        .expect("freshly compressed SAC matrix must be internally consistent");
+    let reconstructed = sac_decompress(&result)?;
 
     let mut max_error = 0.0f64;
     let mut total_error = 0.0f64;
@@ -182,21 +199,22 @@ pub fn sac_compress(weights: &DMatrix<f64>, config: &SACConfig) -> SACCompressed
         signal_power += a * a;
     }
     let mse = total_error / total as f64;
-    let psnr = if mse > 0.0 {
+    let snr = if mse > 0.0 {
         10.0 * (signal_power / (total as f64 * mse)).log10()
     } else {
         f64::INFINITY
     };
 
-    SACCompressed {
+    Ok(SACCompressed {
         stats: SACStats {
-            original_bytes: total * 2, // vs FP16
+            // FP64 baseline, consistent with RC/HRC (was previously FP16).
+            original_bytes: total * 8,
             compressed_bytes,
-            ratio: (total * 2) as f64 / compressed_bytes as f64,
+            ratio: (total * 8) as f64 / compressed_bytes as f64,
             bits_per_weight: (compressed_bytes * 8) as f64 / total as f64,
             mse,
             max_error,
-            psnr_db: psnr,
+            snr_db: snr,
             channel_bytes,
             sparse_bytes,
             dense_bytes,
@@ -206,126 +224,38 @@ pub fn sac_compress(weights: &DMatrix<f64>, config: &SACConfig) -> SACCompressed
             num_outliers: result.sparse_indices.len(),
         },
         ..result
-    }
+    })
 }
 
 /// Decompress a SAC-compressed matrix.
 pub fn sac_decompress(compressed: &SACCompressed) -> Result<DMatrix<f64>, CompressionError> {
-    let rows = compressed.rows;
-    let cols = compressed.cols;
-    if rows == 0 || cols == 0 {
-        return Err(CompressionError::InvalidRepresentation(
-            "SAC matrix shape must be non-zero",
-        ));
-    }
-    if compressed.block_size == 0 {
-        return Err(CompressionError::InvalidRepresentation(
-            "SAC block_size must be non-zero",
-        ));
-    }
-    let total = rows
-        .checked_mul(cols)
-        .ok_or(CompressionError::SizeOverflow)?;
-    if compressed.channel_norm.rows != rows
-        || compressed.channel_norm.cols != cols
-        || compressed.channel_norm.means.len() != rows
-        || compressed.channel_norm.scales.len() != rows
-    {
-        return Err(CompressionError::InvalidRepresentation(
-            "channel normalization dimensions do not match the matrix",
-        ));
-    }
-    if compressed
-        .channel_norm
-        .means
-        .iter()
-        .any(|value| !value.is_finite())
-        || compressed
-            .channel_norm
-            .scales
-            .iter()
-            .any(|value| !value.is_finite() || *value <= 0.0)
-    {
-        return Err(CompressionError::InvalidRepresentation(
-            "channel normalization parameters must be finite with positive scales",
-        ));
-    }
+    // Stages 3 + 2: dequantize the dense blocks and re-apply sparse outliers
+    // (shared with HRC).
+    let w_norm = decode_normalized_matrix(
+        &compressed.channel_norm,
+        &compressed.dense_blocks,
+        &compressed.sparse_indices,
+        &compressed.sparse_values,
+        compressed.block_size,
+        compressed.rows,
+        compressed.cols,
+    )?;
 
-    // Stage 3: Dequantize dense blocks
-    let mut dense_flat = Vec::new();
-    dense_flat
-        .try_reserve_exact(total)
-        .map_err(|_| CompressionError::AllocationFailed)?;
-    for block in &compressed.dense_blocks {
-        let decoded = dequantize(block)?;
-        let remaining = total.saturating_sub(dense_flat.len());
-        let expected_len = compressed.block_size.min(remaining);
-        if decoded.len() != expected_len {
-            return Err(CompressionError::InvalidRepresentation(
-                "SAC residual block length does not match block_size or matrix shape",
-            ));
-        }
-        dense_flat.extend(decoded);
-    }
-    if dense_flat.len() != total {
-        return Err(CompressionError::InvalidRepresentation(
-            "SAC dense residual length does not match the matrix shape",
-        ));
-    }
-
-    // Stage 2: Add sparse outliers
-    if compressed.sparse_indices.len() != compressed.sparse_values.len() {
-        return Err(CompressionError::InvalidRepresentation(
-            "SAC sparse index and value lengths differ",
-        ));
-    }
-    let mut seen_indices = HashSet::new();
-    seen_indices
-        .try_reserve(compressed.sparse_indices.len())
-        .map_err(|_| CompressionError::AllocationFailed)?;
-    for (&idx, &val) in compressed
-        .sparse_indices
-        .iter()
-        .zip(compressed.sparse_values.iter())
-    {
-        let index = idx as usize;
-        if index >= total || !val.is_finite() || !seen_indices.insert(idx) {
-            return Err(CompressionError::InvalidRepresentation(
-                "SAC sparse entries must be unique, in range, and finite",
-            ));
-        }
-        let value = dense_flat[index] + val;
-        if !value.is_finite() {
-            return Err(CompressionError::InvalidRepresentation(
-                "SAC sparse reconstruction produced a non-finite value",
-            ));
-        }
-        dense_flat[index] = value;
-    }
-
-    // Stage 1: Denormalize
-    // Convert flat back to matrix (column-major, matching nalgebra's iter() order)
-    let w_norm = DMatrix::from_iterator(rows, cols, dense_flat);
-    let output = compressed.channel_norm.denormalize(&w_norm)?;
-    if output.iter().any(|value| !value.is_finite()) {
-        return Err(CompressionError::InvalidRepresentation(
-            "SAC denormalization produced a non-finite value",
-        ));
-    }
-    Ok(output)
+    // Stage 1: Denormalize (rejects non-finite results itself)
+    Ok(compressed.channel_norm.denormalize(&w_norm)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::Rng;
+    use rand::{rngs::StdRng, Rng, SeedableRng};
 
     #[test]
     fn sac_roundtrip() {
-        let mut rng = rand::thread_rng();
+        let mut rng = StdRng::seed_from_u64(0x5EED_4001);
         let w = DMatrix::from_fn(64, 64, |_, _| rng.gen_range(-1.0..1.0));
         let config = SACConfig::default();
-        let compressed = sac_compress(&w, &config);
+        let compressed = sac_compress(&w, &config).unwrap();
         let recovered = sac_decompress(&compressed).unwrap();
 
         let mse: f64 = w
@@ -355,7 +285,7 @@ mod tests {
             abs_tol: 0.01,
             ..Default::default()
         };
-        let compressed = sac_compress(&w, &config);
+        let compressed = sac_compress(&w, &config).unwrap();
         println!(
             "SAC structured: {:.2} bpw, MSE={:.2e}, range reduction={:.1}%",
             compressed.stats.bits_per_weight,
@@ -367,11 +297,40 @@ mod tests {
     #[test]
     fn sac_rejects_mismatched_sparse_entries() {
         let weights = DMatrix::from_element(4, 4, 1.0);
-        let mut compressed = sac_compress(&weights, &SACConfig::default());
+        let mut compressed = sac_compress(&weights, &SACConfig::default()).unwrap();
         compressed.sparse_indices.push(0);
         assert!(matches!(
             sac_decompress(&compressed),
             Err(CompressionError::InvalidRepresentation(_))
+        ));
+    }
+
+    #[test]
+    fn invalid_sac_inputs_are_rejected() {
+        let weights = DMatrix::from_element(2, 2, 1.0);
+        assert!(matches!(
+            sac_compress(&DMatrix::zeros(0, 0), &SACConfig::default()),
+            Err(CompressionError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            sac_compress(
+                &weights,
+                &SACConfig {
+                    block_size: 0,
+                    ..SACConfig::default()
+                }
+            ),
+            Err(CompressionError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            sac_compress(
+                &weights,
+                &SACConfig {
+                    outlier_fraction: -0.5,
+                    ..SACConfig::default()
+                }
+            ),
+            Err(CompressionError::InvalidInput(_))
         ));
     }
 }

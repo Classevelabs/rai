@@ -1,47 +1,32 @@
 //! GPTQ: Calibration-based weight quantization guided by the Hessian.
 //!
-//! GPTQ quantizes weight matrices column-by-column, using the inverse Hessian
-//! (H = X^T @ X from calibration data) to propagate each column's quantization
-//! error to remaining columns. This ensures that errors in "important" weight
+//! GPTQ quantizes weight matrices column-by-column, propagating each column's
+//! quantization error to the remaining columns through the upper-triangular
+//! Cholesky factor U of the inverse Hessian (H = X^T @ X from calibration
+//! data, H^-1 = U^T @ U). This ensures that errors in "important" weight
 //! directions (those multiplied by large activations) are minimized.
 //!
 //! Reference: Frantar et al., "GPTQ: Accurate Post-Training Quantization for
 //! Generative Pre-trained Transformers" (2022).
 
 use nalgebra::DMatrix;
-use std::fmt;
 
 /// Errors returned when caller input or a serialized GPTQ representation is invalid.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum GptqError {
+    #[error("invalid GPTQ input: {0}")]
     InvalidInput(&'static str),
+    #[error("invalid GPTQ representation: {0}")]
     InvalidRepresentation(&'static str),
+    #[error("GPTQ dimensions overflow")]
     SizeOverflow,
+    #[error("unable to allocate GPTQ output")]
     AllocationFailed,
+    #[error("damped Hessian is not positive definite")]
     HessianNotPositiveDefinite,
+    #[error("GPTQ numerical failure: {0}")]
     NumericalFailure(&'static str),
 }
-
-impl fmt::Display for GptqError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidInput(message) => write!(formatter, "invalid GPTQ input: {message}"),
-            Self::InvalidRepresentation(message) => {
-                write!(formatter, "invalid GPTQ representation: {message}")
-            }
-            Self::SizeOverflow => formatter.write_str("GPTQ dimensions overflow"),
-            Self::AllocationFailed => formatter.write_str("unable to allocate GPTQ output"),
-            Self::HessianNotPositiveDefinite => {
-                formatter.write_str("damped Hessian is not positive definite")
-            }
-            Self::NumericalFailure(message) => {
-                write!(formatter, "GPTQ numerical failure: {message}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for GptqError {}
 
 fn checked_num_groups(cols: usize, group_size: usize) -> Result<usize, GptqError> {
     if group_size == 0 {
@@ -209,9 +194,18 @@ pub fn gptq_quantize(
     if hessian.iter().any(|value| !value.is_finite()) {
         return Err(GptqError::InvalidInput("Hessian must be finite"));
     }
-    if !(0..cols)
-        .all(|row| (0..cols).all(|col| (hessian[(row, col)] - hessian[(col, row)]).abs() <= 1e-10))
-    {
+    // Symmetry is checked with a RELATIVE tolerance: H is accumulated as
+    // X^T @ X, so its float asymmetry scales with the magnitude of its
+    // entries and an absolute threshold rejects legitimately symmetric
+    // Hessians with large entries. The small absolute floor keeps an
+    // all-zero Hessian symmetric (damping decides its fate later).
+    let max_abs_entry = hessian
+        .iter()
+        .fold(0.0f64, |acc, value| acc.max(value.abs()));
+    let symmetry_tolerance = (1e-8 * max_abs_entry).max(1e-12);
+    if !(0..cols).all(|row| {
+        (0..cols).all(|col| (hessian[(row, col)] - hessian[(col, row)]).abs() <= symmetry_tolerance)
+    }) {
         return Err(GptqError::InvalidInput("Hessian must be symmetric"));
     }
 
@@ -247,14 +241,34 @@ pub fn gptq_quantize(
         h[(i, i)] += damp;
     }
 
-    // Cholesky decomposition and inverse
+    // GPTQ (Frantar et al., 2022, Algorithm 1) operates on the
+    // UPPER-TRIANGULAR Cholesky factor U of the inverse Hessian
+    // (H^-1 = U^T @ U), not on H^-1 itself: the per-column denominator is
+    // U[j, j] and the error-propagation row is U[j, j+1..]. Compute H^-1
+    // through the Cholesky solve, then factor it a second time.
     let chol = h.cholesky().ok_or(GptqError::HessianNotPositiveDefinite)?;
-    let h_inv = chol.inverse();
+    let mut h_inv = chol.inverse();
     if h_inv.iter().any(|value| !value.is_finite()) {
         return Err(GptqError::NumericalFailure(
             "inverse Hessian contains non-finite values",
         ));
     }
+    // Symmetrize before factorizing: the triangular solves behind `inverse`
+    // can leave tiny asymmetries that break the second Cholesky.
+    for r in 0..cols {
+        for c in (r + 1)..cols {
+            let mean = 0.5 * (h_inv[(r, c)] + h_inv[(c, r)]);
+            h_inv[(r, c)] = mean;
+            h_inv[(c, r)] = mean;
+        }
+    }
+    let u = h_inv
+        .cholesky()
+        .ok_or(GptqError::NumericalFailure(
+            "Cholesky factorization of the inverse Hessian failed",
+        ))?
+        .l()
+        .transpose();
 
     // Output quantized codes
     let code_count = rows.checked_mul(cols).ok_or(GptqError::SizeOverflow)?;
@@ -276,10 +290,10 @@ pub fn gptq_quantize(
         for j in 0..bsize {
             let col = block_start + j;
             let gid = col / group_size;
-            let d = h_inv[(col, col)];
+            let d = u[(col, col)];
             if !d.is_finite() || d <= 0.0 {
                 return Err(GptqError::NumericalFailure(
-                    "inverse Hessian diagonal is not positive and finite",
+                    "Cholesky factor diagonal is not positive and finite",
                 ));
             }
 
@@ -324,7 +338,7 @@ pub fn gptq_quantize(
                 // Dequantize
                 let w_hat = q as f64 * gp.scale + gp.zero_point;
 
-                // Error divided by diagonal Hessian inverse element
+                // Error divided by the Cholesky factor's diagonal element
                 let err = (val - w_hat) / d;
                 if !err.is_finite() {
                     return Err(GptqError::NumericalFailure(
@@ -335,7 +349,7 @@ pub fn gptq_quantize(
 
                 // Propagate error to remaining columns within this block
                 for k in (j + 1)..bsize {
-                    let next = w[(r, block_start + k)] - err * h_inv[(col, block_start + k)];
+                    let next = w[(r, block_start + k)] - err * u[(col, block_start + k)];
                     if !next.is_finite() {
                         return Err(GptqError::NumericalFailure(
                             "error propagation produced a non-finite weight",
@@ -347,11 +361,11 @@ pub fn gptq_quantize(
         }
 
         // Inter-block error propagation:
-        // W[:, block_end:] -= err_block @ H_inv[block_start:block_end, block_end:]
+        // W[:, block_end:] -= err_block @ U[block_start:block_end, block_end:]
         if block_end < cols {
             let remaining = cols - block_end;
-            let h_inv_cross = h_inv.view((block_start, block_end), (bsize, remaining));
-            let update = &err_block * h_inv_cross;
+            let u_cross = u.view((block_start, block_end), (bsize, remaining));
+            let update = &err_block * u_cross;
             for r in 0..rows {
                 for c in 0..remaining {
                     let next = w[(r, block_end + c)] - update[(r, c)];
@@ -440,19 +454,11 @@ pub fn hessian_weighted_mse(
     if hessian.iter().any(|value| !value.is_finite()) {
         return Err(GptqError::InvalidInput("Hessian values must be finite"));
     }
-    let mut total = 0.0f64;
-    for r in 0..rows {
-        // Error vector for this row
-        let err: Vec<f64> = (0..cols)
-            .map(|c| original[(r, c)] - quantized[(r, c)])
-            .collect();
-        // Quadratic form: e^T @ H @ e
-        for i in 0..cols {
-            for j in 0..cols {
-                total += err[i] * hessian[(i, j)] * err[j];
-            }
-        }
-    }
+    // trace(E^T @ E @ H) = sum over rows r of e_r^T @ H @ e_r, computed as
+    // sum((E @ H) .* E) so the O(rows * cols^2) work goes through nalgebra's
+    // matrix multiply instead of a scalar triple loop.
+    let err = original - quantized;
+    let total = (&err * hessian).component_mul(&err).sum();
     let elements = rows.checked_mul(cols).ok_or(GptqError::SizeOverflow)?;
     let value = total / elements as f64;
     if !value.is_finite() {
@@ -486,19 +492,20 @@ pub fn gptq_decompress(result: &GptqResult) -> Result<DMatrix<f64>, GptqError> {
 mod tests {
     use super::*;
     use crate::compress::compress_uniform_4bit;
-    use rand::Rng;
+    use rand::{rngs::StdRng, Rng, SeedableRng};
 
     /// With identity Hessian, GPTQ should degrade gracefully.
-    /// H_inv = I means no cross-column error propagation, so GPTQ ~ uniform.
+    /// The Cholesky factor of H^-1 is diagonal, so there is no cross-column
+    /// error propagation and GPTQ ~ uniform.
     #[test]
     fn identity_hessian_degrades_gracefully() {
-        let mut rng = rand::thread_rng();
-        let rows = 64;
-        let cols = 128;
+        let mut rng = StdRng::seed_from_u64(0x5EED_1001);
+        let rows = 32;
+        let cols = 64;
         let weights = DMatrix::from_fn(rows, cols, |_, _| rng.gen_range(-1.0..1.0));
         let hessian = DMatrix::identity(cols, cols);
 
-        let result = gptq_quantize(&weights, &hessian, 4, 128, 128).unwrap();
+        let result = gptq_quantize(&weights, &hessian, 4, 32, 32).unwrap();
 
         assert!(
             result.stats.mse < 0.1,
@@ -509,7 +516,7 @@ mod tests {
         assert_eq!(result.cols, cols);
 
         // With identity H, GPTQ should be roughly similar to uniform
-        let uniform = compress_uniform_4bit(&weights, 64);
+        let uniform = compress_uniform_4bit(&weights, 32).unwrap();
         let ratio = result.stats.mse / uniform.mse;
         println!(
             "Identity H: GPTQ MSE={:.6e}, Uniform MSE={:.6e}, ratio={:.2}",
@@ -529,19 +536,19 @@ mod tests {
     /// quantization error from important to unimportant weight directions.
     #[test]
     fn correlated_hessian_beats_uniform() {
-        let rows = 256;
-        let cols = 256;
+        let rows = 64;
+        let cols = 64;
 
         // Simulate activations where some features are 10x more active.
-        let x = DMatrix::from_fn(2048, cols, |i, j| {
+        let x = DMatrix::from_fn(512, cols, |i, j| {
             let base = ((i as f64 * 0.01 + j as f64 * 0.03).sin()) * 0.5;
-            if j < 64 {
+            if j < 16 {
                 base * 10.0
             } else {
                 base
             }
         });
-        let hessian = x.transpose() * &x / 2048.0;
+        let hessian = x.transpose() * &x / 512.0;
 
         // Weights with realistic structure
         let weights = DMatrix::from_fn(rows, cols, |i, j| {
@@ -550,16 +557,16 @@ mod tests {
                 + ((i * 7 + j * 13) as f64 * 0.001).sin() * 0.05
         });
 
-        let gptq_result = gptq_quantize(&weights, &hessian, 4, 128, 128).unwrap();
+        let gptq_result = gptq_quantize(&weights, &hessian, 4, 32, 32).unwrap();
         let gptq_decompressed = gptq_decompress(&gptq_result).unwrap();
 
         // Reconstruct uniform quantized matrix for weighted comparison
         let flat: Vec<f64> = weights.iter().cloned().collect();
         let mut uniform_recon = vec![0.0f64; rows * cols];
-        for (i, chunk) in flat.chunks(128).enumerate() {
-            let block = crate::quantize::quantize_uniform(chunk, 4);
+        for (i, chunk) in flat.chunks(32).enumerate() {
+            let block = crate::quantize::quantize_uniform(chunk, 4).unwrap();
             let recovered = crate::quantize::dequantize(&block).unwrap();
-            let start = i * 128;
+            let start = i * 32;
             for (j, &v) in recovered.iter().enumerate() {
                 if start + j < uniform_recon.len() {
                     uniform_recon[start + j] = v;
@@ -595,16 +602,161 @@ mod tests {
         );
     }
 
+    /// The matrix-product form of `hessian_weighted_mse`
+    /// (sum((E @ H) .* E) / n) must agree with the definitional scalar form
+    /// (sum over rows of e_r^T @ H @ e_r, divided by n) to float precision.
+    #[test]
+    fn hessian_weighted_mse_matches_scalar_reference() {
+        let mut rng = StdRng::seed_from_u64(0x5EED_1004);
+        let rows = 12;
+        let cols = 17;
+        let original = DMatrix::from_fn(rows, cols, |_, _| rng.gen_range(-1.0..1.0));
+        let quantized = DMatrix::from_fn(rows, cols, |_, _| rng.gen_range(-1.0..1.0));
+        // Symmetric PSD-ish Hessian from random activations.
+        let x = DMatrix::from_fn(40, cols, |_, _| rng.gen_range(-1.0..1.0));
+        let hessian = x.transpose() * &x / 40.0;
+
+        let fast = hessian_weighted_mse(&original, &quantized, &hessian).unwrap();
+
+        let mut scalar_total = 0.0f64;
+        for r in 0..rows {
+            let err: Vec<f64> = (0..cols)
+                .map(|c| original[(r, c)] - quantized[(r, c)])
+                .collect();
+            for i in 0..cols {
+                for j in 0..cols {
+                    scalar_total += err[i] * hessian[(i, j)] * err[j];
+                }
+            }
+        }
+        let scalar = scalar_total / (rows * cols) as f64;
+
+        let denom = scalar.abs().max(1e-30);
+        assert!(
+            ((fast - scalar) / denom).abs() < 1e-12,
+            "matrix form ({fast:.17e}) must match scalar form ({scalar:.17e})"
+        );
+    }
+
+    /// With an isotropic Hessian H = c * I, the Cholesky factor of H^-1 is
+    /// diagonal, so cross-column error propagation is exactly zero and GPTQ
+    /// must bit-match plain round-to-nearest quantization with the same
+    /// per-row-per-group parameters. (The Python exporter test suite asserts
+    /// the same equivalence.)
+    #[test]
+    fn isotropic_hessian_matches_round_to_nearest() {
+        let rows = 16;
+        let cols = 100; // ragged final group: 100 = 3 * 32 + 4
+        let group_size = 32;
+        let bits = 4u8;
+        let levels = (1u32 << bits) as f64;
+        let weights = DMatrix::from_fn(rows, cols, |i, j| {
+            ((i as f64 * 0.37 + j as f64 * 0.19).sin()) * 1.3
+                + ((i * 3 + j * 7) as f64 * 0.01).cos() * 0.4
+        });
+        let hessian = DMatrix::from_diagonal_element(cols, cols, 3.7);
+
+        let result = gptq_quantize(&weights, &hessian, bits, 64, group_size).unwrap();
+
+        let num_groups = checked_num_groups(cols, group_size).unwrap();
+        for gid in 0..num_groups {
+            let g_start = gid * group_size;
+            let g_end = (g_start + group_size).min(cols);
+            for r in 0..rows {
+                let mut min_val = f64::INFINITY;
+                let mut max_val = f64::NEG_INFINITY;
+                for c in g_start..g_end {
+                    min_val = min_val.min(weights[(r, c)]);
+                    max_val = max_val.max(weights[(r, c)]);
+                }
+                let range = max_val - min_val;
+                let scale = if range < 1e-15 {
+                    1.0
+                } else {
+                    range / (levels - 1.0)
+                };
+                let gp = &result.group_params[gid * rows + r];
+                assert_eq!(
+                    gp.scale, scale,
+                    "scale mismatch for row {r} group {gid}: isotropic-Hessian GPTQ must use RTN group params"
+                );
+                assert_eq!(
+                    gp.zero_point, min_val,
+                    "zero-point mismatch for row {r} group {gid}"
+                );
+                for c in g_start..g_end {
+                    let expected = ((weights[(r, c)] - min_val) / scale)
+                        .round()
+                        .max(0.0)
+                        .min(levels - 1.0) as u32;
+                    assert_eq!(
+                        result.quantized_codes[r * cols + c],
+                        expected,
+                        "code mismatch at ({r}, {c}): isotropic-Hessian GPTQ must equal round-to-nearest"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Symmetry must be judged with a RELATIVE tolerance: an H = X^T @ X with
+    /// large-magnitude entries carries float accumulation asymmetry far above
+    /// any absolute epsilon while remaining symmetric for every practical
+    /// purpose, while a genuinely asymmetric Hessian (1% relative skew) must
+    /// still be rejected.
+    #[test]
+    fn symmetry_tolerance_is_relative() {
+        let rows = 8;
+        let cols = 16;
+        let weights = DMatrix::from_fn(rows, cols, |i, j| ((i * 5 + j * 3) as f64 * 0.1).sin());
+
+        // H = X^T @ X with entries around 1e6.
+        let x = DMatrix::from_fn(64, cols, |i, j| {
+            ((i as f64 * 0.13 + j as f64 * 0.71).sin() + 1.5) * 100.0
+        });
+        let mut hessian = x.transpose() * &x;
+        // Make the accumulation asymmetry explicit and deterministic: exactly
+        // symmetrize, then reintroduce a float-scale skew. 1e-4 absolute is
+        // ~1e-10 RELATIVE to these entries — far above the old 1e-10 absolute
+        // threshold, far below the 1e-8 relative one.
+        for r in 0..cols {
+            for c in (r + 1)..cols {
+                let mean = 0.5 * (hessian[(r, c)] + hessian[(c, r)]);
+                hessian[(r, c)] = mean + 1e-4;
+                hessian[(c, r)] = mean - 1e-4;
+            }
+        }
+        let max_abs = hessian.iter().fold(0.0f64, |acc, v| acc.max(v.abs()));
+        assert!(
+            max_abs > 1e6,
+            "test wants large-magnitude entries, got {max_abs:.3e}"
+        );
+        assert!(
+            (hessian[(0, 1)] - hessian[(1, 0)]).abs() > 1e-10,
+            "test wants asymmetry above the old absolute threshold"
+        );
+        gptq_quantize(&weights, &hessian, 4, 16, 16)
+            .expect("symmetric Hessian with float-scale asymmetry must be accepted");
+
+        // A 1% relative skew on one entry is a genuinely asymmetric matrix.
+        let mut asymmetric = hessian;
+        asymmetric[(2, 5)] += 0.01 * asymmetric[(2, 5)].abs();
+        assert_eq!(
+            gptq_quantize(&weights, &asymmetric, 4, 16, 16).unwrap_err(),
+            GptqError::InvalidInput("Hessian must be symmetric")
+        );
+    }
+
     /// 3-bit quantization should work without panics.
     #[test]
     fn three_bit_works() {
-        let mut rng = rand::thread_rng();
-        let rows = 64;
-        let cols = 128;
+        let mut rng = StdRng::seed_from_u64(0x5EED_1002);
+        let rows = 32;
+        let cols = 64;
         let weights = DMatrix::from_fn(rows, cols, |_, _| rng.gen_range(-1.0..1.0));
         let hessian = DMatrix::identity(cols, cols);
 
-        let result = gptq_quantize(&weights, &hessian, 3, 128, 128).unwrap();
+        let result = gptq_quantize(&weights, &hessian, 3, 64, 64).unwrap();
 
         assert_eq!(result.bits, 3);
         assert!(
@@ -619,14 +771,14 @@ mod tests {
     /// Decompress roundtrip should reproduce quantized values exactly.
     #[test]
     fn decompress_roundtrip() {
-        let mut rng = rand::thread_rng();
-        let rows = 32;
-        let cols = 64;
+        let mut rng = StdRng::seed_from_u64(0x5EED_1003);
+        let rows = 16;
+        let cols = 32;
 
         let weights = DMatrix::from_fn(rows, cols, |_, _| rng.gen_range(-2.0..2.0));
         let hessian = DMatrix::identity(cols, cols);
 
-        let result = gptq_quantize(&weights, &hessian, 4, 64, 64).unwrap();
+        let result = gptq_quantize(&weights, &hessian, 4, 32, 32).unwrap();
         let decompressed = gptq_decompress(&result).unwrap();
 
         // Decompressed should exactly match quantized/dequantized values

@@ -4,26 +4,19 @@
 /// This is more efficient than standard byte-aligned storage:
 /// - 2-bit values: 4x denser than u8
 /// - 3-bit values: 2.67x denser than u8
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum BitPackError {
+    #[error("bits_per_value must be 1-8")]
     InvalidBitWidth,
+    #[error("value does not fit the requested bit width")]
+    ValueOutOfRange,
+    #[error("packed dimensions overflow")]
     SizeOverflow,
+    #[error("packed data length mismatch")]
     DataLengthMismatch,
+    #[error("unable to allocate packed or unpacked values")]
     AllocationFailed,
 }
-
-impl std::fmt::Display for BitPackError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidBitWidth => formatter.write_str("bits_per_value must be 1-8"),
-            Self::SizeOverflow => formatter.write_str("packed dimensions overflow"),
-            Self::DataLengthMismatch => formatter.write_str("packed data length mismatch"),
-            Self::AllocationFailed => formatter.write_str("unable to allocate unpacked values"),
-        }
-    }
-}
-
-impl std::error::Error for BitPackError {}
 
 #[derive(Debug, Clone)]
 pub struct BitPacker {
@@ -34,22 +27,32 @@ pub struct BitPacker {
 
 impl BitPacker {
     /// Pack a slice of unsigned integers using `bits` bits each.
-    pub fn pack(values: &[u32], bits: u8) -> Self {
-        assert!(bits > 0 && bits <= 8, "bits must be 1-8");
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BitPackError::InvalidBitWidth`] when `bits` is outside 1-8,
+    /// [`BitPackError::ValueOutOfRange`] when any value needs more than `bits`
+    /// bits, [`BitPackError::SizeOverflow`] when the packed length overflows,
+    /// and [`BitPackError::AllocationFailed`] when the buffer cannot be
+    /// allocated.
+    pub fn pack(values: &[u32], bits: u8) -> Result<Self, BitPackError> {
+        if !(1..=8).contains(&bits) {
+            return Err(BitPackError::InvalidBitWidth);
+        }
         let mask = (1u32 << bits) - 1;
-        assert!(
-            values.iter().all(|&value| value <= mask),
-            "value does not fit the requested bit width"
-        );
-        let total_bits = values
+        if values.iter().any(|&value| value > mask) {
+            return Err(BitPackError::ValueOutOfRange);
+        }
+        let num_bytes = values
             .len()
             .checked_mul(bits as usize)
-            .expect("packed bit length overflows");
-        let num_bytes = total_bits
-            .checked_add(7)
-            .expect("packed byte length overflows")
+            .and_then(|total_bits| total_bits.checked_add(7))
+            .ok_or(BitPackError::SizeOverflow)?
             / 8;
-        let mut data = vec![0u8; num_bytes];
+        let mut data = Vec::new();
+        data.try_reserve_exact(num_bytes)
+            .map_err(|_| BitPackError::AllocationFailed)?;
+        data.resize(num_bytes, 0u8);
 
         for (i, &val) in values.iter().enumerate() {
             let v = val & mask;
@@ -64,11 +67,11 @@ impl BitPacker {
             }
         }
 
-        Self {
+        Ok(Self {
             data,
             bits_per_value: bits,
             num_values: values.len(),
-        }
+        })
     }
 
     /// Unpack all values.
@@ -128,7 +131,7 @@ mod tests {
     #[test]
     fn pack_unpack_2bit() {
         let values: Vec<u32> = vec![0, 1, 2, 3, 1, 0, 3, 2];
-        let packed = BitPacker::pack(&values, 2);
+        let packed = BitPacker::pack(&values, 2).unwrap();
         let unpacked = packed.unpack().unwrap();
         assert_eq!(values, unpacked);
         assert_eq!(packed.size_bytes(), 2); // 8 values * 2 bits = 16 bits = 2 bytes
@@ -137,7 +140,7 @@ mod tests {
     #[test]
     fn pack_unpack_3bit() {
         let values: Vec<u32> = vec![0, 1, 2, 3, 4, 5, 6, 7, 3, 1];
-        let packed = BitPacker::pack(&values, 3);
+        let packed = BitPacker::pack(&values, 3).unwrap();
         let unpacked = packed.unpack().unwrap();
         assert_eq!(values, unpacked);
     }
@@ -145,10 +148,26 @@ mod tests {
     #[test]
     fn pack_unpack_4bit() {
         let values: Vec<u32> = (0..16).collect();
-        let packed = BitPacker::pack(&values, 4);
+        let packed = BitPacker::pack(&values, 4).unwrap();
         let unpacked = packed.unpack().unwrap();
         assert_eq!(values, unpacked);
         assert_eq!(packed.size_bytes(), 8); // 16 * 4 = 64 bits = 8 bytes
+    }
+
+    #[test]
+    fn pack_rejects_invalid_inputs() {
+        assert_eq!(
+            BitPacker::pack(&[0], 0).unwrap_err(),
+            BitPackError::InvalidBitWidth
+        );
+        assert_eq!(
+            BitPacker::pack(&[0], 9).unwrap_err(),
+            BitPackError::InvalidBitWidth
+        );
+        assert_eq!(
+            BitPacker::pack(&[4], 2).unwrap_err(),
+            BitPackError::ValueOutOfRange
+        );
     }
 
     #[test]
