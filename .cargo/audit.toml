@@ -1,0 +1,11 @@
+# cargo-audit policy for the RustSec gate in CI (ci.yml runs `cargo audit
+# --deny warnings`, so every ignore must be listed and justified here).
+
+[advisories]
+ignore = [
+    # `paste` is unmaintained (no vulnerability). It reaches us only as a
+    # proc-macro build dependency of nalgebra via simba; the nalgebra
+    # ecosystem has not migrated off it yet, and there is no replacement
+    # release to update to. Re-evaluate when nalgebra/simba drop it.
+    "RUSTSEC-2024-0436",
+]
