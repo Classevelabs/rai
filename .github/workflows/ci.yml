@@ -91,7 +91,7 @@ jobs:
         run: cargo build --workspace --release --locked
 
       - name: Validate Python exporter syntax
-        run: python -m compileall -q rai-infer/scripts
+        run: python3 -m compileall -q rai-infer/scripts
 
   supply-chain:
     name: Advisory and package gate
