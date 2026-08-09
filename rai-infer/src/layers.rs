@@ -1059,7 +1059,7 @@ mod tests {
     #[should_panic(expected = "KV cache dimensions do not match attention")]
     fn attention_rejects_mismatched_cache_before_simd() {
         let rope = RoPETable::new(16, 4, 10_000.0);
-        let mut cache = KVCache::new(1, 1, 4, 8);
+        let mut cache = KVCache::new(1, 1, 4, 8).unwrap();
         let mut output = [0.0; 16];
         let mut q = [0.0; 16];
         let mut k = [0.0; 16];
@@ -1082,7 +1082,7 @@ mod tests {
     #[test]
     fn attention_uses_scalar_tail_for_non_multiple_of_eight_head_dim() {
         let rope = RoPETable::new(6, 2, 10_000.0);
-        let mut cache = KVCache::new(1, 1, 2, 6);
+        let mut cache = KVCache::new(1, 1, 2, 6).unwrap();
         let mut output = [99.0; 6];
         let mut q = [1.0; 6];
         let mut k = [1.0; 6];

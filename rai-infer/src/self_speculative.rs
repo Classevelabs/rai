@@ -108,7 +108,7 @@ impl<'a> SelfSpecDecoder<'a> {
         let vs = model.config.vocab_size as usize;
         Ok(Self {
             model,
-            kv_cache: model.create_kv_cache(ctx),
+            kv_cache: model.create_kv_cache(ctx)?,
             draft_scratch: Scratch::new(),
             batch_scratch: BatchScratch::new(),
             draft_hidden: vec![0.0; hs],
@@ -425,4 +425,3 @@ impl<'a> SelfSpecDecoder<'a> {
         ))
     }
 }
-

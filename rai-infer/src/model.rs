@@ -66,8 +66,11 @@ impl RaiModel {
         &self.file
     }
 
-    pub fn create_kv_cache(&self, max_ctx: usize) -> KVCache {
-        assert!(max_ctx > 0, "KV cache context must be non-zero");
+    /// Allocate a KV cache for this model. Errors (rather than aborting) when
+    /// the requested context cannot be allocated; `kv_cache_bytes` lets
+    /// callers pre-flight the size.
+    pub fn create_kv_cache(&self, max_ctx: usize) -> Result<KVCache> {
+        ensure!(max_ctx > 0, "KV cache context must be non-zero");
         KVCache::new(
             self.config.num_layers as usize,
             self.config.num_kv_heads as usize,

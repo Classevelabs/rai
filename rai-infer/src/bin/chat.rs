@@ -281,7 +281,10 @@ fn handle_generate(state: &AppState, chat_req: &ChatRequest) -> Result<String, C
         max_ctx,
         state.model.config.vocab_size as usize,
     )?;
-    let mut kv_cache = state.model.create_kv_cache(max_ctx);
+    let mut kv_cache = state
+        .model
+        .create_kv_cache(max_ctx)
+        .map_err(ChatHttpError::internal)?;
     let mut work = InferenceWork::new();
     let mut work2 = InferenceWork::new();
     let mut rng = rand::rngs::StdRng::from_entropy();

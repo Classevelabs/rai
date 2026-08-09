@@ -26,7 +26,7 @@ fn main() -> Result<()> {
     let vs = model.config.vocab_size as usize;
 
     let max_ctx = 512;
-    let mut kv_cache = model.create_kv_cache(max_ctx);
+    let mut kv_cache = model.create_kv_cache(max_ctx)?;
     let mut work = InferenceWork::new();
 
     // Fill KV cache with some positions so attention has work to do
