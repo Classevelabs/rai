@@ -4,7 +4,7 @@ All notable changes to RAI are documented here. The project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and uses semantic
 versioning for its pre-1.0 releases.
 
-## [Unreleased]
+## [0.2.0] - Unreleased
 
 ### Added
 
