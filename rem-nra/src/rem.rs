@@ -49,7 +49,10 @@ pub struct ResidualEquilibriumMemory {
     pub decoder: decoder::DecoderParams,
     pub memory_state: Vec64,
     items: Vec<(Vec64, Vec64)>,
-    residual_norm: f64,
+    /// Running sum of the residual norm observed at each `store`. One residual is recorded per
+    /// stored item, so the mean is this sum divided by `items.len()`.
+    #[serde(default)]
+    residual_sum: f64,
     last_loss: Option<f64>,
 }
 
@@ -67,12 +70,15 @@ impl ResidualEquilibriumMemory {
             decoder: decoder::DecoderParams { bias: decoder_bias },
             config,
             items: Vec::new(),
-            residual_norm: 0.0,
+            residual_sum: 0.0,
             last_loss: None,
         }
     }
 
     /// Restore an exact persisted state without replaying items through `store`.
+    ///
+    /// `residual_norm` is the persisted *mean* residual norm, so the running sum is rebuilt from
+    /// it and the restored item count.
     pub fn from_snapshot(
         config: REMConfig,
         encoder: encoder::EncoderParams,
@@ -111,12 +117,12 @@ impl ResidualEquilibriumMemory {
         }
 
         Ok(Self {
+            residual_sum: residual_norm * items.len() as f64,
             config,
             encoder,
             decoder,
             memory_state,
             items,
-            residual_norm,
             last_loss,
         })
     }
@@ -125,7 +131,7 @@ impl ResidualEquilibriumMemory {
         ensure_dim(key, self.config.dim_key)?;
         ensure_dim(value, self.config.dim_value)?;
         let prediction = self.predict(key);
-        self.residual_norm = (value - prediction).norm();
+        self.residual_sum += (value - prediction).norm();
         self.items.push((key.clone(), value.clone()));
         self.memory_state = rolling_average(&self.memory_state, value);
         self.last_loss = Some(self.current_mse());
@@ -148,8 +154,13 @@ impl ResidualEquilibriumMemory {
         best.clone()
     }
 
+    /// Mean residual norm across every stored item, or `0.0` for an empty memory.
     pub fn mean_residual_norm(&self) -> f64 {
-        self.residual_norm
+        if self.items.is_empty() {
+            0.0
+        } else {
+            self.residual_sum / self.items.len() as f64
+        }
     }
 
     pub fn last_loss(&self) -> Option<f64> {
@@ -235,6 +246,74 @@ mod tests {
             Err(MemoryError::TrainingUnavailable)
         ));
         assert!(memory.last_loss.is_none());
+    }
+
+    fn two_dimensional() -> REMConfig {
+        REMConfig {
+            dim_memory: 2,
+            dim_key: 2,
+            dim_value: 2,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn mean_residual_norm_averages_every_store_not_just_the_last() {
+        let mut memory = ResidualEquilibriumMemory::new(two_dimensional(), &mut rand::thread_rng());
+        assert_eq!(memory.mean_residual_norm(), 0.0);
+
+        // First store predicts zeros, so the residual is the value norm: 3.
+        memory
+            .store(
+                &Vec64::from_row_slice(&[1.0, 0.0]),
+                &Vec64::from_row_slice(&[3.0, 0.0]),
+            )
+            .unwrap();
+        assert!((memory.mean_residual_norm() - 3.0).abs() < 1e-12);
+
+        // The orthogonal key still predicts the only stored value, so the residual is 5.
+        memory
+            .store(
+                &Vec64::from_row_slice(&[0.0, 1.0]),
+                &Vec64::from_row_slice(&[0.0, 4.0]),
+            )
+            .unwrap();
+        let mean = memory.mean_residual_norm();
+        assert!((mean - 4.0).abs() < 1e-12, "expected mean 4.0, got {mean}");
+        assert!(
+            (mean - 5.0).abs() > 1e-9,
+            "mean must not be the last residual"
+        );
+    }
+
+    #[test]
+    fn snapshot_round_trips_the_persisted_mean_residual_norm() {
+        let config = two_dimensional();
+        let items = vec![
+            (
+                Vec64::from_row_slice(&[1.0, 0.0]),
+                Vec64::from_row_slice(&[3.0, 0.0]),
+            ),
+            (
+                Vec64::from_row_slice(&[0.0, 1.0]),
+                Vec64::from_row_slice(&[0.0, 4.0]),
+            ),
+        ];
+        let restored = ResidualEquilibriumMemory::from_snapshot(
+            config.clone(),
+            encoder::EncoderParams {
+                bias: Vec64::zeros(config.dim_memory),
+            },
+            decoder::DecoderParams {
+                bias: Vec64::zeros(config.dim_value),
+            },
+            Vec64::zeros(config.dim_memory),
+            items,
+            4.0,
+            None,
+        )
+        .unwrap();
+        assert!((restored.mean_residual_norm() - 4.0).abs() < 1e-12);
     }
 
     #[test]

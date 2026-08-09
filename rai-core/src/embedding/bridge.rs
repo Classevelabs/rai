@@ -96,7 +96,7 @@ impl EmbeddingBridge {
         }
     }
 
-    /// Create with custom projections (e.g., PCA-learned).
+    /// Create with custom projections (e.g., restored from a persisted snapshot).
     pub fn with_projections(
         embedder: Arc<dyn Embedder>,
         omega_proj: Projection,

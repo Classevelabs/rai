@@ -100,48 +100,57 @@ impl NonlinearResonanceMemory {
         Ok(())
     }
 
+    /// Return the value of the single best-matching stored item.
+    ///
+    /// Retrieval is nearest-neighbour by cosine similarity over the stored addresses. Blending
+    /// every stored value together would return the corpus centroid rather than the match, so
+    /// the best-scoring item wins outright.
     pub fn retrieve_with_diagnostics(&self, omega: &Vec64) -> Result<RetrievalDiagnostics> {
         ensure_dim(omega, self.config.dim_omega)?;
-        if self.items.is_empty() {
+        let Some((_, first_value)) = self.items.first() else {
             return Ok(RetrievalDiagnostics {
                 value: Vec64::zeros(self.config.dim_value),
                 energy: 0.0,
                 steps: 0,
                 grad_norm: 1.0,
             });
-        }
+        };
 
-        let weights = softmax_weights(
-            self.items
-                .iter()
-                .map(|(stored, _)| cosine(omega, stored))
-                .collect(),
-        );
-        let mut value = Vec64::zeros(self.config.dim_value);
+        let mut best_value = first_value;
         let mut best_similarity = f64::NEG_INFINITY;
-
-        for ((stored, stored_value), weight) in self.items.iter().zip(weights.iter()) {
-            best_similarity = best_similarity.max(cosine(omega, stored));
-            value += stored_value * *weight;
+        for (stored, stored_value) in &self.items {
+            let similarity = cosine(omega, stored);
+            if similarity > best_similarity {
+                best_similarity = similarity;
+                best_value = stored_value;
+            }
         }
 
         Ok(RetrievalDiagnostics {
-            value,
+            value: best_value.clone(),
             energy: -best_similarity.max(0.0) * 5.0,
             steps: 1,
             grad_norm: (1.0 - best_similarity.max(0.0)).max(0.0) * 1e-8,
         })
     }
 
+    /// Score every stored address against its neighbours, leaving the item itself out.
+    ///
+    /// Including the item would score `cos(w, w) == 1` for every entry and report the same
+    /// constant energy forever, which hides all crowding between stored addresses.
     pub fn energy_snapshot(&self) -> Vec<(Vec64, f64)> {
         self.items
             .iter()
-            .map(|(omega, _)| {
-                let energy = self
-                    .retrieve_with_diagnostics(omega)
-                    .map(|diag| diag.energy)
-                    .unwrap_or(0.0);
-                (omega.clone(), energy)
+            .enumerate()
+            .map(|(index, (omega, _))| {
+                let best_similarity = self
+                    .items
+                    .iter()
+                    .enumerate()
+                    .filter(|(other, _)| *other != index)
+                    .map(|(_, (stored, _))| cosine(omega, stored))
+                    .fold(0.0f64, f64::max);
+                (omega.clone(), -best_similarity * 5.0)
             })
             .collect()
     }
@@ -225,24 +234,28 @@ fn cosine(a: &Vec64, b: &Vec64) -> f64 {
     }
 }
 
-fn softmax_weights(scores: Vec<f64>) -> Vec<f64> {
-    let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let mut exp: Vec<f64> = scores.iter().map(|score| (score - max).exp()).collect();
-    let sum: f64 = exp.iter().sum();
-    if sum <= 1e-12 {
-        let uniform = 1.0 / exp.len().max(1) as f64;
-        exp.fill(uniform);
-        return exp;
-    }
-    for value in &mut exp {
-        *value /= sum;
-    }
-    exp
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unit_config() -> NRAConfig {
+        NRAConfig {
+            dim_state: 2,
+            dim_omega: 2,
+            dim_value: 2,
+            ..Default::default()
+        }
+    }
+
+    fn memory_with(items: &[([f64; 2], [f64; 2])]) -> NonlinearResonanceMemory {
+        let mut memory = NonlinearResonanceMemory::new(unit_config(), &mut rand::thread_rng());
+        for (omega, value) in items {
+            memory
+                .store(&Vec64::from_row_slice(omega), &Vec64::from_row_slice(value))
+                .expect("store");
+        }
+        memory
+    }
 
     #[test]
     fn training_reports_unavailable_without_mutating_loss() {
@@ -254,5 +267,62 @@ mod tests {
             Err(MemoryError::TrainingUnavailable)
         ));
         assert!(memory.last_loss.is_none());
+    }
+
+    #[test]
+    fn retrieval_returns_the_best_match_not_a_corpus_blend() {
+        // Two stored values that would average to roughly (0.5, 0.5) if blended.
+        let memory = memory_with(&[([1.0, 0.0], [1.0, 0.0]), ([0.0, 1.0], [0.0, 1.0])]);
+
+        let matched = memory
+            .retrieve_with_diagnostics(&Vec64::from_row_slice(&[1.0, 0.05]))
+            .expect("retrieve");
+        assert_eq!(matched.value.as_slice(), &[1.0, 0.0]);
+        assert!(matched.energy < -4.9, "energy: {}", matched.energy);
+
+        let other = memory
+            .retrieve_with_diagnostics(&Vec64::from_row_slice(&[0.05, 1.0]))
+            .expect("retrieve");
+        assert_eq!(other.value.as_slice(), &[0.0, 1.0]);
+    }
+
+    #[test]
+    fn retrieval_on_an_empty_memory_reports_no_match() {
+        let memory = memory_with(&[]);
+        let diagnostics = memory
+            .retrieve_with_diagnostics(&Vec64::from_row_slice(&[1.0, 0.0]))
+            .expect("retrieve");
+        assert_eq!(diagnostics.value.as_slice(), &[0.0, 0.0]);
+        assert_eq!(diagnostics.energy, 0.0);
+        assert_eq!(diagnostics.steps, 0);
+    }
+
+    #[test]
+    fn energy_snapshot_leaves_the_scored_item_out() {
+        // A singleton has no neighbour to resonate with, so its energy is zero rather than
+        // the constant self-similarity floor.
+        let singleton = memory_with(&[([1.0, 0.0], [1.0, 0.0])]);
+        assert_eq!(singleton.energy_snapshot()[0].1, 0.0);
+
+        // A near-duplicate pair plus a distant item must not all report the same energy.
+        let crowded = memory_with(&[
+            ([1.0, 0.0], [1.0, 0.0]),
+            ([1.0, 0.02], [1.0, 0.0]),
+            ([0.0, 1.0], [0.0, 1.0]),
+        ]);
+        let energies: Vec<f64> = crowded.energy_snapshot().iter().map(|(_, e)| *e).collect();
+        assert!(energies[0] < -4.9, "crowded neighbour energy: {energies:?}");
+        assert!(energies[1] < -4.9, "crowded neighbour energy: {energies:?}");
+        assert!(energies[2] > -1.0, "distant item energy: {energies:?}");
+        assert!(energies.iter().any(|energy| *energy != energies[0]));
+    }
+
+    #[test]
+    fn energy_snapshot_ignores_negative_similarity() {
+        // Opposed addresses have cosine -1; energy is clamped at zero rather than going positive.
+        let opposed = memory_with(&[([1.0, 0.0], [1.0, 0.0]), ([-1.0, 0.0], [0.0, 1.0])]);
+        for (_, energy) in opposed.energy_snapshot() {
+            assert_eq!(energy, 0.0);
+        }
     }
 }

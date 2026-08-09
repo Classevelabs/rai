@@ -71,6 +71,7 @@ impl MemoryManager {
         };
 
         let mut rng = rand::thread_rng();
+        let ode_tol = nra_config.ode_tol;
         let nra = NonlinearResonanceMemory::new(nra_config, &mut rng);
         let rem = ResidualEquilibriumMemory::new(rem_config, &mut rng);
 
@@ -78,7 +79,7 @@ impl MemoryManager {
             nra: Arc::new(Mutex::new(nra)),
             rem: Arc::new(Mutex::new(rem)),
             bridge,
-            confidence_gate: ConfidenceGate::default(),
+            confidence_gate: ConfidenceGate::with_ode_tol(ode_tol),
             interference_detector: InterferenceDetector::default(),
             basin_analyzer: BasinAnalyzer::default(),
             surprise_detector: SurpriseDetector::default(),
@@ -116,6 +117,7 @@ impl MemoryManager {
     ) -> Result<Self, RaiError> {
         validate_memory_configs(&bridge, &nra_config, &rem_config)?;
         let mut rng = rand::thread_rng();
+        let ode_tol = nra_config.ode_tol;
         let nra = NonlinearResonanceMemory::new(nra_config, &mut rng);
         let rem = ResidualEquilibriumMemory::new(rem_config, &mut rng);
 
@@ -123,7 +125,7 @@ impl MemoryManager {
             nra: Arc::new(Mutex::new(nra)),
             rem: Arc::new(Mutex::new(rem)),
             bridge,
-            confidence_gate: ConfidenceGate::default(),
+            confidence_gate: ConfidenceGate::with_ode_tol(ode_tol),
             interference_detector: InterferenceDetector::default(),
             basin_analyzer: BasinAnalyzer::default(),
             surprise_detector: SurpriseDetector::default(),
@@ -505,6 +507,10 @@ impl MemoryManager {
     /// Load state from disk. Returns a new MemoryManager.
     pub async fn load(path: &Path, bridge: Arc<EmbeddingBridge>) -> Result<Self, RaiError> {
         let snapshot = MemorySnapshot::load(path)?;
+        // Version 0 files predate the parallel `texts` field, so labels can only be rebuilt from
+        // the text index — which deduplicates. When the same text was stored twice the missing
+        // labels are unrecoverable, so say so instead of failing later as an opaque count
+        // mismatch that reads like corruption.
         let texts = if snapshot.texts.is_empty() {
             snapshot
                 .text_index
@@ -516,6 +522,13 @@ impl MemoryManager {
             snapshot.texts.clone()
         };
         let item_count = snapshot.nra_items.len();
+        if snapshot.version < CURRENT_SNAPSHOT_VERSION && texts.len() != item_count {
+            return Err(RaiError::PersistenceError(
+                "snapshot predates label persistence (version 0); re-create it with this release \
+                 or restore from a version-1 snapshot"
+                    .to_string(),
+            ));
+        }
         if snapshot.total_items != item_count
             || snapshot.rem_items.len() != item_count
             || texts.len() != item_count
@@ -583,6 +596,7 @@ impl MemoryManager {
         ));
 
         // Reconstruct NRA
+        let ode_tol = snapshot.nra_config.ode_tol;
         let mut nra =
             NonlinearResonanceMemory::from_params(snapshot.nra_params, snapshot.nra_config);
         for (omega, value) in &snapshot.nra_items {
@@ -612,7 +626,7 @@ impl MemoryManager {
             nra: Arc::new(Mutex::new(nra)),
             rem: Arc::new(Mutex::new(rem)),
             bridge: restored_bridge,
-            confidence_gate: ConfidenceGate::default(),
+            confidence_gate: ConfidenceGate::with_ode_tol(ode_tol),
             interference_detector: InterferenceDetector::default(),
             basin_analyzer: BasinAnalyzer::default(),
             surprise_detector: SurpriseDetector::default(),
@@ -703,8 +717,189 @@ fn training_not_implemented() -> RaiError {
 #[cfg(test)]
 mod persistence_tests {
     use super::*;
-    use crate::embedding::MockEmbedder;
+    use crate::embedding::{Embedder, MockEmbedder};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Twenty distinct facts used by the recall regression test.
+    const DISTINCT_FACTS: [&str; 20] = [
+        "the kettle boils at ninety eight degrees in this flat",
+        "marta keeps the spare key under the third plant pot",
+        "the quarterly review moved to the second thursday",
+        "our staging cluster runs in the frankfurt region",
+        "the fire drill alarm is tested every first monday",
+        "dmitri is allergic to shellfish but not to iodine",
+        "the archive tapes live in the basement cage seven",
+        "invoice numbering restarts at one every fiscal year",
+        "the roof access code was changed to four one nine two",
+        "priya owns the deployment runbook for the billing service",
+        "the coffee grinder needs descaling every forty days",
+        "our vpn certificate expires on the ninth of november",
+        "the loading bay is closed for resurfacing until spring",
+        "sam prefers written agendas circulated the night before",
+        "the backup generator holds fuel for eleven hours",
+        "customer refunds above two thousand need dual approval",
+        "the conference room projector uses the older hdmi cable",
+        "yusuf handles all correspondence with the auditors",
+        "the parcel locker pin rotates on the first of each month",
+        "our incident retrospectives are written within three days",
+    ];
+
+    /// Mock provider whose embeddings share a large common component, the way production
+    /// providers do.
+    ///
+    /// [`MockEmbedder`] is effectively zero-mean and near-orthogonal, which masks a retrieval
+    /// that returns the corpus centroid instead of the matching item.
+    struct MeanBiasedEmbedder {
+        dim: usize,
+    }
+
+    impl MeanBiasedEmbedder {
+        /// Weight of the direction every embedding shares.
+        const COMMON_WEIGHT: f64 = 0.8;
+        /// Weight of the text-specific direction.
+        const SPECIFIC_WEIGHT: f64 = 0.2;
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for MeanBiasedEmbedder {
+        async fn embed(&self, text: &str) -> Result<Vec<f64>, RaiError> {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+
+            let mut specific = vec![0.0f64; self.dim];
+            for (index, component) in specific.iter_mut().enumerate() {
+                let mut hasher = DefaultHasher::new();
+                text.hash(&mut hasher);
+                index.hash(&mut hasher);
+                *component = (hasher.finish() as f64 / u64::MAX as f64) * 2.0 - 1.0;
+            }
+            normalize(&mut specific);
+
+            let common = 1.0 / (self.dim as f64).sqrt();
+            let mut embedding: Vec<f64> = specific
+                .iter()
+                .map(|component| Self::COMMON_WEIGHT * common + Self::SPECIFIC_WEIGHT * component)
+                .collect();
+            normalize(&mut embedding);
+            Ok(embedding)
+        }
+
+        fn embedding_dim(&self) -> usize {
+            self.dim
+        }
+    }
+
+    fn normalize(vector: &mut [f64]) {
+        let norm = vector.iter().map(|value| value * value).sum::<f64>().sqrt();
+        if norm > 0.0 {
+            for value in vector {
+                *value /= norm;
+            }
+        }
+    }
+
+    /// Every stored fact must be recallable by its own text, even when the embedding space has a
+    /// dominant shared direction. Blending stored values by softmax weight returns the corpus
+    /// centroid here, so this fails unless retrieval picks the single best match.
+    #[tokio::test]
+    async fn recall_returns_the_stored_fact_under_a_mean_biased_embedder() {
+        let embedder = Arc::new(MeanBiasedEmbedder { dim: 384 });
+        let bridge = Arc::new(EmbeddingBridge::new(embedder, 32, 32, 64));
+        let manager = MemoryManager::try_new(bridge).unwrap();
+
+        for fact in DISTINCT_FACTS {
+            manager.store(fact).await.unwrap();
+        }
+        assert_eq!(manager.len().await, DISTINCT_FACTS.len());
+
+        for fact in DISTINCT_FACTS {
+            let result = manager.recall(fact).await.unwrap();
+            assert_eq!(
+                result.content, fact,
+                "recall returned a different memory than the one queried"
+            );
+        }
+    }
+
+    /// Leave-one-out energies have to move when neighbours arrive, and their magnitudes have to
+    /// cross the interference detector's tiers.
+    ///
+    /// Note the direction: an append-only store can only bring an item's nearest neighbour
+    /// closer, so every delta a store produces is non-positive. The detector's positive-delta
+    /// tier is exercised by the opposite comparison — the same memories without the crowding
+    /// neighbour present.
+    #[tokio::test]
+    async fn leave_one_out_energy_varies_and_reaches_the_interference_detector() {
+        let embedder = Arc::new(MockEmbedder::new(384));
+        let bridge = Arc::new(EmbeddingBridge::new(embedder, 32, 32, 64));
+        let manager = MemoryManager::try_new(bridge).unwrap();
+        for fact in ["alpha fact", "beta fact", "gamma fact"] {
+            manager.store(fact).await.unwrap();
+        }
+        let sparse = manager.energy_snapshot().await;
+
+        // Storing the same text again gives "alpha fact" an exactly coincident neighbour.
+        manager.store("alpha fact").await.unwrap();
+        let crowded = manager.energy_snapshot().await;
+
+        assert!(
+            crowded[0].1 < -4.9,
+            "a coincident neighbour must reach the energy floor: {crowded:?}"
+        );
+        assert!(
+            crowded.iter().any(|(_, energy)| *energy != crowded[0].1),
+            "energies must vary across items rather than stay constant: {crowded:?}"
+        );
+        assert!(
+            sparse[0].1 - crowded[0].1 > 0.5,
+            "energy must respond to a new neighbour: {} -> {}",
+            sparse[0].1,
+            crowded[0].1
+        );
+
+        let texts = manager.texts.lock().await[..sparse.len()].to_vec();
+        let report =
+            InterferenceDetector::default().detect(&crowded[..sparse.len()], &sparse, &texts);
+        assert!(report.has_interference);
+        assert_ne!(report.severity, InterferenceSeverity::None);
+        assert!(report
+            .affected_items
+            .iter()
+            .any(|item| item.content == "alpha fact"));
+    }
+
+    /// The gate documents `ode_tol` as coming from the NRA config, so a custom configuration has
+    /// to reach it — on construction and after a reload.
+    #[tokio::test]
+    async fn confidence_gate_uses_the_configured_ode_tolerance() {
+        let bridge = Arc::new(EmbeddingBridge::new(
+            Arc::new(MockEmbedder::new(384)),
+            32,
+            32,
+            64,
+        ));
+        let nra_config = NRAConfig {
+            ode_tol: 1e-3,
+            ..Default::default()
+        };
+        let manager = MemoryManager::with_configs(bridge, nra_config, REMConfig::default())
+            .expect("valid configuration");
+        assert_eq!(manager.confidence_gate.ode_tol, 1e-3);
+
+        let path = unique_temp_path("ode-tol.json");
+        manager.store("tolerance survives a reload").await.unwrap();
+        manager.save(&path).await.unwrap();
+        let fresh_bridge = Arc::new(EmbeddingBridge::new(
+            Arc::new(MockEmbedder::new(384)),
+            32,
+            32,
+            64,
+        ));
+        let restored = MemoryManager::load(&path, fresh_bridge).await.unwrap();
+        assert_eq!(restored.confidence_gate.ode_tol, 1e-3);
+
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn checked_default_constructor_rejects_mismatched_bridge_dimensions() {
@@ -947,12 +1142,15 @@ mod persistence_tests {
         std::fs::remove_file(corrupt_path).unwrap();
     }
 
+    /// Rebuilding labels from the deduplicating text index is only sound when every stored text
+    /// was unique, so that remains the one version-0 shape this release still accepts.
     #[tokio::test]
-    async fn legacy_snapshot_without_parallel_texts_remains_loadable() {
+    async fn legacy_snapshot_without_duplicate_labels_remains_loadable() {
         let embedder = Arc::new(MockEmbedder::new(384));
         let bridge = Arc::new(EmbeddingBridge::new(embedder, 32, 32, 64));
         let manager = MemoryManager::try_new(bridge).unwrap();
         manager.store("legacy memory").await.unwrap();
+        manager.store("another legacy memory").await.unwrap();
         let valid_path = unique_temp_path("valid-legacy.json");
         let legacy_path = unique_temp_path("legacy-v0.json");
         manager.save(&valid_path).await.unwrap();
@@ -972,8 +1170,57 @@ mod persistence_tests {
             .await
             .unwrap();
         let restored_texts = restored.texts.lock().await;
-        assert_eq!(restored_texts.len(), 1);
-        assert_eq!(restored_texts[0], "legacy memory");
+        assert_eq!(
+            *restored_texts,
+            vec![
+                "legacy memory".to_string(),
+                "another legacy memory".to_string()
+            ]
+        );
+        drop(restored_texts);
+
+        std::fs::remove_file(valid_path).unwrap();
+        std::fs::remove_file(legacy_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_snapshot_with_duplicate_labels_is_rejected_with_an_actionable_error() {
+        let embedder = Arc::new(MockEmbedder::new(384));
+        let bridge = Arc::new(EmbeddingBridge::new(embedder, 32, 32, 64));
+        let manager = MemoryManager::try_new(bridge).unwrap();
+        // The text index deduplicates, so two stores of the same text leave a version-0 file
+        // with one index entry for two items: the labels are genuinely unrecoverable.
+        manager.store("repeated memory").await.unwrap();
+        manager.store("repeated memory").await.unwrap();
+        let valid_path = unique_temp_path("valid-duplicate.json");
+        let legacy_path = unique_temp_path("legacy-duplicate-v0.json");
+        manager.save(&valid_path).await.unwrap();
+
+        let mut snapshot = MemorySnapshot::load(&valid_path).unwrap();
+        assert_eq!(snapshot.total_items, 2);
+        assert_eq!(snapshot.text_index.entries.len(), 1);
+        snapshot.version = 0;
+        snapshot.texts.clear();
+        std::fs::write(&legacy_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+
+        let fresh_bridge = Arc::new(EmbeddingBridge::new(
+            Arc::new(MockEmbedder::new(384)),
+            32,
+            32,
+            64,
+        ));
+        let error = match MemoryManager::load(&legacy_path, fresh_bridge).await {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("unrecoverable version-0 snapshot unexpectedly loaded"),
+        };
+        assert!(
+            error.contains("predates label persistence"),
+            "expected an actionable version-0 error, got: {error}"
+        );
+        assert!(
+            !error.contains("incoherent snapshot counts"),
+            "the count mismatch must not surface as corruption: {error}"
+        );
 
         std::fs::remove_file(valid_path).unwrap();
         std::fs::remove_file(legacy_path).unwrap();
