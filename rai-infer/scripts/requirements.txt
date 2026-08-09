@@ -1,0 +1,10 @@
+# Dependencies for the model-export and draft-training scripts.
+# The shared writer module (raimodel.py) and its test suite need ONLY numpy;
+# torch/transformers/datasets are required for exporting real checkpoints.
+#
+# Lower bounds are the versions these scripts are developed against; record
+# `pip freeze` alongside any published .raimodel artifact for reproducibility.
+numpy>=1.26
+torch>=2.2
+transformers>=4.40
+datasets>=2.19

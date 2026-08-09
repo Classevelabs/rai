@@ -70,7 +70,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-cargo-1.95.0-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Verify locked dependency graph
         run: cargo metadata --locked --format-version 1 --no-deps
@@ -93,6 +93,11 @@ jobs:
       - name: Validate Python exporter syntax
         run: python3 -m compileall -q rai-infer/scripts
 
+      - name: Run exporter conformance suite (numpy-only)
+        run: |
+          python3 -m pip install --user 'numpy>=1.26'
+          python3 rai-infer/scripts/test_raimodel.py
+
   supply-chain:
     name: Advisory and package gate
     runs-on: ubuntu-24.04
@@ -110,7 +115,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-cargo-audit-1.95.0-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-audit-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Audit RustSec advisories
         run: |
