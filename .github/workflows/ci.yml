@@ -97,6 +97,10 @@ jobs:
         run: |
           python3 -m pip install --user 'numpy>=1.26'
           python3 rai-infer/scripts/test_raimodel.py
+          # The suite regenerates the golden fixtures; they must byte-match
+          # the committed ones or the Python writer has drifted from what the
+          # Rust reader tests were validated against.
+          git diff --exit-code rai-infer/tests/fixtures/
 
   supply-chain:
     name: Advisory and package gate
