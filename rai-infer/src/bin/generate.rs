@@ -544,7 +544,7 @@ fn main() -> Result<()> {
         );
     } else {
         // === NORMAL DECODING ===
-        let mut kv_cache = model.create_kv_cache(max_ctx);
+        let mut kv_cache = model.create_kv_cache(max_ctx)?;
         let mut work = InferenceWork::new();
         let mut work2 = InferenceWork::new();
 

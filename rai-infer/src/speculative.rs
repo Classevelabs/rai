@@ -94,8 +94,8 @@ impl<'a> SpeculativeDecoder<'a> {
         Ok(Self {
             draft,
             target,
-            draft_kv: draft.create_kv_cache(draft_ctx),
-            target_kv: target.create_kv_cache(target_ctx),
+            draft_kv: draft.create_kv_cache(draft_ctx)?,
+            target_kv: target.create_kv_cache(target_ctx)?,
             draft_scratch: Scratch::new(),
             target_scratch: Scratch::new(),
             target_batch_scratch: BatchScratch::new(),

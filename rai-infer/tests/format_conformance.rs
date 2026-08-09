@@ -45,8 +45,12 @@ fn dequant_linear_row_prefix(linear: &QuantizedLinear, row: usize, count: usize)
     let row_bytes = linear.cols / 2;
     (0..count)
         .map(|col| {
-            let (scale, zero) =
-                group_param(linear.group_params, row, num_groups, col / linear.group_size);
+            let (scale, zero) = group_param(
+                linear.group_params,
+                row,
+                num_groups,
+                col / linear.group_size,
+            );
             let byte = linear.nibble_data[row * row_bytes + col / 2];
             let code = if col % 2 == 0 { byte & 0x0F } else { byte >> 4 };
             f32::from(code) * scale + zero
@@ -84,7 +88,10 @@ fn assert_close(actual: &[f32], expected: &[f32], what: &str) {
 fn check_config(file: &RaiModelFile, sidecar: &Value) {
     let cfg = &sidecar["config"];
     let c = &file.config;
-    assert_eq!(u64::from(c.hidden_size), cfg["hidden_size"].as_u64().unwrap());
+    assert_eq!(
+        u64::from(c.hidden_size),
+        cfg["hidden_size"].as_u64().unwrap()
+    );
     assert_eq!(u64::from(c.num_layers), cfg["num_layers"].as_u64().unwrap());
     assert_eq!(u64::from(c.num_heads), cfg["num_heads"].as_u64().unwrap());
     assert_eq!(
@@ -117,7 +124,11 @@ fn run_fixture(model_name: &str, sidecar_name: &str) {
     let path = fixture(model_name);
 
     let file_size = std::fs::metadata(&path).expect("fixture metadata").len();
-    assert_eq!(file_size, sidecar["file_size"].as_u64().unwrap(), "file size");
+    assert_eq!(
+        file_size,
+        sidecar["file_size"].as_u64().unwrap(),
+        "file size"
+    );
 
     let file = RaiModelFile::open(&path).expect("reader must accept the exporter's output");
     check_config(&file, &sidecar);

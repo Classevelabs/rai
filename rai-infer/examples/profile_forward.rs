@@ -23,7 +23,7 @@ fn main() -> Result<()> {
     let hs = model.config.hidden_size as usize;
     let vs = model.config.vocab_size as usize;
     let max_ctx = 512;
-    let mut kv_cache = model.create_kv_cache(max_ctx);
+    let mut kv_cache = model.create_kv_cache(max_ctx)?;
     let mut work = rai_infer::model::InferenceWork::new();
     let mut hidden = vec![0.0f32; hs];
     let mut normed = vec![0.0f32; hs];

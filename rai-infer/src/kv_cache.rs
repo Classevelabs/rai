@@ -13,6 +13,8 @@
 //! positions, reading a stale entry from a previous request) into panics or
 //! `Err`s at the call site.
 
+use anyhow::{anyhow, ensure, Result};
+
 /// KV cache for a single transformer layer.
 pub struct LayerKVCache {
     /// Key cache: `[num_kv_heads * max_ctx * head_dim]`
@@ -27,23 +29,35 @@ pub struct LayerKVCache {
 }
 
 impl LayerKVCache {
-    pub fn new(num_kv_heads: usize, max_ctx: usize, head_dim: usize) -> Self {
-        assert!(
+    /// Allocate a layer cache. Fails gracefully (instead of aborting the
+    /// process) when the requested context would exceed available memory —
+    /// a legitimately valid model file can still describe a cache far larger
+    /// than the machine.
+    pub fn new(num_kv_heads: usize, max_ctx: usize, head_dim: usize) -> Result<Self> {
+        ensure!(
             num_kv_heads > 0 && max_ctx > 0 && head_dim > 0,
             "KV cache dimensions must be non-zero"
         );
         let total = num_kv_heads
             .checked_mul(max_ctx)
             .and_then(|value| value.checked_mul(head_dim))
-            .expect("KV cache dimensions overflow");
-        Self {
-            k: vec![0.0; total],
-            v: vec![0.0; total],
+            .ok_or_else(|| anyhow!("KV cache dimensions overflow"))?;
+        let mib = (total * 2 * std::mem::size_of::<f32>()) >> 20;
+        let mut k = Vec::new();
+        let mut v = Vec::new();
+        k.try_reserve_exact(total)
+            .and_then(|()| v.try_reserve_exact(total))
+            .map_err(|_| anyhow!("cannot allocate {mib} MiB for the KV cache"))?;
+        k.resize(total, 0.0);
+        v.resize(total, 0.0);
+        Ok(Self {
+            k,
+            v,
             num_kv_heads,
             max_ctx,
             head_dim,
             filled: 0,
-        }
+        })
     }
 
     /// Store K and V vectors at the given position.
@@ -144,12 +158,17 @@ pub struct KVCache {
 
 impl KVCache {
     /// Allocate cache for all layers.
-    pub fn new(num_layers: usize, num_kv_heads: usize, max_ctx: usize, head_dim: usize) -> Self {
-        assert!(num_layers > 0, "KV cache must contain at least one layer");
+    pub fn new(
+        num_layers: usize,
+        num_kv_heads: usize,
+        max_ctx: usize,
+        head_dim: usize,
+    ) -> Result<Self> {
+        ensure!(num_layers > 0, "KV cache must contain at least one layer");
         let layers = (0..num_layers)
             .map(|_| LayerKVCache::new(num_kv_heads, max_ctx, head_dim))
-            .collect();
-        Self { layers }
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { layers })
     }
 
     /// Store K,V at a position for a specific layer.
@@ -221,7 +240,7 @@ mod tests {
 
     #[test]
     fn test_store_and_retrieve() {
-        let mut cache = KVCache::new(2, 3, 16, 4); // 2 layers, 3 kv heads, 16 ctx, dim 4
+        let mut cache = KVCache::new(2, 3, 16, 4).unwrap(); // 2 layers, 3 kv heads, 16 ctx, dim 4
 
         // Store at layer 0, position 0
         let k = vec![
@@ -244,7 +263,7 @@ mod tests {
 
     #[test]
     fn test_overwrite_during_pondering() {
-        let mut cache = KVCache::new(1, 1, 4, 2);
+        let mut cache = KVCache::new(1, 1, 4, 2).unwrap();
 
         // First iteration: store [1.0, 2.0]
         cache.store(0, 0, &[1.0, 2.0], &[3.0, 4.0]);
@@ -259,7 +278,7 @@ mod tests {
     #[test]
     fn test_memory_budget() {
         // SmolLM config: 30 layers, 3 KV heads, 512 ctx, dim 64
-        let cache = KVCache::new(30, 3, 512, 64);
+        let cache = KVCache::new(30, 3, 512, 64).unwrap();
         let bytes = cache.memory_bytes();
         let mb = bytes as f64 / (1024.0 * 1024.0);
         // Expected: 30 * 2 * 3 * 512 * 64 * 4 = 22,118,400 bytes ≈ 21.1 MB
@@ -269,7 +288,7 @@ mod tests {
 
     #[test]
     fn test_filled_watermark_tracks_stores() {
-        let mut cache = KVCache::new(1, 1, 8, 2);
+        let mut cache = KVCache::new(1, 1, 8, 2).unwrap();
         assert_eq!(cache.filled(0), 0);
         cache.store(0, 0, &[1.0, 2.0], &[3.0, 4.0]);
         cache.store(0, 1, &[1.0, 2.0], &[3.0, 4.0]);
@@ -282,7 +301,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "gap")]
     fn test_store_with_gap_panics() {
-        let mut cache = KVCache::new(1, 1, 8, 2);
+        let mut cache = KVCache::new(1, 1, 8, 2).unwrap();
         cache.store(0, 0, &[1.0, 2.0], &[3.0, 4.0]);
         cache.store(0, 5, &[1.0, 2.0], &[3.0, 4.0]); // positions 1..5 never written
     }
@@ -290,7 +309,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "unwritten position")]
     fn test_read_beyond_watermark_panics() {
-        let mut cache = KVCache::new(1, 1, 8, 2);
+        let mut cache = KVCache::new(1, 1, 8, 2).unwrap();
         cache.store(0, 0, &[1.0, 2.0], &[3.0, 4.0]);
         let _ = cache.get_k(0, 0, 1, 2);
     }
@@ -298,14 +317,14 @@ mod tests {
     #[test]
     #[should_panic(expected = "head is out of range")]
     fn test_read_bad_head_panics() {
-        let mut cache = KVCache::new(1, 2, 8, 2);
+        let mut cache = KVCache::new(1, 2, 8, 2).unwrap();
         cache.store(0, 0, &[1.0, 2.0, 3.0, 4.0], &[5.0, 6.0, 7.0, 8.0]);
         let _ = cache.get_k(0, 2, 0, 2);
     }
 
     #[test]
     fn test_truncate_and_refill() {
-        let mut cache = KVCache::new(1, 1, 8, 2);
+        let mut cache = KVCache::new(1, 1, 8, 2).unwrap();
         for pos in 0..4 {
             cache.store(0, pos, &[pos as f32, 0.0], &[0.0, 0.0]);
         }
@@ -320,7 +339,7 @@ mod tests {
 
     #[test]
     fn test_clear_resets_watermark() {
-        let mut cache = KVCache::new(1, 1, 4, 2);
+        let mut cache = KVCache::new(1, 1, 4, 2).unwrap();
         cache.store(0, 0, &[1.0, 2.0], &[3.0, 4.0]);
         cache.clear();
         assert_eq!(cache.filled(0), 0);
