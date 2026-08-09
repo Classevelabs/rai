@@ -393,13 +393,13 @@ impl<'a> SpeculativeDecoder<'a> {
             }
         }
 
-        // No KV fixup needed on rejection. Stale entries from rejected drafts
-        // sit at positions beyond the accepted range. Since attention is bounded
-        // by `0..=pos` (layers.rs), stale entries at higher positions are never
-        // attended to. The next step() call naturally overwrites them when the
-        // draft/target process new tokens at those positions.
-
+        // Drop rejected-draft KV entries in both caches: positions beyond the
+        // tokens this step actually produced must not count as valid context.
+        // The next step() refills from exactly this frontier, and the cache's
+        // gap/watermark checks now enforce that instead of trusting it.
         let produced = accepted_tokens.len();
+        self.draft_kv.truncate(pos + produced);
+        self.target_kv.truncate(pos + produced);
         let accept_rate = if n_drafted > 0 {
             n_accepted as f32 / n_drafted as f32
         } else {
