@@ -1,4 +1,4 @@
-//! Microbenchmark for W4A32 GEMM kernel throughput.
+//! Microbenchmark for W4A8 GEMM kernel throughput.
 
 use half::f16;
 use std::time::Instant;
@@ -42,7 +42,7 @@ fn main() {
 
         // Warmup
         for _ in 0..3 {
-            rai_infer::gemm::w4a32_matvec(
+            rai_infer::gemm::w4a8_matvec(
                 &mut output,
                 &nibble_data,
                 &group_params,
@@ -57,7 +57,7 @@ fn main() {
         let iters = if rows > 10000 { 10 } else { 50 };
         let t0 = Instant::now();
         for _ in 0..iters {
-            rai_infer::gemm::w4a32_matvec(
+            rai_infer::gemm::w4a8_matvec(
                 &mut output,
                 &nibble_data,
                 &group_params,
@@ -106,7 +106,7 @@ fn main() {
         let mut output = vec![0.0f32; rows];
 
         // Warmup
-        rai_infer::gemm::w4a32_matvec(
+        rai_infer::gemm::w4a8_matvec(
             &mut output,
             &nibble_data,
             &group_params,
@@ -118,7 +118,7 @@ fn main() {
 
         let t0 = Instant::now();
         for _ in 0..30 {
-            rai_infer::gemm::w4a32_matvec(
+            rai_infer::gemm::w4a8_matvec(
                 &mut output,
                 &nibble_data,
                 &group_params,

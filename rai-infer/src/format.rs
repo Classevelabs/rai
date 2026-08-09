@@ -12,6 +12,13 @@ use half::f16;
 use std::io::Read;
 use std::path::Path;
 
+// Capacity limits are owned by the modules that enforce them at run time; the
+// format validator imports them so that accepting a file here is exactly the
+// guarantee the kernels rely on (a loaded model can never exceed the GEMM
+// group capacity or the RoPE table budget).
+use crate::gemm::MAX_GROUPS;
+use crate::layers::MAX_ROPE_TABLE_BYTES;
+
 /// Magic bytes: "RAIM"
 const MAGIC: [u8; 4] = *b"RAIM";
 const FORMAT_VERSION: u32 = 1;
@@ -24,8 +31,6 @@ const MAX_LAYERS: u32 = 1_024;
 const MAX_HEADS: u32 = 1_024;
 const MAX_VOCAB_SIZE: u32 = 10_000_000;
 const MAX_CONTEXT: u32 = 1_000_000;
-const MAX_GEMM_GROUPS: usize = 128;
-const MAX_ROPE_TABLE_BYTES: usize = 512 * 1024 * 1024;
 
 /// Model configuration extracted from the header.
 #[derive(Debug, Clone)]
@@ -545,15 +550,15 @@ fn validate_config(config: &ModelConfig) -> Result<()> {
     let max_linear_groups = (config.hidden_size as usize)
         .div_ceil(group_size)
         .max((config.intermediate_size as usize).div_ceil(group_size));
-    if max_linear_groups > MAX_GEMM_GROUPS {
+    if max_linear_groups > MAX_GROUPS {
         bail!(
-            "model requires {max_linear_groups} quantization groups; kernel maximum is {MAX_GEMM_GROUPS}"
+            "model requires {max_linear_groups} quantization groups; kernel maximum is {MAX_GROUPS}"
         );
     }
     let embedding_groups = (config.hidden_size as usize).div_ceil(config.embed_group_size as usize);
-    if embedding_groups > MAX_GEMM_GROUPS {
+    if embedding_groups > MAX_GROUPS {
         bail!(
-            "embedding requires {embedding_groups} quantization groups; kernel maximum is {MAX_GEMM_GROUPS}"
+            "embedding requires {embedding_groups} quantization groups; kernel maximum is {MAX_GROUPS}"
         );
     }
     if !config.rope_theta.is_finite() || config.rope_theta <= 0.0 {

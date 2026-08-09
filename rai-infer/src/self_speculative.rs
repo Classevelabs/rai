@@ -13,7 +13,7 @@ use rand::Rng;
 
 use crate::kv_cache::KVCache;
 use crate::model::{BatchScratch, RaiModel, Scratch};
-use crate::sampler::{apply_repetition_penalty, sample_token, SamplerConfig};
+use crate::sampler::{sample_token, SamplerConfig};
 use crate::speculative::{sample_correction, softmax_prob_of};
 
 /// Configuration for self-speculative decoding.
@@ -152,12 +152,15 @@ impl<'a> SelfSpecDecoder<'a> {
     /// 1. Draft K tokens using first N layers (fast).
     /// 2. Verify all tokens using full model with batched GEMM (1× bandwidth).
     /// 3. Accept/reject via standard speculative decoding.
+    ///
+    /// No generation-history argument is taken: this path requires
+    /// `repetition_penalty == 1.0`, so exact verification never consults
+    /// previously generated tokens.
     pub fn step(
         &mut self,
         pos: usize,
         last_token: usize,
         config: &SelfSpecConfig,
-        all_tokens: &[usize],
         rng: &mut impl Rng,
     ) -> Result<(Vec<usize>, SelfSpecMetrics)> {
         let hs = self.model.config.hidden_size as usize;
@@ -209,11 +212,6 @@ impl<'a> SelfSpecDecoder<'a> {
                 &mut self.draft_scratch.normed,
                 &mut self.verify_logits,
             )?;
-            apply_repetition_penalty(
-                &mut self.verify_logits,
-                all_tokens,
-                config.sampler.repetition_penalty,
-            );
             let token = sample_token(&mut self.verify_logits, &config.sampler, rng);
             return Ok((
                 vec![token],
@@ -256,15 +254,6 @@ impl<'a> SelfSpecDecoder<'a> {
                 &mut self.verify_logits,
             )?;
 
-            // Apply repetition penalty
-            let mut context = all_tokens.to_vec();
-            context.extend_from_slice(&draft_tokens);
-            apply_repetition_penalty(
-                &mut self.verify_logits,
-                &context,
-                config.sampler.repetition_penalty,
-            );
-
             // Compute draft probabilities (softmax)
             let draft_logits = self.verify_logits.clone();
             let next = sample_token(&mut self.verify_logits, &config.sampler, rng);
@@ -277,30 +266,19 @@ impl<'a> SelfSpecDecoder<'a> {
             draft_pos += 1;
         }
 
+        // The draft loop runs exactly k >= 1 iterations and pushes one token
+        // per iteration, so at least one candidate always exists here.
         let n_drafted = draft_tokens.len();
-        if n_drafted == 0 {
-            return Ok((
-                vec![],
-                SelfSpecMetrics {
-                    accepted: 0,
-                    drafted: 0,
-                    produced: 0,
-                    accept_rate: 0.0,
-                },
-            ));
-        }
+        debug_assert!(n_drafted >= 1);
 
         // ================================================================
-        // Phase 2: Verify using full model with batched GEMM
+        // Phase 2: Verify using the full model with batched GEMM
         // ================================================================
-        // We need to run all K+1 tokens (last_token + K draft tokens) through
-        // the FULL model. The KV cache for layers 0..N was written during drafting,
-        // but layers N..L need to be filled. So we run the full model for all tokens.
-        //
-        // First, we need to "undo" the draft's KV writes for layers 0..N at the
-        // draft positions, because the batched full forward will rewrite them
-        // (with identical values, since layers 0..N are deterministic).
-        // Actually, the batched forward will overwrite them, so we don't need to undo.
+        // All K+1 tokens (last_token + K draft tokens) run through every
+        // layer. The draft pass already wrote KV entries for the draft layers
+        // at these positions; the batched full forward overwrites them in
+        // place (`store` permits overwriting below the filled watermark) and
+        // fills in the layers the draft skipped. No undo step is required.
 
         let verify_batch = n_drafted + 1; // last_token + K draft tokens
         self.verify_hiddens.resize(verify_batch * hs, 0.0);
@@ -351,13 +329,6 @@ impl<'a> SelfSpecDecoder<'a> {
             let draft_token = draft_tokens[i];
             let target_logits_i = &mut all_target_logits[i * vs..(i + 1) * vs];
 
-            // Apply repetition penalty to target logits
-            let mut context = all_tokens.to_vec();
-            for j in 0..i {
-                context.push(draft_tokens[j]);
-            }
-            apply_repetition_penalty(target_logits_i, &context, config.sampler.repetition_penalty);
-
             let p_target =
                 softmax_prob_of(target_logits_i, draft_token, config.sampler.temperature);
             let p_draft = draft_probs[i].1;
@@ -383,21 +354,14 @@ impl<'a> SelfSpecDecoder<'a> {
             }
         }
 
-        // If all K tokens accepted, sample bonus from target's last logits
-        if n_accepted == n_drafted && n_drafted > 0 {
-            let last_idx = n_drafted; // target_logits for the last draft token position
-            if last_idx < verify_batch {
-                let target_logits_last = &mut all_target_logits[last_idx * vs..(last_idx + 1) * vs];
-                let mut context = all_tokens.to_vec();
-                context.extend_from_slice(&draft_tokens);
-                apply_repetition_penalty(
-                    target_logits_last,
-                    &context,
-                    config.sampler.repetition_penalty,
-                );
-                let bonus = sample_token(target_logits_last, &config.sampler, rng);
-                accepted_tokens.push(bonus);
-            }
+        // If all K tokens were accepted, sample the bonus token from the
+        // target's last logits. `verify_batch == n_drafted + 1`, so index
+        // `n_drafted` is always the final verification position.
+        if n_accepted == n_drafted {
+            let last_idx = n_drafted;
+            let target_logits_last = &mut all_target_logits[last_idx * vs..(last_idx + 1) * vs];
+            let bonus = sample_token(target_logits_last, &config.sampler, rng);
+            accepted_tokens.push(bonus);
         }
 
         let produced = accepted_tokens.len();
@@ -408,11 +372,8 @@ impl<'a> SelfSpecDecoder<'a> {
         // kv_cache.rs enforce this frontier from here on.
         self.kv_cache.truncate(pos + produced);
 
-        let accept_rate = if n_drafted > 0 {
-            n_accepted as f32 / n_drafted as f32
-        } else {
-            0.0
-        };
+        // n_drafted >= 1 whenever this point is reached (k == 0 returned early).
+        let accept_rate = n_accepted as f32 / n_drafted as f32;
 
         Ok((
             accepted_tokens,

@@ -172,11 +172,21 @@ impl KVCache {
     }
 
     /// Store K,V at a position for a specific layer.
+    ///
+    /// # Panics
+    /// Panics if `layer` is out of range, plus every [`LayerKVCache::store`]
+    /// condition (position out of range, gap below the watermark, vector
+    /// length mismatch).
     pub fn store(&mut self, layer: usize, pos: usize, k: &[f32], v: &[f32]) {
         self.layers[layer].store(pos, k, v);
     }
 
     /// Get cached K for a head at a position in a layer.
+    ///
+    /// # Panics
+    /// Panics if `layer` is out of range, `head_dim` does not match the
+    /// cache, or the [`LayerKVCache::get_k`] conditions fail (head out of
+    /// range, unfilled position).
     pub fn get_k(&self, layer: usize, head: usize, pos: usize, head_dim: usize) -> &[f32] {
         assert_eq!(
             self.layers[layer].head_dim, head_dim,
@@ -186,6 +196,11 @@ impl KVCache {
     }
 
     /// Get cached V for a head at a position in a layer.
+    ///
+    /// # Panics
+    /// Panics if `layer` is out of range, `head_dim` does not match the
+    /// cache, or the [`LayerKVCache::get_v`] conditions fail (head out of
+    /// range, unfilled position).
     pub fn get_v(&self, layer: usize, head: usize, pos: usize, head_dim: usize) -> &[f32] {
         assert_eq!(
             self.layers[layer].head_dim, head_dim,
@@ -195,6 +210,9 @@ impl KVCache {
     }
 
     /// Number of leading positions with stored data in a layer.
+    ///
+    /// # Panics
+    /// Panics if `layer` is out of range.
     pub fn filled(&self, layer: usize) -> usize {
         self.layers[layer].filled()
     }

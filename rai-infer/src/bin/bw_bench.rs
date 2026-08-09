@@ -1,7 +1,22 @@
 //! Micro-benchmarks: raw memory bandwidth + rayon dispatch overhead.
 
+use anyhow::{Context, Result};
+use clap::Parser;
 use rayon::prelude::*;
+use std::path::PathBuf;
 use std::time::Instant;
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "bw-bench",
+    about = "Memory-bandwidth and rayon dispatch micro-benchmarks"
+)]
+struct Args {
+    /// Optional .raimodel file for the mmap read-bandwidth test
+    /// (the test is skipped when no model is given)
+    #[arg(long)]
+    model: Option<PathBuf>,
+}
 
 fn read_prefix_u64(bytes: &[u8]) -> u64 {
     let mut word = [0_u8; 8];
@@ -10,8 +25,9 @@ fn read_prefix_u64(bytes: &[u8]) -> u64 {
     u64::from_ne_bytes(word)
 }
 
-fn main() {
+fn main() -> Result<()> {
     rai_infer::gemm::configure_thread_pool();
+    let args = Args::parse();
 
     // 1. Raw sequential read bandwidth (single-threaded)
     let size = 85 * 1024 * 1024; // 85 MB
@@ -102,10 +118,14 @@ fn main() {
     let bw = (177.0 * 1024.0) / (per_call * 1e-6) / 1e9;
     eprintln!("5. Single-thread 177KB read: {per_call:.2} μs ({bw:.1} GB/s)");
 
-    // 6. Mmap read bandwidth test
-    let model_path = "rai-infer/scripts/smollm-135m-q4.raimodel";
-    if let Ok(file) = std::fs::File::open(model_path) {
-        let mmap = unsafe { memmap2::MmapOptions::new().populate().map(&file).unwrap() };
+    // 6. Mmap read bandwidth test (optional — needs a real model file)
+    if let Some(model_path) = &args.model {
+        let file = std::fs::File::open(model_path)
+            .with_context(|| format!("opening {}", model_path.display()))?;
+        // SAFETY: read-only mapping of a regular file we just opened; the map
+        // lives only for this scope and the file handle outlives it.
+        let mmap = unsafe { memmap2::MmapOptions::new().populate().map(&file) }
+            .with_context(|| format!("memory-mapping {}", model_path.display()))?;
         let mmap_size = mmap.len();
 
         // Warmup
@@ -136,7 +156,12 @@ fn main() {
             "6. Mmap parallel read ({:.1} MB): {bw:.1} GB/s",
             mmap_size as f64 / 1e6
         );
+    } else {
+        eprintln!(
+            "6. Mmap parallel read: skipped (pass --model <path/to/model.raimodel> to enable)"
+        );
     }
 
     std::hint::black_box(sink);
+    Ok(())
 }

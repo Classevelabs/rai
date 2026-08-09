@@ -8,10 +8,16 @@
 #![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 
 use crate::format::QuantizedLinear;
-use crate::gemm::{has_avx2, w4a32_fused_gate_up, w4a32_fused_qkv, w4a32_matvec};
+use crate::gemm::{has_avx2, w4a8_fused_gate_up, w4a8_fused_qkv, w4a8_matvec};
 use crate::kv_cache::KVCache;
 
-const MAX_ROPE_TABLE_BYTES: usize = 512 * 1024 * 1024;
+/// Upper bound on the precomputed RoPE cos/sin table allocation.
+///
+/// `format.rs` imports this constant: `.raimodel` validation at load time is
+/// the single gate that guarantees a loaded model can never ask
+/// `RoPETable::new` for an over-budget table, so the limit is defined once
+/// here at its point of enforcement.
+pub(crate) const MAX_ROPE_TABLE_BYTES: usize = 512 * 1024 * 1024;
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -21,6 +27,10 @@ use std::arch::x86_64::*;
 // ---------------------------------------------------------------------------
 
 /// RMSNorm: `out[i] = (x[i] / sqrt(mean(x^2) + eps)) * weight[i]`
+///
+/// # Panics
+/// Panics if `input` is empty, the buffer lengths differ, or `eps` is not
+/// finite and positive.
 pub fn rms_norm(output: &mut [f32], input: &[f32], weight: &[f32], eps: f32) {
     let n = input.len();
     assert!(n > 0, "RMSNorm input must not be empty");
@@ -53,6 +63,11 @@ pub fn rms_norm(output: &mut [f32], input: &[f32], weight: &[f32], eps: f32) {
 }
 
 /// AVX2 RMSNorm: SIMD sum-of-squares + SIMD multiply.
+///
+/// # Safety
+/// - Must only be called after `has_avx2()` returned true (AVX2+FMA).
+/// - `output`, `input`, and `weight` must each hold at least `n` values;
+///   `rms_norm` asserts exactly these lengths before dispatching here.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn rms_norm_avx2(output: &mut [f32], input: &[f32], weight: &[f32], n: usize, eps: f32) {
@@ -110,6 +125,10 @@ unsafe fn rms_norm_avx2(output: &mut [f32], input: &[f32], weight: &[f32], n: us
 
 /// Fused residual save + RMSNorm: reads `hidden` once, writes both `residual` (copy)
 /// and `normed` (normalized). Saves one full read of hidden per call.
+///
+/// # Panics
+/// Panics if `hidden` is empty, any buffer length differs from `hidden`'s, or
+/// `eps` is not finite and positive.
 pub fn rms_norm_with_residual(
     normed: &mut [f32],
     residual: &mut [f32],
@@ -151,6 +170,12 @@ pub fn rms_norm_with_residual(
 }
 
 /// AVX2 fused residual save + RMSNorm.
+///
+/// # Safety
+/// - Must only be called after `has_avx2()` returned true (AVX2+FMA).
+/// - `normed`, `residual`, `hidden`, and `weight` must each hold at least `n`
+///   values; `rms_norm_with_residual` asserts exactly these lengths before
+///   dispatching here.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn rms_norm_with_residual_avx2(
@@ -219,26 +244,10 @@ unsafe fn rms_norm_with_residual_avx2(
     }
 }
 
-/// In-place RMSNorm.
-pub fn rms_norm_inplace(x: &mut [f32], weight: &[f32], eps: f32) {
-    let n = x.len();
-    assert!(n > 0, "RMSNorm input must not be empty");
-    assert_eq!(n, weight.len(), "RMSNorm weight length mismatch");
-    assert!(
-        eps.is_finite() && eps > 0.0,
-        "RMSNorm epsilon must be finite and positive"
-    );
-    let mut sum_sq = 0.0f32;
-    for &v in x.iter() {
-        sum_sq += v * v;
-    }
-    let inv_rms = 1.0 / (sum_sq / n as f32 + eps).sqrt();
-    for i in 0..n {
-        x[i] = x[i] * inv_rms * weight[i];
-    }
-}
-
 /// SIMD vector add: hidden[i] = residual[i] + addition[i]
+///
+/// # Panics
+/// Panics if the three buffer lengths differ.
 pub fn vec_add(hidden: &mut [f32], residual: &[f32], addition: &[f32]) {
     let n = hidden.len();
     assert_eq!(n, residual.len(), "residual length mismatch");
@@ -285,6 +294,12 @@ pub struct RoPETable {
 
 impl RoPETable {
     /// Build RoPE tables with the given theta and maximum context length.
+    ///
+    /// # Panics
+    /// Panics if `head_dim` is zero or odd, `max_ctx` is zero, `theta` is not
+    /// finite and positive, the table would exceed [`MAX_ROPE_TABLE_BYTES`]
+    /// (`.raimodel` validation guarantees loaded models stay within it), or
+    /// the allocation fails.
     pub fn new(head_dim: usize, max_ctx: usize, theta: f32) -> Self {
         assert!(
             head_dim > 0 && head_dim.is_multiple_of(2),
@@ -337,6 +352,10 @@ impl RoPETable {
     ///
     /// `heads` is `[num_heads * head_dim]`. Each head's pairs (x[2i], x[2i+1])
     /// are rotated by the position-dependent angle.
+    ///
+    /// # Panics
+    /// Panics if `pos >= max_ctx`, the head-count product overflows, or
+    /// `heads.len() != num_heads * head_dim`.
     pub fn apply(&self, heads: &mut [f32], num_heads: usize, pos: usize) {
         let hd = self.head_dim;
         let half = hd / 2;
@@ -375,6 +394,12 @@ impl RoPETable {
 
     /// AVX2 RoPE: processes 8 pairs per iteration using FMA.
     /// For head_dim=64: 4 iterations per head instead of 32 scalar ops.
+    ///
+    /// # Safety
+    /// - Must only be called after `has_avx2()` returned true (AVX2+FMA).
+    /// - `heads` must hold `num_heads * head_dim` values with `head_dim` a
+    ///   multiple of 8, and `cos_row`/`sin_row` must hold `head_dim / 2`
+    ///   values; `apply` asserts these bounds before dispatching here.
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2,fma")]
     unsafe fn apply_avx2(
@@ -427,14 +452,10 @@ pub fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
-/// In-place SiLU on a vector.
-pub fn silu_inplace(x: &mut [f32]) {
-    for v in x.iter_mut() {
-        *v = silu(*v);
-    }
-}
-
 /// Fused SiLU(gate) * up, result written to gate. SIMD-accelerated.
+///
+/// # Panics
+/// Panics if `gate` or `up` holds fewer than `n` values.
 pub fn silu_mul_inplace(gate: &mut [f32], up: &[f32], n: usize) {
     assert!(n <= gate.len(), "SiLU gate buffer is too small");
     assert!(n <= up.len(), "SiLU up buffer is too small");
@@ -454,6 +475,11 @@ pub fn silu_mul_inplace(gate: &mut [f32], up: &[f32], n: usize) {
 
 /// AVX2 fast SiLU(x) * y using Schraudolph exp approximation.
 /// SiLU(x) = x / (1 + exp(-x)). Approximation error < 2% for |x| < 10.
+///
+/// # Safety
+/// - Must only be called after `has_avx2()` returned true (AVX2+FMA).
+/// - `gate` and `up` must each hold at least `n` values; `silu_mul_inplace`
+///   asserts these bounds before dispatching here.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn silu_mul_avx2(gate: &mut [f32], up: &[f32], n: usize) {
@@ -504,6 +530,14 @@ unsafe fn silu_mul_avx2(gate: &mut [f32], up: &[f32], n: usize) {
 /// 5. Project attention output through o_proj
 ///
 /// `work` is a reusable workspace to avoid allocations.
+///
+/// # Panics
+/// Panics if any dimension is zero, `num_heads` is not divisible by
+/// `num_kv_heads`, a buffer length does not match the dimensions, `pos` is
+/// outside the RoPE context, the KV cache does not match the attention
+/// dimensions, any position `0..=pos` needed by attention is not yet filled
+/// in the KV cache (the misuse-proofing watermark), or a projection fails the
+/// GEMM buffer checks.
 pub fn gqa_attention_decode(
     output: &mut [f32], // [hidden_size]
     input: &[f32],      // [hidden_size]
@@ -558,7 +592,7 @@ pub fn gqa_attention_decode(
         "attention at position {pos} would read unwritten KV entries (layer {layer_idx}, filled {filled})"
     );
 
-    // 1. Projections: Q, K, V via W4A32 matvec
+    // 1. Projections: Q, K, V via W4A8 matvec
     work.q.resize(hidden, 0.0);
     work.k.resize(kv_dim, 0.0);
     work.v.resize(kv_dim, 0.0);
@@ -573,7 +607,7 @@ pub fn gqa_attention_decode(
         }
     }
 
-    w4a32_fused_qkv(
+    w4a8_fused_qkv(
         &mut work.q,
         &mut work.k,
         &mut work.v,
@@ -659,7 +693,7 @@ pub fn gqa_attention_decode(
     }
 
     // 5. Output projection
-    w4a32_matvec(
+    w4a8_matvec(
         output,
         o_proj.nibble_data,
         o_proj.group_params,
@@ -671,6 +705,16 @@ pub fn gqa_attention_decode(
 }
 
 /// AVX2 attention head: score computation + softmax + value accumulation.
+///
+/// # Safety
+/// - Must only be called after `has_avx2()` returned true (AVX2+FMA).
+/// - `q_head` and `out_head` must each hold at least `head_dim` values with
+///   `head_dim` a multiple of 8.
+/// - `scores.len() >= pos + 1` (the kernel writes every index `0..=pos`
+///   unchecked).
+/// - `layer_idx`/`kvh` must be in range for `kv_cache` and every position
+///   `0..=pos` must already be stored (`supports_attention` plus the filled
+///   watermark, asserted by the callers, establish this).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn attention_head_avx2(
@@ -786,6 +830,13 @@ unsafe fn attention_head_avx2(
 /// Standalone attention for batched forward: takes pre-computed Q, K, V,
 /// applies RoPE, stores K/V in cache, computes attention, writes output.
 /// Does NOT do QKV or O projections (those are batched separately).
+///
+/// # Panics
+/// Panics if any dimension is zero, `num_heads` is not divisible by
+/// `num_kv_heads`, a buffer length does not match the dimensions, `pos` is
+/// outside the RoPE context, the KV cache does not match the attention
+/// dimensions, or storing at `pos` would leave a gap below the KV cache's
+/// filled watermark.
 pub fn compute_attention(
     attn_out: &mut [f32], // [num_heads * head_dim]
     q: &mut [f32],        // [num_heads * head_dim], RoPE applied in-place
@@ -924,6 +975,11 @@ impl AttentionWork {
 ///
 /// `hidden = silu(gate_proj(input)) * up_proj(input)`
 /// `output = down_proj(hidden)`
+///
+/// # Panics
+/// Panics if the projections disagree on dimensions or any buffer fails the
+/// GEMM checks (see [`crate::gemm::w4a8_fused_gate_up`] and
+/// [`crate::gemm::w4a8_matvec`]).
 pub fn swiglu_mlp(
     output: &mut [f32], // [hidden_size]
     input: &[f32],      // [hidden_size]
@@ -938,13 +994,13 @@ pub fn swiglu_mlp(
     work.up.resize(intermediate, 0.0);
 
     // gate = gate_proj(input), up = up_proj(input) — fused and overlapped
-    w4a32_fused_gate_up(&mut work.gate, &mut work.up, gate_proj, up_proj, input);
+    w4a8_fused_gate_up(&mut work.gate, &mut work.up, gate_proj, up_proj, input);
 
     // hidden = silu(gate) * up — SIMD-vectorized when available
     silu_mul_inplace(&mut work.gate, &work.up, intermediate);
 
     // output = down_proj(hidden)
-    w4a32_matvec(
+    w4a8_matvec(
         output,
         down_proj.nibble_data,
         down_proj.group_params,

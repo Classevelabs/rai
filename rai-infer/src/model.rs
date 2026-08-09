@@ -8,7 +8,7 @@ use anyhow::{ensure, Context, Result};
 use std::path::Path;
 
 use crate::format::{self, ModelConfig, RaiModelFile};
-use crate::gemm::{embed_lookup, tied_lm_head, w4a32_matmul, w4a32_matvec};
+use crate::gemm::{embed_lookup, tied_lm_head, w4a8_matmul, w4a8_matvec};
 use crate::kv_cache::KVCache;
 use crate::layers::{
     compute_attention, gqa_attention_decode, rms_norm, rms_norm_with_residual, silu_mul_inplace,
@@ -218,7 +218,7 @@ impl RaiModel {
         );
         if self.has_separate_lm_head {
             let lm = self.file.lm_head()?.expect("lm_head section missing");
-            w4a32_matvec(
+            w4a8_matvec(
                 logits,
                 lm.nibble_data,
                 lm.group_params,
@@ -414,7 +414,7 @@ impl RaiModel {
             }
 
             // 2. Batched QKV projection (read weights once for all tokens)
-            w4a32_matmul(
+            w4a8_matmul(
                 &mut bs.q_batch,
                 layer.q_proj.nibble_data,
                 layer.q_proj.group_params,
@@ -424,7 +424,7 @@ impl RaiModel {
                 batch,
                 layer.q_proj.group_size,
             );
-            w4a32_matmul(
+            w4a8_matmul(
                 &mut bs.k_batch,
                 layer.k_proj.nibble_data,
                 layer.k_proj.group_params,
@@ -434,7 +434,7 @@ impl RaiModel {
                 batch,
                 layer.k_proj.group_size,
             );
-            w4a32_matmul(
+            w4a8_matmul(
                 &mut bs.v_batch,
                 layer.v_proj.nibble_data,
                 layer.v_proj.group_params,
@@ -465,7 +465,7 @@ impl RaiModel {
             }
 
             // 4. Batched O projection
-            w4a32_matmul(
+            w4a8_matmul(
                 &mut bs.o_out,
                 layer.o_proj.nibble_data,
                 layer.o_proj.group_params,
@@ -493,7 +493,7 @@ impl RaiModel {
             }
 
             // 7. Batched gate + up projections
-            w4a32_matmul(
+            w4a8_matmul(
                 &mut bs.gate_batch,
                 layer.gate_proj.nibble_data,
                 layer.gate_proj.group_params,
@@ -503,7 +503,7 @@ impl RaiModel {
                 batch,
                 layer.gate_proj.group_size,
             );
-            w4a32_matmul(
+            w4a8_matmul(
                 &mut bs.up_batch,
                 layer.up_proj.nibble_data,
                 layer.up_proj.group_params,
@@ -524,7 +524,7 @@ impl RaiModel {
             }
 
             // 9. Batched down projection
-            w4a32_matmul(
+            w4a8_matmul(
                 &mut bs.mlp_out,
                 layer.down_proj.nibble_data,
                 layer.down_proj.group_params,
@@ -581,7 +581,7 @@ impl RaiModel {
 
         if self.has_separate_lm_head {
             let lm = self.file.lm_head()?.expect("lm_head section missing");
-            w4a32_matmul(
+            w4a8_matmul(
                 logits,
                 lm.nibble_data,
                 lm.group_params,
