@@ -549,6 +549,14 @@ pub fn gqa_attention_decode(
         kv_cache.supports_attention(layer_idx, num_kv_heads, pos, head_dim),
         "KV cache dimensions do not match attention"
     );
+    // Attention reads positions 0..=pos; every one of them must hold real
+    // data. A storing pass writes `pos` itself below, a probe pass (ponder)
+    // relies on a previous pass having stored it.
+    let filled = kv_cache.filled(layer_idx);
+    assert!(
+        if store_kv { pos <= filled } else { pos < filled },
+        "attention at position {pos} would read unwritten KV entries (layer {layer_idx}, filled {filled})"
+    );
 
     // 1. Projections: Q, K, V via W4A32 matvec
     work.q.resize(hidden, 0.0);

@@ -393,6 +393,13 @@ impl<'a> SelfSpecDecoder<'a> {
         }
 
         let produced = accepted_tokens.len();
+
+        // Drop rejected-draft KV entries: the shared cache was written through
+        // pos + n_drafted by verification, but only pos + produced positions
+        // are real context for the next step. The watermark checks in
+        // kv_cache.rs enforce this frontier from here on.
+        self.kv_cache.truncate(pos + produced);
+
         let accept_rate = if n_drafted > 0 {
             n_accepted as f32 / n_drafted as f32
         } else {

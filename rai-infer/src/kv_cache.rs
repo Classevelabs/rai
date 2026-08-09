@@ -5,6 +5,13 @@
 //! each iteration — only the final converged values persist for future tokens.
 //!
 //! Layout per layer: `[num_kv_heads, max_ctx, head_dim]` stored flat.
+//!
+//! Each layer tracks a `filled` watermark: the number of leading positions that
+//! hold real data. Stores must not leave gaps, reads must stay below the
+//! watermark, and speculative decoding truncates it when drafts are rejected.
+//! This turns the silent-garbage failure modes (attending over never-written
+//! positions, reading a stale entry from a previous request) into panics or
+//! `Err`s at the call site.
 
 /// KV cache for a single transformer layer.
 pub struct LayerKVCache {
@@ -15,6 +22,8 @@ pub struct LayerKVCache {
     num_kv_heads: usize,
     max_ctx: usize,
     head_dim: usize,
+    /// Number of leading positions that contain stored data.
+    filled: usize,
 }
 
 impl LayerKVCache {
@@ -33,15 +42,26 @@ impl LayerKVCache {
             num_kv_heads,
             max_ctx,
             head_dim,
+            filled: 0,
         }
     }
 
     /// Store K and V vectors at the given position.
     ///
     /// `k_vec` is `[num_kv_heads * head_dim]`, `v_vec` is `[num_kv_heads * head_dim]`.
-    /// Overwrites any existing data at `pos` — this is intentional for pondering iterations.
+    /// Overwriting an already-filled position is intentional (pondering
+    /// iterations, speculative re-verification).
+    ///
+    /// # Panics
+    /// Panics if `pos` is out of range, if storing at `pos` would leave a gap
+    /// of unwritten positions below it, or on a vector length mismatch.
     pub fn store(&mut self, pos: usize, k_vec: &[f32], v_vec: &[f32]) {
         assert!(pos < self.max_ctx, "KV cache position is out of range");
+        assert!(
+            pos <= self.filled,
+            "KV store at position {pos} would leave a gap (filled {})",
+            self.filled
+        );
         let expected = self
             .num_kv_heads
             .checked_mul(self.head_dim)
@@ -57,26 +77,58 @@ impl LayerKVCache {
             self.v[dst_start..dst_start + self.head_dim]
                 .copy_from_slice(&v_vec[src_start..src_start + self.head_dim]);
         }
+        self.filled = self.filled.max(pos + 1);
     }
 
     /// Get the cached K vector for a specific KV head at a specific position.
+    ///
+    /// # Panics
+    /// Panics if `head` is out of range or `pos` is not a filled position.
     #[inline]
     pub fn get_k(&self, head: usize, pos: usize) -> &[f32] {
+        assert!(head < self.num_kv_heads, "KV cache head is out of range");
+        assert!(
+            pos < self.filled,
+            "KV read at unwritten position {pos} (filled {})",
+            self.filled
+        );
         let start = (head * self.max_ctx + pos) * self.head_dim;
         &self.k[start..start + self.head_dim]
     }
 
     /// Get the cached V vector for a specific KV head at a specific position.
+    ///
+    /// # Panics
+    /// Panics if `head` is out of range or `pos` is not a filled position.
     #[inline]
     pub fn get_v(&self, head: usize, pos: usize) -> &[f32] {
+        assert!(head < self.num_kv_heads, "KV cache head is out of range");
+        assert!(
+            pos < self.filled,
+            "KV read at unwritten position {pos} (filled {})",
+            self.filled
+        );
         let start = (head * self.max_ctx + pos) * self.head_dim;
         &self.v[start..start + self.head_dim]
+    }
+
+    /// Number of leading positions that contain stored data.
+    #[inline]
+    pub fn filled(&self) -> usize {
+        self.filled
+    }
+
+    /// Discard everything at and beyond `len` positions (no-op if already shorter).
+    /// Used by speculative decoding to drop rejected draft entries.
+    pub fn truncate(&mut self, len: usize) {
+        self.filled = self.filled.min(len);
     }
 
     /// Reset the cache (for new generation).
     pub fn clear(&mut self) {
         self.k.iter_mut().for_each(|v| *v = 0.0);
         self.v.iter_mut().for_each(|v| *v = 0.0);
+        self.filled = 0;
     }
 
     /// Memory usage in bytes.
@@ -106,21 +158,35 @@ impl KVCache {
     }
 
     /// Get cached K for a head at a position in a layer.
-    pub fn get_k(&self, layer: usize, head: usize, pos: usize, _head_dim: usize) -> &[f32] {
+    pub fn get_k(&self, layer: usize, head: usize, pos: usize, head_dim: usize) -> &[f32] {
         assert_eq!(
-            self.layers[layer].head_dim, _head_dim,
+            self.layers[layer].head_dim, head_dim,
             "KV cache head_dim mismatch"
         );
         self.layers[layer].get_k(head, pos)
     }
 
     /// Get cached V for a head at a position in a layer.
-    pub fn get_v(&self, layer: usize, head: usize, pos: usize, _head_dim: usize) -> &[f32] {
+    pub fn get_v(&self, layer: usize, head: usize, pos: usize, head_dim: usize) -> &[f32] {
         assert_eq!(
-            self.layers[layer].head_dim, _head_dim,
+            self.layers[layer].head_dim, head_dim,
             "KV cache head_dim mismatch"
         );
         self.layers[layer].get_v(head, pos)
+    }
+
+    /// Number of leading positions with stored data in a layer.
+    pub fn filled(&self, layer: usize) -> usize {
+        self.layers[layer].filled()
+    }
+
+    /// Truncate every layer to at most `len` filled positions.
+    /// Speculative decoders call this after rejection so stale draft entries
+    /// stop counting as valid context.
+    pub fn truncate(&mut self, len: usize) {
+        for layer in &mut self.layers {
+            layer.truncate(len);
+        }
     }
 
     /// Validate the dimensions used by an attention call before entering SIMD code.
@@ -199,5 +265,64 @@ mod tests {
         // Expected: 30 * 2 * 3 * 512 * 64 * 4 = 22,118,400 bytes ≈ 21.1 MB
         assert!(mb < 25.0, "KV cache too large: {mb:.1} MB");
         assert!(mb > 20.0, "KV cache too small: {mb:.1} MB");
+    }
+
+    #[test]
+    fn test_filled_watermark_tracks_stores() {
+        let mut cache = KVCache::new(1, 1, 8, 2);
+        assert_eq!(cache.filled(0), 0);
+        cache.store(0, 0, &[1.0, 2.0], &[3.0, 4.0]);
+        cache.store(0, 1, &[1.0, 2.0], &[3.0, 4.0]);
+        assert_eq!(cache.filled(0), 2);
+        // Overwrite below the watermark does not shrink it.
+        cache.store(0, 0, &[9.0, 9.0], &[9.0, 9.0]);
+        assert_eq!(cache.filled(0), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "gap")]
+    fn test_store_with_gap_panics() {
+        let mut cache = KVCache::new(1, 1, 8, 2);
+        cache.store(0, 0, &[1.0, 2.0], &[3.0, 4.0]);
+        cache.store(0, 5, &[1.0, 2.0], &[3.0, 4.0]); // positions 1..5 never written
+    }
+
+    #[test]
+    #[should_panic(expected = "unwritten position")]
+    fn test_read_beyond_watermark_panics() {
+        let mut cache = KVCache::new(1, 1, 8, 2);
+        cache.store(0, 0, &[1.0, 2.0], &[3.0, 4.0]);
+        let _ = cache.get_k(0, 0, 1, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "head is out of range")]
+    fn test_read_bad_head_panics() {
+        let mut cache = KVCache::new(1, 2, 8, 2);
+        cache.store(0, 0, &[1.0, 2.0, 3.0, 4.0], &[5.0, 6.0, 7.0, 8.0]);
+        let _ = cache.get_k(0, 2, 0, 2);
+    }
+
+    #[test]
+    fn test_truncate_and_refill() {
+        let mut cache = KVCache::new(1, 1, 8, 2);
+        for pos in 0..4 {
+            cache.store(0, pos, &[pos as f32, 0.0], &[0.0, 0.0]);
+        }
+        // Reject drafts beyond position 1.
+        cache.truncate(2);
+        assert_eq!(cache.filled(0), 2);
+        // Refill from the new frontier without a gap.
+        cache.store(0, 2, &[7.0, 7.0], &[7.0, 7.0]);
+        assert_eq!(cache.get_k(0, 0, 2, 2), &[7.0, 7.0]);
+        assert_eq!(cache.filled(0), 3);
+    }
+
+    #[test]
+    fn test_clear_resets_watermark() {
+        let mut cache = KVCache::new(1, 1, 4, 2);
+        cache.store(0, 0, &[1.0, 2.0], &[3.0, 4.0]);
+        cache.clear();
+        assert_eq!(cache.filled(0), 0);
     }
 }
