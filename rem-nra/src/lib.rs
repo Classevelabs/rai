@@ -1,3 +1,10 @@
+//! Local associative-memory backend for the RAI workspace.
+//!
+//! Both stores are exact nearest-neighbour tables over cosine similarity: `store` appends a
+//! (address, value) pair and retrieval scans every stored address for the best match. There is
+//! no optimizer, no dynamical system, and no iterative solver in this crate.
+#![forbid(unsafe_code)]
+
 pub mod nra;
 pub mod rem;
 
@@ -7,12 +14,6 @@ pub type Vec64 = nalgebra::DVector<f64>;
 pub enum MemoryError {
     #[error("dimension mismatch: expected {expected}, got {actual}")]
     DimensionMismatch { expected: usize, actual: usize },
-    #[error("memory is empty")]
-    Empty,
-    #[error(
-        "training is unavailable because this build does not implement parameter optimization"
-    )]
-    TrainingUnavailable,
     #[error("invalid memory data: {0}")]
     InvalidData(String),
 }

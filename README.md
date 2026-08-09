@@ -128,6 +128,10 @@ Sampling controls: `--temperature`, `--top-k`, `--top-p`,
 `--ponder-strategy cfg|ensemble|cfg-ensemble|adaptive` with
 `--guidance-scale`, `--ensemble-n`, `--noise-sigma`, `--entropy-threshold`.
 
+Set `RAYON_NUM_THREADS` to cap the inference worker count used by `rai-generate`
+and `rai-chat`; it defaults to Rayon's own choice and does not affect
+`rai-server`.
+
 ### Speculative decoding
 
 ```bash
@@ -180,25 +184,47 @@ request bodies to 64 KiB.
 ./target/release/rai-server mcp
 ```
 
-REST endpoints: `POST /v1/store`, `/v1/recall`, `/v1/intersect`,
-`/v1/contradict`, `/v1/surprise`, `/v1/confidence`, `/v1/train`,
-`/v1/snapshot`, and `GET /v1/health`.
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /v1/store` | Store a fact; returns an address-space crowding report |
+| `POST /v1/recall` | Return the stored memory with the highest cosine similarity to the query |
+| `POST /v1/intersect` | Retrieve at the normalized average of several concept addresses |
+| `POST /v1/contradict` | Report how a candidate fact would change address-space crowding |
+| `POST /v1/surprise` | Residual against the nearest stored key's value |
+| `POST /v1/confidence` | The retrieval score and the tier it falls in |
+| `POST /v1/snapshot` | Per-item crowding scores |
+| `GET /v1/health` | Stored count, mean residual norm, capacity ratio |
 
-`POST /v1/train` is reserved but returns HTTP 501 in this build; functional
-training is not implemented and the service does not report a no-op as trained.
+The current backend is a cosine nearest-neighbour store, not a validated
+resonance-training system. There is no training: no endpoint, no tool, and no
+optimizer. Retrieval is nearest-vector by cosine similarity, and the confidence
+tiers are a relabelling of that similarity rather than calibrated probabilities.
 
-The current backend is not a validated resonance-training system: training is
-not yet an optimizer, retrieval is nearest-vector/cosine-like, and
-contradiction, confidence, attractor, and interference outputs do not yet have
-evaluation evidence sufficient for product claims. Treat these endpoints as an
-experimental API until their algorithms and tests are completed.
+`/v1/contradict` (and the `rai_contradict` tool) reports **address-space
+crowding**, not semantic contradiction. Each stored item is scored against its
+nearest other neighbour; the endpoint compares those scores with and without the
+candidate fact. Because appending a memory can only bring a neighbour closer, a
+store can never raise another item's score — so under the current semantics this
+cannot detect a contradiction, and an empty report is not evidence that a fact
+agrees with memory. The same caveat applies to the interference report returned
+by `/v1/store`.
 
-REST request bodies are limited to 64 KiB, concurrent work is bounded, and a
-global request ceiling protects the local process from accidental overload.
+The store holds **512 items by default** (`num_units`); a store beyond that
+returns HTTP 409 with the limit in the message rather than a generic failure.
+The service is **single-writer**: reads run concurrently, every mutation takes
+an exclusive lock, and a durable store publishes in memory only after its
+snapshot is on disk.
+
+REST request bodies are limited to 64 KiB and individual text fields to 16 KiB
+(bytes, not characters — the REST and MCP transports share one limit); concurrent
+work is bounded, a global request ceiling protects the local process from
+accidental overload, and any request still running after 30 seconds is abandoned
+with HTTP 503. Ctrl-C shuts down gracefully so in-flight durable stores finish.
 Local loopback usage needs no token. `rai-server` serves plain HTTP and therefore
 refuses every non-loopback `RAI_HOST`, even when a token is configured. For
 remote access, keep RAI on loopback behind a TLS-terminating reverse proxy and
-have the proxy send the internal `Host` value (`127.0.0.1:<RAI_PORT>`). Host and
+have the proxy send a loopback `Host` value (`127.0.0.1:<RAI_PORT>`, or a
+portless `localhost`; a port, when present, must match `RAI_PORT`). Host and
 Origin checks reject DNS-rebinding and browser cross-origin requests.
 
 Set `RAI_API_TOKEN` to a random value of at least 32 bytes to require bearer
@@ -255,7 +281,10 @@ at startup rather than silently falling back to mock embeddings.
 | `OPENAI_API_KEY` | unset | Required when the provider is `openai` |
 | `RAI_DATA_PATH` | unset | Snapshot file; state is ephemeral when unset |
 | `RAI_MCP_MUTATIONS_ENABLED` | `false` | Exact `true`/`false`; exposes mutating MCP tools when true |
-| `RAYON_NUM_THREADS` | Rayon default | Inference worker count |
+
+A variable whose value is not valid Unicode fails startup rather than being
+ignored. `rai-server --help` prints the mode and variable summary;
+`rai-server --version` prints the version.
 
 Common startup failures are deliberate safeguards: use a loopback
 `RAI_HOST`, provide a 32-byte-or-longer token, set an OpenAI key with the
@@ -318,8 +347,9 @@ because it is finished. Interfaces may change. Current state:
 - x86-64 only for the optimized paths. There is a scalar fallback, but ARM
   NEON kernels are future work.
 - The memory/reasoning service and RC/HRC/SAC compression paths are research
-  prototypes; do not rely on their training, confidence, contradiction, or
-  modeled-size outputs as validated product guarantees.
+  prototypes; do not rely on their confidence, crowding, or modeled-size outputs
+  as validated product guarantees. The memory service has no training of any
+  kind, and its crowding report cannot detect semantic contradiction.
 
 Issues and PRs are welcome. See [SECURITY.md](./SECURITY.md),
 [SUPPORT.md](./SUPPORT.md), and [CONTRIBUTING.md](./CONTRIBUTING.md).

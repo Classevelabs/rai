@@ -6,12 +6,14 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NRAConfig {
+    /// Row count of the persisted `omega_basis` matrix.
     pub dim_state: usize,
+    /// Dimension of the address vectors accepted by `store` and retrieval.
     pub dim_omega: usize,
+    /// Dimension of the value vectors accepted by `store` and returned by retrieval.
     pub dim_value: usize,
+    /// Maximum number of items the enclosing store is willing to hold.
     pub num_units: usize,
-    pub train_epochs: usize,
-    pub ode_tol: f64,
 }
 
 impl Default for NRAConfig {
@@ -21,16 +23,15 @@ impl Default for NRAConfig {
             dim_omega: 32,
             dim_value: 64,
             num_units: 512,
-            train_epochs: 300,
-            ode_tol: 1e-7,
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NRAParams {
+    /// Fixed random basis carried with the store so a reloaded snapshot keeps its identity.
+    /// Retrieval is a similarity scan over stored addresses and does not consult this matrix.
     pub omega_basis: DMatrix<f64>,
-    pub value_basis: DMatrix<f64>,
 }
 
 impl NRAParams {
@@ -39,29 +40,18 @@ impl NRAParams {
         let omega_basis = DMatrix::from_fn(config.dim_state, config.dim_omega, |_, _| {
             rng.sample::<f64, _>(StandardNormal) * scale
         });
-        let value_basis = DMatrix::from_fn(config.dim_value, config.dim_state, |_, _| {
-            rng.sample::<f64, _>(StandardNormal) * scale
-        });
-        Self {
-            omega_basis,
-            value_basis,
-        }
+        Self { omega_basis }
     }
 }
 
+/// Outcome of a retrieval scan.
 #[derive(Debug, Clone)]
 pub struct RetrievalDiagnostics {
+    /// Value stored alongside the best-matching address.
     pub value: Vec64,
+    /// `-5 · max(cosine, 0)` for the best-matching address: `0.0` when nothing scored above
+    /// zero similarity, `-5.0` for an exact match.
     pub energy: f64,
-    pub steps: usize,
-    pub grad_norm: f64,
-}
-
-#[derive(Debug, Clone)]
-pub struct AttractorResult {
-    pub state: Vec64,
-    pub steps: usize,
-    pub grad_norm: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,7 +59,6 @@ pub struct NonlinearResonanceMemory {
     pub config: NRAConfig,
     pub params: NRAParams,
     items: Vec<(Vec64, Vec64)>,
-    last_loss: Option<f64>,
 }
 
 impl NonlinearResonanceMemory {
@@ -79,24 +68,58 @@ impl NonlinearResonanceMemory {
             config,
             params,
             items: Vec::new(),
-            last_loss: None,
         }
     }
 
-    pub fn from_params(params: NRAParams, config: NRAConfig) -> Self {
-        Self {
+    /// Restore a persisted store, rejecting any shape the retrieval scan could not handle.
+    ///
+    /// Deserialized state is untrusted: a ragged item list would otherwise reach the similarity
+    /// scan with mismatched dimensions.
+    pub fn from_snapshot(
+        config: NRAConfig,
+        params: NRAParams,
+        items: Vec<(Vec64, Vec64)>,
+    ) -> Result<Self> {
+        if config.dim_state == 0 || config.dim_omega == 0 || config.dim_value == 0 {
+            return Err(MemoryError::InvalidData(
+                "state, address, and value dimensions must be non-zero".to_string(),
+            ));
+        }
+        if config.num_units == 0 || items.len() > config.num_units {
+            return Err(MemoryError::InvalidData(
+                "stored item count exceeds the configured capacity".to_string(),
+            ));
+        }
+        if params.omega_basis.nrows() != config.dim_state
+            || params.omega_basis.ncols() != config.dim_omega
+        {
+            return Err(MemoryError::InvalidData(
+                "omega basis shape does not match the configuration".to_string(),
+            ));
+        }
+        if !params.omega_basis.iter().all(|value| value.is_finite()) {
+            return Err(MemoryError::InvalidData(
+                "omega basis must be finite".to_string(),
+            ));
+        }
+        for (omega, value) in &items {
+            ensure_dim(omega, config.dim_omega)?;
+            ensure_dim(value, config.dim_value)?;
+            ensure_finite(omega, "stored address")?;
+            ensure_finite(value, "stored value")?;
+        }
+
+        Ok(Self {
             config,
             params,
-            items: Vec::new(),
-            last_loss: None,
-        }
+            items,
+        })
     }
 
     pub fn store(&mut self, omega: &Vec64, value: &Vec64) -> Result<()> {
         ensure_dim(omega, self.config.dim_omega)?;
         ensure_dim(value, self.config.dim_value)?;
         self.items.push((omega.clone(), value.clone()));
-        self.last_loss = Some(self.current_mse());
         Ok(())
     }
 
@@ -111,8 +134,6 @@ impl NonlinearResonanceMemory {
             return Ok(RetrievalDiagnostics {
                 value: Vec64::zeros(self.config.dim_value),
                 energy: 0.0,
-                steps: 0,
-                grad_norm: 1.0,
             });
         };
 
@@ -129,8 +150,6 @@ impl NonlinearResonanceMemory {
         Ok(RetrievalDiagnostics {
             value: best_value.clone(),
             energy: -best_similarity.max(0.0) * 5.0,
-            steps: 1,
-            grad_norm: (1.0 - best_similarity.max(0.0)).max(0.0) * 1e-8,
         })
     }
 
@@ -155,14 +174,6 @@ impl NonlinearResonanceMemory {
             .collect()
     }
 
-    pub fn mse(&self) -> Result<f64> {
-        Ok(self.last_loss.unwrap_or_else(|| self.current_mse()))
-    }
-
-    pub fn train_two_phase(&mut self) -> Result<Vec<f64>> {
-        Err(MemoryError::TrainingUnavailable)
-    }
-
     pub fn len(&self) -> usize {
         self.items.len()
     }
@@ -174,44 +185,6 @@ impl NonlinearResonanceMemory {
     pub fn items(&self) -> &[(Vec64, Vec64)] {
         &self.items
     }
-
-    fn current_mse(&self) -> f64 {
-        if self.items.is_empty() {
-            return 0.0;
-        }
-        let total: f64 = self
-            .items
-            .iter()
-            .map(|(_, value)| value.norm_squared() / value.len().max(1) as f64)
-            .sum();
-        total / self.items.len() as f64
-    }
-}
-
-pub fn find_attractor(
-    params: &NRAParams,
-    omega: &Vec64,
-    initial_state: Vec64,
-    config: &NRAConfig,
-) -> AttractorResult {
-    let projected = &params.omega_basis * omega;
-    let state = if projected.len() == config.dim_state {
-        projected
-    } else if initial_state.len() == config.dim_state {
-        initial_state
-    } else {
-        Vec64::zeros(config.dim_state)
-    };
-    AttractorResult {
-        state,
-        steps: 1,
-        grad_norm: config.ode_tol,
-    }
-}
-
-pub fn energy(params: &NRAParams, state: &Vec64, omega: &Vec64) -> f64 {
-    let projected = &params.omega_basis * omega;
-    -cosine(state, &projected).max(0.0) * 5.0
 }
 
 fn ensure_dim(value: &Vec64, expected: usize) -> Result<()> {
@@ -225,7 +198,20 @@ fn ensure_dim(value: &Vec64, expected: usize) -> Result<()> {
     }
 }
 
+fn ensure_finite(value: &Vec64, label: &str) -> Result<()> {
+    if value.iter().all(|entry| entry.is_finite()) {
+        Ok(())
+    } else {
+        Err(MemoryError::InvalidData(format!("{label} must be finite")))
+    }
+}
+
+/// Cosine similarity that treats mismatched or degenerate vectors as "no similarity" rather
+/// than panicking, so a hand-edited snapshot cannot abort a retrieval scan.
 fn cosine(a: &Vec64, b: &Vec64) -> f64 {
+    if a.len() != b.len() {
+        return 0.0;
+    }
     let denom = a.norm() * b.norm();
     if denom <= 1e-12 {
         0.0
@@ -258,18 +244,6 @@ mod tests {
     }
 
     #[test]
-    fn training_reports_unavailable_without_mutating_loss() {
-        let mut memory =
-            NonlinearResonanceMemory::new(NRAConfig::default(), &mut rand::thread_rng());
-        assert!(memory.last_loss.is_none());
-        assert!(matches!(
-            memory.train_two_phase(),
-            Err(MemoryError::TrainingUnavailable)
-        ));
-        assert!(memory.last_loss.is_none());
-    }
-
-    #[test]
     fn retrieval_returns_the_best_match_not_a_corpus_blend() {
         // Two stored values that would average to roughly (0.5, 0.5) if blended.
         let memory = memory_with(&[([1.0, 0.0], [1.0, 0.0]), ([0.0, 1.0], [0.0, 1.0])]);
@@ -294,7 +268,6 @@ mod tests {
             .expect("retrieve");
         assert_eq!(diagnostics.value.as_slice(), &[0.0, 0.0]);
         assert_eq!(diagnostics.energy, 0.0);
-        assert_eq!(diagnostics.steps, 0);
     }
 
     #[test]
@@ -324,5 +297,49 @@ mod tests {
         for (_, energy) in opposed.energy_snapshot() {
             assert_eq!(energy, 0.0);
         }
+    }
+
+    #[test]
+    fn snapshot_restore_rejects_shapes_the_similarity_scan_cannot_handle() {
+        let config = unit_config();
+        let params = NRAParams::random(&config, &mut rand::thread_rng());
+        let good = vec![(
+            Vec64::from_row_slice(&[1.0, 0.0]),
+            Vec64::from_row_slice(&[1.0, 0.0]),
+        )];
+        assert!(
+            NonlinearResonanceMemory::from_snapshot(config.clone(), params.clone(), good).is_ok()
+        );
+
+        // A ragged address would reach the similarity scan with the wrong dimension.
+        let ragged = vec![(
+            Vec64::from_row_slice(&[1.0, 0.0, 0.0]),
+            Vec64::from_row_slice(&[1.0, 0.0]),
+        )];
+        assert!(
+            NonlinearResonanceMemory::from_snapshot(config.clone(), params.clone(), ragged)
+                .is_err()
+        );
+
+        let non_finite = vec![(
+            Vec64::from_row_slice(&[f64::NAN, 0.0]),
+            Vec64::from_row_slice(&[1.0, 0.0]),
+        )];
+        assert!(
+            NonlinearResonanceMemory::from_snapshot(config.clone(), params, non_finite).is_err()
+        );
+
+        // A basis whose shape disagrees with the configuration is rejected too.
+        let wrong_basis = NRAParams {
+            omega_basis: DMatrix::zeros(config.dim_state + 1, config.dim_omega),
+        };
+        assert!(NonlinearResonanceMemory::from_snapshot(config, wrong_basis, Vec::new()).is_err());
+    }
+
+    #[test]
+    fn mismatched_dimensions_score_as_no_similarity_instead_of_panicking() {
+        let short = Vec64::from_row_slice(&[1.0, 0.0]);
+        let long = Vec64::from_row_slice(&[1.0, 0.0, 0.0]);
+        assert_eq!(cosine(&short, &long), 0.0);
     }
 }

@@ -1,14 +1,14 @@
 use crate::mcp::schema::{JsonRpcRequest, JsonRpcResponse, ToolCallResult};
 use crate::mcp::tools::tool_definitions;
 use crate::state::AppState;
+use crate::validate::{self, MAX_INTERSECTION_CONCEPTS};
+use rai_core::RaiError;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::io;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 const MAX_MCP_FRAME_BYTES: usize = 64 * 1024;
-const MAX_TEXT_CHARS: usize = 16_384;
-const MAX_INTERSECT_CONCEPTS: usize = 32;
 const SUPPORTED_PROTOCOL_VERSION: &str = "2024-11-05";
 
 enum Frame {
@@ -272,10 +272,12 @@ async fn handle_tool_call(
                 Err(error) => return error,
             };
             match state.store(content).await {
-                Ok(report) => {
-                    serialize_tool_result(&report, "Stored successfully.\n\nInterference report:\n")
-                }
-                Err(error) => internal_tool_error("store", &error),
+                Ok(report) => serialize_tool_result(
+                    &report,
+                    "Stored successfully.\n\nAddress-space crowding report (not a contradiction \
+                     check):\n",
+                ),
+                Err(error) => tool_error("store", &error),
             }
         }
 
@@ -286,7 +288,7 @@ async fn handle_tool_call(
             };
             match state.manager.recall(query).await {
                 Ok(result) => serialize_tool_result(&result, ""),
-                Err(error) => internal_tool_error("recall", &error),
+                Err(error) => tool_error("recall", &error),
             }
         }
 
@@ -297,7 +299,7 @@ async fn handle_tool_call(
             };
             match state.manager.intersect(&concepts).await {
                 Ok(result) => serialize_tool_result(&result, ""),
-                Err(error) => internal_tool_error("intersect", &error),
+                Err(error) => tool_error("intersect", &error),
             }
         }
 
@@ -308,7 +310,7 @@ async fn handle_tool_call(
             };
             match state.manager.check_contradiction(fact).await {
                 Ok(report) => serialize_tool_result(&report, ""),
-                Err(error) => internal_tool_error("contradiction check", &error),
+                Err(error) => tool_error("contradiction check", &error),
             }
         }
 
@@ -319,7 +321,7 @@ async fn handle_tool_call(
             };
             match state.manager.measure_surprise(content).await {
                 Ok(result) => serialize_tool_result(&result, ""),
-                Err(error) => internal_tool_error("surprise measurement", &error),
+                Err(error) => tool_error("surprise measurement", &error),
             }
         }
 
@@ -330,13 +332,13 @@ async fn handle_tool_call(
             };
             match state.manager.explain_confidence(query).await {
                 Ok(result) => serialize_tool_result(&result, ""),
-                Err(error) => internal_tool_error("confidence explanation", &error),
+                Err(error) => tool_error("confidence explanation", &error),
             }
         }
 
         "rai_memory_health" => match state.manager.health().await {
             Ok(report) => serialize_tool_result(&report, ""),
-            Err(error) => internal_tool_error("memory health", &error),
+            Err(error) => tool_error("memory health", &error),
         },
 
         _ => ToolCallResult::error("Unknown tool".to_string()),
@@ -355,16 +357,8 @@ fn required_text<'a>(args: &'a Value, field: &str) -> Result<&'a str, ToolCallRe
     let Some(value) = object.get(field).and_then(Value::as_str) else {
         return Err(ToolCallResult::error(format!("'{field}' must be a string")));
     };
-    if value.trim().is_empty() {
-        return Err(ToolCallResult::error(format!(
-            "'{field}' must not be empty"
-        )));
-    }
-    if value.chars().count() > MAX_TEXT_CHARS {
-        return Err(ToolCallResult::error(format!(
-            "'{field}' exceeds the {MAX_TEXT_CHARS}-character limit"
-        )));
-    }
+    // Shared with the REST handlers: one byte-measured limit for every transport.
+    validate::validate_text(field, value).map_err(ToolCallResult::error)?;
     Ok(value)
 }
 
@@ -380,28 +374,23 @@ fn required_concepts(args: &Value) -> Result<Vec<String>, ToolCallResult> {
     let Some(values) = object.get("concepts").and_then(Value::as_array) else {
         return Err(ToolCallResult::error("'concepts' must be an array".into()));
     };
-    if !(2..=MAX_INTERSECT_CONCEPTS).contains(&values.len()) {
+    if !(2..=MAX_INTERSECTION_CONCEPTS).contains(&values.len()) {
         return Err(ToolCallResult::error(format!(
-            "'concepts' must contain 2..={MAX_INTERSECT_CONCEPTS} strings"
+            "'concepts' must contain 2..={MAX_INTERSECTION_CONCEPTS} strings"
         )));
     }
 
-    values
+    let concepts = values
         .iter()
         .map(|value| {
-            let Some(concept) = value.as_str() else {
-                return Err(ToolCallResult::error(
-                    "every concept must be a string".into(),
-                ));
-            };
-            if concept.trim().is_empty() || concept.chars().count() > MAX_TEXT_CHARS {
-                return Err(ToolCallResult::error(format!(
-                    "each concept must contain 1..={MAX_TEXT_CHARS} characters"
-                )));
-            }
-            Ok(concept.to_string())
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| ToolCallResult::error("every concept must be a string".into()))
         })
-        .collect()
+        .collect::<Result<Vec<String>, ToolCallResult>>()?;
+    validate::validate_concepts(&concepts).map_err(ToolCallResult::error)?;
+    Ok(concepts)
 }
 
 fn serialize_tool_result<T: Serialize>(value: &T, prefix: &str) -> ToolCallResult {
@@ -414,9 +403,22 @@ fn serialize_tool_result<T: Serialize>(value: &T, prefix: &str) -> ToolCallResul
     }
 }
 
-fn internal_tool_error(operation: &str, error: &impl std::fmt::Display) -> ToolCallResult {
-    log::error!("MCP {operation} failed: {error}");
-    ToolCallResult::error(format!("{operation} failed"))
+/// Turn a library error into a tool result.
+///
+/// Conditions the caller can act on — bad input, and a store that has run out of room — are
+/// reported verbatim so the agent can correct itself. Everything else is logged and reduced to
+/// a bare failure so internal detail never reaches the client.
+fn tool_error(operation: &str, error: &RaiError) -> ToolCallResult {
+    match error {
+        RaiError::InvalidInput(message) => ToolCallResult::error(message.clone()),
+        RaiError::CapacityExhausted { .. } => ToolCallResult::error(format!(
+            "{error}. Remove memories or raise the configured capacity before storing again."
+        )),
+        other => {
+            log::error!("MCP {operation} failed: {other}");
+            ToolCallResult::error(format!("{operation} failed"))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -510,6 +512,44 @@ mod tests {
         let error = response.error.unwrap();
         assert_eq!(error.code, -32600);
         assert_eq!(error.message, "Invalid JSON-RPC request");
+    }
+
+    /// A full store is the caller's problem, so the MCP result has to name it rather than
+    /// report an opaque "store failed". Internal faults still stay opaque.
+    #[test]
+    fn actionable_errors_reach_the_client_and_internal_ones_do_not() {
+        let full = tool_error("store", &RaiError::CapacityExhausted { limit: 512 });
+        let text = &full.content[0].text;
+        assert_eq!(full.is_error, Some(true));
+        assert!(text.contains("512"), "{text}");
+        assert!(text.contains("capacity"), "{text}");
+        assert!(!text.contains("store failed"), "{text}");
+
+        let bad_input = tool_error("store", &RaiError::InvalidInput("empty content".into()));
+        assert_eq!(bad_input.content[0].text, "empty content");
+
+        let internal = tool_error(
+            "store",
+            &RaiError::PersistenceError(r"C:\private\memory.json".into()),
+        );
+        assert_eq!(internal.content[0].text, "store failed");
+        assert!(!internal.content[0].text.contains("private"));
+    }
+
+    /// The text limit is shared with the REST transport and measured in bytes.
+    #[tokio::test]
+    async fn oversized_tool_text_is_rejected_by_the_shared_byte_limit() {
+        let oversized = "x".repeat(validate::MAX_TEXT_BYTES + 1);
+        let request = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"rai_recall","arguments":{{"query":"{oversized}"}}}}}}"#
+        );
+        let response = process_message(&test_state(), request.as_bytes(), false)
+            .await
+            .unwrap();
+        let result = response.result.unwrap();
+        assert_eq!(result["isError"], true);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("byte limit"), "{text}");
     }
 
     #[tokio::test]

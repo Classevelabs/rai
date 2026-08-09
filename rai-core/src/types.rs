@@ -1,68 +1,67 @@
-use rem_nra::Vec64;
 use serde::{Deserialize, Serialize};
 
 /// Experimental, uncalibrated tier derived from the current retrieval score.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConfidenceLevel {
-    /// Experimental score below the configured high-tier threshold.
+    /// Retrieval score below the configured high-tier threshold.
     High,
-    /// Experimental score in the configured medium tier.
+    /// Retrieval score in the configured medium tier.
     Medium,
-    /// Experimental score in the low tier; treat retrieval as unverified.
+    /// Retrieval score in the low tier; treat retrieval as unverified.
     Low,
-    /// Experimental gradient diagnostic exceeded its configured threshold.
+    /// No stored memory scored above zero cosine similarity with the query.
     NoMatch,
-    /// Experimental perturbation diagnostic reported multiple candidate states.
-    Ambiguous,
 }
 
-/// Result of a retrieval operation with full diagnostics.
+/// Result of a retrieval operation with its score diagnostics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetrievalResult {
     /// The retrieved text content.
     pub content: String,
-    /// Confidence level based on energy analysis.
+    /// Experimental score tier; not a calibrated probability.
     pub confidence: ConfidenceLevel,
-    /// Raw energy at the attractor.
+    /// `-5 · max(cosine, 0)` between the query address and the best-matching stored address.
+    /// `0.0` means nothing matched; `-5.0` is an exact match.
     pub energy: f64,
-    /// Number of ODE integration steps.
-    pub steps: usize,
-    /// Final gradient norm.
-    pub grad_norm: f64,
-    /// Human-readable explanation of confidence.
+    /// Human-readable explanation of the score tier.
     pub explanation: String,
 }
 
-/// Report of interference when storing a new fact.
+/// Report of how a candidate fact changes crowding in the stored address space.
+///
+/// This measures address-space crowding only: each stored item is scored against its nearest
+/// *other* neighbour, and the report compares those scores before and after. Appending an item
+/// can only bring a neighbour closer, so a store never raises another item's score — under the
+/// current semantics this report cannot detect a semantic contradiction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InterferenceReport {
-    /// Whether any existing memories were destabilized.
+    /// Whether any stored item's crowding score moved into a reported tier.
     pub has_interference: bool,
-    /// Items whose energy changed significantly.
+    /// Items whose crowding score changed significantly.
     pub affected_items: Vec<AffectedItem>,
-    /// Overall interference severity.
+    /// Largest reported crowding-change tier.
     pub severity: InterferenceSeverity,
 }
 
-/// An item affected by storing a new fact.
+/// An item whose crowding score changed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AffectedItem {
     /// The text content of the affected memory.
     pub content: String,
-    /// Energy before the new store.
+    /// Crowding score before the comparison point.
     pub energy_before: f64,
-    /// Energy after the new store.
+    /// Crowding score after the comparison point.
     pub energy_after: f64,
-    /// Energy delta (positive means destabilized).
+    /// Score delta; only positive deltas (less crowding) are reported.
     pub delta: f64,
 }
 
-/// Severity of interference.
+/// Severity of a reported crowding change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InterferenceSeverity {
-    /// No significant energy changes.
+    /// No significant score changes.
     None,
-    /// Minor perturbation, memories still stable.
+    /// Minor score shift.
     Minor,
     /// Significant score shift; not proof of contradiction.
     Major,
@@ -73,22 +72,22 @@ pub enum InterferenceSeverity {
 /// Result of an intersection query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntersectionResult {
-    /// The retrieved content at the concept intersection.
+    /// The retrieved content nearest the combined concept address.
     pub content: String,
-    /// Confidence at the intersection point.
+    /// Experimental score tier at the combined address.
     pub confidence: ConfidenceLevel,
-    /// Energy at the combined omega.
+    /// Retrieval score at the combined address; see [`RetrievalResult::energy`].
     pub energy: f64,
     /// The individual concept names used.
     pub concepts: Vec<String>,
 }
 
-/// Surprise/novelty score from REM prior.
+/// Surprise/novelty score from the nearest-key residual.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SurpriseResult {
-    /// Novelty score (REM prior residual norm).
+    /// Novelty score (residual norm against the nearest stored key's value).
     pub score: f64,
-    /// Whether this is genuinely novel (high residual).
+    /// Whether the residual exceeded the configured novelty threshold.
     pub is_novel: bool,
     /// Human-readable explanation.
     pub explanation: String,
@@ -99,49 +98,19 @@ pub struct SurpriseResult {
 pub struct HealthReport {
     /// Number of stored memories.
     pub num_memories: usize,
-    /// NRA mean squared error.
-    pub nra_mse: Option<f64>,
-    /// REM mean squared error.
-    pub rem_mse: Option<f64>,
-    /// REM mean residual norm (prior quality).
-    pub rem_residual_norm: Option<f64>,
-    /// NRA capacity utilization estimate.
+    /// Mean residual norm across every stored item, or `None` when nothing is stored.
+    pub mean_residual_norm: Option<f64>,
+    /// Stored items divided by the configured store capacity.
     pub nra_capacity_ratio: f64,
-    /// Whether the system needs retraining.
-    pub needs_training: bool,
 }
 
-/// A stored memory entry with text and vectors.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MemoryEntry {
-    /// Unique ID for this memory.
-    pub id: usize,
-    /// Original text content.
-    pub content: String,
-    /// Omega vector (NRA address).
-    #[serde(skip)]
-    pub omega: Option<Vec64>,
-    /// Key vector (REM key).
-    #[serde(skip)]
-    pub key: Option<Vec64>,
-    /// Value vector (shared).
-    #[serde(skip)]
-    pub value: Option<Vec64>,
-}
-
-/// Confidence explanation with energy landscape details.
+/// Detailed score diagnostics for a retrieval.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfidenceExplanation {
-    /// The confidence level.
+    /// The score tier.
     pub confidence: ConfidenceLevel,
-    /// Energy at attractor.
+    /// Retrieval score; see [`RetrievalResult::energy`].
     pub energy: f64,
-    /// Gradient norm at attractor.
-    pub grad_norm: f64,
-    /// Number of attractors found from perturbed starts.
-    pub num_attractors: usize,
-    /// Basin analysis: spread of attractor energies from perturbed starts.
-    pub basin_spread: f64,
     /// Detailed explanation.
     pub explanation: String,
 }

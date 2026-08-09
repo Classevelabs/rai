@@ -1,7 +1,13 @@
 use crate::types::{AffectedItem, InterferenceReport, InterferenceSeverity};
 use rem_nra::Vec64;
 
-/// Thresholds for interference detection.
+/// Thresholds for reporting crowding changes in the stored address space.
+///
+/// Each stored item is scored against its nearest *other* neighbour, so the score reports how
+/// crowded that item's address is. Storing a fact can only bring a neighbour closer, which means
+/// every delta a store produces is non-positive and no tier below is reachable in that direction.
+/// The tiers are reachable only when the comparison removes crowding — for example when
+/// contrasting a snapshot against the same memories without a neighbour present.
 pub struct InterferenceDetector {
     /// Positive score change above this enters the minor tier.
     pub minor_threshold: f64,
@@ -22,11 +28,14 @@ impl Default for InterferenceDetector {
 }
 
 impl InterferenceDetector {
-    /// Compare energy snapshots before and after a store operation.
+    /// Compare crowding snapshots before and after a candidate store.
     ///
-    /// `before`: (omega, energy) pairs before storing.
-    /// `after`: (omega, energy) pairs after storing.
+    /// `before`: (address, crowding score) pairs before storing.
+    /// `after`: (address, crowding score) pairs after storing.
     /// `texts`: corresponding text labels for each item.
+    ///
+    /// This does not detect semantic contradiction; it reports only that stored addresses moved
+    /// apart in the comparison.
     pub fn detect(
         &self,
         before: &[(Vec64, f64)],
@@ -38,8 +47,8 @@ impl InterferenceDetector {
 
         for (i, ((_, e_before), (_, e_after))) in before.iter().zip(after.iter()).enumerate() {
             let delta = e_after - e_before;
-            // Only worsening (positive) score changes are interference. A lower energy is an
-            // improvement and must not be mislabeled as damage.
+            // Only positive score changes are reported. A lower score means the item's nearest
+            // neighbour got closer, which must not be mislabeled as damage.
             if delta > self.minor_threshold {
                 let text = texts.get(i).cloned().unwrap_or_else(|| format!("item_{i}"));
                 affected_items.push(AffectedItem {

@@ -4,9 +4,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::state::AppState;
-
-const MAX_TEXT_BYTES: usize = 16 * 1024;
-const MAX_INTERSECTION_CONCEPTS: usize = 32;
+use crate::validate;
 
 type ApiError = (StatusCode, Json<ErrorResponse>);
 
@@ -49,12 +47,6 @@ pub struct ConfidenceRequest {
 }
 
 #[derive(Serialize)]
-pub struct TrainResponse {
-    pub status: String,
-    pub final_loss: Option<f64>,
-}
-
-#[derive(Serialize)]
 pub struct SnapshotEntry {
     pub index: usize,
     pub energy: f64,
@@ -71,7 +63,7 @@ pub async fn store(
     State(state): State<AppState>,
     Json(req): Json<StoreRequest>,
 ) -> Result<Json<StoreResponse>, ApiError> {
-    validate_text("content", &req.content)?;
+    validate::validate_text("content", &req.content).map_err(client_error)?;
     let interference = state
         .store(&req.content)
         .await
@@ -87,7 +79,7 @@ pub async fn recall(
     State(state): State<AppState>,
     Json(req): Json<RecallRequest>,
 ) -> Result<Json<rai_core::RetrievalResult>, ApiError> {
-    validate_text("query", &req.query)?;
+    validate::validate_text("query", &req.query).map_err(client_error)?;
     let result = state
         .manager
         .recall(&req.query)
@@ -101,7 +93,7 @@ pub async fn intersect(
     State(state): State<AppState>,
     Json(req): Json<IntersectRequest>,
 ) -> Result<Json<rai_core::IntersectionResult>, ApiError> {
-    validate_concepts(&req.concepts)?;
+    validate::validate_concepts(&req.concepts).map_err(client_error)?;
     let result = state
         .manager
         .intersect(&req.concepts)
@@ -115,12 +107,12 @@ pub async fn contradict(
     State(state): State<AppState>,
     Json(req): Json<ContradictRequest>,
 ) -> Result<Json<rai_core::InterferenceReport>, ApiError> {
-    validate_text("fact", &req.fact)?;
+    validate::validate_text("fact", &req.fact).map_err(client_error)?;
     let result = state
         .manager
         .check_contradiction(&req.fact)
         .await
-        .map_err(|error| rai_error("contradiction check", error))?;
+        .map_err(|error| rai_error("crowding check", error))?;
 
     Ok(Json(result))
 }
@@ -129,7 +121,7 @@ pub async fn surprise(
     State(state): State<AppState>,
     Json(req): Json<SurpriseRequest>,
 ) -> Result<Json<rai_core::SurpriseResult>, ApiError> {
-    validate_text("content", &req.content)?;
+    validate::validate_text("content", &req.content).map_err(client_error)?;
     let result = state
         .manager
         .measure_surprise(&req.content)
@@ -143,7 +135,7 @@ pub async fn confidence(
     State(state): State<AppState>,
     Json(req): Json<ConfidenceRequest>,
 ) -> Result<Json<rai_core::ConfidenceExplanation>, ApiError> {
-    validate_text("query", &req.query)?;
+    validate::validate_text("query", &req.query).map_err(client_error)?;
     let result = state
         .manager
         .explain_confidence(&req.query)
@@ -151,26 +143,6 @@ pub async fn confidence(
         .map_err(|error| rai_error("confidence explanation", error))?;
 
     Ok(Json(result))
-}
-
-pub async fn train(State(state): State<AppState>) -> Result<Json<TrainResponse>, ApiError> {
-    let _training = state.try_training_lock().ok_or_else(|| {
-        (
-            StatusCode::CONFLICT,
-            Json(ErrorResponse {
-                error: "training is already in progress".to_string(),
-            }),
-        )
-    })?;
-    let losses = state
-        .train_nra()
-        .await
-        .map_err(|error| rai_error("training", error))?;
-
-    Ok(Json(TrainResponse {
-        status: "trained".to_string(),
-        final_loss: losses.last().copied(),
-    }))
 }
 
 pub async fn snapshot(State(state): State<AppState>) -> Result<Json<Vec<SnapshotEntry>>, ApiError> {
@@ -196,43 +168,6 @@ pub async fn health(
     Ok(Json(report))
 }
 
-fn validate_text(field: &str, value: &str) -> Result<(), ApiError> {
-    if value.trim().is_empty() {
-        return Err(client_error(format!("{field} must not be empty")));
-    }
-    if value.len() > MAX_TEXT_BYTES {
-        return Err(client_error(format!(
-            "{field} exceeds the {MAX_TEXT_BYTES}-byte limit"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_concepts(concepts: &[String]) -> Result<(), ApiError> {
-    if concepts.len() < 2 {
-        return Err(client_error("at least two concepts are required"));
-    }
-    if concepts.len() > MAX_INTERSECTION_CONCEPTS {
-        return Err(client_error(format!(
-            "concepts exceeds the {MAX_INTERSECTION_CONCEPTS}-item limit"
-        )));
-    }
-
-    let mut total_bytes = 0usize;
-    for concept in concepts {
-        validate_text("concept", concept)?;
-        total_bytes = total_bytes
-            .checked_add(concept.len())
-            .ok_or_else(|| client_error("combined concept text is too large"))?;
-    }
-    if total_bytes > MAX_TEXT_BYTES {
-        return Err(client_error(format!(
-            "combined concept text exceeds the {MAX_TEXT_BYTES}-byte limit"
-        )));
-    }
-    Ok(())
-}
-
 fn client_error(message: impl Into<String>) -> ApiError {
     (
         StatusCode::BAD_REQUEST,
@@ -245,11 +180,11 @@ fn client_error(message: impl Into<String>) -> ApiError {
 fn rai_error(operation: &'static str, error: rai_core::RaiError) -> ApiError {
     match error {
         rai_core::RaiError::InvalidInput(message) => client_error(message),
-        rai_core::RaiError::TrainingError(_) => (
-            StatusCode::NOT_IMPLEMENTED,
+        // The store being full is the caller's problem to resolve, not an internal fault.
+        error @ rai_core::RaiError::CapacityExhausted { .. } => (
+            StatusCode::CONFLICT,
             Json(ErrorResponse {
-                error: "training is unavailable because this build does not implement parameter optimization"
-                    .to_string(),
+                error: error.to_string(),
             }),
         ),
         error => internal_error(operation, "internal server error", error),
@@ -275,15 +210,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validation_rejects_empty_and_amplifying_inputs() {
-        assert!(validate_text("query", "   ").is_err());
-        assert!(validate_text("query", &"x".repeat(MAX_TEXT_BYTES + 1)).is_err());
-        assert!(validate_concepts(&[]).is_err());
-        assert!(validate_concepts(&vec!["x".to_string(); MAX_INTERSECTION_CONCEPTS + 1]).is_err());
-        assert!(validate_concepts(&["valid".to_string(), " ".to_string()]).is_err());
-    }
-
-    #[test]
     fn internal_error_details_are_not_returned() {
         let secret = r#"C:\\private\\memory.json"#;
         let (status, Json(response)) = internal_error(
@@ -307,16 +233,13 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_training_is_reported_honestly() {
+    fn a_full_store_is_a_conflict_not_an_internal_error() {
         let (status, Json(response)) = rai_error(
-            "training",
-            rai_core::RaiError::TrainingError("internal training details".to_string()),
+            "store",
+            rai_core::RaiError::CapacityExhausted { limit: 512 },
         );
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-        assert_eq!(
-            response.error,
-            "training is unavailable because this build does not implement parameter optimization"
-        );
-        assert!(!response.error.contains("internal training details"));
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(response.error.contains("512"), "{}", response.error);
+        assert!(response.error.contains("capacity"), "{}", response.error);
     }
 }

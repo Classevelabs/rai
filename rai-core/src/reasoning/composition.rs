@@ -1,20 +1,35 @@
+use crate::RaiError;
 use rem_nra::Vec64;
 
-/// Experimental compositional addressing over omega vectors.
+/// Experimental compositional addressing over address vectors.
 pub struct Compositor;
 
 impl Compositor {
-    /// Combine multiple omega vectors via normalized averaging.
+    /// Combine multiple address vectors via normalized averaging.
+    ///
     /// The result is a heuristic composite query, not a proven concept intersection.
-    pub fn intersect(omegas: &[Vec64]) -> Vec64 {
-        if omegas.is_empty() {
-            panic!("cannot compose zero omega vectors");
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RaiError::InvalidInput`] when no vectors are supplied or when they do not all
+    /// share one dimension. Both were previously panics reachable from the public API.
+    pub fn intersect(omegas: &[Vec64]) -> Result<Vec64, RaiError> {
+        let Some(first) = omegas.first() else {
+            return Err(RaiError::InvalidInput(
+                "cannot compose zero address vectors".to_string(),
+            ));
+        };
+        let dimension = first.len();
+        if omegas.iter().any(|omega| omega.len() != dimension) {
+            return Err(RaiError::InvalidInput(
+                "every address vector must share one dimension".to_string(),
+            ));
         }
         if omegas.len() == 1 {
-            return omegas[0].clone();
+            return Ok(first.clone());
         }
 
-        let mut combined = omegas[0].clone();
+        let mut combined = first.clone();
         for omega in &omegas[1..] {
             combined += omega;
         }
@@ -24,46 +39,7 @@ impl Compositor {
             combined /= norm;
         }
 
-        combined
-    }
-
-    /// Weighted combination of omega vectors.
-    pub fn weighted_intersect(omegas: &[Vec64], weights: &[f64]) -> Vec64 {
-        assert_eq!(omegas.len(), weights.len(), "omegas and weights must match");
-        assert!(!omegas.is_empty(), "cannot compose zero omega vectors");
-
-        let mut combined = &omegas[0] * weights[0];
-        for (omega, &w) in omegas[1..].iter().zip(&weights[1..]) {
-            combined += omega * w;
-        }
-
-        let norm = combined.norm();
-        if norm > 1e-10 {
-            combined /= norm;
-        }
-
-        combined
-    }
-
-    /// Difference vector: query for "A but not B".
-    pub fn difference(positive: &Vec64, negative: &Vec64) -> Vec64 {
-        let mut result = positive - negative;
-        let norm = result.norm();
-        if norm > 1e-10 {
-            result /= norm;
-        }
-        result
-    }
-
-    /// Analogy: "A is to B as C is to ?"
-    /// Returns omega_C + (omega_B - omega_A).
-    pub fn analogy(a: &Vec64, b: &Vec64, c: &Vec64) -> Vec64 {
-        let mut result = c + &(b - a);
-        let norm = result.norm();
-        if norm > 1e-10 {
-            result /= norm;
-        }
-        result
+        Ok(combined)
     }
 }
 
@@ -76,7 +52,7 @@ mod tests {
     fn intersect_normalizes() {
         let a = DVector::from_vec(vec![1.0, 0.0, 0.0, 0.0]);
         let b = DVector::from_vec(vec![0.0, 1.0, 0.0, 0.0]);
-        let result = Compositor::intersect(&[a, b]);
+        let result = Compositor::intersect(&[a, b]).expect("valid composition");
         let norm = result.norm();
         assert!((norm - 1.0).abs() < 1e-10);
     }
@@ -84,7 +60,17 @@ mod tests {
     #[test]
     fn single_omega_returns_same() {
         let a = DVector::from_vec(vec![0.5, 0.5, 0.0, 0.0]);
-        let result = Compositor::intersect(std::slice::from_ref(&a));
+        let result = Compositor::intersect(std::slice::from_ref(&a)).expect("valid composition");
         assert_eq!(result, a);
+    }
+
+    #[test]
+    fn empty_and_ragged_input_is_an_error_not_a_panic() {
+        assert!(Compositor::intersect(&[]).is_err());
+        assert!(Compositor::intersect(&[
+            DVector::from_vec(vec![1.0, 0.0]),
+            DVector::from_vec(vec![1.0, 0.0, 0.0]),
+        ])
+        .is_err());
     }
 }

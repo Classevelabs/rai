@@ -17,6 +17,12 @@ const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_CONCURRENT_REQUESTS: usize = 16;
 const MAX_REQUESTS_PER_MINUTE: u32 = 240;
 
+/// Wall-clock ceiling for handling one request, embedding round-trip included.
+///
+/// The default OpenAI embedding request already carries a 30-second timeout, so this is set just
+/// above it: a stuck request is abandoned instead of holding a concurrency permit forever.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Clone)]
 struct AuthState {
     token: Option<Arc<str>>,
@@ -49,12 +55,41 @@ pub fn build_router(state: AppState, api_token: Option<String>, port: u16) -> Ro
         .route("/v1/contradict", post(handlers::contradict))
         .route("/v1/surprise", post(handlers::surprise))
         .route("/v1/confidence", post(handlers::confidence))
-        .route("/v1/train", post(handlers::train))
         .route("/v1/snapshot", post(handlers::snapshot))
         .route("/v1/health", get(handlers::health))
         .route_layer(middleware::from_fn_with_state(auth, require_auth))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
+        // Outermost, so the deadline also covers authentication, body reading, and the
+        // concurrency permit held inside `require_auth`.
+        .layer(middleware::from_fn(enforce_timeout))
         .with_state(state)
+}
+
+/// Abandon a request that outlives [`REQUEST_TIMEOUT`].
+///
+/// Dropping the handler future releases whatever it held, including the concurrency permit, so a
+/// wedged upstream cannot exhaust the server's request slots.
+async fn enforce_timeout(request: Request, next: Next) -> Response {
+    run_with_deadline(REQUEST_TIMEOUT, request, next).await
+}
+
+async fn run_with_deadline(limit: Duration, request: Request, next: Next) -> Response {
+    match tokio::time::timeout(limit, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => {
+            log::error!("request exceeded the {limit:?} handling timeout");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": format!(
+                        "request exceeded the {}-second handling timeout",
+                        REQUEST_TIMEOUT.as_secs()
+                    )
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn require_auth(State(auth): State<AuthState>, request: Request, next: Next) -> Response {
@@ -76,7 +111,13 @@ async fn require_auth(State(auth): State<AuthState>, request: Request, next: Nex
     if !host.is_some_and(|host| is_allowed_host(host, auth.port)) {
         return (
             StatusCode::FORBIDDEN,
-            Json(json!({"error": "invalid Host header"})),
+            Json(json!({
+                "error": format!(
+                    "invalid Host header; send a loopback host such as '127.0.0.1:{port}', \
+                     '[::1]:{port}', or 'localhost' (a port, when present, must be {port})",
+                    port = auth.port
+                )
+            })),
         )
             .into_response();
     }
@@ -119,9 +160,16 @@ async fn require_auth(State(auth): State<AuthState>, request: Request, next: Nex
     response
 }
 
+/// Accept only loopback `Host` values, with or without a port.
+///
+/// The DNS-rebinding defence is the host *name* check: a rebound browser request always carries
+/// the attacker's own hostname. A port is therefore optional — a reverse proxy or a hand-written
+/// `curl -H "Host: localhost"` is legitimate — but when one is present it must be this server's.
 fn is_allowed_host(host: &str, port: u16) -> bool {
     host.parse::<Authority>().is_ok_and(|authority| {
-        authority.port_u16() == Some(port) && is_loopback_name(authority.host())
+        !authority.as_str().contains('@')
+            && authority.port_u16().is_none_or(|actual| actual == port)
+            && is_loopback_name(authority.host())
     })
 }
 
@@ -305,13 +353,72 @@ mod tests {
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
-    #[test]
-    fn training_lock_is_single_flight() {
-        let state = test_state();
-        let first = state.try_training_lock().expect("first training guard");
-        assert!(state.try_training_lock().is_none());
-        drop(first);
-        assert!(state.try_training_lock().is_some());
+    /// Training was removed rather than left as a permanent 501, so the route must be gone.
+    #[tokio::test]
+    async fn the_removed_training_route_is_not_found() {
+        let router = build_router(test_state(), None, 3000);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/train")
+                    .header(header::HOST, "127.0.0.1:3000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A handler that never finishes must be abandoned with a JSON error rather than hanging on
+    /// to its concurrency permit forever.
+    #[tokio::test]
+    async fn a_handler_that_outlives_the_deadline_returns_a_json_error() {
+        let deadline = Duration::from_millis(10);
+        let router = Router::new()
+            .route(
+                "/slow",
+                get(|| async {
+                    std::future::pending::<()>().await;
+                    StatusCode::OK
+                }),
+            )
+            .layer(middleware::from_fn(move |request, next| {
+                run_with_deadline(deadline, request, next)
+            }));
+
+        let response = router
+            .oneshot(Request::builder().uri("/slow").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            error["error"].as_str().unwrap().contains("timeout"),
+            "{error}"
+        );
+    }
+
+    /// A request that finishes inside the deadline must pass through untouched.
+    #[tokio::test]
+    async fn a_prompt_handler_is_not_affected_by_the_deadline() {
+        let router = build_router(test_state(), None, 3000);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/health")
+                    .header(header::HOST, "127.0.0.1:3000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -344,6 +451,30 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
+    /// A rejected Host must say what form is expected instead of a bare 403.
+    #[tokio::test]
+    async fn a_rejected_host_names_the_required_form() {
+        let router = build_router(test_state(), None, 3000);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/health")
+                    .header(header::HOST, "attacker.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let message = error["error"].as_str().unwrap();
+        assert!(message.contains("127.0.0.1:3000"), "{message}");
+        assert!(message.contains("localhost"), "{message}");
+    }
+
     #[test]
     fn accepts_all_loopback_host_forms_with_the_exact_port() {
         assert!(is_allowed_host("localhost:3000", 3000));
@@ -361,5 +492,18 @@ mod tests {
         assert!(!is_allowed_origin("http://127.0.0.1:3000/?query", 3000));
         assert!(!is_allowed_origin("http://user@127.0.0.1:3000", 3000));
         assert!(!is_allowed_origin("http://attacker.example:3000", 3000));
+    }
+
+    /// A portless loopback Host is legitimate — it names a loopback address, which is what the
+    /// DNS-rebinding check is actually about — and must not be a silent 403.
+    #[test]
+    fn accepts_portless_loopback_hosts_but_not_portless_foreign_ones() {
+        assert!(is_allowed_host("localhost", 3000));
+        assert!(is_allowed_host("127.0.0.1", 3000));
+        assert!(is_allowed_host("[::1]", 3000));
+
+        assert!(!is_allowed_host("attacker.example", 3000));
+        assert!(!is_allowed_host("192.168.1.2", 3000));
+        assert!(!is_allowed_host("user@localhost", 3000));
     }
 }

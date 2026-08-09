@@ -1,3 +1,4 @@
+use crate::RaiError;
 use nalgebra::{DMatrix, DVector};
 use rand::Rng;
 use rand_distr::StandardNormal;
@@ -33,19 +34,35 @@ impl Projection {
     }
 
     /// Project an embedding vector to target dimension.
-    pub fn project(&self, embedding: &[f64]) -> Vec64 {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RaiError::EmbeddingError`] when `embedding` is not `source_dim` long. The
+    /// matrix product would otherwise panic on the dimension mismatch.
+    pub fn project(&self, embedding: &[f64]) -> Result<Vec64, RaiError> {
+        if embedding.len() != self.source_dim || self.matrix.ncols() != embedding.len() {
+            return Err(RaiError::EmbeddingError(format!(
+                "projection expects {} input dimensions, got {}",
+                self.source_dim,
+                embedding.len()
+            )));
+        }
         let v = DVector::from_row_slice(embedding);
-        &self.matrix * v
+        Ok(&self.matrix * v)
     }
 
     /// Project an embedding vector, then normalize to unit length.
-    pub fn project_normalized(&self, embedding: &[f64]) -> Vec64 {
-        let mut result = self.project(embedding);
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Projection::project`].
+    pub fn project_normalized(&self, embedding: &[f64]) -> Result<Vec64, RaiError> {
+        let mut result = self.project(embedding)?;
         let norm = result.norm();
         if norm > 1e-10 {
             result /= norm;
         }
-        result
+        Ok(result)
     }
 
     /// Validate serialized metadata against the actual matrix payload.
@@ -70,7 +87,15 @@ mod tests {
         let mut rng = rand::thread_rng();
         let proj = Projection::random_gaussian(384, 32, &mut rng);
         let embedding = vec![0.5; 384];
-        let result = proj.project(&embedding);
+        let result = proj.project(&embedding).expect("matching dimensions");
         assert_eq!(result.nrows(), 32);
+    }
+
+    #[test]
+    fn dimension_mismatch_is_an_error_not_a_panic() {
+        let mut rng = rand::thread_rng();
+        let proj = Projection::random_gaussian(384, 32, &mut rng);
+        assert!(proj.project(&[0.5; 383]).is_err());
+        assert!(proj.project_normalized(&[0.5; 385]).is_err());
     }
 }

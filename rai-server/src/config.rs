@@ -64,10 +64,14 @@ impl Default for ServerConfig {
 
 impl ServerConfig {
     /// Load from environment variables, falling back to defaults.
+    ///
+    /// A variable whose value is not valid Unicode fails startup. Silently discarding it would
+    /// be worse than refusing to start: a mangled `RAI_API_TOKEN` would leave the REST API
+    /// running with authentication disabled.
     pub fn from_env() -> Result<Self, ConfigError> {
         let mut config = Self::default();
 
-        if let Ok(port) = std::env::var("RAI_PORT") {
+        if let Some(port) = env_var("RAI_PORT")? {
             config.port = port.parse::<u16>().map_err(|_| {
                 ConfigError::new(format!("invalid RAI_PORT '{port}'; expected 1..=65535"))
             })?;
@@ -75,26 +79,26 @@ impl ServerConfig {
                 return Err(ConfigError::new("RAI_PORT must be greater than zero"));
             }
         }
-        if let Ok(host) = std::env::var("RAI_HOST") {
+        if let Some(host) = env_var("RAI_HOST")? {
             if host.trim().is_empty() {
                 return Err(ConfigError::new("RAI_HOST must not be empty"));
             }
             config.host = host;
         }
-        if let Ok(provider) = std::env::var("RAI_EMBEDDING_PROVIDER") {
+        if let Some(provider) = env_var("RAI_EMBEDDING_PROVIDER")? {
             config.embedding_provider = provider;
         }
-        if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+        if let Some(key) = env_var("OPENAI_API_KEY")? {
             config.openai_api_key = Some(key);
         }
-        if let Ok(token) = std::env::var("RAI_API_TOKEN") {
+        if let Some(token) = env_var("RAI_API_TOKEN")? {
             config.api_token = Some(token);
         }
-        if let Ok(enabled) = std::env::var("RAI_MCP_MUTATIONS_ENABLED") {
+        if let Some(enabled) = env_var("RAI_MCP_MUTATIONS_ENABLED")? {
             config.mcp_mutations_enabled =
                 parse_strict_bool("RAI_MCP_MUTATIONS_ENABLED", &enabled)?;
         }
-        if let Ok(path) = std::env::var("RAI_DATA_PATH") {
+        if let Some(path) = env_var("RAI_DATA_PATH")? {
             config.data_path = Some(path);
         }
 
@@ -151,6 +155,19 @@ impl ServerConfig {
             ));
         }
         Ok(())
+    }
+}
+
+/// Read one environment variable, failing on a value that is not valid Unicode.
+fn env_var(name: &str) -> Result<Option<String>, ConfigError> {
+    match std::env::var_os(name) {
+        None => Ok(None),
+        Some(value) => value.into_string().map(Some).map_err(|_| {
+            ConfigError::new(format!(
+                "{name} is set to a value that is not valid Unicode; RAI refuses to start rather \
+                 than ignore it"
+            ))
+        }),
     }
 }
 
@@ -218,6 +235,30 @@ mod tests {
         config.api_token = Some("a".repeat(MIN_API_TOKEN_BYTES));
         assert!(config.validate().is_ok());
         assert!(config.validate_rest_security().is_err());
+    }
+
+    /// A non-Unicode value must fail rather than be silently discarded: dropping a mangled
+    /// `RAI_API_TOKEN` would start the REST API with authentication disabled.
+    #[test]
+    fn non_unicode_environment_values_fail_instead_of_being_ignored() {
+        let name = "RAI_TEST_NON_UNICODE_VALUE";
+        #[cfg(windows)]
+        let bad = {
+            use std::os::windows::ffi::OsStringExt;
+            std::ffi::OsString::from_wide(&[0x0074, 0xD800, 0x006F])
+        };
+        #[cfg(not(windows))]
+        let bad = {
+            use std::os::unix::ffi::OsStringExt;
+            std::ffi::OsString::from_vec(vec![0x74, 0xFF, 0x6F])
+        };
+
+        std::env::set_var(name, &bad);
+        let error = env_var(name).unwrap_err();
+        std::env::remove_var(name);
+        assert!(error.to_string().contains("not valid Unicode"));
+
+        assert_eq!(env_var("RAI_TEST_DEFINITELY_UNSET_VALUE").unwrap(), None);
     }
 
     #[test]
