@@ -147,9 +147,61 @@ jobs:
       - name: Build pinned image
         run: docker build --tag rai-audit:local .
 
-      - name: Smoke-test MCP initialization
+      # This used to assert only that the initialize response contained
+      # "rai-server" — i.e. that the binary starts and can complete a
+      # handshake. An image whose every tool was broken passed that check.
+      # The shipped artifact is worth more than a greeting, so the smoke now
+      # exercises the actual product: enumerate the tools, prove the
+      # mutation-off default holds, and drive a real store -> recall round
+      # trip through the container.
+      - name: Smoke-test MCP handshake and tool surface
         run: |
-          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}' \
+          printf '%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+            '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"rai_store","arguments":{"content":"ci canary"}}}' \
             | docker run --rm -i rai-audit:local mcp \
-            | tee /tmp/rai-mcp-response.json
-          grep -q '"name":"rai-server"' /tmp/rai-mcp-response.json
+            | tee /tmp/rai-mcp-surface.json
+
+          grep -q '"name":"rai-server"' /tmp/rai-mcp-surface.json
+
+          # Every read-only tool must actually be advertised by the image. A
+          # build that silently drops one would otherwise ship unnoticed.
+          for tool in rai_recall rai_intersect rai_contradict \
+                      rai_surprise rai_memory_health rai_explain_confidence; do
+            grep -q "\"$tool\"" /tmp/rai-mcp-surface.json \
+              || { echo "::error::image does not advertise $tool"; exit 1; }
+          done
+
+          # Writes are opt-in, and the default does two things: it hides
+          # rai_store from tools/list entirely, and it refuses the call if one
+          # is made anyway. Both are asserted — a client that never sees the
+          # tool cannot be tempted by it, and a client that guesses the name
+          # still gets nothing. If either half inverts, an MCP client gains
+          # silent write access to the operator's memory store.
+          grep -q '"rai_store"' /tmp/rai-mcp-surface.json \
+            && { echo "::error::rai_store is advertised with mutations disabled — the write tool must be hidden by default"; exit 1; }
+
+          grep -q 'rai_store is disabled' /tmp/rai-mcp-surface.json \
+            || { echo "::error::rai_store was NOT refused by default — the mutation opt-in has regressed"; exit 1; }
+
+      - name: Smoke-test a real store and recall round trip
+        run: |
+          printf '%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"rai_store","arguments":{"content":"the ci canary fact about zebras"}}}' \
+            '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"rai_recall","arguments":{"query":"zebras"}}}' \
+            | docker run --rm -i -e RAI_MCP_MUTATIONS_ENABLED=true rai-audit:local mcp \
+            | tee /tmp/rai-mcp-roundtrip.json
+
+          grep -q 'Stored successfully' /tmp/rai-mcp-roundtrip.json \
+            || { echo "::error::rai_store did not store with mutations enabled"; exit 1; }
+
+          # The stored text must come back out. Starting is not working.
+          grep -q 'the ci canary fact about zebras' /tmp/rai-mcp-roundtrip.json \
+            || { echo "::error::rai_recall did not return the stored content — the image starts but does not work"; exit 1; }
+
+          # The recall payload is JSON inside a JSON-RPC text field, so the
+          # field name arrives escaped as \"confidence\" — match it unquoted.
+          grep -q 'confidence' /tmp/rai-mcp-roundtrip.json \
+            || { echo "::error::recall response is missing its confidence field"; exit 1; }
