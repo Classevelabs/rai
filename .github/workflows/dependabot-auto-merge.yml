@@ -70,7 +70,7 @@ jobs:
               # main moved somewhere this branch cannot be replayed onto.
               # Dependabot rebuilds it from the current base on request.
               echo "conflicted — asking Dependabot to recreate the branch"
-              gh pr comment "$n" --repo "$REPO" --body "@dependabot recreate"
+              gh pr comment "$n" --repo "$REPO" --body "@dependabot recreate" || true
               echo "::endgroup::"; continue
             fi
 
@@ -85,14 +85,25 @@ jobs:
                 # time. One rebase costs a CI run and tells the two apart.
                 echo "red — rebasing so the next verdict is about this bump"
                 gh pr update-branch "$n" --repo "$REPO" --rebase \
-                  || gh pr comment "$n" --repo "$REPO" --body "@dependabot recreate"
+                  || gh pr comment "$n" --repo "$REPO" --body "@dependabot recreate" \
+                  || true
                 ;;
               " ")
                 echo "no checks reported — leaving alone" ;;
               *)
                 echo "CI green on the current base — merging"
-                gh pr merge "$n" --repo "$REPO" --squash --delete-branch
+                # Every merge moves main, so a lockfile bump can strand the
+                # next one mid-sweep. That is ordinary, not a failure: hand it
+                # back to Dependabot and keep going. Letting it abort the run
+                # would leave the rest untriaged and paint this workflow red —
+                # the exact thing it exists to prevent.
+                if ! gh pr merge "$n" --repo "$REPO" --squash --delete-branch; then
+                  echo "merge refused (main moved underneath) — asking Dependabot to recreate"
+                  gh pr comment "$n" --repo "$REPO" --body "@dependabot recreate" || true
+                fi
                 ;;
             esac
             echo "::endgroup::"
           done
+
+          echo "Sweep complete."
