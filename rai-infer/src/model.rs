@@ -27,7 +27,15 @@ fn no_biases() -> LayerBiases {
     Default::default()
 }
 
+/// A loaded `.raimodel`, ready to run.
+///
+/// Owns the one heap buffer the file was read into and the values derived from
+/// it at load time: the RoPE tables, the dequantized f32 norm weights, and any
+/// projection biases. Quantized weights are *not* copied out — the forward pass
+/// reads them straight from the file buffer and unpacks them inside the GEMM
+/// inner loop, so no fp32 copy of the weights ever exists.
 pub struct RaiModel {
+    /// Architecture and quantization parameters read from the file header.
     pub config: ModelConfig,
     file: RaiModelFile,
     rope: RoPETable,
@@ -40,6 +48,17 @@ pub struct RaiModel {
 }
 
 impl RaiModel {
+    /// Read and validate a `.raimodel` file.
+    ///
+    /// The whole file is read into one heap buffer, its header and section
+    /// bounds are checked against each other, and every quantization scale and
+    /// norm weight is checked for finiteness before this returns. A malformed
+    /// or truncated file is an error here rather than a wrong answer later, so
+    /// a model that loads is one the kernels can run.
+    ///
+    /// # Panics
+    /// Every failure — including every form of malformed input and a RoPE
+    /// table that does not fit in memory — returns `Err`.
     pub fn load(path: &Path) -> Result<Self> {
         let file = RaiModelFile::open(path).context("loading .raimodel")?;
         let config = file.config.clone();
@@ -48,7 +67,8 @@ impl RaiModel {
             config.max_context as usize,
             config.rope_theta,
             config.rope_scaling,
-        );
+        )
+        .context("building the RoPE table")?;
 
         let num_layers = config.num_layers as usize;
         let mut layer_input_norms = Vec::with_capacity(num_layers);

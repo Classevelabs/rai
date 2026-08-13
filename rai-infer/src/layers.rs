@@ -7,6 +7,8 @@
 // dimension arguments document and validate each buffer contract at the call boundary.
 #![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 
+use anyhow::{anyhow, ensure, Result};
+
 use crate::format::QuantizedLinear;
 use crate::gemm::{has_avx2, w4a8_fused_gate_up, w4a8_fused_qkv, w4a8_matvec};
 use crate::kv_cache::KVCache;
@@ -409,49 +411,52 @@ pub struct RoPETable {
 impl RoPETable {
     /// Build RoPE tables with the given theta and maximum context length.
     ///
-    /// # Panics
-    /// Panics if `head_dim` is zero or odd, `max_ctx` is zero, `theta` is not
-    /// finite and positive, the table would exceed [`MAX_ROPE_TABLE_BYTES`]
-    /// (`.raimodel` validation guarantees loaded models stay within it), or
-    /// the allocation fails.
-    pub fn new(head_dim: usize, max_ctx: usize, theta: f32) -> Self {
+    /// Returns an error rather than aborting when the table does not fit: a
+    /// `.raimodel` only a few kilobytes long can legally declare a very large
+    /// `max_context`, and a model file must never be able to kill the process.
+    pub fn new(head_dim: usize, max_ctx: usize, theta: f32) -> Result<Self> {
         Self::with_scaling(head_dim, max_ctx, theta, RopeScaling::None)
     }
 
     /// Build RoPE tables, optionally applying a frequency-rescaling scheme.
     ///
-    /// # Panics
-    /// Same conditions as [`RoPETable::new`], plus non-finite or non-positive
-    /// llama3 scaling parameters.
-    pub fn with_scaling(head_dim: usize, max_ctx: usize, theta: f32, scaling: RopeScaling) -> Self {
-        assert!(
+    /// Same error conditions as [`RoPETable::new`], plus non-finite or
+    /// non-positive llama3 scaling parameters.
+    pub fn with_scaling(
+        head_dim: usize,
+        max_ctx: usize,
+        theta: f32,
+        scaling: RopeScaling,
+    ) -> Result<Self> {
+        ensure!(
             head_dim > 0 && head_dim.is_multiple_of(2),
-            "RoPE head_dim must be positive and even"
+            "RoPE head_dim must be positive and even, got {head_dim}"
         );
-        assert!(max_ctx > 0, "RoPE context must be non-zero");
-        assert!(
+        ensure!(max_ctx > 0, "RoPE context must be non-zero");
+        ensure!(
             theta.is_finite() && theta > 0.0,
-            "RoPE theta must be finite and positive"
+            "RoPE theta must be finite and positive, got {theta}"
         );
         let half_dim = head_dim / 2;
         let elements = max_ctx
             .checked_mul(half_dim)
-            .expect("RoPE table dimensions overflow");
+            .ok_or_else(|| anyhow!("RoPE table dimensions overflow"))?;
         let bytes = elements
             .checked_mul(2)
             .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
-            .expect("RoPE table byte size overflows");
-        assert!(
+            .ok_or_else(|| anyhow!("RoPE table byte size overflows"))?;
+        ensure!(
             bytes <= MAX_ROPE_TABLE_BYTES,
-            "RoPE table exceeds the memory budget"
+            "RoPE table needs {} MiB for max_context {max_ctx}, over the {} MiB budget",
+            bytes >> 20,
+            MAX_ROPE_TABLE_BYTES >> 20
         );
         let mut cos = Vec::new();
-        cos.try_reserve_exact(elements)
-            .expect("unable to allocate RoPE cosine table");
-        cos.resize(elements, 0.0);
         let mut sin = Vec::new();
-        sin.try_reserve_exact(elements)
-            .expect("unable to allocate RoPE sine table");
+        cos.try_reserve_exact(elements)
+            .and_then(|()| sin.try_reserve_exact(elements))
+            .map_err(|_| anyhow!("cannot allocate {} MiB for the RoPE table", bytes >> 20))?;
+        cos.resize(elements, 0.0);
         sin.resize(elements, 0.0);
 
         // The inverse frequencies are position-independent, so they are
@@ -483,12 +488,12 @@ impl RoPETable {
             }
         }
 
-        Self {
+        Ok(Self {
             cos,
             sin,
             head_dim,
             max_ctx,
-        }
+        })
     }
 
     /// Apply RoPE rotation to a set of heads at the given position.
@@ -1706,7 +1711,7 @@ mod tests {
 
     #[test]
     fn test_rope_basic() {
-        let rope = RoPETable::new(4, 16, 10000.0);
+        let rope = RoPETable::new(4, 16, 10000.0).unwrap();
         // At position 0, all angles are 0, so cos=1, sin=0 → no rotation
         let mut heads = vec![1.0, 2.0, 3.0, 4.0]; // 1 head, head_dim=4
         let orig = heads.clone();
@@ -1749,16 +1754,39 @@ mod tests {
     }
 
     #[test]
+    fn an_oversized_rope_request_is_an_error_not_an_abort() {
+        // A .raimodel only a few kilobytes long can legally declare a very
+        // large max_context. Building its table must fail with a message
+        // rather than take the process down.
+        let text = match RoPETable::new(128, 50_000_000, 10_000.0) {
+            Ok(_) => panic!("a 50M-position table must be refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(text.contains("budget"), "unexpected message: {text}");
+        assert!(
+            text.contains("50000000"),
+            "message should name the context: {text}"
+        );
+
+        // Degenerate arguments are errors too, not panics.
+        assert!(RoPETable::new(0, 16, 10_000.0).is_err());
+        assert!(RoPETable::new(7, 16, 10_000.0).is_err());
+        assert!(RoPETable::new(8, 0, 10_000.0).is_err());
+        assert!(RoPETable::new(8, 16, f32::NAN).is_err());
+        assert!(RoPETable::new(8, 16, -1.0).is_err());
+    }
+
+    #[test]
     #[should_panic(expected = "RoPE head buffer length mismatch")]
     fn rope_rejects_mismatched_head_buffer_before_simd() {
-        let rope = RoPETable::new(8, 4, 10_000.0);
+        let rope = RoPETable::new(8, 4, 10_000.0).unwrap();
         rope.apply(&mut [0.0; 7], 1, 0);
     }
 
     #[test]
     #[should_panic(expected = "KV cache dimensions do not match attention")]
     fn attention_rejects_mismatched_cache_before_simd() {
-        let rope = RoPETable::new(16, 4, 10_000.0);
+        let rope = RoPETable::new(16, 4, 10_000.0).unwrap();
         let mut cache = KVCache::new(1, 1, 4, 8).unwrap();
         let mut output = [0.0; 16];
         let mut q = [0.0; 16];
@@ -1781,7 +1809,7 @@ mod tests {
 
     #[test]
     fn attention_uses_scalar_tail_for_non_multiple_of_eight_head_dim() {
-        let rope = RoPETable::new(6, 2, 10_000.0);
+        let rope = RoPETable::new(6, 2, 10_000.0).unwrap();
         let mut cache = KVCache::new(1, 1, 2, 6).unwrap();
         let mut output = [99.0; 6];
         let mut q = [1.0; 6];
@@ -1968,7 +1996,7 @@ mod tests {
             high_freq_factor: 4.0,
             original_max_position: 8_192,
         };
-        let table = RoPETable::with_scaling(64, 4, 500_000.0, scaling);
+        let table = RoPETable::with_scaling(64, 4, 500_000.0, scaling).unwrap();
 
         // At pos = 1 the angle *is* the inverse frequency, so the table's
         // cos/sin row is a direct read-out of the transform.
@@ -1989,7 +2017,7 @@ mod tests {
 
         // All three bands must be represented, or the test would pass on an
         // implementation that only handles one of them.
-        let unscaled = RoPETable::with_scaling(64, 4, 500_000.0, RopeScaling::None);
+        let unscaled = RoPETable::with_scaling(64, 4, 500_000.0, RopeScaling::None).unwrap();
         let old_context = 8_192.0f64;
         let (mut untouched, mut divided, mut smoothed) = (0, 0, 0);
         for (i, &reference) in LLAMA3_1B_INV_FREQ.iter().enumerate() {
@@ -2028,8 +2056,8 @@ mod tests {
 
     #[test]
     fn default_rope_scaling_leaves_the_table_untouched() {
-        let plain = RoPETable::new(16, 8, 10_000.0);
-        let explicit = RoPETable::with_scaling(16, 8, 10_000.0, RopeScaling::None);
+        let plain = RoPETable::new(16, 8, 10_000.0).unwrap();
+        let explicit = RoPETable::with_scaling(16, 8, 10_000.0, RopeScaling::None).unwrap();
         assert_eq!(plain.cos, explicit.cos);
         assert_eq!(plain.sin, explicit.sin);
     }
