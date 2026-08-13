@@ -1,16 +1,27 @@
 # Installing RAI
 
-RAI is four command-line programs and no installer:
+RAI is two command-line programs and no installer:
 
 | Binary | What it is for |
 | --- | --- |
-| `rai-convert` | Turn a HuggingFace checkpoint into a `.raimodel` file |
-| `rai-generate` | Generate text from a `.raimodel` on the CPU |
-| `rai-chat` | Serve a local chat UI over HTTP |
+| `rai` | Convert checkpoints, generate text, serve a local chat UI, list models |
 | `rai-server` | Local REST + MCP memory service |
 
+`rai` has four subcommands:
+
+| Command | What it does |
+| --- | --- |
+| `rai convert <model-dir>` | Turn a HuggingFace checkpoint into a `.raimodel` file |
+| `rai run <model.raimodel>` | Generate text on the CPU |
+| `rai serve <model.raimodel>` | Serve a local chat UI over HTTP |
+| `rai models [dir]` | List the `.raimodel` files in a directory |
+
+The archives also carry `rai-convert`, `rai-generate`, and `rai-chat`. Those
+are deprecated wrappers over the same code, kept so existing scripts keep
+working; new work should use `rai`.
+
 Nothing runs as a service, nothing writes outside the paths you name, and no
-GPU is required. `rai-chat` and `rai-server` listen on loopback only.
+GPU is required. `rai serve` and `rai-server` listen on loopback only.
 
 If you want to build from source instead, skip to
 [Installing from source](#installing-from-source). For model export details,
@@ -69,7 +80,7 @@ that lists all three. If the check fails, delete the download; do not run it.
 
 ## 3. Put the binaries on your PATH
 
-Unpack, then move the four binaries somewhere already on `PATH`. They are
+Unpack, then move the binaries somewhere already on `PATH`. They are
 self-contained and can live anywhere.
 
 Linux and macOS:
@@ -77,8 +88,8 @@ Linux and macOS:
 ```bash
 tar xzf rai-0.2.0-x86_64-unknown-linux-gnu.tar.gz
 cd rai-0.2.0-x86_64-unknown-linux-gnu
-install -m 0755 rai-convert rai-generate rai-chat rai-server ~/.local/bin/
-rai-generate --help
+install -m 0755 rai rai-server ~/.local/bin/
+rai --help
 ```
 
 If `~/.local/bin` is not on your `PATH`, add it (`export
@@ -89,7 +100,7 @@ macOS marks downloaded files with a quarantine attribute, and these binaries
 are not notarized. Gatekeeper will refuse them until you clear it:
 
 ```bash
-xattr -d com.apple.quarantine rai-convert rai-generate rai-chat rai-server
+xattr -d com.apple.quarantine rai rai-server
 ```
 
 Windows PowerShell:
@@ -100,7 +111,7 @@ $dir = "$HOME\bin\rai-0.2.0-x86_64-pc-windows-msvc"
 [Environment]::SetEnvironmentVariable(
   "Path", "$([Environment]::GetEnvironmentVariable('Path','User'));$dir", "User")
 # open a new terminal, then:
-rai-generate --help
+rai --help
 ```
 
 The Windows binaries are unsigned, so SmartScreen may warn on first run. The
@@ -108,33 +119,37 @@ checksum you verified in step 2 is the assurance here.
 
 ## 4. Sixty seconds to your first generation
 
-You need a checkpoint on disk. Any plain Llama- or Mistral-architecture model
-works; a ~1B model converts in well under a minute. TinyLlama-1.1B-Chat is the
-one these instructions were verified against.
+You need a checkpoint on disk. A ~1B model converts in well under a minute.
+TinyLlama-1.1B-Chat is the one these instructions were verified against.
 
 ```bash
-# Convert it once. No Python, no torch — rai-convert reads the checkpoint
+# Convert it once. No Python, no torch — `rai convert` reads the checkpoint
 # directory directly and writes tokenizer.json next to the model file.
-rai-convert --model /path/to/TinyLlama-1.1B-Chat-v1.0 \
-            --output tinyllama-q4.raimodel
+rai convert /path/to/TinyLlama-1.1B-Chat-v1.0 -o tinyllama-q4.raimodel
 
-# Generate.
-rai-generate --model tinyllama-q4.raimodel \
-             --tokenizer tokenizer.json \
-             --chat-template zephyr \
-             --prompt "Explain photosynthesis in simple terms."
+# Generate. The tokenizer beside the model is found automatically.
+rai run tinyllama-q4.raimodel \
+        --chat-template zephyr \
+        --prompt "Explain photosynthesis in simple terms."
 ```
 
 Then, if you want a browser instead of a terminal:
 
 ```bash
-rai-chat --model tinyllama-q4.raimodel --tokenizer tokenizer.json
+rai serve tinyllama-q4.raimodel
 # open http://127.0.0.1:8090
 ```
 
-Not every checkpoint converts. RAI runs plain Llama- and Mistral-architecture
-models; Qwen, Gemma, Llama-3.1/3.2, and mixture-of-experts checkpoints are
-refused at conversion time with the reason named. Check
+The double-click launchers in `launchers/` start that same interface without a
+terminal. To see what is already on the machine:
+
+```bash
+rai models .
+```
+
+Not every checkpoint converts. RAI runs Qwen2/2.5, Llama-2/3/3.1/3.2, Gemma,
+Mistral, TinyLlama, and SmolLM; Qwen3, Gemma2/Gemma3, and mixture-of-experts
+checkpoints are refused at conversion time with the reason named. Check
 [docs/MODELS.md](./docs/MODELS.md) before downloading weights.
 
 **The one thing that trips everybody up:** instruction-tuned checkpoints need
@@ -164,7 +179,7 @@ which `rustup` will install automatically from `rust-toolchain.toml`.
 ```bash
 git clone https://github.com/Classevelabs/rai.git
 cd rai
-cargo install --locked --path rai-infer     # rai-convert, rai-generate, rai-chat
+cargo install --locked --path rai-infer     # rai, and the deprecated wrappers
 cargo install --locked --path rai-server    # rai-server
 ```
 
@@ -191,7 +206,7 @@ baseline.
 The published `Dockerfile` builds the MCP stdio image. See
 [docs/INSTALL.md](./docs/INSTALL.md#container) for how to run it, and
 [Dockerfile](./Dockerfile) for the `--target` stages, including one that carries
-the inference CLI as well as the server.
+the inference CLI instead of the server.
 
 ## Uninstalling
 

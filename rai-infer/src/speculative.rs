@@ -83,9 +83,8 @@ impl<'a> SpeculativeDecoder<'a> {
         let tvs = target.config.vocab_size as usize;
         if dvs != tvs {
             bail!(
-                "Speculative decoding requires matching vocab sizes. \
-                 Draft vocab={dvs}, target vocab={tvs}. \
-                 Draft and target must use the same tokenizer."
+                "draft and target vocabularies differ: draft has {dvs}, target has {tvs}; \
+                 speculative decoding requires both models to use the same tokenizer"
             );
         }
 

@@ -8,11 +8,23 @@ use rand::Rng;
 use std::collections::HashSet;
 
 /// Sampling configuration.
+///
+/// The filters compose in this order: repetition penalty, temperature, top-k,
+/// top-p. Speculative decoding requires all of them disabled except
+/// temperature (`top_k: 0`, `top_p: 1.0`, `repetition_penalty: 1.0`), so that
+/// verification compares against the distribution the target model produced.
 #[derive(Debug, Clone)]
 pub struct SamplerConfig {
+    /// Logit scale before the softmax. Lower is more deterministic; `0.0`
+    /// always takes the most likely token.
     pub temperature: f32,
+    /// Keep only the `k` most likely tokens. `0` disables the filter.
     pub top_k: usize,
+    /// Keep the smallest set of tokens whose probabilities sum to at least
+    /// this. `1.0` disables the filter.
     pub top_p: f32,
+    /// Divisor applied to the logit of every token already in the context.
+    /// `1.0` disables the penalty; above `1.0` discourages repetition.
     pub repetition_penalty: f32,
 }
 

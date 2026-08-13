@@ -18,9 +18,11 @@ rai-infer/scripts/mistral-tokenizer.json
 rai-infer/scripts/teacher_data/
 rai-infer/scripts/train.log
 
-# Python cache
+# Python cache and the virtualenv docs/INSTALL.md tells you to create here
 __pycache__/
 *.pyc
+.venv/
+venv/
 
 # IDE
 .vscode/

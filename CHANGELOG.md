@@ -7,19 +7,48 @@ versioning for its pre-1.0 releases.
 ## [0.2.0] - Unreleased
 
 ### Added
+- **One `rai` binary with four verbs — `rai convert`, `rai run`, `rai serve`,
+  `rai models`** — replacing the four separate commands. `rai run` and
+  `rai serve` take the model as a positional argument and default `--tokenizer`
+  to the `tokenizer.json` beside it. `rai models` lists a directory's
+  `.raimodel` files from their headers alone. `rai-convert`, `rai-generate`,
+  and `rai-chat` remain as deprecated wrappers over the same entry points and
+  will be removed in a future release.
+- **A Rust-native streaming converter** behind `rai convert`. It reads
+  `.safetensors` directly, needs no Python or torch, and writes each section in
+  place, so peak memory is one row block rather than the whole model — a 7B
+  checkpoint converts on a 16 GB machine. Output is byte-identical to
+  `export_rtn.py` for the same checkpoint and options, pinned by
+  `tests/convert_matches_python.rs`.
+- **Container format v2**, adding Qwen2/Qwen2.5, Llama-3.1/3.2, and Gemma
+  support. The header grows to 128 bytes and gains an activation code (GeGLU
+  alongside SwiGLU), the `llama3` RoPE rescaling parameters, a per-projection
+  bias mask, and an embedding scale; layer sections gain optional f32 bias
+  vectors. Gemma's `(1 + w)` RMSNorm folds into the stored norm weights at
+  conversion. A converter emits v1 whenever none of the new fields is needed,
+  so pre-v2 checkpoints still produce identical bytes. Decoupled `head_dim` is
+  now accepted. The Python exporters remain v1-only and still refuse all three
+  families.
+- **Prompt-lookup speculative decoding** (`--lookup-k`, `--lookup-ngram`,
+  `--lookup-min-ngram`): the draft is copied from the context, so there is no
+  draft model and no draft forward pass. Off by default — it is a gain on
+  context-quoting workloads and a loss on original prose, both measured in
+  BENCHMARKS.md.
+- Converter preflight that refuses checkpoints the `.raimodel` format cannot
+  represent — per-head QK norms (Qwen3, OLMo2, Gemma3), mixture-of-experts
+  routing, logit softcapping (Gemma2), unsupported `rope_type` and activation
+  values, and non-Llama module trees. These previously exported "successfully"
+  and generated nonsense.
 - Chat templates `chatml` (`<|im_start|>`) and `zephyr` (`<|user|>`), with
   auto-detection for ChatML. Zephyr-style models (TinyLlama-Chat) need the
   template passed explicitly because their markers are plain text, not
   vocabulary tokens.
-- Exporter preflight that refuses checkpoints the `.raimodel` format cannot
-  represent — projection bias vectors (Qwen2/2.5), per-head QK norms (Qwen3,
-  Gemma3), RoPE scaling (Llama-3.1/3.2), mixture-of-experts routing, logit
-  softcapping, Gemma's modified RMSNorm, and non-Llama module trees. These
-  previously exported "successfully" and generated nonsense.
 - `rai-infer/scripts/requirements-lock.txt`: exact dependency versions verified
   to convert a real model end to end.
-- `rai-generate` explains itself when a model emits end-of-sequence immediately
+- `rai run` explains itself when a model emits end-of-sequence immediately
   instead of printing nothing at all.
+- Double-click launchers in `launchers/` that start the local chat UI without a
+  terminal on Windows, macOS, and Linux.
 - rai-infer test coverage: parallel-path GEMM reference tests (fused QKV,
   fused gate/up, and the tied LM head against dequantized references above the
   rayon threshold), chat-template unit tests with an in-memory tokenizer stub,

@@ -7,7 +7,7 @@ it: inference (`rai-infer`) and the memory/reasoning service (`rai-server` →
 
 | Crate | Role |
 | --- | --- |
-| `classeve-rai-infer` | `.raimodel` loader, AVX2/FMA/F16C W4A8 GEMM kernels, transformer layers, KV cache, sampling, pondering, speculative decoding, and the CLI/chat binaries. |
+| `classeve-rai-infer` | `.raimodel` loader and writer, AVX2/FMA/F16C W4A8 GEMM kernels, transformer layers, KV cache, sampling, pondering, speculative decoding, and the `rai` binary. |
 | `classeve-rai-compress` | Quantization and compression research toolkit: an independent Rust GPTQ implementation, plus RC/HRC/SAC adaptive residual coding, sparse outlier extraction, and bit-packing. Not on the inference path and not part of the `.raimodel` export pipeline. |
 | `classeve-rai-server` | Local REST and MCP server for the memory/reasoning layer. |
 | `classeve-rai-core` | Embeddings, memory management, composition, confidence, interference, and surprise primitives. |
@@ -18,23 +18,28 @@ it: inference (`rai-infer`) and the memory/reasoning service (`rai-server` →
 ### Runtime flow
 
 1. Convert a HuggingFace checkpoint into `.raimodel` plus `tokenizer.json` —
-   `rai-convert` for round-to-nearest, the Python exporters for GPTQ. Both run
-   the same architecture preflight; see [MODELS.md](./MODELS.md).
+   `rai convert` for round-to-nearest, the Python exporters for GPTQ. Their
+   architecture preflights differ; see [MODELS.md](./MODELS.md).
 2. Load the flat `.raimodel` file through `rai-infer`.
 3. Decode with packed 4-bit linears and an 8-bit embedding table.
-4. Generate through `rai-generate`, chat through `rai-chat`.
+4. Generate with `rai run`, chat with `rai serve`.
 
 ### Model format
 
 The `.raimodel` file is a flat little-endian binary:
 
-- 64-byte header: magic `RAIM`, format version, architecture dimensions,
-  `rope_theta`, `norm_eps`, and the quantization configuration.
+- Header: magic `RAIM`, format version, architecture dimensions, `rope_theta`,
+  `norm_eps`, and the quantization configuration — 64 bytes at container v1.
+  Version 2 extends it to 128 bytes and adds the activation code, the `llama3`
+  RoPE rescaling parameters, the per-projection bias mask, and the embedding
+  scale. A converter emits v1 whenever none of those is needed, so pre-v2
+  checkpoints still produce identical bytes.
 - Section index table: 16 bytes per section, offset and size.
 - Section 0: 8-bit quantized embedding table.
 - Sections 1..N: one per transformer layer, each holding seven 4-bit
-  projections (`q`, `k`, `v`, `o`, `gate`, `up`, `down`) followed by two f32
-  RMSNorm weight vectors.
+  projections (`q`, `k`, `v`, `o`, `gate`, `up`, `down`), then one f32 bias
+  vector per bit set in the header's `bias_mask`, then two f32 RMSNorm weight
+  vectors.
 - Section N+1: final RMSNorm weights (f32).
 - Section N+2: 4-bit `lm_head`, present when the head is not tied to the
   embedding table.
@@ -53,8 +58,9 @@ can never exceed the GEMM group capacity or the RoPE table budget.
 ### Kernels
 
 `layers.rs` implements RMSNorm as `x / rms * w`, rotary position embeddings
-built from a single theta, full causal attention with grouped-query head
-mapping, and a SwiGLU MLP with a SiLU gate. Each has a scalar path and an
+built from a single theta with an optional `llama3` frequency rescale, full
+causal attention with grouped-query head mapping, and a gated MLP with either a
+SiLU (SwiGLU) or a GeLU-tanh (GeGLU) gate. Each has a scalar path and an
 AVX2+FMA path selected at run time by `has_avx2()`.
 
 The GEMM entry points are named `w4a8_*` (`w4a8_matvec`, `w4a8_fused_qkv`,
@@ -65,12 +71,18 @@ f32 arithmetic, and no equivalence claim is made without measured tolerances.
 ### Feature split
 
 `rai-infer` separates the inference library from the command-line surface.
-`--no-default-features` compiles the inference library — format reader, kernels, model, sampling, speculative
-decoding — against `half`, `rayon`, `anyhow`, and `rand` alone. The default-on
-`cli` feature adds `clap`, `tokenizers`, `tiny_http`, `serde`, `serde_json`,
-and `memmap2`; every binary (`rai-generate`, `rai-chat`, `profile-fwd`,
-`gemm-bench`, `bw-bench`) requires it, as do the tokenizer-aware
-`ChatTemplate::auto_detect` and `ChatTemplate::from_str_arg` helpers.
+`--no-default-features` compiles the inference library — format reader,
+kernels, model, sampling, speculative decoding — against `half`, `rayon`,
+`anyhow`, and `rand` alone. The default-on `cli` feature adds `clap`,
+`tokenizers`, `tiny_http`, `serde`, `serde_json`, and `memmap2`; every binary
+(`rai`, the deprecated `rai-convert`/`rai-generate`/`rai-chat` wrappers, and the
+`profile-fwd`, `gemm-bench`, `bw-bench` dev tools) requires it, as do the
+checkpoint converter and the tokenizer-aware `ChatTemplate::auto_detect` and
+`ChatTemplate::from_str_arg` helpers.
+
+Each `rai` subcommand's implementation lives in `src/cli/`, not in `src/bin/`,
+so argument validation and the model/tokenizer resolution rules are unit
+testable rather than trapped inside a `fn main`.
 
 ### Performance-sensitive code
 

@@ -47,6 +47,6 @@ deployment hardware, and retain those measurements before raising limits.
 ## Upgrade
 
 Back up state, record the current binary/crate/container digest, run the full
-[release-readiness gate](./RELEASE_READINESS.md), and exercise a copy of the
-snapshot with the candidate. A crate version cannot be overwritten after it is
-published. Follow [ROLLBACK.md](./ROLLBACK.md) if validation fails.
+[release gate](./RELEASE.md#gate), and exercise a copy of the snapshot with the
+candidate. A crate version cannot be overwritten after it is published. Follow
+the [rollback procedure](./RELEASE.md#rollback) if validation fails.
