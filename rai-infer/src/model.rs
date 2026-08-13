@@ -12,8 +12,8 @@ use crate::gemm::{embed_lookup, tied_lm_head, w4a8_matmul, w4a8_matvec};
 use crate::kv_cache::KVCache;
 use crate::layers::{
     add_bias, attend_batch, glu_mul_inplace, gqa_attention_decode, rms_norm,
-    rms_norm_with_residual, soft_cap_slice, swiglu_mlp, vec_add, AttentionWork, MlpWork,
-    ProjectionBiases, QkNorm, RoPETable, ScoreShaping,
+    rms_norm_with_residual, route_experts, soft_cap_slice, swiglu_mlp, vec_add, AttentionWork,
+    MlpWork, ProjectionBiases, QkNorm, RoPETable, Routing, ScoreShaping,
 };
 
 /// One layer's decoded bias vectors, indexed in `format::PROJECTION_NAMES`
@@ -70,6 +70,9 @@ pub struct RaiModel {
     layer_post_attn_norms: Vec<Vec<f32>>,
     layer_biases: Vec<LayerBiases>,
     layer_norm_extras: Vec<LayerNormExtras>,
+    /// Each layer's mixture-of-experts routing matrix, decoded to f32 at load
+    /// for the same reason the norms are. `None` for a dense layer.
+    layer_routers: Vec<Option<Vec<f32>>>,
     final_norm_weights: Vec<f32>,
     /// How a raw query-key dot product becomes an attention logit for this
     /// model: the header's scale (or `1/sqrt(head_dim)`) and its softcap.
@@ -125,6 +128,7 @@ impl RaiModel {
         let mut layer_post_attn_norms = Vec::with_capacity(num_layers);
         let mut layer_biases = Vec::with_capacity(num_layers);
         let mut layer_norm_extras = Vec::with_capacity(num_layers);
+        let mut layer_routers = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
             let layer = file
                 .layer(i)
@@ -139,6 +143,7 @@ impl RaiModel {
             // `validate_layout` has already proven both halves of each pair are
             // present exactly when the header says so, so zipping them cannot
             // silently drop one.
+            layer_routers.push(layer.router.map(format::read_f32_vector));
             layer_norm_extras.push(LayerNormExtras {
                 qk: layer
                     .q_norm
@@ -168,6 +173,7 @@ impl RaiModel {
             layer_post_attn_norms,
             layer_biases,
             layer_norm_extras,
+            layer_routers,
             final_norm_weights,
             shaping,
             has_separate_lm_head,
@@ -191,6 +197,67 @@ impl RaiModel {
     /// Access the underlying file for direct layer access (profiling).
     pub fn file_ref(&self) -> &RaiModelFile {
         &self.file
+    }
+
+    /// Run layer `li`'s MLP block for one token.
+    ///
+    /// A dense layer is the one-expert case and takes the same path it always
+    /// did. A sparse layer routes the token, runs only the selected experts,
+    /// and accumulates their outputs weighted by the routing probabilities.
+    #[allow(clippy::too_many_arguments)]
+    fn mlp_block(
+        &self,
+        li: usize,
+        layer: &format::LayerRefs<'_>,
+        output: &mut [f32],
+        input: &[f32],
+        work: &mut MlpWork,
+        routing: &mut Routing,
+        expert_out: &mut Vec<f32>,
+        biases: &ProjectionBiases<'_>,
+    ) -> Result<()> {
+        let Some(router) = self.layer_routers[li].as_deref() else {
+            swiglu_mlp(
+                output,
+                input,
+                &layer.gate_proj,
+                &layer.up_proj,
+                &layer.down_proj,
+                work,
+                self.config.activation,
+                biases,
+            );
+            return Ok(());
+        };
+        route_experts(
+            routing,
+            input,
+            router,
+            self.config.num_experts as usize,
+            self.config.experts_per_token as usize,
+            self.config.norm_topk_prob,
+        );
+        expert_out.clear();
+        expert_out.resize(output.len(), 0.0);
+        output.fill(0.0);
+        for (slot, &expert) in routing.experts.iter().enumerate() {
+            let mlp = layer.expert(expert, &self.config)?;
+            swiglu_mlp(
+                expert_out,
+                input,
+                &mlp.gate,
+                &mlp.up,
+                &mlp.down,
+                work,
+                self.config.activation,
+                biases,
+            );
+            let weight = routing.weights[slot];
+            for (out, value) in output.iter_mut().zip(expert_out.iter()) {
+                *out += weight * value;
+            }
+        }
+        Ok(())
     }
 
     /// Borrow layer `li`'s bias vectors in `format::PROJECTION_NAMES` order.
@@ -419,16 +486,16 @@ impl RaiModel {
                 hidden,
                 eps,
             );
-            swiglu_mlp(
+            self.mlp_block(
+                li,
+                &layer,
                 &mut scratch.mlp_out,
                 &scratch.normed,
-                &layer.gate_proj,
-                &layer.up_proj,
-                &layer.down_proj,
                 &mut scratch.mlp_work,
-                self.config.activation,
+                &mut scratch.routing,
+                &mut scratch.expert_out,
                 &biases,
-            );
+            )?;
             norm_block_output(
                 &mut scratch.mlp_out,
                 &mut scratch.norm_tmp,
@@ -603,16 +670,16 @@ impl RaiModel {
                 hidden,
                 eps,
             );
-            swiglu_mlp(
+            self.mlp_block(
+                li,
+                &layer,
                 &mut scratch.mlp_out,
                 &scratch.normed,
-                &layer.gate_proj,
-                &layer.up_proj,
-                &layer.down_proj,
                 &mut scratch.mlp_work,
-                self.config.activation,
+                &mut scratch.routing,
+                &mut scratch.expert_out,
                 &biases,
-            );
+            )?;
             norm_block_output(
                 &mut scratch.mlp_out,
                 &mut scratch.norm_tmp,
@@ -812,51 +879,77 @@ impl RaiModel {
                 Self::enter_block(norms.before_mlp, n, r, h, eps);
             }
 
-            // 7. Batched gate + up projections
-            w4a8_matmul(
-                &mut bs.gate_batch,
-                layer.gate_proj.nibble_data,
-                layer.gate_proj.group_params,
-                &bs.normed,
-                inter,
-                hs,
-                batch,
-                layer.gate_proj.group_size,
-            );
-            w4a8_matmul(
-                &mut bs.up_batch,
-                layer.up_proj.nibble_data,
-                layer.up_proj.group_params,
-                &bs.normed,
-                inter,
-                hs,
-                batch,
-                layer.up_proj.group_size,
-            );
-            add_bias_batch(&mut bs.gate_batch, biases[4], inter, batch);
-            add_bias_batch(&mut bs.up_batch, biases[5], inter, batch);
-
-            // 8. act(gate) * up per token
-            for b in 0..batch {
-                glu_mul_inplace(
-                    self.config.activation,
-                    &mut bs.gate_batch[b * inter..(b + 1) * inter],
-                    &bs.up_batch[b * inter..(b + 1) * inter],
+            // 7-9. The MLP block.
+            //
+            //   A dense layer batches its three projections: every token uses
+            //   the same weights, so the GEMM reads them once for all of them.
+            //   A sparse layer cannot - each token is routed to its own
+            //   experts, so there is no shared weight matrix to amortize - and
+            //   goes token by token through exactly the kernel the sequential
+            //   path uses, which is what keeps the two bit-identical.
+            if self.layer_routers[li].is_some() {
+                for b in 0..batch {
+                    let (normed, out) = (
+                        bs.normed[b * hs..(b + 1) * hs].to_vec(),
+                        &mut bs.mlp_out[b * hs..(b + 1) * hs],
+                    );
+                    self.mlp_block(
+                        li,
+                        &layer,
+                        out,
+                        &normed,
+                        &mut bs.mlp_work,
+                        &mut bs.routing,
+                        &mut bs.expert_out,
+                        &biases,
+                    )?;
+                }
+            } else {
+                w4a8_matmul(
+                    &mut bs.gate_batch,
+                    layer.gate_proj.nibble_data,
+                    layer.gate_proj.group_params,
+                    &bs.normed,
                     inter,
+                    hs,
+                    batch,
+                    layer.gate_proj.group_size,
+                );
+                w4a8_matmul(
+                    &mut bs.up_batch,
+                    layer.up_proj.nibble_data,
+                    layer.up_proj.group_params,
+                    &bs.normed,
+                    inter,
+                    hs,
+                    batch,
+                    layer.up_proj.group_size,
+                );
+                add_bias_batch(&mut bs.gate_batch, biases[4], inter, batch);
+                add_bias_batch(&mut bs.up_batch, biases[5], inter, batch);
+
+                // 8. act(gate) * up per token
+                for b in 0..batch {
+                    glu_mul_inplace(
+                        self.config.activation,
+                        &mut bs.gate_batch[b * inter..(b + 1) * inter],
+                        &bs.up_batch[b * inter..(b + 1) * inter],
+                        inter,
+                    );
+                }
+
+                // 9. Batched down projection
+                w4a8_matmul(
+                    &mut bs.mlp_out,
+                    layer.down_proj.nibble_data,
+                    layer.down_proj.group_params,
+                    &bs.gate_batch,
+                    hs,
+                    inter,
+                    batch,
+                    layer.down_proj.group_size,
                 );
             }
-
-            // 9. Batched down projection
-            w4a8_matmul(
-                &mut bs.mlp_out,
-                layer.down_proj.nibble_data,
-                layer.down_proj.group_params,
-                &bs.gate_batch,
-                hs,
-                inter,
-                batch,
-                layer.down_proj.group_size,
-            );
             add_bias_batch(&mut bs.mlp_out, biases[6], hs, batch);
             norm_block_output_batch(
                 &mut bs.mlp_out,
@@ -1013,6 +1106,10 @@ pub struct Scratch {
     pub norm_tmp: Vec<f32>,
     pub attn_work: AttentionWork,
     pub mlp_work: MlpWork,
+    /// Mixture-of-experts scratch: the routing decision and one expert's
+    /// output, accumulated into `mlp_out`. Unused by a dense model.
+    pub routing: Routing,
+    pub expert_out: Vec<f32>,
     /// Pre-allocated logits buffer (vocab_size f32s). Avoids 192 KB alloc per token.
     pub logits: Vec<f32>,
 }
@@ -1025,6 +1122,8 @@ impl Scratch {
             mlp_out: Vec::new(),
             residual: Vec::new(),
             norm_tmp: Vec::new(),
+            routing: Routing::default(),
+            expert_out: Vec::new(),
             attn_work: AttentionWork::new(),
             mlp_work: MlpWork::new(),
             logits: Vec::new(),
@@ -1074,6 +1173,12 @@ pub struct BatchScratch {
     pub scores: Vec<f32>,
     /// Destination for an aliasing in-place norm; see `norm_block_output`.
     pub norm_tmp: Vec<f32>,
+    /// Mixture-of-experts scratch. A sparse layer runs its MLP token by token
+    /// through the same kernel the sequential path uses, so it needs that
+    /// path's workspace here too.
+    pub mlp_work: MlpWork,
+    pub routing: Routing,
+    pub expert_out: Vec<f32>,
 }
 
 impl BatchScratch {
@@ -1081,6 +1186,9 @@ impl BatchScratch {
         Self {
             normed: Vec::new(),
             residual: Vec::new(),
+            mlp_work: MlpWork::default(),
+            routing: Routing::default(),
+            expert_out: Vec::new(),
             q_batch: Vec::new(),
             k_batch: Vec::new(),
             v_batch: Vec::new(),

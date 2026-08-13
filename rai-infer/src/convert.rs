@@ -201,6 +201,12 @@ struct RaiConfig {
     rope_local_theta: f32,
     /// Layer *i* is global when `(i + 1) % stride == 0`; 0 = unused.
     global_layer_stride: u8,
+    /// Experts per layer; 0 = a dense MLP.
+    num_experts: u16,
+    /// Experts each token is routed to.
+    experts_per_token: u8,
+    /// Rescale the selected experts' weights to sum to one.
+    norm_topk_prob: bool,
 }
 
 impl RaiConfig {
@@ -222,6 +228,7 @@ impl RaiConfig {
             && self.final_logit_softcap == 0.0
             && self.attn_scale == 0.0
             && self.global_layer_stride == 0
+            && self.num_experts == 0
         {
             1
         } else {
@@ -352,6 +359,7 @@ pub fn convert_with_progress(
     let final_logit_softcap = resolve_softcap(&hf, "final_logit_softcapping")?;
     let attn_scale = resolve_attn_scale(&hf, head_dim)?;
     let per_layer_rope = resolve_per_layer_rope(&hf, num_layers)?;
+    let experts = resolve_experts(&hf, intermediate_size)?;
     let folds = GemmaFolds {
         norm_plus_one: is_gemma,
     };
@@ -389,6 +397,9 @@ pub fn convert_with_progress(
         post_norm: false,
         rope_local_theta: per_layer_rope.0,
         global_layer_stride: per_layer_rope.1,
+        num_experts: experts.0,
+        experts_per_token: experts.1,
+        norm_topk_prob: experts.2,
         attn_logit_softcap,
         final_logit_softcap,
         attn_scale,
@@ -476,13 +487,59 @@ pub fn convert_with_progress(
     // a single byte is written.
     let layout = ProjectionLayout::detect(&store, num_layers)?;
     layout.check_fused_tensors(&store, num_layers, &linear_dims)?;
+    let expert_layout = if config.num_experts > 0 {
+        let experts = ExpertLayout::detect(&store)?;
+        if config.bias_mask != 0 {
+            bail!(
+                "checkpoint declares experts and projection biases; the bias mask addresses the                  seven dense projections and has no slot for a per-expert bias."
+            );
+        }
+        // Every expert of every layer, checked before a byte is written: a
+        // checkpoint missing expert 47 of layer 12 must fail now, not after
+        // twenty minutes of quantization.
+        for layer in 0..num_layers {
+            check_vector(
+                &store,
+                &experts.router(layer),
+                config.num_experts as usize * hidden,
+            )
+            .or_else(|_| {
+                check_tensor(
+                    &store,
+                    &experts.router(layer),
+                    config.num_experts as usize,
+                    hidden,
+                )
+            })?;
+            for expert in 0..config.num_experts as usize {
+                for (name, (rows, cols)) in experts
+                    .expert(layer, expert)
+                    .into_iter()
+                    .zip(&linear_dims[4..])
+                {
+                    check_tensor(&store, &name, *rows, *cols)?;
+                }
+            }
+        }
+        Some(experts)
+    } else {
+        None
+    };
     check_tensor(&store, "model.embed_tokens.weight", vocab, hidden)?;
     for layer in 0..num_layers {
         for (index, (name, (rows, cols))) in LAYER_LINEAR_NAMES.iter().zip(linear_dims).enumerate()
         {
             // A fused projection was already checked as a whole, above; its
             // parts have no tensor of their own to check.
-            let source = layout.source(layer, index, &linear_dims);
+            let source = match (expert_layout, index) {
+                // A sparse layer has no `mlp.gate_proj`: its first expert is
+                // the layer's MLP, which is what keeps a dense file unchanged.
+                (Some(experts), 4..=6) => ProjectionSource {
+                    tensor: experts.expert(layer, 0)[index - 4].clone(),
+                    row_offset: 0,
+                },
+                _ => layout.source(layer, index, &linear_dims),
+            };
             if source.row_offset == 0 && source.tensor == layer_linear_name(layer, name) {
                 check_tensor(&store, &source.tensor, rows, cols)?;
             }
@@ -592,7 +649,15 @@ pub fn convert_with_progress(
         for (index, (name, (rows, cols))) in LAYER_LINEAR_NAMES.iter().zip(linear_dims).enumerate()
         {
             let label = format!("L{layer}.{name}");
-            let source = layout.source(layer, index, &linear_dims);
+            let source = match (expert_layout, index) {
+                // A sparse layer has no `mlp.gate_proj`: its first expert is
+                // the layer's MLP, which is what keeps a dense file unchanged.
+                (Some(experts), 4..=6) => ProjectionSource {
+                    tensor: experts.expert(layer, 0)[index - 4].clone(),
+                    row_offset: 0,
+                },
+                _ => layout.source(layer, index, &linear_dims),
+            };
             let mse = write_matrix(
                 &mut file,
                 &mut store,
@@ -642,6 +707,39 @@ pub fn convert_with_progress(
         if config.has_sandwich_norm {
             for name in sandwich_norm_names(layer) {
                 write_f32_vector(&mut file, &mut store, &name, hidden, folds.norm_plus_one)?;
+            }
+        }
+        if let Some(experts) = expert_layout {
+            // Router first, then experts 1.., matching the reader. Expert 0's
+            // three projections were already written above as the layer's MLP.
+            write_f32_vector(
+                &mut file,
+                &mut store,
+                &experts.router(layer),
+                config.num_experts as usize * hidden,
+                false,
+            )?;
+            for expert in 1..config.num_experts as usize {
+                for (name, (rows, cols)) in experts
+                    .expert(layer, expert)
+                    .into_iter()
+                    .zip(&linear_dims[4..])
+                {
+                    write_matrix(
+                        &mut file,
+                        &mut store,
+                        &MatrixJob {
+                            tensor: &name,
+                            source_row_offset: 0,
+                            label: &format!("L{layer}.e{expert}"),
+                            rows: *rows,
+                            cols: *cols,
+                            group_size,
+                            bits: 4,
+                            emit_dims: true,
+                        },
+                    )?;
+                }
             }
         }
         for name in tail_norm_names(layer, config.has_sandwich_norm, config.post_norm) {
@@ -1030,6 +1128,110 @@ fn qk_norm_names(layer: u32) -> [String; 2] {
     ]
 }
 
+/// How many experts a layer has, how many each token uses, and whether the
+/// selected weights are renormalized.
+///
+/// Returns `(0, 0, false)` for a dense model. The expert *tensors* are found
+/// by name in [`ExpertLayout`]; this reads only the config, so a config-only
+/// inspection reports the same verdict a conversion would.
+fn resolve_experts(hf: &serde_json::Value, intermediate_size: u32) -> Result<(u16, u8, bool)> {
+    let count = ["num_experts", "num_local_experts"]
+        .iter()
+        .filter_map(|key| optional_u32(hf, key).transpose())
+        .next()
+        .transpose()?
+        .unwrap_or(0);
+    if count == 0 {
+        return Ok((0, 0, false));
+    }
+    let count = u16::try_from(count)
+        .map_err(|_| anyhow::anyhow!("num_experts {count} does not fit in the header's u16"))?;
+    if count < 2 {
+        bail!("config declares {count} expert; a dense model must not declare experts at all");
+    }
+    let per_token = optional_u32(hf, "num_experts_per_tok")?
+        .context("config declares experts but no num_experts_per_tok")?;
+    let per_token = u8::try_from(per_token)
+        .ok()
+        .filter(|value| *value as u16 <= count && *value > 0)
+        .with_context(|| format!("num_experts_per_tok {per_token} is not in 1..={count}"))?;
+    // A shared expert runs for *every* token in addition to the routed ones.
+    // The container has no slot for one, and dropping it would remove a whole
+    // pathway from the model rather than degrade it.
+    for key in ["shared_expert_intermediate_size", "n_shared_experts"] {
+        if let Some(value) = optional_u32(hf, key)? {
+            if value > 0 {
+                bail!(
+                    "config declares {key}={value}; this model runs a shared expert for every                      token alongside the routed ones, and the container stores routed experts                      only. Use a model without a shared expert."
+                );
+            }
+        }
+    }
+    if let Some(moe_intermediate) = optional_u32(hf, "moe_intermediate_size")? {
+        if moe_intermediate != intermediate_size {
+            bail!(
+                "config declares moe_intermediate_size={moe_intermediate} but                  intermediate_size={intermediate_size}; the container stores one MLP width."
+            );
+        }
+    }
+    let norm_topk = hf
+        .get("norm_topk_prob")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true);
+    Ok((count, per_token, norm_topk))
+}
+
+/// Where a sparse checkpoint keeps its router and expert tensors.
+///
+/// The two published spellings differ only in prefix and projection names, so
+/// the layout is detected from the tensors present rather than from
+/// `model_type` - the same rule the fused-projection detection follows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExpertLayout {
+    /// `mlp.gate` + `mlp.experts.{e}.{gate,up,down}_proj` (OLMoE, Qwen3-MoE).
+    MlpExperts,
+    /// `block_sparse_moe.gate` + `block_sparse_moe.experts.{e}.w1/w3/w2`
+    /// (Mixtral). `w1` is the gate, `w3` the up, `w2` the down.
+    BlockSparseMoe,
+}
+
+impl ExpertLayout {
+    fn detect(store: &SafeTensorsSet) -> Result<Self> {
+        if store.info("model.layers.0.mlp.gate.weight").is_some() {
+            return Ok(Self::MlpExperts);
+        }
+        if store
+            .info("model.layers.0.block_sparse_moe.gate.weight")
+            .is_some()
+        {
+            return Ok(Self::BlockSparseMoe);
+        }
+        bail!(
+            "config declares experts but the checkpoint has neither              model.layers.0.mlp.gate.weight nor model.layers.0.block_sparse_moe.gate.weight,              so the router cannot be located."
+        )
+    }
+
+    fn router(self, layer: u32) -> String {
+        match self {
+            Self::MlpExperts => format!("model.layers.{layer}.mlp.gate.weight"),
+            Self::BlockSparseMoe => {
+                format!("model.layers.{layer}.block_sparse_moe.gate.weight")
+            }
+        }
+    }
+
+    /// The gate, up and down tensors of one expert, in stored order.
+    fn expert(self, layer: u32, expert: usize) -> [String; 3] {
+        match self {
+            Self::MlpExperts => ["gate_proj", "up_proj", "down_proj"]
+                .map(|name| format!("model.layers.{layer}.mlp.experts.{expert}.{name}.weight")),
+            Self::BlockSparseMoe => ["w1", "w3", "w2"].map(|name| {
+                format!("model.layers.{layer}.block_sparse_moe.experts.{expert}.{name}.weight")
+            }),
+        }
+    }
+}
+
 /// Read the second RoPE base and the layer stride, for a model whose layers do
 /// not all rotate at the same frequency.
 ///
@@ -1370,16 +1572,8 @@ fn assert_exportable_architecture(
     // `rope_scaling` is handled by `resolve_rope_scaling`, which accepts
     // default and llama3 and refuses every other scheme by name.
 
-    for attr in ["num_experts", "num_local_experts"] {
-        if let Some(value) = hf.get(attr) {
-            if truthy_number(value) {
-                problems.push(format!(
-                    "config declares {attr}={value}; mixture-of-experts routing is not supported."
-                ));
-                break;
-            }
-        }
-    }
+    // Mixture-of-experts is a v2 capability now; `resolve_experts` reads the
+    // counts and refuses a routing scheme the container cannot express.
 
     // `attn_logit_softcapping` and `final_logit_softcapping` are v2 header
     // fields now; `resolve_softcap` refuses a non-numeric or non-positive one.
@@ -1437,6 +1631,10 @@ pub struct PreflightContainer {
     pub rope_local_theta: f32,
     /// Layer *i* is global when `(i + 1) % stride == 0`; 0 when unused.
     pub global_layer_stride: u8,
+    /// Experts per layer; 0 for a dense MLP.
+    pub num_experts: u16,
+    /// Experts each token is routed to.
+    pub experts_per_token: u8,
     /// Attention-logit softcap; 0.0 when the model does not cap.
     pub attn_logit_softcap: f32,
     /// Output-logit softcap; 0.0 when the model does not cap.
@@ -1591,6 +1789,7 @@ pub fn preflight(
         let has_sandwich_norm =
             SANDWICH_NORM_MODEL_TYPES.contains(&model_type.as_str()) && !post_norm;
         let per_layer_rope = resolve_per_layer_rope(hf, num_layers)?;
+        let experts = resolve_experts(hf, intermediate_size)?;
         if has_sandwich_norm {
             if let Some(store) = store.as_ref() {
                 check_sandwich_norms(store, num_layers, hidden_size as usize)?;
@@ -1629,6 +1828,9 @@ pub fn preflight(
             post_norm,
             rope_local_theta: per_layer_rope.0,
             global_layer_stride: per_layer_rope.1,
+            num_experts: experts.0,
+            experts_per_token: experts.1,
+            norm_topk_prob: experts.2,
             attn_logit_softcap: resolve_softcap(hf, "attn_logit_softcapping")?,
             final_logit_softcap: resolve_softcap(hf, "final_logit_softcapping")?,
             attn_scale: resolve_attn_scale(hf, head_dim)?,
@@ -1658,6 +1860,8 @@ pub fn preflight(
             post_norm,
             rope_local_theta: per_layer_rope.0,
             global_layer_stride: per_layer_rope.1,
+            num_experts: experts.0,
+            experts_per_token: experts.1,
             attn_logit_softcap: config.attn_logit_softcap,
             final_logit_softcap: config.final_logit_softcap,
             attn_scale: config.attn_scale,
@@ -1699,15 +1903,6 @@ pub fn preflight(
         }
     }
     Ok(report)
-}
-
-fn truthy_number(value: &serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::Null => false,
-        serde_json::Value::Bool(flag) => *flag,
-        serde_json::Value::Number(number) => number.as_f64().is_some_and(|v| v != 0.0),
-        _ => true,
-    }
 }
 
 fn check_tensor(store: &SafeTensorsSet, name: &str, rows: usize, cols: usize) -> Result<()> {
@@ -2044,8 +2239,26 @@ fn layer_section_len(
     if config.has_sandwich_norm {
         total += 2 * hidden as u64 * 4;
     }
+    // Router (f32) and the experts after the first. A dense model declares no
+    // experts and adds nothing, which is why its sections are unchanged.
+    if config.num_experts > 0 {
+        let experts = config.num_experts as u64;
+        total += experts * hidden as u64 * 4;
+        let per_expert: u64 = linear_dims[4..]
+            .iter()
+            .map(|&(rows, cols)| linear_bytes(rows, cols, config.group_size as usize))
+            .sum();
+        total += (experts - 1) * per_expert;
+    }
     // The two hidden-sized layer norms that every version carries.
     Ok(total + 2 * hidden as u64 * 4)
+}
+
+/// Bytes one quantized linear occupies: `[u32 rows][u32 cols]` then the group
+/// parameters then the packed nibbles.
+fn linear_bytes(rows: usize, cols: usize, group_size: usize) -> u64 {
+    let groups = cols.div_ceil(group_size);
+    8 + (rows * groups * 4) as u64 + (rows * cols).div_ceil(2) as u64
 }
 
 fn write_header(file: &mut File, config: &RaiConfig, num_sections: u32) -> Result<()> {
@@ -2093,7 +2306,10 @@ fn write_header(file: &mut File, config: &RaiConfig, num_sections: u32) -> Resul
         header[96..100].copy_from_slice(&config.attn_scale.to_le_bytes());
         header[100..104].copy_from_slice(&config.rope_local_theta.to_le_bytes());
         header[104] = config.global_layer_stride;
-        // 105..128 stays zero: the reader rejects a non-zero value there.
+        header[105..107].copy_from_slice(&config.num_experts.to_le_bytes());
+        header[107] = config.experts_per_token;
+        header[108] = u8::from(config.num_experts > 0 && config.norm_topk_prob);
+        // 109..128 stays zero: the reader rejects a non-zero value there.
     }
     file.write_all(&header)?;
     Ok(())
@@ -2471,6 +2687,9 @@ mod tests {
             post_norm: false,
             rope_local_theta: 0.0,
             global_layer_stride: 0,
+            num_experts: 0,
+            experts_per_token: 0,
+            norm_topk_prob: false,
             attn_logit_softcap: 0.0,
             final_logit_softcap: 0.0,
             attn_scale: 0.0,
@@ -2541,6 +2760,9 @@ mod tests {
             post_norm: false,
             rope_local_theta: 0.0,
             global_layer_stride: 0,
+            num_experts: 0,
+            experts_per_token: 0,
+            norm_topk_prob: false,
             attn_logit_softcap: 0.0,
             final_logit_softcap: 0.0,
             attn_scale: 0.0,

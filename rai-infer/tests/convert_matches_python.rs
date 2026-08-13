@@ -152,6 +152,9 @@ struct Spec {
     qk_norm: QkNorm,
     /// Emit Gemma2's four-norm sandwich layout instead of the usual two.
     sandwich_norm: bool,
+    /// Emit a sparse MLP with this many experts instead of a dense one, in
+    /// the `mlp.experts.{e}` spelling OLMoE and Qwen3-MoE use.
+    experts: usize,
     /// Emit OLMo2's post-norm layout: no `input_layernorm` anywhere, and the
     /// two norms are `post_attention_layernorm` and
     /// `post_feedforward_layernorm` applied to the block outputs.
@@ -177,6 +180,7 @@ impl Default for Spec {
             hidden_activation: serde_json::Value::Null,
             qk_norm: QkNorm::None,
             sandwich_norm: false,
+            experts: 0,
             post_norm: false,
             fused_projections: false,
             extra_config: serde_json::Value::Null,
@@ -245,6 +249,22 @@ fn write_checkpoint(dir: &Path, spec: &Spec) -> Checkpoint {
             let values = rng.weights(rows, cols);
             if spec.fused_projections {
                 pending.push(values);
+            } else if spec.experts > 0 && index >= 4 {
+                // A sparse layer keeps no `mlp.gate_proj`; expert 0 takes its
+                // place, and the remaining experts follow.
+                let side = ["gate_proj", "up_proj", "down_proj"][index - 4];
+                tensors.push((
+                    format!("model.layers.{layer}.mlp.experts.0.{side}.weight"),
+                    vec![rows, cols],
+                    values,
+                ));
+                for expert in 1..spec.experts {
+                    tensors.push((
+                        format!("model.layers.{layer}.mlp.experts.{expert}.{side}.weight"),
+                        vec![rows, cols],
+                        rng.weights(rows, cols),
+                    ));
+                }
             } else {
                 tensors.push((
                     format!("model.layers.{layer}.{name}.weight"),
@@ -294,6 +314,13 @@ fn write_checkpoint(dir: &Path, spec: &Spec) -> Checkpoint {
         // Per-head QK norms, when the spec asks for them. Emitted before the
         // layer norms only for readability — the converter locates every tensor
         // by name, so the order in the safetensors file is irrelevant.
+        if spec.experts > 0 {
+            tensors.push((
+                format!("model.layers.{layer}.mlp.gate.weight"),
+                vec![spec.experts, HIDDEN],
+                rng.weights(spec.experts, HIDDEN),
+            ));
+        }
         // A full-width pair is two *different* lengths under grouped-query
         // attention, which is the detail that makes it a distinct shape rather
         // than a longer version of the per-head one.
@@ -1084,9 +1111,14 @@ fn architectures_the_container_cannot_express_are_still_refused() {
         (
             "moe",
             Box::new(|config: &mut serde_json::Value| {
+                // Routed experts convert now. A *shared* expert does not:
+                // it runs for every token alongside them, and dropping it
+                // would remove a pathway rather than degrade one.
                 config["num_local_experts"] = serde_json::json!(8);
+                config["num_experts_per_tok"] = serde_json::json!(2);
+                config["shared_expert_intermediate_size"] = serde_json::json!(512);
             }),
-            "mixture-of-experts",
+            "shared expert",
         ),
         (
             "sliding-window",
@@ -1376,6 +1408,7 @@ fn the_new_capabilities_keep_batched_and_sequential_identical() {
         ("gemma2", gemma2_spec()),
         ("olmo2", olmo2_spec()),
         ("gemma3", gemma3_spec()),
+        ("moe", moe_spec()),
         (
             "both",
             Spec {
@@ -1436,6 +1469,88 @@ fn a_partial_or_wrongly_shaped_qk_norm_set_is_refused() {
         error.contains("head_dim") && error.contains("num_heads*head_dim"),
         "error should name both supported widths: {error}"
     );
+}
+
+/// A sparse mixture-of-experts model: four experts, two per token.
+fn moe_spec() -> Spec {
+    Spec {
+        model_type: "olmoe",
+        experts: 4,
+        extra_config: serde_json::json!({
+            "num_experts": 4,
+            "num_experts_per_tok": 2,
+            "norm_topk_prob": true,
+        }),
+        ..Spec::default()
+    }
+}
+
+#[test]
+fn a_sparse_checkpoint_stores_its_router_and_every_expert() {
+    let (root, output, _) = convert_spec("moe", &moe_spec());
+
+    let header = header_bytes(&output);
+    assert_eq!(header[4], 2, "experts need container v2");
+    assert_eq!(u16::from_le_bytes(header[105..107].try_into().unwrap()), 4);
+    assert_eq!(header[107], 2, "experts_per_token");
+    assert_eq!(header[108], 1, "norm_topk_prob");
+
+    let file = RaiModelFile::open(&output).expect("the produced model must load");
+    assert_eq!(file.config.num_experts, 4);
+    assert_eq!(file.config.experts_per_token, 2);
+    assert!(file.config.norm_topk_prob);
+
+    // Every expert must be reachable and correctly shaped. Expert 0 lives in
+    // the MLP slots; 1..4 come out of the extra block, and a mis-sized stride
+    // would surface here rather than as bad output.
+    let layer = file.layer(0).expect("layer 0");
+    for expert in 0..4 {
+        let mlp = layer.expert(expert, &file.config).expect("expert");
+        assert_eq!(mlp.gate.rows, INTERMEDIATE);
+        assert_eq!(mlp.gate.cols, HIDDEN);
+        assert_eq!(mlp.down.rows, HIDDEN);
+        assert_eq!(mlp.down.cols, INTERMEDIATE);
+    }
+    assert!(
+        layer.expert(4, &file.config).is_err(),
+        "an expert past the end must be an error, not a wrong slice"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Routing has to actually route. A model whose experts are all consulted, or
+/// none, would still load and still be the right size.
+#[test]
+fn routing_changes_the_output() {
+    // Same weights, different number of experts consulted per token.
+    let mut one = moe_spec();
+    one.extra_config = serde_json::json!({
+        "num_experts": 4, "num_experts_per_tok": 1, "norm_topk_prob": true,
+    });
+    let (root_a, top1, _) = convert_spec("moe-top1", &one);
+    let (root_b, top2, _) = convert_spec("moe-top2", &moe_spec());
+    assert_eq!(
+        std::fs::metadata(&top1).unwrap().len(),
+        std::fs::metadata(&top2).unwrap().len(),
+        "experts_per_token is a header field; the file size must not move"
+    );
+
+    let tokens = [1usize, 5, 9, 13, 21];
+    let a = run_forward(&RaiModel::load(&top1).unwrap(), &tokens);
+    let b = run_forward(&RaiModel::load(&top2).unwrap(), &tokens);
+    let max_diff = a
+        .iter()
+        .zip(&b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_diff > 1e-3,
+        "consulting two experts instead of one must change the logits, got {max_diff:e}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root_a);
+    let _ = std::fs::remove_dir_all(&root_b);
 }
 
 /// The exact Gemma3 shape: everything Gemma2 has, plus per-head QK norms and
