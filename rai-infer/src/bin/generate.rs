@@ -10,6 +10,7 @@ use rand::SeedableRng;
 use tokenizers::Tokenizer;
 
 use rai_infer::chat_template::ChatTemplate;
+use rai_infer::lookup::{LookupConfig, LookupDecoder};
 use rai_infer::model::{BatchScratch, InferenceWork, RaiModel};
 use rai_infer::ponder::{pondered_forward, PonderConfig, PonderStrategy};
 use rai_infer::sampler::{apply_repetition_penalty, sample_token, SamplerConfig};
@@ -74,10 +75,29 @@ struct Args {
     /// Self-speculative: layer skip mode (covers full depth instead of first-N)
     #[arg(long)]
     self_spec_skip: bool,
+    /// Prompt-lookup speculation: draft up to N tokens copied from the context
+    /// (0 = disabled). No draft model and no draft forward pass. NOTE: measured
+    /// on TinyLlama-1.1B-q4 this is still ~0.7-0.9x baseline because batched
+    /// verification barely amortises weight reads in this engine; small K (1-2)
+    /// is closest to break-even and large K is much worse.
+    #[arg(long, default_value = "0")]
+    lookup_k: usize,
+    /// Prompt-lookup: longest suffix n-gram to match first
+    #[arg(long, default_value = "3")]
+    lookup_ngram: usize,
+    /// Prompt-lookup: shortest suffix n-gram to fall back to. Raising this to 2
+    /// or 3 suppresses weak single-token matches, which is what makes the
+    /// non-repetitive worst case expensive.
+    #[arg(long, default_value = "1")]
+    lookup_min_ngram: usize,
 }
 
 const MAX_ENSEMBLE_SIZE: usize = 8;
 const MAX_SPECULATIVE_TOKENS: usize = 32;
+const MAX_LOOKUP_NGRAM: usize = 16;
+/// Below this draft-acceptance rate, self-speculative decoding cannot recover
+/// the cost of its draft forward passes and is slower than plain decoding.
+const SELF_SPEC_USEFUL_ACCEPT_RATE: f64 = 0.30;
 
 fn build_ponder_config(args: &Args) -> Result<PonderConfig> {
     validate_args(args)?;
@@ -135,9 +155,14 @@ fn validate_args(args: &Args) -> Result<()> {
             "ensemble strategies require --ensemble-n >= 2"
         );
     }
+    // The three speculative paths each own the KV cache and the decode loop,
+    // so at most one may be selected.
+    let speculative_modes = usize::from(args.draft.is_some())
+        + usize::from(args.self_spec_layers > 0)
+        + usize::from(args.lookup_k > 0);
     ensure!(
-        !(args.draft.is_some() && args.self_spec_layers > 0),
-        "--draft and --self-spec-layers cannot be used together"
+        speculative_modes <= 1,
+        "--draft, --self-spec-layers, and --lookup-k are mutually exclusive"
     );
     if args.draft.is_some() {
         ensure!(
@@ -151,7 +176,22 @@ fn validate_args(args: &Args) -> Result<()> {
             "--self-spec-k must be between 1 and {MAX_SPECULATIVE_TOKENS}"
         );
     }
-    if args.draft.is_some() || args.self_spec_layers > 0 {
+    if args.lookup_k > 0 {
+        ensure!(
+            args.lookup_k <= MAX_SPECULATIVE_TOKENS,
+            "--lookup-k must be between 1 and {MAX_SPECULATIVE_TOKENS}"
+        );
+        ensure!(
+            (1..=MAX_LOOKUP_NGRAM).contains(&args.lookup_ngram),
+            "--lookup-ngram must be between 1 and {MAX_LOOKUP_NGRAM}"
+        );
+        ensure!(
+            args.lookup_min_ngram >= 1 && args.lookup_min_ngram <= args.lookup_ngram,
+            "--lookup-min-ngram must be between 1 and --lookup-ngram ({})",
+            args.lookup_ngram
+        );
+    }
+    if args.draft.is_some() || args.self_spec_layers > 0 || args.lookup_k > 0 {
         ensure!(
             args.temperature > 1e-6
                 && args.top_k == 0
@@ -332,6 +372,16 @@ fn main() -> Result<()> {
             SelfSpecConfig::early_exit(draft_layers, args.self_spec_k, sampler_config.clone())?
         };
         eprintln!("Draft layers: {:?}", spec_config.draft_layer_indices);
+        eprintln!(
+            "WARNING: --self-spec-layers is experimental and measures BADLY. On \
+             TinyLlama-1.1B-q4 (i5-10300H, --self-spec-layers 11 --self-spec-k 4, \
+             context-quoting QA prompt) it accepted 0.4% of its drafts and ran at \
+             1.7 tok/s against a 25.1 tok/s baseline — roughly 15x SLOWER. An \
+             untrained early exit is a poor predictor of the full model, so both the \
+             draft passes and the verification are wasted. No K or layer count has \
+             been found where this wins; plain decoding (no flag) is faster. This \
+             run's own acceptance rate is printed in the stats below."
+        );
         let mut decoder = SelfSpecDecoder::new(&model, max_ctx)?;
 
         // Prefill
@@ -428,6 +478,15 @@ fn main() -> Result<()> {
                 0.0
             }
         );
+        if total_drafted > 0 && accept_rate < SELF_SPEC_USEFUL_ACCEPT_RATE {
+            eprintln!(
+                "Measured acceptance {:.1}% is below the {:.0}% needed for this path to pay \
+                 for its draft passes — this run was almost certainly slower than plain \
+                 decoding. Drop the flag, or try --lookup-k on context-quoting workloads.",
+                accept_rate * 100.0,
+                SELF_SPEC_USEFUL_ACCEPT_RATE * 100.0
+            );
+        }
     } else if let Some(draft_path) = &args.draft {
         // === SPECULATIVE DECODING ===
         eprintln!("Loading draft model: {}", draft_path.display());
@@ -539,6 +598,123 @@ fn main() -> Result<()> {
             } else {
                 0.0
             }
+        );
+    } else if args.lookup_k > 0 {
+        // === PROMPT-LOOKUP (N-GRAM) SPECULATIVE DECODING ===
+        // The draft is copied out of the context, so there is no draft model
+        // and no draft forward pass: a miss costs about one ordinary step and
+        // a hit produces several tokens for the price of one.
+        let lookup_config = LookupConfig {
+            max_draft: args.lookup_k,
+            max_ngram: args.lookup_ngram,
+            min_ngram: args.lookup_min_ngram,
+            sampler: sampler_config.clone(),
+        };
+        eprintln!(
+            "Prompt-lookup: K={}, n-gram {}..{} (draft copied from context, no draft model)",
+            args.lookup_k, args.lookup_ngram, args.lookup_min_ngram
+        );
+        let mut decoder = LookupDecoder::new(&model, max_ctx)?;
+
+        let t_prefill = Instant::now();
+        let mut pos = decoder.prefill(&prompt_tokens)?;
+        let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "\nPrefill: {} tokens in {:.1}ms ({:.1} tok/s)",
+            prompt_tokens.len(),
+            prefill_ms,
+            prompt_tokens.len() as f64 / (prefill_ms / 1000.0)
+        );
+
+        let t_decode = Instant::now();
+        let mut tokens_generated = 0;
+        let mut total_drafted = 0;
+        let mut total_accepted = 0;
+        let mut steps = 0usize;
+        let mut steps_with_draft = 0usize;
+        let mut previous_text = String::new();
+
+        while tokens_generated < args.max_tokens && pos < max_ctx {
+            // The decoder searches `all_tokens` for the draft, so the caller
+            // owes it the invariant that the token at `pos` is the last one.
+            ensure!(
+                pos + 1 == all_tokens.len(),
+                "prompt-lookup context and decode position went out of sync"
+            );
+            let (new_tokens, metrics) = decoder.step(pos, &all_tokens, &lookup_config, &mut rng)?;
+            ensure!(
+                !new_tokens.is_empty(),
+                "prompt-lookup decoder made no progress"
+            );
+
+            steps += 1;
+            total_drafted += metrics.drafted;
+            total_accepted += metrics.accepted;
+            if metrics.matched_ngram.is_some() {
+                steps_with_draft += 1;
+            }
+
+            let mut hit_eos = false;
+            let remaining = (max_ctx - pos).min(args.max_tokens - tokens_generated);
+            for &tok in new_tokens.iter().take(remaining) {
+                if is_eos(tok) {
+                    hit_eos = true;
+                    break;
+                }
+                all_tokens.push(tok);
+                pos += 1;
+                tokens_generated += 1;
+                if tokens_generated >= args.max_tokens {
+                    break;
+                }
+            }
+
+            print_new_text(
+                &all_tokens,
+                prompt_tokens.len(),
+                &mut previous_text,
+                &tokenizer,
+            );
+
+            if args.verbose {
+                eprint!(
+                    "[lookup:{}d/{}a/n{}]",
+                    metrics.drafted,
+                    metrics.accepted,
+                    metrics.matched_ngram.unwrap_or(0)
+                );
+            }
+
+            if hit_eos {
+                break;
+            }
+        }
+
+        let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
+        let decode_tps = tokens_generated as f64 / (decode_ms / 1000.0);
+        let accept_rate = if total_drafted > 0 {
+            total_accepted as f64 / total_drafted as f64
+        } else {
+            0.0
+        };
+
+        flush_held_text(
+            &all_tokens,
+            prompt_tokens.len(),
+            &mut previous_text,
+            &tokenizer,
+        );
+        println!();
+        eprintln!("\n--- Prompt-Lookup Stats ---");
+        eprintln!("Tokens: {tokens_generated}, {decode_tps:.2} tok/s");
+        eprintln!(
+            "Drafted: {total_drafted}, Accepted: {total_accepted}, Rate: {:.1}%",
+            accept_rate * 100.0
+        );
+        eprintln!(
+            "Steps: {steps} ({steps_with_draft} with a draft, {:.1}%), {:.2} tokens/step",
+            100.0 * steps_with_draft as f64 / steps.max(1) as f64,
+            tokens_generated as f64 / steps.max(1) as f64
         );
     } else {
         // === NORMAL DECODING ===
@@ -712,7 +888,16 @@ mod tests {
             self_spec_layers: 0,
             self_spec_k: 8,
             self_spec_skip: false,
+            lookup_k: 0,
+            lookup_ngram: 3,
+            lookup_min_ngram: 1,
         }
+    }
+
+    fn exact_sampling(args: &mut Args) {
+        args.top_k = 0;
+        args.top_p = 1.0;
+        args.repetition_penalty = 1.0;
     }
 
     #[test]
@@ -743,6 +928,55 @@ mod tests {
         args.top_k = 0;
         args.top_p = 1.0;
         args.repetition_penalty = 1.0;
+        assert!(validate_args(&args).is_ok());
+    }
+
+    #[test]
+    fn lookup_mode_enforces_exact_sampling_and_exclusivity() {
+        // Prompt-lookup uses the same exact-verification sampler restriction.
+        let mut args = valid_args();
+        args.lookup_k = 8;
+        assert!(validate_args(&args).is_err());
+        exact_sampling(&mut args);
+        assert!(validate_args(&args).is_ok());
+
+        // Mutually exclusive with the other two speculative paths.
+        let mut args = valid_args();
+        exact_sampling(&mut args);
+        args.lookup_k = 8;
+        args.self_spec_layers = 4;
+        assert!(validate_args(&args).is_err());
+
+        let mut args = valid_args();
+        exact_sampling(&mut args);
+        args.lookup_k = 8;
+        args.draft = Some(PathBuf::from("draft.raimodel"));
+        assert!(validate_args(&args).is_err());
+
+        // Bounds on K and the n-gram length.
+        let mut args = valid_args();
+        exact_sampling(&mut args);
+        args.lookup_k = MAX_SPECULATIVE_TOKENS + 1;
+        assert!(validate_args(&args).is_err());
+
+        let mut args = valid_args();
+        exact_sampling(&mut args);
+        args.lookup_k = 8;
+        args.lookup_ngram = 0;
+        assert!(validate_args(&args).is_err());
+        args.lookup_ngram = MAX_LOOKUP_NGRAM + 1;
+        assert!(validate_args(&args).is_err());
+
+        // The n-gram floor must sit inside the ceiling.
+        let mut args = valid_args();
+        exact_sampling(&mut args);
+        args.lookup_k = 8;
+        args.lookup_ngram = 3;
+        args.lookup_min_ngram = 4;
+        assert!(validate_args(&args).is_err());
+        args.lookup_min_ngram = 0;
+        assert!(validate_args(&args).is_err());
+        args.lookup_min_ngram = 3;
         assert!(validate_args(&args).is_ok());
     }
 
