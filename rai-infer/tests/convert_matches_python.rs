@@ -792,7 +792,8 @@ fn a_llama3_rope_checkpoint_records_its_scaling() {
 
     // The loaded model's table must be the scaled one, not the plain one.
     let model = RaiModel::load(&output).expect("loading the llama3-rope model");
-    let plain = rai_infer::layers::RoPETable::new(HEAD_DIM, MAX_CONTEXT as usize, 10_000.0);
+    let plain =
+        rai_infer::layers::RoPETable::new(HEAD_DIM, MAX_CONTEXT as usize, 10_000.0).unwrap();
     let differing = (0..HEAD_DIM / 2)
         .filter(|&i| {
             (model.rope().sin[HEAD_DIM / 2 + i] - plain.sin[HEAD_DIM / 2 + i]).abs() > 1e-9

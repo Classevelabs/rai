@@ -229,7 +229,8 @@ fn decode_profile(model: &RaiModel, pos: usize, max_ctx: usize, iters: usize) ->
     let (mut kv_cache, _) = warm_cache(model, pos, max_ctx)?;
     let file = model.file_ref();
     let rope =
-        rai_infer::layers::RoPETable::with_scaling(hd, max_ctx, cfg.rope_theta, cfg.rope_scaling);
+        rai_infer::layers::RoPETable::with_scaling(hd, max_ctx, cfg.rope_theta, cfg.rope_scaling)
+            .unwrap();
 
     let mut hidden = vec![0.0f32; hs];
     let mut normed = vec![0.0f32; hs];
@@ -484,7 +485,8 @@ fn prefill_profile(model: &RaiModel, prompt_len: usize, max_ctx: usize, eps: f32
     let batch = (prompt_len - 1).min(max_ctx - 1);
     let file = model.file_ref();
     let rope =
-        rai_infer::layers::RoPETable::with_scaling(hd, max_ctx, cfg.rope_theta, cfg.rope_scaling);
+        rai_infer::layers::RoPETable::with_scaling(hd, max_ctx, cfg.rope_theta, cfg.rope_scaling)
+            .unwrap();
 
     let mut norm_weights = Vec::with_capacity(nl);
     for i in 0..nl {
