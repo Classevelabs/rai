@@ -130,6 +130,10 @@ versioning for its pre-1.0 releases.
   language.
 
 ### Fixed
+- GPTQ calibration no longer dies on `datasets` 5.x: the hardcoded bare
+  `wikitext` repo id is rejected by the namespaced-id rule, so calibration is
+  now `Salesforce/wikitext` and overridable with `--calibration-dataset` /
+  `--calibration-config`.
 - The export scripts no longer require the optional `accelerate` package: they
   load weights on CPU without `device_map`, and pass the dtype keyword under the
   name the installed transformers expects (`dtype` from 5.0, `torch_dtype`

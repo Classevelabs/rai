@@ -44,6 +44,11 @@ def main():
     parser.add_argument('--embed-bits', type=int, default=8, help='Embedding bits')
     parser.add_argument('--embed-group-size', type=int, default=64, help='Embedding group size')
     parser.add_argument('--cal-chunks', type=int, default=128, help='Calibration chunks')
+    # datasets >= 5 requires a namespaced repo id: a bare "wikitext" is rejected.
+    parser.add_argument('--calibration-dataset', type=str, default='Salesforce/wikitext',
+                       help='HuggingFace dataset id used for GPTQ calibration')
+    parser.add_argument('--calibration-config', type=str, default='wikitext-2-raw-v1',
+                       help='Configuration name within the calibration dataset')
     parser.add_argument('--seq-len', type=int, default=2048, help='Calibration sequence length')
     parser.add_argument('--max-context', type=int, default=2048, help='Max context length')
     parser.add_argument('--hessian-dtype', type=str, default='float64', choices=['float32', 'float64'],
@@ -128,7 +133,7 @@ def main():
     print("STEP 1: COLLECTING HESSIANS")
     print(f"{'='*60}")
 
-    dataset_train = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+    dataset_train = load_dataset(args.calibration_dataset, args.calibration_config, split="train")
     train_text = "\n\n".join(dataset_train["text"])
     train_tokens = tokenizer(train_text, return_tensors="pt")["input_ids"][0]
 
