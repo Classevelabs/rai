@@ -142,8 +142,12 @@ jobs:
           cargo install cargo-audit --version 0.22.2 --locked --no-default-features
           cargo audit --deny warnings
 
+      # Only rai-infer and rai-compress are published. The memory-layer crates
+      # are `publish = false` and their released versions are yanked, so
+      # `--workspace` fails resolving rai-core's dependency on rem-nra against
+      # the index. Gate exactly what ships.
       - name: Verify publishable crate archives
-        run: cargo package --workspace --locked
+        run: cargo package -p classeve-rai-infer -p classeve-rai-compress --locked
 
   container:
     name: Container build and MCP smoke
