@@ -84,27 +84,16 @@ const LAYER_LINEAR_NAMES: [&str; 7] = PROJECTION_NAMES;
 /// six would be rotated at the wrong frequency. That is a per-layer
 /// architectural variation, not a missing parameter, so it is refused rather
 /// than approximated.
-const UNSUPPORTED_MODEL_TYPES: [(&str, &str); 2] = [
-    (
-        "gemma3",
-        "Gemma3 gives its sliding and global attention layers different RoPE bases \
-         (rope_local_base_freq vs rope_theta) and the container stores a single rope_theta",
-    ),
-    (
-        "gemma3_text",
-        "Gemma3 gives its sliding and global attention layers different RoPE bases \
-         (rope_local_base_freq vs rope_theta) and the container stores a single rope_theta",
-    ),
-];
+const UNSUPPORTED_MODEL_TYPES: [(&str, &str); 0] = [];
 
 /// Model families that need the container's Gemma-specific conversion folds:
 /// the `1 + w` RMSNorm and the `sqrt(hidden_size)` embedding scale. Gemma2 uses
 /// both, on all four of its norms.
-const GEMMA_MODEL_TYPES: [&str; 2] = ["gemma", "gemma2"];
+const GEMMA_MODEL_TYPES: [&str; 4] = ["gemma", "gemma2", "gemma3", "gemma3_text"];
 
 /// Families that use Gemma2's sandwich normalization, i.e. carry
 /// `pre_feedforward_layernorm` and `post_feedforward_layernorm` per layer.
-const SANDWICH_NORM_MODEL_TYPES: [&str; 1] = ["gemma2"];
+const SANDWICH_NORM_MODEL_TYPES: [&str; 3] = ["gemma2", "gemma3", "gemma3_text"];
 
 /// Conversion inputs. Defaults match `export_rtn.py`.
 #[derive(Debug, Clone)]
@@ -208,6 +197,10 @@ struct RaiConfig {
     final_logit_softcap: f32,
     /// Explicit query-key scale; 0.0 = the default `1/sqrt(head_dim)`.
     attn_scale: f32,
+    /// RoPE base for non-global layers; 0.0 = one base for every layer.
+    rope_local_theta: f32,
+    /// Layer *i* is global when `(i + 1) % stride == 0`; 0 = unused.
+    global_layer_stride: u8,
 }
 
 impl RaiConfig {
@@ -228,6 +221,7 @@ impl RaiConfig {
             && self.attn_logit_softcap == 0.0
             && self.final_logit_softcap == 0.0
             && self.attn_scale == 0.0
+            && self.global_layer_stride == 0
         {
             1
         } else {
@@ -357,6 +351,7 @@ pub fn convert_with_progress(
     let attn_logit_softcap = resolve_softcap(&hf, "attn_logit_softcapping")?;
     let final_logit_softcap = resolve_softcap(&hf, "final_logit_softcapping")?;
     let attn_scale = resolve_attn_scale(&hf, head_dim)?;
+    let per_layer_rope = resolve_per_layer_rope(&hf, num_layers)?;
     let folds = GemmaFolds {
         norm_plus_one: is_gemma,
     };
@@ -392,6 +387,8 @@ pub fn convert_with_progress(
         has_sandwich_norm,
         has_full_qk_norm: false,
         post_norm: false,
+        rope_local_theta: per_layer_rope.0,
+        global_layer_stride: per_layer_rope.1,
         attn_logit_softcap,
         final_logit_softcap,
         attn_scale,
@@ -1033,6 +1030,59 @@ fn qk_norm_names(layer: u32) -> [String; 2] {
     ]
 }
 
+/// Read the second RoPE base and the layer stride, for a model whose layers do
+/// not all rotate at the same frequency.
+///
+/// Returns `(0.0, 0)` for the overwhelming majority of checkpoints, which have
+/// one base. Gemma3 is the family this exists for: its sliding layers use
+/// `rope_local_base_freq` and its global layers `rope_theta`, and
+/// `Gemma3Config` derives which is which as
+/// `"sliding_attention" if (i + 1) % sliding_window_pattern else "full_attention"`.
+///
+/// An explicit `layer_types` list is honoured only when it *is* that pattern.
+/// The container stores a stride, and silently rounding an irregular list to
+/// the nearest stride would rotate some layers at the wrong base — a model
+/// that loads, runs, and is quietly worse.
+fn resolve_per_layer_rope(hf: &serde_json::Value, num_layers: u32) -> Result<(f32, u8)> {
+    let local = resolve_softcap(hf, "rope_local_base_freq").unwrap_or(0.0);
+    if local <= 0.0 {
+        return Ok((0.0, 0));
+    }
+    let stride = optional_u32(hf, "sliding_window_pattern")?.unwrap_or(6);
+    if stride < 2 {
+        bail!(
+            "sliding_window_pattern is {stride}; the container stores a stride of 2 or more,              and a stride below that describes no alternation at all."
+        );
+    }
+    let stride = u8::try_from(stride).map_err(|_| {
+        anyhow::anyhow!("sliding_window_pattern {stride} does not fit in the header's one byte")
+    })?;
+
+    if let Some(types) = hf.get("layer_types").and_then(|value| value.as_array()) {
+        if types.len() != num_layers as usize {
+            bail!(
+                "layer_types lists {} entries but the model has {num_layers} layers",
+                types.len()
+            );
+        }
+        for (index, entry) in types.iter().enumerate() {
+            let name = entry.as_str().unwrap_or_default();
+            let is_global = (index + 1).is_multiple_of(stride as usize);
+            let expected = if is_global {
+                "full_attention"
+            } else {
+                "sliding_attention"
+            };
+            if name != expected {
+                bail!(
+                    "layer_types[{index}] is '{name}' but a stride of {stride} implies                      '{expected}'. The container stores the stride, not a per-layer list, so an                      irregular pattern cannot be represented and would rotate some layers at the                      wrong RoPE base."
+                );
+            }
+        }
+    }
+    Ok((local, stride))
+}
+
 /// The tensor names of a layer's two sandwich norms, in stored order.
 fn sandwich_norm_names(layer: u32) -> [String; 2] {
     [
@@ -1383,6 +1433,10 @@ pub struct PreflightContainer {
     /// The two tail norms apply to block outputs, not the residual stream
     /// before them (OLMo2).
     pub post_norm: bool,
+    /// Second RoPE base for non-global layers; 0.0 when the model has one.
+    pub rope_local_theta: f32,
+    /// Layer *i* is global when `(i + 1) % stride == 0`; 0 when unused.
+    pub global_layer_stride: u8,
     /// Attention-logit softcap; 0.0 when the model does not cap.
     pub attn_logit_softcap: f32,
     /// Output-logit softcap; 0.0 when the model does not cap.
@@ -1536,6 +1590,7 @@ pub fn preflight(
         };
         let has_sandwich_norm =
             SANDWICH_NORM_MODEL_TYPES.contains(&model_type.as_str()) && !post_norm;
+        let per_layer_rope = resolve_per_layer_rope(hf, num_layers)?;
         if has_sandwich_norm {
             if let Some(store) = store.as_ref() {
                 check_sandwich_norms(store, num_layers, hidden_size as usize)?;
@@ -1572,6 +1627,8 @@ pub fn preflight(
             has_sandwich_norm,
             has_full_qk_norm,
             post_norm,
+            rope_local_theta: per_layer_rope.0,
+            global_layer_stride: per_layer_rope.1,
             attn_logit_softcap: resolve_softcap(hf, "attn_logit_softcapping")?,
             final_logit_softcap: resolve_softcap(hf, "final_logit_softcapping")?,
             attn_scale: resolve_attn_scale(hf, head_dim)?,
@@ -1599,6 +1656,8 @@ pub fn preflight(
             has_sandwich_norm,
             has_full_qk_norm,
             post_norm,
+            rope_local_theta: per_layer_rope.0,
+            global_layer_stride: per_layer_rope.1,
             attn_logit_softcap: config.attn_logit_softcap,
             final_logit_softcap: config.final_logit_softcap,
             attn_scale: config.attn_scale,
@@ -2032,7 +2091,9 @@ fn write_header(file: &mut File, config: &RaiConfig, num_sections: u32) -> Resul
         header[88..92].copy_from_slice(&config.attn_logit_softcap.to_le_bytes());
         header[92..96].copy_from_slice(&config.final_logit_softcap.to_le_bytes());
         header[96..100].copy_from_slice(&config.attn_scale.to_le_bytes());
-        // 100..128 stays zero: the reader rejects a non-zero value there.
+        header[100..104].copy_from_slice(&config.rope_local_theta.to_le_bytes());
+        header[104] = config.global_layer_stride;
+        // 105..128 stays zero: the reader rejects a non-zero value there.
     }
     file.write_all(&header)?;
     Ok(())
@@ -2408,6 +2469,8 @@ mod tests {
             has_sandwich_norm: false,
             has_full_qk_norm: false,
             post_norm: false,
+            rope_local_theta: 0.0,
+            global_layer_stride: 0,
             attn_logit_softcap: 0.0,
             final_logit_softcap: 0.0,
             attn_scale: 0.0,
@@ -2476,6 +2539,8 @@ mod tests {
             has_sandwich_norm: false,
             has_full_qk_norm: false,
             post_norm: false,
+            rope_local_theta: 0.0,
+            global_layer_stride: 0,
             attn_logit_softcap: 0.0,
             final_logit_softcap: 0.0,
             attn_scale: 0.0,

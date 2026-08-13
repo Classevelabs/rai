@@ -76,7 +76,7 @@ pub struct GenerationArgs {
     /// Print per-step decoding diagnostics to stderr
     #[arg(long, default_value = "false")]
     pub verbose: bool,
-    /// Chat template: auto, none, few-shot, mistral, llama3, chatml, zephyr, phi3
+    /// Chat template: auto, none, few-shot, mistral, llama3, chatml, zephyr, phi3, gemma
     #[arg(long, default_value = "none")]
     pub chat_template: String,
     /// Draft model for speculative decoding (e.g. smollm-135m-q4.raimodel)
@@ -155,9 +155,9 @@ pub fn validate_args(args: &GenerationArgs) -> Result<()> {
     ensure!(
         matches!(
             args.chat_template.as_str(),
-            "auto" | "none" | "few-shot" | "mistral" | "llama3" | "chatml" | "zephyr" | "phi3"
+            "auto" | "none" | "few-shot" | "mistral" | "llama3" | "chatml" | "zephyr" | "phi3" | "gemma"
         ),
-        "unknown --chat-template '{}'; expected auto, none, few-shot, mistral, llama3, chatml, zephyr, or phi3",
+        "unknown --chat-template '{}'; expected auto, none, few-shot, mistral, llama3, chatml, zephyr, phi3, or gemma",
         args.chat_template
     );
     ensure!(
@@ -259,7 +259,7 @@ pub fn run(args: &RunArgs) -> Result<()> {
     let template = ChatTemplate::from_str_arg(&generation.chat_template, &tokenizer);
     let formatted_prompt = template.format_prompt(&generation.prompt);
     let encoding = tokenizer
-        .encode(formatted_prompt.as_str(), false)
+        .encode(formatted_prompt.as_str(), template.prepends_bos())
         .map_err(|e| anyhow::anyhow!("encode error: {e}"))?;
     let prompt_tokens: Vec<usize> = encoding.get_ids().iter().map(|&id| id as usize).collect();
     eprintln!("Prompt: {} tokens", prompt_tokens.len());
@@ -302,16 +302,20 @@ pub fn run(args: &RunArgs) -> Result<()> {
     print!("{}", generation.prompt);
     io::stdout().flush()?;
 
-    // Helper: check if token is EOS
-    let is_eos = |tok: usize| -> bool {
-        ["</s>", "<|endoftext|>", "<|eot_id|>", "<|end_of_text|>"]
-            .iter()
-            .any(|s| {
-                tokenizer
-                    .token_to_id(s)
-                    .is_some_and(|id| tok == id as usize)
-            })
-    };
+    // Which token ids end generation.
+    //
+    // The generic end-of-text markers are not enough on their own: a chat
+    // model ends its *turn* with a token its template names, and Gemma's
+    // <end_of_turn> is in none of the generic lists. Missing it does not fail
+    // — generation simply runs to --max-tokens emitting turn markers — so the
+    // template's own stop tokens are folded in here.
+    let eos_ids: Vec<usize> = ["</s>", "<|endoftext|>", "<|eot_id|>", "<|end_of_text|>"]
+        .iter()
+        .copied()
+        .chain(template.stop_sequences().iter().copied())
+        .filter_map(|name| tokenizer.token_to_id(name).map(|id| id as usize))
+        .collect();
+    let is_eos = |tok: usize| -> bool { eos_ids.contains(&tok) };
 
     // Helper: print newly generated text with correct spacing. A trailing
     // U+FFFD usually means a multi-byte codepoint is split across tokens;
@@ -704,7 +708,7 @@ pub fn run(args: &RunArgs) -> Result<()> {
             eprintln!(
                 "\nNo tokens generated: the model emitted end-of-sequence first. \
                  If this is an instruction-tuned model, pass the matching \
-                 --chat-template (auto, mistral, llama3, chatml, zephyr, phi3, few-shot)."
+                 --chat-template (auto, mistral, llama3, chatml, zephyr, phi3, gemma, few-shot)."
             );
         }
         eprintln!("\n--- Stats ---");

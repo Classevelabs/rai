@@ -375,22 +375,23 @@ mod tests {
 
     #[test]
     fn an_unsupported_architecture_is_refused_from_config_alone() {
-        // Gemma2 used to be the example here; the container gained logit
-        // softcapping and the sandwich norms, so it converts now. Gemma3 is the
-        // architecture that is still refused from the config alone, and for a
-        // reason no capability bit fixes: its sliding and global layers use
-        // different RoPE bases and the header stores one.
-        let dir = scratch("gemma3");
+        // This example has been rewritten twice as the container grew:
+        // Gemma2 gained softcapping and sandwich norms, then Gemma3 gained
+        // per-layer RoPE bases. What is left is a refusal no capability bit
+        // can lift, because it is about the arithmetic of a scheme the
+        // container does not implement rather than a weight it cannot hold.
+        let dir = scratch("yarn-rope");
         let config = serde_json::json!({
-            "model_type": "gemma3_text",
-            "architectures": ["Gemma3ForCausalLM"],
-            "hidden_size": 2304,
-            "num_hidden_layers": 26,
-            "num_attention_heads": 8,
+            "model_type": "llama",
+            "architectures": ["LlamaForCausalLM"],
+            "hidden_size": 2048,
+            "num_hidden_layers": 16,
+            "num_attention_heads": 16,
             "num_key_value_heads": 4,
-            "head_dim": 256,
-            "intermediate_size": 9216,
-            "vocab_size": 256000,
+            "head_dim": 128,
+            "intermediate_size": 8192,
+            "vocab_size": 32000,
+            "rope_scaling": {"rope_type": "yarn", "factor": 4.0},
         });
         std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
 
@@ -409,11 +410,10 @@ mod tests {
         );
         assert_eq!(value["supported"], false);
         let reason = value["reason"].as_str().unwrap();
-        assert!(reason.contains("gemma3_text"), "{reason}");
-        assert!(reason.contains("RoPE base"), "{reason}");
+        assert!(reason.contains("yarn"), "{reason}");
         assert!(value["container"].is_null());
         // The shape is still reported: the user wants to know what it *is*.
-        assert_eq!(value["shape"]["num_layers"], 26);
+        assert_eq!(value["shape"]["num_layers"], 16);
         std::fs::remove_dir_all(&dir).ok();
     }
 

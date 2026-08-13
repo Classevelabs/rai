@@ -32,7 +32,9 @@
 //! | 88..92  | f32  | `attn_logit_softcap` — 0.0 = disabled |
 //! | 92..96  | f32  | `final_logit_softcap` — 0.0 = disabled |
 //! | 96..100 | f32  | `attn_scale` — 0.0 = the default `1/sqrt(head_dim)` |
-//! | 100..128| —    | reserved, must be zero |
+//! | 100..104| f32  | `rope_local_theta` — 0.0 = one theta for every layer |
+//! | 104     | u8   | `global_layer_stride` — 0 = unused; else layer *i* uses `rope_theta` when `(i+1) % stride == 0` and `rope_local_theta` otherwise |
+//! | 105..128| —    | reserved, must be zero |
 //!
 //! Unknown `activation`, `rope_type`, `flags` bits, `bias_mask` bits and any
 //! non-zero reserved byte are hard errors. A reader that cannot implement a
@@ -220,6 +222,17 @@ pub struct ModelConfig {
     /// residual stream before each block (OLMo2). Never true at the same time
     /// as `has_sandwich_norm`.
     pub post_norm: bool,
+    /// RoPE base for the layers that are *not* global, when a model uses two.
+    /// `0.0` means one base for every layer, which is every model but Gemma3.
+    pub rope_local_theta: f32,
+    /// Layer *i* uses `rope_theta` when `(i + 1) % global_layer_stride == 0`,
+    /// and `rope_local_theta` otherwise. `0` means per-layer RoPE is unused.
+    ///
+    /// A stride rather than a per-layer list: the pattern is regular in every
+    /// published model, and a list would be a second variable-length block for
+    /// no gain. A checkpoint whose `layer_types` do not follow a stride is
+    /// refused at conversion rather than approximated.
+    pub global_layer_stride: u8,
     /// `cap` in `cap * tanh(x / cap)` applied to attention logits before the
     /// softmax. `0.0` disables it, which is every model but Gemma2.
     pub attn_logit_softcap: f32,
@@ -933,6 +946,8 @@ fn parse_header(data: &[u8]) -> Result<HeaderInfo> {
         has_sandwich_norm: false,
         has_full_qk_norm: false,
         post_norm: false,
+        rope_local_theta: 0.0,
+        global_layer_stride: 0,
         attn_logit_softcap: 0.0,
         final_logit_softcap: 0.0,
         attn_scale: 0.0,
@@ -973,8 +988,8 @@ fn read_v2_capabilities(data: &[u8], config: &mut ModelConfig) -> Result<()> {
     if data[56..64].iter().any(|&byte| byte != 0) {
         bail!("header bytes 56..64 are reserved and must be zero");
     }
-    if data[100..HEADER_SIZE_V2].iter().any(|&byte| byte != 0) {
-        bail!("header bytes 100..128 are reserved and must be zero");
+    if data[105..HEADER_SIZE_V2].iter().any(|&byte| byte != 0) {
+        bail!("header bytes 105..128 are reserved and must be zero");
     }
 
     let activation_code = data[64];
@@ -1089,6 +1104,22 @@ fn read_v2_capabilities(data: &[u8], config: &mut ModelConfig) -> Result<()> {
     config.attn_logit_softcap = read_optional_positive(data, 88, "attn_logit_softcap")?;
     config.final_logit_softcap = read_optional_positive(data, 92, "final_logit_softcap")?;
     config.attn_scale = read_optional_positive(data, 96, "attn_scale")?;
+    config.rope_local_theta = read_optional_positive(data, 100, "rope_local_theta")?;
+    config.global_layer_stride = data[104];
+    // The two describe one mechanism. Either alone would leave the reader
+    // guessing which layers use which base, so neither is allowed alone.
+    if (config.rope_local_theta > 0.0) != (config.global_layer_stride > 0) {
+        bail!(
+            "header is inconsistent: rope_local_theta is {} and global_layer_stride is {};              per-layer RoPE needs both or neither",
+            config.rope_local_theta,
+            config.global_layer_stride
+        );
+    }
+    // A stride of 1 would make every layer global, i.e. the local base is
+    // stored and never used - a file that says one thing and means another.
+    if config.global_layer_stride == 1 {
+        bail!("global_layer_stride of 1 makes every layer global; omit per-layer RoPE instead");
+    }
 
     Ok(())
 }
@@ -1312,6 +1343,8 @@ mod tests {
             has_sandwich_norm: false,
             has_full_qk_norm: false,
             post_norm: false,
+            rope_local_theta: 0.0,
+            global_layer_stride: 0,
             attn_logit_softcap: 0.0,
             final_logit_softcap: 0.0,
             attn_scale: 0.0,
@@ -1843,7 +1876,7 @@ mod tests {
             (
                 "reserved-tail",
                 Box::new(|h: &mut [u8]| h[127] = 1),
-                "bytes 100..128 are reserved",
+                "bytes 105..128 are reserved",
             ),
         ] {
             let error = open_error(label, build_model_bytes(2, 0, patch));

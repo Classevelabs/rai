@@ -1064,11 +1064,15 @@ fn a_decoupled_head_dim_converts_and_runs() {
 fn architectures_the_container_cannot_express_are_still_refused() {
     for (label, mutate, needle) in [
         (
-            "gemma3",
+            // Gemma3 used to sit here. It converts now, so what remains is the
+            // stride it could not have: a pattern of 1 claims every layer is
+            // global, which stores a second base that is never read.
+            "degenerate-rope-stride",
             Box::new(|config: &mut serde_json::Value| {
-                config["model_type"] = serde_json::json!("gemma3_text");
+                config["rope_local_base_freq"] = serde_json::json!(10_000.0);
+                config["sliding_window_pattern"] = serde_json::json!(1);
             }) as Box<dyn Fn(&mut serde_json::Value)>,
-            "RoPE base",
+            "sliding_window_pattern is 1",
         ),
         (
             "negative-softcap",
@@ -1371,6 +1375,7 @@ fn the_new_capabilities_keep_batched_and_sequential_identical() {
         ("qwen3", qwen3_spec()),
         ("gemma2", gemma2_spec()),
         ("olmo2", olmo2_spec()),
+        ("gemma3", gemma3_spec()),
         (
             "both",
             Spec {
@@ -1430,6 +1435,116 @@ fn a_partial_or_wrongly_shaped_qk_norm_set_is_refused() {
     assert!(
         error.contains("head_dim") && error.contains("num_heads*head_dim"),
         "error should name both supported widths: {error}"
+    );
+}
+
+/// The exact Gemma3 shape: everything Gemma2 has, plus per-head QK norms and
+/// a second RoPE base for the sliding layers.
+fn gemma3_spec() -> Spec {
+    Spec {
+        model_type: "gemma3_text",
+        hidden_act: "gelu_pytorch_tanh",
+        hidden_activation: serde_json::json!("gelu_pytorch_tanh"),
+        sandwich_norm: true,
+        qk_norm: QkNorm::EveryLayer,
+        extra_config: serde_json::json!({
+            "rope_local_base_freq": 10_000.0,
+            "sliding_window_pattern": 2,
+            "sliding_window": 4096,
+        }),
+        ..Spec::default()
+    }
+}
+
+#[test]
+fn a_gemma3_shaped_checkpoint_stores_both_rope_bases() {
+    let (root, output, _) = convert_spec("gemma3", &gemma3_spec());
+
+    let header = header_bytes(&output);
+    assert_eq!(header[4], 2);
+    assert_eq!(
+        f32::from_le_bytes(header[100..104].try_into().unwrap()),
+        10_000.0,
+        "the local RoPE base belongs at 100..104"
+    );
+    assert_eq!(header[104], 2, "the global-layer stride belongs at 104");
+
+    let file = RaiModelFile::open(&output).expect("the produced model must load");
+    assert_eq!(file.config.rope_local_theta, 10_000.0);
+    assert_eq!(file.config.global_layer_stride, 2);
+    assert!(file.config.has_qk_norm && file.config.has_sandwich_norm);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Two bases is the whole point, so a model whose local base equals its global
+/// one must produce different logits from one where they differ. Nothing about
+/// the file size changes, so only the arithmetic can show it.
+#[test]
+fn the_second_rope_base_changes_the_output() {
+    let mut same = gemma3_spec();
+    same.extra_config = serde_json::json!({
+        // Equal to the default rope_theta the fixture writes, so every layer
+        // rotates identically even though two tables are built.
+        "rope_local_base_freq": 10_000.0,
+        "sliding_window_pattern": 2,
+        "sliding_window": 4096,
+    });
+    let mut different = gemma3_spec();
+    different.extra_config = serde_json::json!({
+        "rope_local_base_freq": 1_000_000.0,
+        "sliding_window_pattern": 2,
+        "sliding_window": 4096,
+    });
+
+    let (root_a, a) = {
+        let (r, o, _) = convert_spec("gemma3-same", &same);
+        (r, o)
+    };
+    let (root_b, b) = {
+        let (r, o, _) = convert_spec("gemma3-diff", &different);
+        (r, o)
+    };
+    assert_eq!(
+        std::fs::metadata(&a).unwrap().len(),
+        std::fs::metadata(&b).unwrap().len(),
+        "the base is a header field; the file size must not move"
+    );
+
+    let tokens = [1usize, 5, 9, 13, 21];
+    let left = run_forward(&RaiModel::load(&a).unwrap(), &tokens);
+    let right = run_forward(&RaiModel::load(&b).unwrap(), &tokens);
+    let max_diff = left
+        .iter()
+        .zip(&right)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_diff > 1e-3,
+        "the sliding layers' RoPE base should change the logits, max diff was {max_diff:e}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root_a);
+    let _ = std::fs::remove_dir_all(&root_b);
+}
+
+/// The container stores a stride, not a per-layer list. A checkpoint whose
+/// `layer_types` are irregular cannot be represented, and rounding it to the
+/// nearest stride would rotate some layers at the wrong base.
+#[test]
+fn an_irregular_layer_type_list_is_refused() {
+    let mut spec = gemma3_spec();
+    spec.extra_config = serde_json::json!({
+        "rope_local_base_freq": 10_000.0,
+        "sliding_window_pattern": 2,
+        "sliding_window": 4096,
+        // A stride of 2 implies [sliding, full]; this says the opposite.
+        "layer_types": ["full_attention", "sliding_attention"],
+    });
+    let error = convert_error("gemma3-irregular", &spec);
+    assert!(
+        error.contains("layer_types[0]") && error.contains("stride"),
+        "the refusal must name the layer and the stride: {error}"
     );
 }
 
