@@ -162,6 +162,45 @@ fn main() -> Result<()> {
         );
     }
 
+    // 7. Cost of the per-call quantized-activation buffers.
+    //
+    // `w4a8_matvec` / `w4a8_fused_qkv` / `w4a8_fused_gate_up` each allocate a
+    // fresh zeroed `input_even` + `input_odd` on every call. For a 22-layer
+    // TinyLlama decode step that is 178 allocations per token. This measures
+    // exactly that pattern so the "allocations are the decode bottleneck"
+    // hypothesis can be settled with a number instead of intuition.
+    {
+        // Per layer: fused_qkv, o_proj, fused_gate_up, down_proj = 4 call
+        // sites × 2 buffers. hidden/2 = 1024 bytes except down_proj, which
+        // quantizes the 5632-wide intermediate = 2816 bytes.
+        let sizes: [usize; 8] = [1024, 1024, 1024, 1024, 1024, 1024, 2816, 2816];
+        let layers = 22;
+        let iters3 = 200;
+        let t0 = Instant::now();
+        for _ in 0..iters3 {
+            for _ in 0..layers {
+                for &size in &sizes {
+                    let buffer = vec![0i8; size];
+                    std::hint::black_box(buffer.as_ptr());
+                }
+            }
+            // LM head quantizes the hidden state once more.
+            let buffer = vec![0i8; 2048];
+            std::hint::black_box(buffer.as_ptr());
+        }
+        let dt = t0.elapsed().as_secs_f64();
+        let per_token_us = dt / iters3 as f64 * 1e6;
+        eprintln!(
+            "7. Per-token quantization-buffer alloc+zero ({} allocs): {per_token_us:.1} μs",
+            layers * sizes.len() + 1
+        );
+        eprintln!(
+            "   → at 30 tok/s ({:.0} μs/token) that is {:.2}% of a decode step",
+            1e6 / 30.0,
+            per_token_us / (1e6 / 30.0) * 100.0
+        );
+    }
+
     std::hint::black_box(sink);
     Ok(())
 }

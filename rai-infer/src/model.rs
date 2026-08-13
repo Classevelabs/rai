@@ -11,7 +11,7 @@ use crate::format::{self, ModelConfig, RaiModelFile};
 use crate::gemm::{embed_lookup, tied_lm_head, w4a8_matmul, w4a8_matvec};
 use crate::kv_cache::KVCache;
 use crate::layers::{
-    compute_attention, gqa_attention_decode, rms_norm, rms_norm_with_residual, silu_mul_inplace,
+    attend_batch, gqa_attention_decode, rms_norm, rms_norm_with_residual, silu_mul_inplace,
     swiglu_mlp, vec_add, AttentionWork, MlpWork, RoPETable,
 };
 
@@ -445,24 +445,35 @@ impl RaiModel {
                 layer.v_proj.group_size,
             );
 
-            // 3. Per-token: RoPE + KV store + attention (causal, sequential)
+            // 3a. RoPE + KV store for every token first. This is cheap and
+            //     inherently sequential (the cache forbids gaps).
             for b in 0..batch {
                 let pos = positions[b];
-                compute_attention(
-                    &mut bs.attn_out[b * q_dim..(b + 1) * q_dim],
-                    &mut bs.q_batch[b * q_dim..(b + 1) * q_dim],
-                    &mut bs.k_batch[b * kv_dim..(b + 1) * kv_dim],
-                    &bs.v_batch[b * kv_dim..(b + 1) * kv_dim],
-                    &self.rope,
-                    kv_cache,
+                self.rope
+                    .apply(&mut bs.q_batch[b * q_dim..(b + 1) * q_dim], nh, pos);
+                self.rope
+                    .apply(&mut bs.k_batch[b * kv_dim..(b + 1) * kv_dim], nkv, pos);
+                kv_cache.store(
                     li,
                     pos,
-                    nh,
-                    nkv,
-                    hd,
-                    &mut bs.scores,
+                    &bs.k_batch[b * kv_dim..(b + 1) * kv_dim],
+                    &bs.v_batch[b * kv_dim..(b + 1) * kv_dim],
                 );
             }
+
+            // 3b. Attend for every token in parallel. Token b still reads only
+            //     positions 0..=b, so this is the same causal computation the
+            //     interleaved loop performed — just no longer serialized.
+            attend_batch(
+                &mut bs.attn_out[..batch * q_dim],
+                &bs.q_batch[..batch * q_dim],
+                kv_cache,
+                li,
+                positions,
+                nh,
+                nkv,
+                hd,
+            );
 
             // 4. Batched O projection
             w4a8_matmul(
