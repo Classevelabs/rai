@@ -16,7 +16,7 @@ import argparse, time, sys, tempfile
 from pathlib import Path
 import numpy as np
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 
 import raimodel
 
@@ -35,11 +35,9 @@ def main():
         args.output = f"{args.model.split('/')[-1].lower()}-q{args.bits}.raimodel"
 
     print(f"Output: {args.output}"); sys.stdout.flush()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
     print(f"Loading {args.model}..."); sys.stdout.flush()
     t0 = time.time()
-    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float16, device_map=device)
+    model = raimodel.load_hf_causal_lm(args.model)
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     if not tokenizer.is_fast:
         raise RuntimeError(
@@ -69,8 +67,10 @@ def main():
         'bits': args.bits, 'group_size': args.group_size,
         'embed_bits': 8, 'embed_group_size': 64,
     }
-    # Fail fast on anything the Rust reader would reject.
+    # Fail fast on anything the Rust reader would reject, and on architectures
+    # whose extra state this container cannot store.
     raimodel.validate_model_config(mc)
+    raimodel.assert_exportable_architecture(model, cfg, args.max_context)
 
     print(f"{getattr(cfg,'model_type','?')}: {nl}L h={hs} inter={inter} heads={nh}/{nkv} vocab={vs}")
     sys.stdout.flush()

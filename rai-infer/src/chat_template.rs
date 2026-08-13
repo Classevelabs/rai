@@ -3,6 +3,8 @@
 //! Supports:
 //! - `MistralInstruct`: `<s>[INST] {msg} [/INST]` (Mistral-7B-Instruct)
 //! - `Llama3Instruct`: `<|begin_of_text|><|start_header_id|>user<|end_header_id|>...`
+//! - `ChatML`: `<|im_start|>user ... <|im_start|>assistant` (Qwen, many others)
+//! - `Zephyr`: `<|user|> ... </s> <|assistant|>` (TinyLlama-Chat, Zephyr, StableLM)
 //! - `FewShot`: Simple few-shot prompt for base models (SmolLM-135M etc.)
 //! - `None`: Raw prompt passthrough
 
@@ -17,6 +19,10 @@ pub enum ChatTemplate {
     MistralInstruct,
     /// Llama-3-Instruct: header-based format
     Llama3Instruct,
+    /// ChatML: `<|im_start|>user ... <|im_end|>` (Qwen and many fine-tunes)
+    ChatML,
+    /// Zephyr-style: `<|user|> ... </s> <|assistant|>` (TinyLlama-Chat, Zephyr)
+    Zephyr,
 }
 
 impl ChatTemplate {
@@ -39,6 +45,10 @@ impl ChatTemplate {
                  {}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
                 user_message
             ),
+            ChatTemplate::ChatML => {
+                format!("<|im_start|>user\n{user_message}<|im_end|>\n<|im_start|>assistant\n")
+            }
+            ChatTemplate::Zephyr => format!("<|user|>\n{user_message}</s>\n<|assistant|>\n"),
         }
     }
 
@@ -49,6 +59,8 @@ impl ChatTemplate {
             ChatTemplate::FewShot => &["\nUser:", "\nHuman:", "\nStudent", "\nQ:", "\n\n\n"],
             ChatTemplate::MistralInstruct => &["</s>", "[INST]"],
             ChatTemplate::Llama3Instruct => &["<|eot_id|>", "<|end_of_text|>"],
+            ChatTemplate::ChatML => &["<|im_end|>", "<|im_start|>"],
+            ChatTemplate::Zephyr => &["</s>", "<|user|>"],
         }
     }
 
@@ -59,6 +71,8 @@ impl ChatTemplate {
             ChatTemplate::FewShot => "Few-Shot",
             ChatTemplate::MistralInstruct => "Mistral Instruct",
             ChatTemplate::Llama3Instruct => "Llama-3 Instruct",
+            ChatTemplate::ChatML => "ChatML",
+            ChatTemplate::Zephyr => "Zephyr",
         }
     }
 
@@ -77,6 +91,14 @@ impl ChatTemplate {
         if tokenizer.token_to_id("<|start_header_id|>").is_some() {
             return ChatTemplate::Llama3Instruct;
         }
+        // ChatML sentinel: <|im_start|> (Qwen and many fine-tunes)
+        if tokenizer.token_to_id("<|im_start|>").is_some() {
+            return ChatTemplate::ChatML;
+        }
+        // Zephyr sentinel: <|assistant|> (TinyLlama-Chat, Zephyr, StableLM-Zephyr)
+        if tokenizer.token_to_id("<|assistant|>").is_some() {
+            return ChatTemplate::Zephyr;
+        }
         // Default: few-shot for base models
         ChatTemplate::FewShot
     }
@@ -93,6 +115,8 @@ impl ChatTemplate {
             "few-shot" => ChatTemplate::FewShot,
             "mistral" => ChatTemplate::MistralInstruct,
             "llama3" => ChatTemplate::Llama3Instruct,
+            "chatml" => ChatTemplate::ChatML,
+            "zephyr" => ChatTemplate::Zephyr,
             _ => {
                 eprintln!("Warning: unknown chat template '{s}', using auto-detect");
                 Self::auto_detect(tokenizer)
@@ -167,6 +191,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn format_prompt_chatml_uses_im_markers() {
+        let prompt = ChatTemplate::ChatML.format_prompt("What is 2+2?");
+        assert_eq!(
+            prompt,
+            "<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n"
+        );
+    }
+
+    #[test]
+    fn format_prompt_zephyr_closes_the_user_turn_and_opens_the_assistant_turn() {
+        let prompt = ChatTemplate::Zephyr.format_prompt("What is 2+2?");
+        assert_eq!(prompt, "<|user|>\nWhat is 2+2?</s>\n<|assistant|>\n");
+    }
+
+    #[test]
+    fn new_templates_stop_on_their_own_turn_markers() {
+        assert_eq!(
+            ChatTemplate::ChatML.stop_sequences(),
+            &["<|im_end|>", "<|im_start|>"]
+        );
+        assert_eq!(ChatTemplate::Zephyr.stop_sequences(), &["</s>", "<|user|>"]);
+    }
+
     /// Tokenizer-dependent tests: build a minimal in-memory WordLevel
     /// tokenizer so no model files are needed.
     #[cfg(feature = "cli")]
@@ -187,6 +235,23 @@ mod tests {
                 .build()
                 .expect("stub WordLevel model");
             tokenizers::Tokenizer::new(model)
+        }
+
+        #[test]
+        fn auto_detect_recognizes_chatml_and_zephyr_sentinels() {
+            assert_eq!(
+                ChatTemplate::auto_detect(&stub_tokenizer(&["<|im_start|>"])),
+                ChatTemplate::ChatML
+            );
+            assert_eq!(
+                ChatTemplate::auto_detect(&stub_tokenizer(&["<|assistant|>"])),
+                ChatTemplate::Zephyr
+            );
+            // Mistral and Llama-3 sentinels still win over the newer families.
+            assert_eq!(
+                ChatTemplate::auto_detect(&stub_tokenizer(&["[INST]", "<|im_start|>"])),
+                ChatTemplate::MistralInstruct
+            );
         }
 
         #[test]

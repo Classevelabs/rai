@@ -28,7 +28,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 
 import raimodel
 
@@ -62,7 +62,8 @@ def main():
 
     model_name = args.model
     print(f"\nLoading {model_name}...")
-    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16).to(device)
+    model = raimodel.load_hf_causal_lm(model_name)
+    model.to(device)  # calibration runs where the chunks are
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if not tokenizer.is_fast:
         raise RuntimeError(
@@ -109,6 +110,7 @@ def main():
     # Fail fast on anything the Rust reader would reject, BEFORE spending
     # an hour on calibration.
     raimodel.validate_model_config(model_config)
+    raimodel.assert_exportable_architecture(model, cfg, args.max_context)
 
     print(f"Architecture: {arch}, {n_layers} layers, hidden={hidden_size}, inter={intermediate_size}")
     print(f"Heads: {num_heads} query, {num_kv_heads} KV, head_dim={head_dim}")

@@ -689,7 +689,81 @@ def test_generate_golden_fixtures():
 # Runner
 # =============================================================================
 
+# ---------------------------------------------------------------------------
+# Architecture preflight (no torch: the checker only walks attributes)
+# ---------------------------------------------------------------------------
+
+
+class _Stub:
+    """Attribute bag standing in for an nn.Module / config object."""
+
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+def _fake_model(bias=False, qk_norm=False, layers=2):
+    def linear():
+        return _Stub(bias=object() if bias else None)
+
+    built = []
+    for _ in range(layers):
+        attn = _Stub(q_proj=linear(), k_proj=linear(), v_proj=linear(), o_proj=linear())
+        if qk_norm:
+            attn.q_norm = object()
+            attn.k_norm = object()
+        mlp = _Stub(gate_proj=linear(), up_proj=linear(), down_proj=linear())
+        built.append(_Stub(self_attn=attn, mlp=mlp))
+    return _Stub(model=_Stub(layers=built))
+
+
+def _expect_rejected(model, config, max_context, needle):
+    try:
+        raimodel.assert_exportable_architecture(model, config, max_context)
+    except RuntimeError as error:
+        assert needle in str(error), f"expected {needle!r} in: {error}"
+        return
+    raise AssertionError(f"expected rejection mentioning {needle!r}, but the export was allowed")
+
+
+def test_preflight_accepts_a_plain_llama_style_model():
+    # transformers >= 5 normalizes plain RoPE to {"rope_type": "default"};
+    # that must not be mistaken for a scaling scheme.
+    config = _Stub(model_type="llama", rope_scaling={"rope_type": "default"}, sliding_window=None)
+    raimodel.assert_exportable_architecture(_fake_model(), config, 2048)
+
+
+def test_preflight_rejects_unrepresentable_architectures():
+    plain = _Stub(model_type="llama")
+    _expect_rejected(_fake_model(bias=True), plain, 2048, "bias")
+    _expect_rejected(_fake_model(qk_norm=True), plain, 2048, "QK norm")
+    _expect_rejected(
+        _fake_model(), _Stub(model_type="llama", rope_scaling={"rope_type": "llama3"}), 2048,
+        "rope_scaling",
+    )
+    _expect_rejected(
+        _fake_model(), _Stub(model_type="llama", num_local_experts=8), 2048, "mixture-of-experts"
+    )
+    _expect_rejected(
+        _fake_model(), _Stub(model_type="gemma2"), 2048, "not supported"
+    )
+    _expect_rejected(
+        _fake_model(), _Stub(model_type="llama", sliding_window=1024), 4096, "sliding_window"
+    )
+    # A context inside the window is fine.
+    raimodel.assert_exportable_architecture(
+        _fake_model(), _Stub(model_type="llama", sliding_window=4096), 2048
+    )
+
+
+def test_preflight_rejects_a_non_llama_module_tree():
+    _expect_rejected(_Stub(model=_Stub(layers=None)), _Stub(model_type="gpt2"), 2048,
+                     "does not expose model.model.layers")
+
+
 TESTS = [
+    test_preflight_accepts_a_plain_llama_style_model,
+    test_preflight_rejects_unrepresentable_architectures,
+    test_preflight_rejects_a_non_llama_module_tree,
     test_pack_nibbles_roundtrip,
     test_pack_nibbles_rejects_odd_columns,
     test_group_param_byte_layout,

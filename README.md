@@ -326,13 +326,26 @@ a general performance advantage over `mmap`.
 
 ## Performance
 
-One historical author-run measurement reported **~195 tokens/s** for
-SmolLM-135M (83 MB at 4-bit) on a described 4-core/8-thread laptop-class x86-64
-CPU. Raw output and the complete environment were not retained, so this is not
-an independently reproduced release result.
+Measured end to end on 2026-08-09 with **TinyLlama-1.1B-Chat** on an Intel
+i5-10300H (4 cores / 8 threads), converting the fp16 checkpoint and decoding
+greedily against HuggingFace `transformers` on the same machine:
 
-See [BENCHMARKS.md](./BENCHMARKS.md) for methodology, the full numbers, and
-compression-quality measurements.
+| | RAI 0.2.0 (4-bit) | transformers fp32 (CPU) |
+| --- | --- | --- |
+| Decode, 91 tokens | **21.8 tok/s** | 4.3 tok/s |
+| Peak process RSS | **629 MB** | fp32 weights alone are ~4.4 GB |
+| Model on disk | **619.5 MB** | 2,200 MB |
+| Load time | 0.33 s | ~2 s |
+
+Conversion took **47 s** for the whole 1.1B model. The exact environment is
+pinned in `rai-infer/scripts/requirements-lock.txt`.
+
+An older author-run measurement reported ~195 tokens/s for SmolLM-135M, but its
+raw output and environment were not retained; it is kept in BENCHMARKS.md as
+historical context, not as release evidence.
+
+See [BENCHMARKS.md](./BENCHMARKS.md) for the full method, quantization-quality
+comparison, and the measured result for self-speculative decoding.
 
 ## Project status
 

@@ -85,7 +85,7 @@ struct Args {
     port: u16,
     #[arg(long, default_value = "512")]
     max_context: usize,
-    /// Chat template: auto, none, few-shot, mistral, llama3
+    /// Chat template: auto, none, few-shot, mistral, llama3, chatml, zephyr
     #[arg(long, default_value = "auto")]
     chat_template: String,
 }

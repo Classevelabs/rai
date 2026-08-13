@@ -56,7 +56,7 @@ struct Args {
     seed: u64,
     #[arg(long, default_value = "false")]
     verbose: bool,
-    /// Chat template: auto, none, few-shot, mistral, llama3
+    /// Chat template: auto, none, few-shot, mistral, llama3, chatml, zephyr
     #[arg(long, default_value = "none")]
     chat_template: String,
     /// Draft model for speculative decoding (e.g. smollm-135m-q4.raimodel)
@@ -120,9 +120,9 @@ fn validate_args(args: &Args) -> Result<()> {
     ensure!(
         matches!(
             args.chat_template.as_str(),
-            "auto" | "none" | "few-shot" | "mistral" | "llama3"
+            "auto" | "none" | "few-shot" | "mistral" | "llama3" | "chatml" | "zephyr"
         ),
-        "unknown --chat-template '{}'; expected auto, none, few-shot, mistral, or llama3",
+        "unknown --chat-template '{}'; expected auto, none, few-shot, mistral, llama3, chatml, or zephyr",
         args.chat_template
     );
     ensure!(
@@ -656,6 +656,16 @@ fn main() -> Result<()> {
             &tokenizer,
         );
         println!();
+        if tokens_generated == 0 {
+            // Silence here reads as a broken tool. The usual cause is an
+            // instruction-tuned model given a bare prompt: it ends the
+            // sequence immediately because nothing marks a turn.
+            eprintln!(
+                "\nNo tokens generated: the model emitted end-of-sequence first. \
+                 If this is an instruction-tuned model, pass the matching \
+                 --chat-template (auto, mistral, llama3, chatml, zephyr, few-shot)."
+            );
+        }
         eprintln!("\n--- Stats ---");
         eprintln!("Tokens: {tokens_generated}, {decode_tps:.2} tok/s");
         eprintln!("Passes: {total_passes} total, {avg_passes:.1} avg/token");
