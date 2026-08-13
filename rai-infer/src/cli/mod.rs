@@ -15,7 +15,9 @@
 //! Gated on the `cli` feature: `--no-default-features` still builds the lean
 //! inference library with none of this compiled in.
 
+pub mod catalog;
 pub mod convert;
+pub mod jobs;
 pub mod models;
 pub mod run;
 pub mod serve;

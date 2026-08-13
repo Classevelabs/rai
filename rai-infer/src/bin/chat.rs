@@ -32,7 +32,9 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
     rai_infer::cli::serve::run(&ServeArgs {
-        model: args.model,
+        // `rai serve` may now start with no model; this deprecated wrapper
+        // still requires one, exactly as it always did.
+        model: Some(args.model),
         tokenizer: Some(args.tokenizer),
         options: args.options,
     })
