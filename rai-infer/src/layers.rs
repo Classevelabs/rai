@@ -182,6 +182,119 @@ pub fn rms_norm(output: &mut [f32], input: &[f32], weight: &[f32], eps: f32) {
     }
 }
 
+/// RMSNorm every head of a packed multi-head vector, in place.
+///
+/// Qwen3 and Gemma3 normalize each attention head's query and key vector with a
+/// single weight vector of length `head_dim`, *shared across heads*, before the
+/// rotary embedding. Matched against `transformers`
+/// `models/qwen3/modeling_qwen3.py:252-257`: `q_norm` is applied to
+/// `q_proj(x).view(*input_shape, -1, head_dim)` — i.e. after the reshape into
+/// heads and before `apply_rotary_pos_emb` — so it is exactly a per-head
+/// RMSNorm over the last axis, and the weight is `Qwen3RMSNorm(self.head_dim)`
+/// (`:237-238`, "unlike olmo, only on the head dim!").
+///
+/// `heads` is `[num_heads * head_dim]` with head `h` at `h * head_dim`.
+///
+/// # Panics
+/// Panics if the buffer does not hold exactly `num_heads * head_dim` values,
+/// `weight` is not `head_dim` long, or `eps` is not finite and positive.
+pub fn rms_norm_heads(
+    heads: &mut [f32],
+    num_heads: usize,
+    head_dim: usize,
+    weight: &[f32],
+    eps: f32,
+) {
+    assert!(
+        num_heads > 0 && head_dim > 0,
+        "per-head RMSNorm dimensions must be non-zero"
+    );
+    assert_eq!(
+        heads.len(),
+        num_heads * head_dim,
+        "per-head RMSNorm buffer length mismatch"
+    );
+    assert_eq!(
+        weight.len(),
+        head_dim,
+        "per-head RMSNorm weight must be head_dim long"
+    );
+    assert!(
+        eps.is_finite() && eps > 0.0,
+        "RMSNorm epsilon must be finite and positive"
+    );
+    // `rms_norm` cannot alias its input and output, and this is an in-place
+    // transform, so each head is normalized through a small stack buffer's
+    // worth of arithmetic rather than a second allocation: the scale is one
+    // reduction over the head, then a scaled multiply back over the same slice.
+    for head in heads.chunks_exact_mut(head_dim) {
+        let mut sum_sq = 0.0f32;
+        for &value in head.iter() {
+            sum_sq += value * value;
+        }
+        let inv_rms = 1.0 / (sum_sq / head_dim as f32 + eps).sqrt();
+        for (value, &w) in head.iter_mut().zip(weight) {
+            *value = *value * inv_rms * w;
+        }
+    }
+}
+
+/// Gemma2's logit softcap: `cap * tanh(x / cap)`, a smooth clamp to `±cap`.
+///
+/// `cap <= 0.0` means "disabled" and returns `x` untouched, which is the
+/// encoding the header uses.
+#[inline]
+pub fn soft_cap(x: f32, cap: f32) -> f32 {
+    if cap > 0.0 {
+        cap * (x / cap).tanh()
+    } else {
+        x
+    }
+}
+
+/// [`soft_cap`] over a whole slice. Used for the final output logits.
+pub fn soft_cap_slice(values: &mut [f32], cap: f32) {
+    if cap <= 0.0 {
+        return;
+    }
+    for value in values.iter_mut() {
+        *value = cap * (*value / cap).tanh();
+    }
+}
+
+/// How an attention score is turned from a raw dot product into a logit.
+///
+/// Bundled rather than passed as two loose floats because every attention entry
+/// point takes both and they must move together: a scale without its softcap is
+/// how Gemma2 silently degrades.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScoreShaping {
+    /// Multiplier on the query-key dot product.
+    pub scale: f32,
+    /// `cap` in `cap * tanh(x / cap)`, applied *after* the scale and *before*
+    /// the softmax, matching `transformers`
+    /// `models/gemma2/modeling_gemma2.py:202-205`. `0.0` disables it.
+    pub softcap: f32,
+}
+
+impl ScoreShaping {
+    /// The plain `1/sqrt(head_dim)`, no cap — every model but Gemma2.
+    pub fn plain(head_dim: usize) -> Self {
+        Self {
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            softcap: 0.0,
+        }
+    }
+}
+
+/// The per-head query/key norms a layer applies before RoPE.
+#[derive(Debug, Clone, Copy)]
+pub struct QkNorm<'a> {
+    pub q: &'a [f32],
+    pub k: &'a [f32],
+    pub eps: f32,
+}
+
 /// AVX2 RMSNorm: SIMD sum-of-squares + SIMD multiply.
 ///
 /// # Safety
@@ -971,6 +1084,8 @@ pub fn gqa_attention_decode(
     work: &mut AttentionWork,
     store_kv: bool, // false = probe pass, don't write K,V to cache
     biases: &ProjectionBiases<'_>,
+    qk_norm: Option<QkNorm<'_>>,
+    shaping: ScoreShaping,
 ) {
     assert!(
         num_heads > 0 && num_kv_heads > 0 && head_dim > 0,
@@ -1064,6 +1179,14 @@ pub fn gqa_attention_decode(
     add_bias(&mut work.k, biases[1]);
     add_bias(&mut work.v, biases[2]);
 
+    // 1c. Per-head QK norm (Qwen3, Gemma3). Applied after the bias and before
+    //     RoPE, which is where `q_norm(q_proj(x).view(..., head_dim))` sits in
+    //     the reference model — see `rms_norm_heads`. V is never normed.
+    if let Some(norm) = qk_norm {
+        rms_norm_heads(&mut work.q, num_heads, head_dim, norm.q, norm.eps);
+        rms_norm_heads(&mut work.k, num_kv_heads, head_dim, norm.k, norm.eps);
+    }
+
     // 2. Apply RoPE to Q (num_heads heads) and K (num_kv_heads heads)
     rope.apply(&mut work.q, num_heads, pos);
     rope.apply(&mut work.k, num_kv_heads, pos);
@@ -1092,6 +1215,7 @@ pub fn gqa_attention_decode(
         num_heads,
         num_kv_heads,
         head_dim,
+        shaping,
     );
 
     // 5. Output projection
@@ -1129,9 +1253,10 @@ unsafe fn attention_head_avx2(
     kvh: usize,
     pos: usize,
     head_dim: usize,
-    scale: f32,
+    shaping: ScoreShaping,
 ) {
-    let _scale_v = _mm256_set1_ps(scale);
+    let scale = shaping.scale;
+    let softcap = shaping.softcap;
     let chunks8 = head_dim / 8;
 
     // Compute dot(Q, K_cached) for all positions using AVX2
@@ -1156,7 +1281,12 @@ unsafe fn attention_head_avx2(
         let hi2 = _mm_movehl_ps(s2, s2);
         let dot = _mm_cvtss_f32(_mm_add_ss(s2, hi2));
 
-        let sc = dot * scale;
+        // The softcap is applied to the scaled logit before the softmax, and in
+        // scalar `f32::tanh` rather than the polynomial the GeLU kernel uses:
+        // this value feeds an exponential, and both the decode and the batched
+        // path reach it through this same line, which is what keeps them
+        // bit-identical (`tests/model_invariants.rs`).
+        let sc = soft_cap(dot * scale, softcap);
         *scores.get_unchecked_mut(t) = sc;
         if sc > max_score {
             max_score = sc;
@@ -1247,7 +1377,7 @@ fn attention_head(
     kvh: usize,
     pos: usize,
     head_dim: usize,
-    scale: f32,
+    shaping: ScoreShaping,
 ) {
     debug_assert_eq!(q_head.len(), head_dim, "query head length mismatch");
     debug_assert_eq!(out_head.len(), head_dim, "attention head output mismatch");
@@ -1262,7 +1392,7 @@ fn attention_head(
             // and the filled watermark covering `0..=pos`.
             unsafe {
                 attention_head_avx2(
-                    q_head, out_head, scores, kv_cache, layer_idx, kvh, pos, head_dim, scale,
+                    q_head, out_head, scores, kv_cache, layer_idx, kvh, pos, head_dim, shaping,
                 );
             }
             return;
@@ -1276,7 +1406,7 @@ fn attention_head(
         for d in 0..head_dim {
             dot += q_head[d] * k_cached[d];
         }
-        scores[t] = dot * scale;
+        scores[t] = soft_cap(dot * shaping.scale, shaping.softcap);
         if scores[t] > max_score {
             max_score = scores[t];
         }
@@ -1342,6 +1472,7 @@ fn attention_all_heads(
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
+    shaping: ScoreShaping,
 ) {
     let row = pos + 1;
     let hidden = num_heads * head_dim;
@@ -1351,7 +1482,6 @@ fn attention_all_heads(
         scores.len() >= num_heads * row,
         "attention score scratch is too small"
     );
-    let scale = 1.0 / (head_dim as f32).sqrt();
     let heads_per_kv = num_heads / num_kv_heads;
 
     if pos < PARALLEL_ATTENTION_MIN_POS || crate::gemm::serial_decode_attention_enabled() {
@@ -1365,7 +1495,7 @@ fn attention_all_heads(
                 qh / heads_per_kv,
                 pos,
                 head_dim,
-                scale,
+                shaping,
             );
         }
         return;
@@ -1385,7 +1515,7 @@ fn attention_all_heads(
                 qh / heads_per_kv,
                 pos,
                 head_dim,
-                scale,
+                shaping,
             );
         });
 }
@@ -1419,6 +1549,7 @@ pub fn attention_all_heads_for_profiling(
         num_heads,
         num_kv_heads,
         head_dim,
+        ScoreShaping::plain(head_dim),
     );
 }
 
@@ -1445,6 +1576,8 @@ pub fn compute_attention(
     num_kv_heads: usize,
     head_dim: usize,
     scores: &mut Vec<f32>,
+    qk_norm: Option<QkNorm<'_>>,
+    shaping: ScoreShaping,
 ) {
     assert!(
         num_heads > 0 && num_kv_heads > 0 && head_dim > 0,
@@ -1476,6 +1609,12 @@ pub fn compute_attention(
         kv_cache.supports_attention(layer_idx, num_kv_heads, pos, head_dim),
         "KV cache dimensions do not match attention"
     );
+    // Per-head QK norm, before RoPE (see `rms_norm_heads`).
+    if let Some(norm) = qk_norm {
+        rms_norm_heads(q, num_heads, head_dim, norm.q, norm.eps);
+        rms_norm_heads(k, num_kv_heads, head_dim, norm.k, norm.eps);
+    }
+
     // Apply RoPE
     rope.apply(q, num_heads, pos);
     rope.apply(k, num_kv_heads, pos);
@@ -1484,7 +1623,6 @@ pub fn compute_attention(
     kv_cache.store(layer_idx, pos, k, v);
 
     // Attention
-    let scale = 1.0 / (head_dim as f32).sqrt();
     let heads_per_kv = num_heads / num_kv_heads;
     scores.resize(pos + 1, 0.0);
 
@@ -1493,7 +1631,7 @@ pub fn compute_attention(
         let q_head = &q[qh * head_dim..(qh + 1) * head_dim];
         let out_head = &mut attn_out[qh * head_dim..(qh + 1) * head_dim];
         attention_head(
-            q_head, out_head, scores, kv_cache, layer_idx, kvh, pos, head_dim, scale,
+            q_head, out_head, scores, kv_cache, layer_idx, kvh, pos, head_dim, shaping,
         );
     }
 }
@@ -1524,6 +1662,7 @@ pub fn attend_batch(
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
+    shaping: ScoreShaping,
 ) {
     assert!(
         num_heads > 0 && num_kv_heads > 0 && head_dim > 0,
@@ -1548,7 +1687,6 @@ pub fn attend_batch(
         "KV cache dimensions do not match attention"
     );
 
-    let scale = 1.0 / (head_dim as f32).sqrt();
     let heads_per_kv = num_heads / num_kv_heads;
 
     let attend_token = |out_tok: &mut [f32], q_tok: &[f32], pos: usize| {
@@ -1566,7 +1704,7 @@ pub fn attend_batch(
                 kvh,
                 pos,
                 head_dim,
-                scale,
+                shaping,
             );
         }
     };
@@ -1808,6 +1946,8 @@ mod tests {
             1,
             16,
             &mut Vec::new(),
+            None,
+            ScoreShaping::plain(16),
         );
     }
 
@@ -1831,6 +1971,8 @@ mod tests {
             1,
             6,
             &mut Vec::new(),
+            None,
+            ScoreShaping::plain(6),
         );
         assert_eq!(output, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     }

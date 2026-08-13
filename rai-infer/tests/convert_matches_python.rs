@@ -119,6 +119,20 @@ enum Bias {
     QOnLayerZeroOnly,
 }
 
+/// Which per-head QK norm tensors the synthetic checkpoint carries.
+#[derive(Clone, Copy, PartialEq)]
+enum QkNorm {
+    /// None at all — the Llama/Qwen2 shape.
+    None,
+    /// `q_norm` and `k_norm` of length `head_dim` on every layer: Qwen3.
+    EveryLayer,
+    /// `q_norm` alone on layer 0: a checkpoint no single flag can describe.
+    QOnLayerZeroOnly,
+    /// The pair on every layer but sized over the whole projection rather than
+    /// one head — the OLMo2 shape, which this container does not implement.
+    FullWidthEveryLayer,
+}
+
 /// What the synthetic checkpoint should look like.
 #[derive(Clone)]
 struct Spec {
@@ -131,8 +145,12 @@ struct Spec {
     rope_scaling: serde_json::Value,
     hidden_act: &'static str,
     hidden_activation: serde_json::Value,
-    /// Add a per-head `q_norm` tensor, as Qwen3/Gemma3 carry.
-    qk_norm: bool,
+    /// Per-head `q_norm`/`k_norm` tensors, as Qwen3 carries.
+    qk_norm: QkNorm,
+    /// Emit Gemma2's four-norm sandwich layout instead of the usual two.
+    sandwich_norm: bool,
+    /// Extra keys merged into `config.json` verbatim.
+    extra_config: serde_json::Value,
     shards: usize,
 }
 
@@ -145,7 +163,9 @@ impl Default for Spec {
             rope_scaling: serde_json::Value::Null,
             hidden_act: "silu",
             hidden_activation: serde_json::Value::Null,
-            qk_norm: false,
+            qk_norm: QkNorm::None,
+            sandwich_norm: false,
+            extra_config: serde_json::Value::Null,
             shards: 1,
         }
     }
@@ -221,19 +241,45 @@ fn write_checkpoint(dir: &Path, spec: &Spec) -> Checkpoint {
                 biases.push((tensor, values));
             }
         }
-        for suffix in ["input_layernorm", "post_attention_layernorm"] {
+        // Per-head QK norms, when the spec asks for them. Emitted before the
+        // layer norms only for readability — the converter locates every tensor
+        // by name, so the order in the safetensors file is irrelevant.
+        let qk_len = match spec.qk_norm {
+            QkNorm::FullWidthEveryLayer => q_dim,
+            _ => spec.head_dim,
+        };
+        let qk_sides: &[&str] = match (spec.qk_norm, layer) {
+            (QkNorm::None, _) => &[],
+            (QkNorm::QOnLayerZeroOnly, 0) => &["q_norm"],
+            (QkNorm::QOnLayerZeroOnly, _) => &[],
+            _ => &["q_norm", "k_norm"],
+        };
+        for side in qk_sides {
+            let values = rng.norm(qk_len);
+            let tensor = format!("model.layers.{layer}.self_attn.{side}.weight");
+            tensors.push((tensor.clone(), vec![qk_len], values.clone()));
+            norms.push((tensor, values));
+        }
+        // Gemma2 replaces the two-norm layout with four: `input_layernorm` and
+        // `pre_feedforward_layernorm` on the residual stream, plus
+        // `post_attention_layernorm` and `post_feedforward_layernorm` on the
+        // block outputs.
+        let suffixes: &[&str] = if spec.sandwich_norm {
+            &[
+                "input_layernorm",
+                "pre_feedforward_layernorm",
+                "post_attention_layernorm",
+                "post_feedforward_layernorm",
+            ]
+        } else {
+            &["input_layernorm", "post_attention_layernorm"]
+        };
+        for suffix in suffixes {
             let values = rng.norm(HIDDEN);
             let tensor = format!("model.layers.{layer}.{suffix}.weight");
             tensors.push((tensor.clone(), vec![HIDDEN], values.clone()));
             norms.push((tensor, values));
         }
-    }
-    if spec.qk_norm {
-        tensors.push((
-            "model.layers.0.self_attn.q_norm.weight".to_string(),
-            vec![spec.head_dim],
-            vec![1.0f32; spec.head_dim],
-        ));
     }
     let final_norm = rng.norm(HIDDEN);
     tensors.push((
@@ -294,6 +340,11 @@ fn write_checkpoint(dir: &Path, spec: &Spec) -> Checkpoint {
     // when it actually says something.
     if spec.head_dim != HIDDEN / HEADS {
         config["head_dim"] = serde_json::json!(spec.head_dim);
+    }
+    if let Some(extra) = spec.extra_config.as_object() {
+        for (key, value) in extra {
+            config[key] = value.clone();
+        }
     }
     std::fs::write(
         dir.join("config.json"),
@@ -890,25 +941,18 @@ fn a_decoupled_head_dim_converts_and_runs() {
 fn architectures_the_container_cannot_express_are_still_refused() {
     for (label, mutate, needle) in [
         (
-            "gemma2",
-            Box::new(|config: &mut serde_json::Value| {
-                config["model_type"] = serde_json::json!("gemma2");
-            }) as Box<dyn Fn(&mut serde_json::Value)>,
-            "gemma2",
-        ),
-        (
             "gemma3",
             Box::new(|config: &mut serde_json::Value| {
                 config["model_type"] = serde_json::json!("gemma3_text");
-            }),
-            "gemma3",
+            }) as Box<dyn Fn(&mut serde_json::Value)>,
+            "RoPE base",
         ),
         (
-            "softcap",
+            "negative-softcap",
             Box::new(|config: &mut serde_json::Value| {
-                config["final_logit_softcapping"] = serde_json::json!(30.0);
+                config["final_logit_softcapping"] = serde_json::json!(-30.0);
             }),
-            "logit softcapping",
+            "final_logit_softcapping must be finite and positive",
         ),
         (
             "moe",
@@ -953,16 +997,322 @@ fn architectures_the_container_cannot_express_are_still_refused() {
     }
 }
 
+/// The exact Qwen3 shape: per-head QK norms on every layer, no biases.
+fn qwen3_spec() -> Spec {
+    Spec {
+        model_type: "qwen3",
+        qk_norm: QkNorm::EveryLayer,
+        ..Spec::default()
+    }
+}
+
+/// The exact Gemma2 shape: GeGLU, sandwich norms, both softcaps.
+fn gemma2_spec() -> Spec {
+    Spec {
+        model_type: "gemma2",
+        hidden_act: "gelu_pytorch_tanh",
+        hidden_activation: serde_json::json!("gelu_pytorch_tanh"),
+        sandwich_norm: true,
+        extra_config: serde_json::json!({
+            "attn_logit_softcapping": 50.0,
+            "final_logit_softcapping": 30.0,
+            "query_pre_attn_scalar": HEAD_DIM,
+            // Wider than --max-context (512), so full causal attention is
+            // exactly equivalent and the export is accepted.
+            "sliding_window": 4096,
+        }),
+        ..Spec::default()
+    }
+}
+
 #[test]
-fn per_head_qk_norms_are_still_refused() {
-    // Qwen3/Gemma3 add q_norm/k_norm tensors the container has nowhere to put.
-    let spec = Spec {
-        qk_norm: true,
+fn a_qwen3_shaped_checkpoint_stores_its_per_head_qk_norms() {
+    let (root, output, checkpoint) = convert_spec("qwen3", &qwen3_spec());
+
+    let header = header_bytes(&output);
+    assert_eq!(header[4], 2, "QK norms require container v2");
+    // flags bit 1 set, bit 0 (biases) clear.
+    assert_eq!(header[65], 0x02, "flags should declare QK norms only");
+
+    let file = RaiModelFile::open(&output).expect("the produced model must load");
+    assert!(file.config.has_qk_norm);
+    assert!(!file.config.has_sandwich_norm);
+
+    // Every layer's stored q_norm/k_norm must be the checkpoint's tensor,
+    // value for value: these are written as raw f32, so this is exact.
+    for layer in 0..LAYERS {
+        let refs = file.layer(layer).expect("layer parses");
+        for (side, stored) in [("q_norm", refs.q_norm), ("k_norm", refs.k_norm)] {
+            let name = format!("model.layers.{layer}.self_attn.{side}.weight");
+            let expected = &checkpoint
+                .norms
+                .iter()
+                .find(|(tensor, _)| *tensor == name)
+                .unwrap_or_else(|| panic!("checkpoint should carry {name}"))
+                .1;
+            let actual = rai_infer::format::read_f32_vector(
+                stored.unwrap_or_else(|| panic!("{name} should be stored")),
+            );
+            assert_eq!(actual.len(), HEAD_DIM, "{name} must be head_dim long");
+            assert_eq!(&actual, expected, "{name} round trip");
+        }
+        assert!(refs.attn_out_norm.is_none());
+        assert!(refs.mlp_out_norm.is_none());
+    }
+
+    // And it runs: the QK norm must not produce non-finite logits.
+    let model = RaiModel::load(&output).expect("the produced model must load");
+    let logits = run_forward(&model, &[1, 2, 3, 4, 5]);
+    assert!(logits.iter().all(|v| v.is_finite()));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn qk_norms_change_the_output() {
+    // A capability that is stored but not applied would pass every structural
+    // check above. The only proof it reaches the kernels is that it moves the
+    // logits.
+    let (root_a, plain, _) = convert_spec("qk-off", &Spec::default());
+    let (root_b, normed, _) = convert_spec("qk-on", &qwen3_spec());
+    let tokens = [1usize, 5, 9, 13];
+    let without = run_forward(&RaiModel::load(&plain).unwrap(), &tokens);
+    let with = run_forward(&RaiModel::load(&normed).unwrap(), &tokens);
+    let max_diff = without
+        .iter()
+        .zip(&with)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_diff > 1e-3,
+        "per-head QK norm should change the logits, max diff was {max_diff:e}"
+    );
+    let _ = std::fs::remove_dir_all(&root_a);
+    let _ = std::fs::remove_dir_all(&root_b);
+}
+
+#[test]
+fn a_gemma2_shaped_checkpoint_stores_its_sandwich_norms_and_softcaps() {
+    let (root, output, checkpoint) = convert_spec("gemma2", &gemma2_spec());
+
+    let header = header_bytes(&output);
+    assert_eq!(header[4], 2);
+    assert_eq!(header[64], 1, "GeGLU activation code");
+    assert_eq!(header[65], 0x04, "flags should declare the sandwich norms");
+    assert_eq!(f32::from_le_bytes(header[88..92].try_into().unwrap()), 50.0);
+    assert_eq!(f32::from_le_bytes(header[92..96].try_into().unwrap()), 30.0);
+    // query_pre_attn_scalar == head_dim, so the scale is the default and
+    // nothing is stored.
+    assert_eq!(f32::from_le_bytes(header[96..100].try_into().unwrap()), 0.0);
+
+    let file = RaiModelFile::open(&output).expect("the produced model must load");
+    assert!(file.config.has_sandwich_norm);
+    assert!(!file.config.has_qk_norm);
+    assert_eq!(file.config.attn_logit_softcap, 50.0);
+    assert_eq!(file.config.final_logit_softcap, 30.0);
+    assert_eq!(
+        file.config.attention_scale(),
+        1.0 / (HEAD_DIM as f32).sqrt()
+    );
+
+    // The four norms must land in the right four slots. Gemma folds `1 + w`,
+    // so the stored value is one more than the checkpoint's.
+    let expect_norm = |name: &str| -> Vec<f32> {
+        checkpoint
+            .norms
+            .iter()
+            .find(|(tensor, _)| tensor == name)
+            .unwrap_or_else(|| panic!("checkpoint should carry {name}"))
+            .1
+            .iter()
+            .map(|v| 1.0 + v)
+            .collect()
+    };
+    for layer in 0..LAYERS {
+        let refs = file.layer(layer).expect("layer parses");
+        let slots = [
+            (
+                rai_infer::format::read_norm_weights(&refs.input_layernorm),
+                format!("model.layers.{layer}.input_layernorm.weight"),
+            ),
+            (
+                rai_infer::format::read_norm_weights(&refs.post_attn_layernorm),
+                // The pre-MLP slot must carry Gemma2's *pre_feedforward*
+                // norm, not its post_attention one.
+                format!("model.layers.{layer}.pre_feedforward_layernorm.weight"),
+            ),
+            (
+                rai_infer::format::read_f32_vector(refs.attn_out_norm.unwrap()),
+                format!("model.layers.{layer}.post_attention_layernorm.weight"),
+            ),
+            (
+                rai_infer::format::read_f32_vector(refs.mlp_out_norm.unwrap()),
+                format!("model.layers.{layer}.post_feedforward_layernorm.weight"),
+            ),
+        ];
+        for (actual, name) in slots {
+            assert_eq!(actual, expect_norm(&name), "{name} round trip");
+        }
+    }
+
+    let model = RaiModel::load(&output).expect("the produced model must load");
+    let logits = run_forward(&model, &[1, 2, 3, 4, 5]);
+    assert!(logits.iter().all(|v| v.is_finite()));
+    // The final softcap is a hard bound: no logit can leave (-30, 30).
+    assert!(
+        logits.iter().all(|v| v.abs() < 30.0),
+        "the final softcap must bound every logit"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn softcapping_and_sandwich_norms_change_the_output() {
+    let mut uncapped = gemma2_spec();
+    uncapped.extra_config = serde_json::json!({ "sliding_window": 4096 });
+    uncapped.sandwich_norm = false;
+    // Same weights, same activation; only the new capabilities differ.
+    uncapped.model_type = "gemma";
+
+    let (root_a, plain, _) = convert_spec("gemma2-off", &uncapped);
+    let (root_b, full, _) = convert_spec("gemma2-on", &gemma2_spec());
+    let tokens = [2usize, 4, 6, 8];
+    let without = run_forward(&RaiModel::load(&plain).unwrap(), &tokens);
+    let with = run_forward(&RaiModel::load(&full).unwrap(), &tokens);
+    let max_diff = without
+        .iter()
+        .zip(&with)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_diff > 1e-3,
+        "softcapping and sandwich norms should change the logits, max diff was {max_diff:e}"
+    );
+    let _ = std::fs::remove_dir_all(&root_a);
+    let _ = std::fs::remove_dir_all(&root_b);
+}
+
+/// Every position's logits from the batched path, and from the sequential one.
+fn batched_and_sequential(model: &RaiModel, tokens: &[usize]) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+    let hs = model.config.hidden_size as usize;
+    let vs = model.config.vocab_size as usize;
+    let n = tokens.len();
+
+    let mut sequential = Vec::with_capacity(n);
+    let mut kv = model.create_kv_cache(64).unwrap();
+    let mut scratch = Scratch::new();
+    let mut hidden = vec![0.0f32; hs];
+    for (pos, &token) in tokens.iter().enumerate() {
+        hidden.resize(hs, 0.0);
+        model.embed_token(token, &mut hidden).unwrap();
+        model
+            .forward_from_hidden(&mut hidden, pos, &mut kv, true, &mut scratch)
+            .unwrap();
+        let mut normed = vec![0.0f32; hs];
+        let mut logits = vec![0.0f32; vs];
+        model
+            .hidden_to_logits_into(&hidden, &mut normed, &mut logits)
+            .unwrap();
+        sequential.push(logits);
+    }
+
+    let mut hiddens = vec![0.0f32; n * hs];
+    for (i, &token) in tokens.iter().enumerate() {
+        model
+            .embed_token(token, &mut hiddens[i * hs..(i + 1) * hs])
+            .unwrap();
+    }
+    let mut kv = model.create_kv_cache(64).unwrap();
+    let mut bs = BatchScratch::new();
+    let positions: Vec<usize> = (0..n).collect();
+    model
+        .forward_batch(&mut hiddens, &positions, &mut kv, &mut bs)
+        .unwrap();
+    let mut normed = vec![0.0f32; n * hs];
+    let mut flat = vec![0.0f32; n * vs];
+    model
+        .hidden_to_logits_batch(&hiddens, &mut normed, &mut flat, n)
+        .unwrap();
+    let batched = (0..n)
+        .map(|i| flat[i * vs..(i + 1) * vs].to_vec())
+        .collect();
+    (batched, sequential)
+}
+
+#[test]
+fn the_new_capabilities_keep_batched_and_sequential_identical() {
+    // Speculative decoding's exactness argument rests on this equivalence, and
+    // every new capability is a fresh chance to apply something in one path and
+    // not the other. Bit-identical, not merely close: both paths must reach the
+    // same kernels with the same inputs.
+    for (label, spec) in [
+        ("qwen3", qwen3_spec()),
+        ("gemma2", gemma2_spec()),
+        (
+            "both",
+            Spec {
+                qk_norm: QkNorm::EveryLayer,
+                ..gemma2_spec()
+            },
+        ),
+    ] {
+        let (root, output, _) = convert_spec(&format!("invariant-{label}"), &spec);
+        let model = RaiModel::load(&output).expect("the produced model must load");
+        let tokens = [3usize, 11, 27, 43, 58, 7];
+        let (batched, sequential) = batched_and_sequential(&model, &tokens);
+        for (pos, (b, s)) in batched.iter().zip(&sequential).enumerate() {
+            assert!(
+                s.iter().all(|v| v.is_finite()),
+                "{label}: non-finite logits at {pos}"
+            );
+            for (i, (x, y)) in s.iter().zip(b).enumerate() {
+                assert_eq!(
+                    x, y,
+                    "{label}: batched and sequential differ at position {pos} token {i}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[test]
+fn a_partial_or_wrongly_shaped_qk_norm_set_is_refused() {
+    let partial = Spec {
+        qk_norm: QkNorm::QOnLayerZeroOnly,
         ..Spec::default()
     };
-    let error = convert_error("qk-norm", &spec);
+    let error = convert_error("qk-partial", &partial);
     assert!(
-        error.contains("QK norm"),
-        "error should name the QK norms: {error}"
+        error.contains("only one of self_attn.q_norm / self_attn.k_norm"),
+        "error should name the missing half: {error}"
+    );
+
+    // OLMo2 norms the whole projection, not each head. Refusing it by name is
+    // the difference between "unsupported" and "silently wrong".
+    let full_width = Spec {
+        qk_norm: QkNorm::FullWidthEveryLayer,
+        ..Spec::default()
+    };
+    let error = convert_error("qk-full-width", &full_width);
+    assert!(
+        error.contains("head_dim") && error.contains("OLMo2"),
+        "error should name the shape mismatch: {error}"
+    );
+}
+
+#[test]
+fn a_gemma2_export_past_its_sliding_window_is_refused() {
+    // --max-context is 512 in these tests, so a 128-token window means full
+    // causal attention would read outside it on the sliding layers.
+    let mut spec = gemma2_spec();
+    spec.extra_config = serde_json::json!({
+        "attn_logit_softcapping": 50.0,
+        "final_logit_softcapping": 30.0,
+        "sliding_window": 128,
+    });
+    let error = convert_error("gemma2-window", &spec);
+    assert!(
+        error.contains("sliding_window=128") && error.contains("--max-context 128"),
+        "the refusal must name the window and the fix: {error}"
     );
 }

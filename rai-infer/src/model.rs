@@ -11,9 +11,9 @@ use crate::format::{self, ModelConfig, RaiModelFile, NUM_PROJECTIONS};
 use crate::gemm::{embed_lookup, tied_lm_head, w4a8_matmul, w4a8_matvec};
 use crate::kv_cache::KVCache;
 use crate::layers::{
-    add_bias, attend_batch, glu_mul_inplace, gqa_attention_decode, rms_norm,
-    rms_norm_with_residual, swiglu_mlp, vec_add, AttentionWork, MlpWork, ProjectionBiases,
-    RoPETable,
+    add_bias, attend_batch, glu_mul_inplace, gqa_attention_decode, rms_norm, rms_norm_heads,
+    rms_norm_with_residual, soft_cap_slice, swiglu_mlp, vec_add, AttentionWork, MlpWork,
+    ProjectionBiases, QkNorm, RoPETable, ScoreShaping,
 };
 
 /// One layer's decoded bias vectors, indexed in `format::PROJECTION_NAMES`
@@ -25,6 +25,17 @@ pub type LayerBiases = [Option<Vec<f32>>; NUM_PROJECTIONS];
 /// A `LayerBiases` with nothing set — the shape every v1 model has.
 fn no_biases() -> LayerBiases {
     Default::default()
+}
+
+/// One layer's optional extra norm vectors, decoded to f32 at load time for the
+/// same reason the layer norms are: the file buffer has no alignment guarantee.
+#[derive(Default)]
+struct LayerNormExtras {
+    /// Per-head query/key norms, `head_dim` values each (Qwen3, Gemma3).
+    qk: Option<(Vec<f32>, Vec<f32>)>,
+    /// Gemma2's sandwich norms on the attention and MLP outputs,
+    /// `hidden_size` values each.
+    sandwich: Option<(Vec<f32>, Vec<f32>)>,
 }
 
 /// A loaded `.raimodel`, ready to run.
@@ -42,7 +53,12 @@ pub struct RaiModel {
     layer_input_norms: Vec<Vec<f32>>,
     layer_post_attn_norms: Vec<Vec<f32>>,
     layer_biases: Vec<LayerBiases>,
+    layer_norm_extras: Vec<LayerNormExtras>,
     final_norm_weights: Vec<f32>,
+    /// How a raw query-key dot product becomes an attention logit for this
+    /// model: the header's scale (or `1/sqrt(head_dim)`) and its softcap.
+    /// Derived once at load so no forward pass recomputes a square root.
+    shaping: ScoreShaping,
     /// True if the model has a separate (untied) lm_head.
     pub has_separate_lm_head: bool,
 }
@@ -74,6 +90,7 @@ impl RaiModel {
         let mut layer_input_norms = Vec::with_capacity(num_layers);
         let mut layer_post_attn_norms = Vec::with_capacity(num_layers);
         let mut layer_biases = Vec::with_capacity(num_layers);
+        let mut layer_norm_extras = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
             let layer = file
                 .layer(i)
@@ -85,10 +102,28 @@ impl RaiModel {
                 *slot = layer.biases[index].map(format::read_f32_vector);
             }
             layer_biases.push(biases);
+            // `validate_layout` has already proven both halves of each pair are
+            // present exactly when the header says so, so zipping them cannot
+            // silently drop one.
+            layer_norm_extras.push(LayerNormExtras {
+                qk: layer
+                    .q_norm
+                    .zip(layer.k_norm)
+                    .map(|(q, k)| (format::read_f32_vector(q), format::read_f32_vector(k))),
+                sandwich: layer
+                    .attn_out_norm
+                    .zip(layer.mlp_out_norm)
+                    .map(|(a, m)| (format::read_f32_vector(a), format::read_f32_vector(m))),
+            });
         }
         let final_norm = file.final_norm()?;
         let final_norm_weights = format::read_norm_weights(&final_norm);
         let has_separate_lm_head = file.has_lm_head();
+
+        let shaping = ScoreShaping {
+            scale: config.attention_scale(),
+            softcap: config.attn_logit_softcap,
+        };
 
         Ok(Self {
             config,
@@ -97,7 +132,9 @@ impl RaiModel {
             layer_input_norms,
             layer_post_attn_norms,
             layer_biases,
+            layer_norm_extras,
             final_norm_weights,
+            shaping,
             has_separate_lm_head,
         })
     }
@@ -113,6 +150,24 @@ impl RaiModel {
     fn biases_for(&self, li: usize) -> ProjectionBiases<'_> {
         let stored = &self.layer_biases[li];
         std::array::from_fn(|index| stored[index].as_deref())
+    }
+
+    /// Layer `li`'s per-head query/key norms, or `None` for a model without
+    /// them (every model but Qwen3-shaped ones).
+    fn qk_norm_for(&self, li: usize) -> Option<QkNorm<'_>> {
+        self.layer_norm_extras[li].qk.as_ref().map(|(q, k)| QkNorm {
+            q,
+            k,
+            eps: self.config.norm_eps,
+        })
+    }
+
+    /// Layer `li`'s Gemma2 sandwich norms as `(attention output, MLP output)`.
+    fn sandwich_for(&self, li: usize) -> Option<(&[f32], &[f32])> {
+        self.layer_norm_extras[li]
+            .sandwich
+            .as_ref()
+            .map(|(attn, mlp)| (attn.as_slice(), mlp.as_slice()))
     }
 
     /// Allocate a KV cache for this model. Errors (rather than aborting) when
@@ -235,6 +290,17 @@ impl RaiModel {
                 &mut scratch.attn_work,
                 store_kv,
                 &biases,
+                self.qk_norm_for(li),
+                self.shaping,
+            );
+            // Gemma2's sandwich norm: the attention output is normalized before
+            // it rejoins the residual stream.
+            let sandwich = self.sandwich_for(li);
+            norm_block_output(
+                &mut scratch.attn_out,
+                &mut scratch.norm_tmp,
+                sandwich.map(|(attn, _)| attn),
+                eps,
             );
             vec_add(hidden, &scratch.residual, &scratch.attn_out);
 
@@ -255,6 +321,12 @@ impl RaiModel {
                 &mut scratch.mlp_work,
                 self.config.activation,
                 &biases,
+            );
+            norm_block_output(
+                &mut scratch.mlp_out,
+                &mut scratch.norm_tmp,
+                sandwich.map(|(_, mlp)| mlp),
+                eps,
             );
             vec_add(hidden, &scratch.residual, &scratch.mlp_out);
         }
@@ -304,6 +376,9 @@ impl RaiModel {
                 embed.group_size,
             );
         }
+        // Gemma2 caps the output logits as the very last step, after the head
+        // and before anything reads them (`modeling_gemma2.py:527-530`).
+        soft_cap_slice(&mut logits[..vocab_size], self.config.final_logit_softcap);
         Ok(())
     }
 
@@ -402,6 +477,15 @@ impl RaiModel {
                 &mut scratch.attn_work,
                 true,
                 &biases,
+                self.qk_norm_for(li),
+                self.shaping,
+            );
+            let sandwich = self.sandwich_for(li);
+            norm_block_output(
+                &mut scratch.attn_out,
+                &mut scratch.norm_tmp,
+                sandwich.map(|(attn, _)| attn),
+                eps,
             );
             vec_add(hidden, &scratch.residual, &scratch.attn_out);
 
@@ -421,6 +505,12 @@ impl RaiModel {
                 &mut scratch.mlp_work,
                 self.config.activation,
                 &biases,
+            );
+            norm_block_output(
+                &mut scratch.mlp_out,
+                &mut scratch.norm_tmp,
+                sandwich.map(|(_, mlp)| mlp),
+                eps,
             );
             vec_add(hidden, &scratch.residual, &scratch.mlp_out);
         }
@@ -523,6 +613,30 @@ impl RaiModel {
             add_bias_batch(&mut bs.k_batch, biases[1], kv_dim, batch);
             add_bias_batch(&mut bs.v_batch, biases[2], kv_dim, batch);
 
+            // 2c. Per-head QK norm, per token, on exactly the same buffer the
+            //     sequential path norms and in the same order relative to the
+            //     bias and RoPE. Same function, same inputs, so the two paths
+            //     stay bit-identical.
+            let qk_norm = self.qk_norm_for(li);
+            if let Some(norm) = qk_norm {
+                for b in 0..batch {
+                    rms_norm_heads(
+                        &mut bs.q_batch[b * q_dim..(b + 1) * q_dim],
+                        nh,
+                        hd,
+                        norm.q,
+                        norm.eps,
+                    );
+                    rms_norm_heads(
+                        &mut bs.k_batch[b * kv_dim..(b + 1) * kv_dim],
+                        nkv,
+                        hd,
+                        norm.k,
+                        norm.eps,
+                    );
+                }
+            }
+
             // 3a. RoPE + KV store for every token first. This is cheap and
             //     inherently sequential (the cache forbids gaps).
             for b in 0..batch {
@@ -551,6 +665,7 @@ impl RaiModel {
                 nh,
                 nkv,
                 hd,
+                self.shaping,
             );
 
             // 4. Batched O projection
@@ -565,6 +680,17 @@ impl RaiModel {
                 layer.o_proj.group_size,
             );
             add_bias_batch(&mut bs.o_out, biases[3], hs, batch);
+
+            // 4b. Gemma2 sandwich norm on the attention output, per token.
+            let sandwich = self.sandwich_for(li);
+            norm_block_output_batch(
+                &mut bs.o_out,
+                &mut bs.norm_tmp,
+                sandwich.map(|(attn, _)| attn),
+                hs,
+                batch,
+                eps,
+            );
 
             // 5. Add residual
             for b in 0..batch {
@@ -628,6 +754,14 @@ impl RaiModel {
                 layer.down_proj.group_size,
             );
             add_bias_batch(&mut bs.mlp_out, biases[6], hs, batch);
+            norm_block_output_batch(
+                &mut bs.mlp_out,
+                &mut bs.norm_tmp,
+                sandwich.map(|(_, mlp)| mlp),
+                hs,
+                batch,
+                eps,
+            );
 
             // 10. Add residual
             for b in 0..batch {
@@ -700,6 +834,13 @@ impl RaiModel {
                 );
             }
         }
+        // Per token, over exactly the same slice the sequential path caps.
+        for b in 0..batch {
+            soft_cap_slice(
+                &mut logits[b * vs..(b + 1) * vs],
+                self.config.final_logit_softcap,
+            );
+        }
         Ok(())
     }
 
@@ -723,6 +864,40 @@ fn add_bias_batch(buffer: &mut [f32], bias: Option<&[f32]>, row: usize, batch: u
     }
 }
 
+/// RMS-normalize a block's output in place, if this model normalizes it.
+///
+/// Gemma2's sandwich norm sits between a block and the residual add, so the
+/// value being normalized is also the destination. `rms_norm` cannot alias its
+/// input and output, so the result lands in `tmp` and is copied back — one
+/// `hidden_size` copy per block, against the projection that produced the
+/// vector.
+fn norm_block_output(out: &mut [f32], tmp: &mut Vec<f32>, weight: Option<&[f32]>, eps: f32) {
+    let Some(weight) = weight else {
+        return;
+    };
+    tmp.resize(out.len(), 0.0);
+    rms_norm(tmp, out, weight, eps);
+    out.copy_from_slice(tmp);
+}
+
+/// [`norm_block_output`] for every token of a batched buffer, on slices of the
+/// same length and alignment the sequential path uses.
+fn norm_block_output_batch(
+    buffer: &mut [f32],
+    tmp: &mut Vec<f32>,
+    weight: Option<&[f32]>,
+    row: usize,
+    batch: usize,
+    eps: f32,
+) {
+    if weight.is_none() {
+        return;
+    }
+    for b in 0..batch {
+        norm_block_output(&mut buffer[b * row..(b + 1) * row], tmp, weight, eps);
+    }
+}
+
 /// Scratch workspace for forward passes (does NOT contain the hidden state).
 #[derive(Default)]
 pub struct Scratch {
@@ -730,6 +905,8 @@ pub struct Scratch {
     pub attn_out: Vec<f32>,
     pub mlp_out: Vec<f32>,
     pub residual: Vec<f32>,
+    /// Destination for an aliasing in-place norm; see `norm_block_output`.
+    pub norm_tmp: Vec<f32>,
     pub attn_work: AttentionWork,
     pub mlp_work: MlpWork,
     /// Pre-allocated logits buffer (vocab_size f32s). Avoids 192 KB alloc per token.
@@ -743,6 +920,7 @@ impl Scratch {
             attn_out: Vec::new(),
             mlp_out: Vec::new(),
             residual: Vec::new(),
+            norm_tmp: Vec::new(),
             attn_work: AttentionWork::new(),
             mlp_work: MlpWork::new(),
             logits: Vec::new(),
@@ -790,6 +968,8 @@ pub struct BatchScratch {
     pub up_batch: Vec<f32>,
     pub mlp_out: Vec<f32>,
     pub scores: Vec<f32>,
+    /// Destination for an aliasing in-place norm; see `norm_block_output`.
+    pub norm_tmp: Vec<f32>,
 }
 
 impl BatchScratch {
@@ -806,6 +986,7 @@ impl BatchScratch {
             up_batch: Vec::new(),
             mlp_out: Vec::new(),
             scores: Vec::new(),
+            norm_tmp: Vec::new(),
         }
     }
 

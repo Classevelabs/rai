@@ -18,29 +18,54 @@
 //! shared. Bytes `56..64` stay reserved-zero (they are zero in every v1 file
 //! ever written) and `64..128` carry the new capability block:
 //!
-//! | offset | type | field |
-//! |--------|------|-------|
-//! | 64     | u8   | `activation` — 0 = SiLU/SwiGLU, 1 = GeLU-tanh/GeGLU |
-//! | 65     | u8   | `flags` — bit 0: per-layer projection biases present |
-//! | 66     | u8   | `rope_type` — 0 = default, 1 = llama3 |
-//! | 67     | u8   | `bias_mask` — bit *i* set: projection *i* carries a bias |
-//! | 68..72 | f32  | `rope_factor` |
-//! | 72..76 | f32  | `rope_low_freq_factor` |
-//! | 76..80 | f32  | `rope_high_freq_factor` |
-//! | 80..84 | u32  | `rope_original_max_position` |
-//! | 84..88 | f32  | `embed_scale` — input embeddings are multiplied by this |
-//! | 88..128| —    | reserved, must be zero |
+//! | offset  | type | field |
+//! |---------|------|-------|
+//! | 64      | u8   | `activation` — 0 = SiLU/SwiGLU, 1 = GeLU-tanh/GeGLU |
+//! | 65      | u8   | `flags` — bit 0: projection biases; bit 1: per-head QK norms |
+//! | 66      | u8   | `rope_type` — 0 = default, 1 = llama3 |
+//! | 67      | u8   | `bias_mask` — bit *i* set: projection *i* carries a bias |
+//! | 68..72  | f32  | `rope_factor` |
+//! | 72..76  | f32  | `rope_low_freq_factor` |
+//! | 76..80  | f32  | `rope_high_freq_factor` |
+//! | 80..84  | u32  | `rope_original_max_position` |
+//! | 84..88  | f32  | `embed_scale` — input embeddings are multiplied by this |
+//! | 88..92  | f32  | `attn_logit_softcap` — 0.0 = disabled |
+//! | 92..96  | f32  | `final_logit_softcap` — 0.0 = disabled |
+//! | 96..100 | f32  | `attn_scale` — 0.0 = the default `1/sqrt(head_dim)` |
+//! | 100..128| —    | reserved, must be zero |
 //!
 //! Unknown `activation`, `rope_type`, `flags` bits, `bias_mask` bits and any
 //! non-zero reserved byte are hard errors. A reader that cannot implement a
 //! capability must refuse the file, never run it with the capability ignored.
 //!
-//! `bias_mask` bit order is [`PROJECTION_NAMES`] order. When the bias flag is
-//! set, a layer section carries, *after* its seven quantized linears and
-//! *before* its two norm vectors, one `rows * 4`-byte f32 vector for each set
-//! mask bit, in the same order. Biases are stored as f32 rather than quantized:
-//! they are `rows` values against a matrix of `rows * cols`, so the space is
-//! noise and the quantization error would not be.
+//! # Layer section layout
+//!
+//! A layer section is, in order:
+//!
+//! 1. the seven quantized linears, in [`PROJECTION_NAMES`] order;
+//! 2. the **bias block** — present when `flags` bit 0 is set: one `rows * 4`-byte
+//!    f32 vector per set `bias_mask` bit, in the same order. Biases are stored
+//!    as f32 rather than quantized: they are `rows` values against a matrix of
+//!    `rows * cols`, so the space is noise and the quantization error would not
+//!    be;
+//! 3. the **QK-norm block** — present when `flags` bit 1 is set: exactly two
+//!    `head_dim * 4`-byte f32 vectors, `q_norm` then `k_norm`. They sit here,
+//!    after the biases and before the layer norms, so that the two hidden-sized
+//!    RMSNorm vectors every version has always remain the tail of the section;
+//! 4. the **sandwich-norm block** — present when `flags` bit 2 is set: two
+//!    `hidden_size * 4`-byte f32 vectors, `attn_out_norm` then `mlp_out_norm`,
+//!    applied to the attention and MLP *outputs* before the residual add;
+//! 5. the two `hidden_size * 4`-byte RMSNorm vectors, input then pre-MLP.
+//!
+//! Note the naming: slot 5's second vector is whichever norm the reference model
+//! applies to the residual stream before the MLP — `post_attention_layernorm`
+//! for Llama/Qwen/Gemma, `pre_feedforward_layernorm` for a sandwich-normed
+//! Gemma2. The sandwich block then carries Gemma2's *own*
+//! `post_attention_layernorm` and `post_feedforward_layernorm`, which act on the
+//! block outputs rather than on the residual stream.
+//!
+//! Each block is absent — not zero-length-but-declared — when its flag is clear,
+//! which is why a v1 layer section's size is unchanged by any of this.
 
 use anyhow::{bail, Context, Result};
 use half::f16;
@@ -79,8 +104,14 @@ pub const NUM_PROJECTIONS: usize = PROJECTION_NAMES.len();
 
 /// `flags` bit 0: the layer sections carry bias vectors.
 pub const FLAG_HAS_BIASES: u8 = 0x01;
+/// `flags` bit 1: the layer sections carry per-head `q_norm`/`k_norm` vectors,
+/// applied to each attention head before RoPE (Qwen3, Gemma3, OLMo2-style).
+pub const FLAG_HAS_QK_NORM: u8 = 0x02;
+/// `flags` bit 2: the layer sections carry the two extra "sandwich" norms that
+/// Gemma2 applies to the attention and MLP outputs before the residual add.
+pub const FLAG_HAS_SANDWICH_NORM: u8 = 0x04;
 /// Every `flags` bit this reader understands.
-const KNOWN_FLAGS: u8 = FLAG_HAS_BIASES;
+const KNOWN_FLAGS: u8 = FLAG_HAS_BIASES | FLAG_HAS_QK_NORM | FLAG_HAS_SANDWICH_NORM;
 /// Every `bias_mask` bit this reader understands (one per projection).
 const KNOWN_BIAS_MASK: u8 = 0x7F;
 const MAX_MODEL_FILE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
@@ -145,12 +176,40 @@ pub struct ModelConfig {
     /// the output projection uses the *unscaled* weights, so a folded table
     /// would multiply every logit by ~45. See `RaiModel::embed_token`.
     pub embed_scale: f32,
+    /// True when every layer section carries a `q_norm`/`k_norm` pair of
+    /// `head_dim` f32 values, RMS-normalizing each attention head before RoPE.
+    /// False for v1 files.
+    pub has_qk_norm: bool,
+    /// True when every layer section carries the two extra Gemma2 "sandwich"
+    /// norms applied to the attention and MLP outputs. False for v1 files.
+    pub has_sandwich_norm: bool,
+    /// `cap` in `cap * tanh(x / cap)` applied to attention logits before the
+    /// softmax. `0.0` disables it, which is every model but Gemma2.
+    pub attn_logit_softcap: f32,
+    /// The same transform applied to the final output logits. `0.0` disables it.
+    pub final_logit_softcap: f32,
+    /// Multiplier on the query-key dot product. `0.0` means "the default",
+    /// `1/sqrt(head_dim)`; see [`ModelConfig::attention_scale`]. Gemma2-27b is
+    /// the reason this exists: it sets `query_pre_attn_scalar` to 144 against a
+    /// `head_dim` of 128, and using the wrong one degrades the output rather
+    /// than failing visibly.
+    pub attn_scale: f32,
 }
 
 impl ModelConfig {
     /// Whether projection `index` (see [`PROJECTION_NAMES`]) carries a bias.
     pub fn has_bias(&self, index: usize) -> bool {
         index < NUM_PROJECTIONS && self.bias_mask & (1 << index) != 0
+    }
+
+    /// The multiplier applied to every query-key dot product: the stored
+    /// `attn_scale` when the header set one, else `1/sqrt(head_dim)`.
+    pub fn attention_scale(&self) -> f32 {
+        if self.attn_scale > 0.0 {
+            self.attn_scale
+        } else {
+            1.0 / (self.head_dim as f32).sqrt()
+        }
     }
 
     /// Total attention width, `num_heads * head_dim`. Equal to `hidden_size`
@@ -247,11 +306,23 @@ pub struct LayerRefs<'a> {
     pub up_proj: QuantizedLinear<'a>,
     pub down_proj: QuantizedLinear<'a>,
     pub input_layernorm: RMSNormWeights<'a>,
+    /// The norm applied to the residual stream before the MLP. This is the
+    /// reference model's `post_attention_layernorm` for Llama/Qwen/Gemma and its
+    /// `pre_feedforward_layernorm` for a sandwich-normed Gemma2.
     pub post_attn_layernorm: RMSNormWeights<'a>,
     /// Raw little-endian f32 bias vectors, indexed by [`PROJECTION_NAMES`]
     /// order. `None` wherever the header's `bias_mask` bit is clear — which is
     /// every entry for a v1 file.
     pub biases: [Option<&'a [u8]>; NUM_PROJECTIONS],
+    /// Per-head query/key RMSNorm weights, `head_dim` f32 values each. `None`
+    /// unless the header sets [`FLAG_HAS_QK_NORM`].
+    pub q_norm: Option<&'a [u8]>,
+    pub k_norm: Option<&'a [u8]>,
+    /// Gemma2's sandwich norms, applied to the attention and MLP outputs before
+    /// the residual add. `None` unless the header sets
+    /// [`FLAG_HAS_SANDWICH_NORM`].
+    pub attn_out_norm: Option<&'a [u8]>,
+    pub mlp_out_norm: Option<&'a [u8]>,
 }
 
 /// The full model file: header + validated heap-allocated data.
@@ -433,10 +504,49 @@ impl RaiModelFile {
                     ),
                 }
             }
+            // The QK-norm and sandwich blocks are held to exactly the standard
+            // the biases are: present iff the header says so, the declared
+            // length, and finite throughout.
+            let head_dim = self.config.head_dim as usize;
+            let hidden = self.config.hidden_size as usize;
+            for (declared, vector, values, name) in [
+                (self.config.has_qk_norm, refs.q_norm, head_dim, "q_norm"),
+                (self.config.has_qk_norm, refs.k_norm, head_dim, "k_norm"),
+                (
+                    self.config.has_sandwich_norm,
+                    refs.attn_out_norm,
+                    hidden,
+                    "attention output norm",
+                ),
+                (
+                    self.config.has_sandwich_norm,
+                    refs.mlp_out_norm,
+                    hidden,
+                    "MLP output norm",
+                ),
+            ] {
+                match (declared, vector) {
+                    (false, None) => {}
+                    (true, Some(bytes)) => {
+                        let expected = checked_mul(values, 4, "norm vector bytes")?;
+                        if bytes.len() != expected {
+                            bail!(
+                                "layer {layer} {name} is {} bytes, expected {expected}",
+                                bytes.len()
+                            );
+                        }
+                        validate_f32_vector(bytes, &format!("layer {layer} {name}"))?;
+                    }
+                    (declared, _) => bail!(
+                        "layer {layer} {name} presence disagrees with the header (flags say \
+                         {declared})"
+                    ),
+                }
+            }
             validate_norm_weights(&refs.input_layernorm, &format!("layer {layer} input norm"))?;
             validate_norm_weights(
                 &refs.post_attn_layernorm,
-                &format!("layer {layer} post-attention norm"),
+                &format!("layer {layer} pre-MLP norm"),
             )?;
         }
         let final_norm = self.final_norm().context("validating final norm")?;
@@ -559,6 +669,35 @@ impl RaiModelFile {
             offset = end;
         }
 
+        // QK-norm block: q_norm then k_norm, `head_dim` f32 values each. Both
+        // or neither — one flag covers the pair, because a model that normed
+        // only its queries would need a different flag to say so.
+        let head_dim = self.config.head_dim as usize;
+        let take_vector = |offset: &mut usize, values: usize, label: &str| -> Result<&[u8]> {
+            let bytes = checked_mul(values, 4, label)?;
+            let end = checked_add(*offset, bytes, label)?;
+            if end > data.len() {
+                bail!("layer {layer_idx}: {label} truncated");
+            }
+            let slice = &data[*offset..end];
+            *offset = end;
+            Ok(slice)
+        };
+        let (q_norm, k_norm) = if self.config.has_qk_norm {
+            let q = take_vector(&mut offset, head_dim, "q_norm")?;
+            let k = take_vector(&mut offset, head_dim, "k_norm")?;
+            (Some(q), Some(k))
+        } else {
+            (None, None)
+        };
+        let (attn_out_norm, mlp_out_norm) = if self.config.has_sandwich_norm {
+            let attn = take_vector(&mut offset, hidden, "attention output norm")?;
+            let mlp = take_vector(&mut offset, hidden, "MLP output norm")?;
+            (Some(attn), Some(mlp))
+        } else {
+            (None, None)
+        };
+
         // Two RMSNorm weight vectors: hidden_size * 4 bytes each
         let norm_bytes = checked_mul(hidden, 4, "norm bytes")?;
         let both_norms = checked_mul(2, norm_bytes, "layer norm bytes")?;
@@ -590,6 +729,10 @@ impl RaiModelFile {
             input_layernorm: input_ln,
             post_attn_layernorm: post_attn_ln,
             biases,
+            q_norm,
+            k_norm,
+            attn_out_norm,
+            mlp_out_norm,
         })
     }
 
@@ -735,6 +878,11 @@ fn parse_header(data: &[u8]) -> Result<HeaderInfo> {
         rope_scaling: RopeScaling::None,
         bias_mask: 0,
         embed_scale: 1.0,
+        has_qk_norm: false,
+        has_sandwich_norm: false,
+        attn_logit_softcap: 0.0,
+        final_logit_softcap: 0.0,
+        attn_scale: 0.0,
     };
     if version >= 2 {
         read_v2_capabilities(data, &mut config)?;
@@ -772,8 +920,8 @@ fn read_v2_capabilities(data: &[u8], config: &mut ModelConfig) -> Result<()> {
     if data[56..64].iter().any(|&byte| byte != 0) {
         bail!("header bytes 56..64 are reserved and must be zero");
     }
-    if data[88..HEADER_SIZE_V2].iter().any(|&byte| byte != 0) {
-        bail!("header bytes 88..128 are reserved and must be zero");
+    if data[100..HEADER_SIZE_V2].iter().any(|&byte| byte != 0) {
+        bail!("header bytes 100..128 are reserved and must be zero");
     }
 
     let activation_code = data[64];
@@ -805,6 +953,8 @@ fn read_v2_capabilities(data: &[u8], config: &mut ModelConfig) -> Result<()> {
         );
     }
     config.bias_mask = bias_mask;
+    config.has_qk_norm = flags & FLAG_HAS_QK_NORM != 0;
+    config.has_sandwich_norm = flags & FLAG_HAS_SANDWICH_NORM != 0;
 
     let rope_type = data[66];
     let factor = f32::from_le_bytes(data[68..72].try_into().unwrap());
@@ -857,7 +1007,24 @@ fn read_v2_capabilities(data: &[u8], config: &mut ModelConfig) -> Result<()> {
     }
     config.embed_scale = embed_scale;
 
+    // Softcaps and the attention scale are "0.0 means off"; anything else must
+    // be a usable positive number. A negative or NaN cap would sail straight
+    // through `cap * tanh(x / cap)` and poison every logit, so it is refused
+    // here rather than producing a model that loads and generates noise.
+    config.attn_logit_softcap = read_optional_positive(data, 88, "attn_logit_softcap")?;
+    config.final_logit_softcap = read_optional_positive(data, 92, "final_logit_softcap")?;
+    config.attn_scale = read_optional_positive(data, 96, "attn_scale")?;
+
     Ok(())
+}
+
+/// Read an f32 header field whose "unset" encoding is `0.0`.
+fn read_optional_positive(data: &[u8], offset: usize, name: &str) -> Result<f32> {
+    let value = f32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+    if !value.is_finite() || value < 0.0 {
+        bail!("{name} must be finite and non-negative (0.0 disables it), got {value}");
+    }
+    Ok(value)
 }
 
 fn validate_config(config: &ModelConfig) -> Result<()> {
@@ -1066,6 +1233,11 @@ mod tests {
             rope_scaling: RopeScaling::None,
             bias_mask: 0,
             embed_scale: 1.0,
+            has_qk_norm: false,
+            has_sandwich_norm: false,
+            attn_logit_softcap: 0.0,
+            final_logit_softcap: 0.0,
+            attn_scale: 0.0,
         }
     }
 
@@ -1234,12 +1406,27 @@ mod tests {
         build_model_bytes(1, 0, |_| {})
     }
 
+    /// [`build_model_bytes`] with extra per-layer vectors appended for the
+    /// capability `flags` requests, so the section size still adds up.
+    fn build_model_with_flags(flags: u8, patch: impl Fn(&mut [u8])) -> Vec<u8> {
+        build_model_bytes_inner(2, 0, flags, patch)
+    }
+
     /// Assemble the smallest legal model: 8-wide, 1 layer, 2-token vocab.
     ///
     /// `version` picks the header size, `bias_mask` adds the corresponding
     /// bias vectors to the layer section, and `patch` gets the finished header
     /// so a test can corrupt exactly one field.
     fn build_model_bytes(version: u32, bias_mask: u8, patch: impl Fn(&mut [u8])) -> Vec<u8> {
+        build_model_bytes_inner(version, bias_mask, 0, patch)
+    }
+
+    fn build_model_bytes_inner(
+        version: u32,
+        bias_mask: u8,
+        extra_flags: u8,
+        patch: impl Fn(&mut [u8]),
+    ) -> Vec<u8> {
         let header_size = if version >= 2 {
             HEADER_SIZE_V2
         } else {
@@ -1268,7 +1455,7 @@ mod tests {
         header[51] = 8;
         header[52..56].copy_from_slice(&3_u32.to_le_bytes());
         if version >= 2 {
-            header[65] = if bias_mask != 0 { FLAG_HAS_BIASES } else { 0 };
+            header[65] = if bias_mask != 0 { FLAG_HAS_BIASES } else { 0 } | extra_flags;
             header[67] = bias_mask;
             header[84..88].copy_from_slice(&1.0_f32.to_le_bytes());
         }
@@ -1290,6 +1477,16 @@ mod tests {
                     layer.extend_from_slice(&(row as f32 * 0.5).to_le_bytes());
                 }
             }
+        }
+        // head_dim and hidden are both 8 in this fixture, so each of the four
+        // optional vectors is 32 bytes.
+        if extra_flags & FLAG_HAS_QK_NORM != 0 {
+            for value in 0..16_u32 {
+                layer.extend_from_slice(&(1.0 + value as f32 / 16.0).to_le_bytes());
+            }
+        }
+        if extra_flags & FLAG_HAS_SANDWICH_NORM != 0 {
+            layer.extend_from_slice(&[0_u8; 64]);
         }
         layer.extend_from_slice(&[0_u8; 64]);
         let final_norm = vec![0_u8; 32];
@@ -1421,7 +1618,7 @@ mod tests {
             ),
             (
                 "flags",
-                Box::new(|h: &mut [u8]| h[65] = 0x02),
+                Box::new(|h: &mut [u8]| h[65] = 0x80),
                 "set bits this reader does not implement",
             ),
             (
@@ -1456,6 +1653,117 @@ mod tests {
                 "bad-embed-scale",
                 Box::new(|h: &mut [u8]| h[84..88].copy_from_slice(&0.0_f32.to_le_bytes())),
                 "embed_scale must be finite and positive",
+            ),
+        ] {
+            let error = open_error(label, build_model_bytes(2, 0, patch));
+            assert!(
+                error.contains(needle),
+                "{label}: expected {needle:?}, got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_locates_the_qk_norm_and_sandwich_blocks() {
+        let model = open_bytes(
+            "v2-qk-sandwich",
+            build_model_with_flags(FLAG_HAS_QK_NORM | FLAG_HAS_SANDWICH_NORM, |_| {}),
+        )
+        .unwrap();
+        assert!(model.config.has_qk_norm);
+        assert!(model.config.has_sandwich_norm);
+        let layer = model.layer(0).unwrap();
+        let q_norm = read_f32_vector(layer.q_norm.unwrap());
+        let k_norm = read_f32_vector(layer.k_norm.unwrap());
+        // The fixture writes 16 ascending values: the first 8 are q_norm, the
+        // next 8 k_norm. Getting the order or the offset wrong swaps them.
+        assert_eq!(
+            q_norm,
+            (0..8).map(|v| 1.0 + v as f32 / 16.0).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            k_norm,
+            (8..16).map(|v| 1.0 + v as f32 / 16.0).collect::<Vec<_>>()
+        );
+        assert_eq!(read_f32_vector(layer.attn_out_norm.unwrap()).len(), 8);
+        assert_eq!(read_f32_vector(layer.mlp_out_norm.unwrap()).len(), 8);
+        // The two hidden-sized norms must still be the tail of the section.
+        assert_eq!(read_norm_weights(&layer.input_layernorm).len(), 8);
+        assert_eq!(read_norm_weights(&layer.post_attn_layernorm).len(), 8);
+    }
+
+    #[test]
+    fn v2_carries_the_softcaps_and_the_attention_scale() {
+        let model = open_bytes(
+            "v2-softcap",
+            build_model_bytes(2, 0, |header| {
+                header[88..92].copy_from_slice(&50.0_f32.to_le_bytes());
+                header[92..96].copy_from_slice(&30.0_f32.to_le_bytes());
+                header[96..100].copy_from_slice(&0.125_f32.to_le_bytes());
+            }),
+        )
+        .unwrap();
+        assert_eq!(model.config.attn_logit_softcap, 50.0);
+        assert_eq!(model.config.final_logit_softcap, 30.0);
+        assert_eq!(model.config.attn_scale, 0.125);
+        assert_eq!(model.config.attention_scale(), 0.125);
+    }
+
+    #[test]
+    fn an_unset_attention_scale_falls_back_to_one_over_sqrt_head_dim() {
+        let model = open_bytes("v2-default-scale", build_model_bytes(2, 0, |_| {})).unwrap();
+        assert_eq!(model.config.attn_scale, 0.0);
+        // head_dim is 8 in the fixture.
+        assert_eq!(model.config.attention_scale(), 1.0 / 8.0_f32.sqrt());
+    }
+
+    #[test]
+    fn a_declared_qk_norm_that_is_missing_is_caught() {
+        // Set the flag without appending the vectors: the section then runs
+        // short and the size check is what notices.
+        let error = open_error(
+            "qk-norm-missing",
+            build_model_bytes(2, 0, |header| header[65] = FLAG_HAS_QK_NORM),
+        );
+        assert!(error.contains("section size mismatch"), "got {error:?}");
+    }
+
+    #[test]
+    fn a_declared_sandwich_norm_that_is_missing_is_caught() {
+        let error = open_error(
+            "sandwich-missing",
+            build_model_bytes(2, 0, |header| header[65] = FLAG_HAS_SANDWICH_NORM),
+        );
+        assert!(error.contains("section size mismatch"), "got {error:?}");
+    }
+
+    #[test]
+    fn the_new_capability_fields_are_still_validated() {
+        for (label, patch, needle) in [
+            (
+                "flags",
+                Box::new(|h: &mut [u8]| h[65] = 0x08) as Box<dyn Fn(&mut [u8])>,
+                "set bits this reader does not implement",
+            ),
+            (
+                "negative-attn-cap",
+                Box::new(|h: &mut [u8]| h[88..92].copy_from_slice(&(-1.0_f32).to_le_bytes())),
+                "attn_logit_softcap must be finite and non-negative",
+            ),
+            (
+                "nan-final-cap",
+                Box::new(|h: &mut [u8]| h[92..96].copy_from_slice(&f32::NAN.to_le_bytes())),
+                "final_logit_softcap must be finite and non-negative",
+            ),
+            (
+                "negative-scale",
+                Box::new(|h: &mut [u8]| h[96..100].copy_from_slice(&(-0.5_f32).to_le_bytes())),
+                "attn_scale must be finite and non-negative",
+            ),
+            (
+                "reserved-tail",
+                Box::new(|h: &mut [u8]| h[127] = 1),
+                "bytes 100..128 are reserved",
             ),
         ] {
             let error = open_error(label, build_model_bytes(2, 0, patch));
