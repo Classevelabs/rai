@@ -5,6 +5,7 @@
 //! - `Llama3Instruct`: `<|begin_of_text|><|start_header_id|>user<|end_header_id|>...`
 //! - `ChatML`: `<|im_start|>user ... <|im_start|>assistant` (Qwen, many others)
 //! - `Zephyr`: `<|user|> ... </s> <|assistant|>` (TinyLlama-Chat, Zephyr, StableLM)
+//! - `Phi3`: `<|user|> ... <|end|> <|assistant|>` (Phi-3, Phi-3.5)
 //! - `FewShot`: Simple few-shot prompt for base models (SmolLM-135M etc.)
 //! - `None`: Raw prompt passthrough
 
@@ -23,6 +24,13 @@ pub enum ChatTemplate {
     ChatML,
     /// Zephyr-style: `<|user|> ... </s> <|assistant|>` (TinyLlama-Chat, Zephyr)
     Zephyr,
+    /// Phi-3: `<|user|> ... <|end|> <|assistant|>`.
+    ///
+    /// Shares Zephyr's role markers but ends a turn with `<|end|>` rather than
+    /// `</s>`. It needs its own variant because formatting Phi-3 as Zephyr
+    /// produces a prompt shape it was never trained on and leaves generation
+    /// with a stop sequence the model never emits.
+    Phi3,
 }
 
 impl ChatTemplate {
@@ -49,6 +57,7 @@ impl ChatTemplate {
                 format!("<|im_start|>user\n{user_message}<|im_end|>\n<|im_start|>assistant\n")
             }
             ChatTemplate::Zephyr => format!("<|user|>\n{user_message}</s>\n<|assistant|>\n"),
+            ChatTemplate::Phi3 => format!("<|user|>\n{user_message}<|end|>\n<|assistant|>\n"),
         }
     }
 
@@ -61,6 +70,7 @@ impl ChatTemplate {
             ChatTemplate::Llama3Instruct => &["<|eot_id|>", "<|end_of_text|>"],
             ChatTemplate::ChatML => &["<|im_end|>", "<|im_start|>"],
             ChatTemplate::Zephyr => &["</s>", "<|user|>"],
+            ChatTemplate::Phi3 => &["<|end|>", "<|user|>", "<|endoftext|>"],
         }
     }
 
@@ -73,6 +83,7 @@ impl ChatTemplate {
             ChatTemplate::Llama3Instruct => "Llama-3 Instruct",
             ChatTemplate::ChatML => "ChatML",
             ChatTemplate::Zephyr => "Zephyr",
+            ChatTemplate::Phi3 => "Phi-3",
         }
     }
 
@@ -94,6 +105,15 @@ impl ChatTemplate {
         // ChatML sentinel: <|im_start|> (Qwen and many fine-tunes)
         if tokenizer.token_to_id("<|im_start|>").is_some() {
             return ChatTemplate::ChatML;
+        }
+        // Phi-3 is tested before Zephyr: it carries <|assistant|> too, so
+        // checking Zephyr's sentinel first would silently select a template
+        // whose turn terminator (</s>) Phi-3 never emits. <|end|> separates
+        // them.
+        if tokenizer.token_to_id("<|end|>").is_some()
+            && tokenizer.token_to_id("<|assistant|>").is_some()
+        {
+            return ChatTemplate::Phi3;
         }
         // Zephyr sentinel: <|assistant|> (TinyLlama-Chat, Zephyr, StableLM-Zephyr)
         if tokenizer.token_to_id("<|assistant|>").is_some() {
@@ -117,6 +137,7 @@ impl ChatTemplate {
             "llama3" => ChatTemplate::Llama3Instruct,
             "chatml" => ChatTemplate::ChatML,
             "zephyr" => ChatTemplate::Zephyr,
+            "phi3" => ChatTemplate::Phi3,
             _ => {
                 eprintln!("warning: unknown chat template '{s}'; using auto-detect");
                 Self::auto_detect(tokenizer)
@@ -204,6 +225,25 @@ mod tests {
     fn format_prompt_zephyr_closes_the_user_turn_and_opens_the_assistant_turn() {
         let prompt = ChatTemplate::Zephyr.format_prompt("What is 2+2?");
         assert_eq!(prompt, "<|user|>\nWhat is 2+2?</s>\n<|assistant|>\n");
+    }
+
+    /// Phi-3 and Zephyr differ by one token, and picking the wrong one costs
+    /// nothing at load time and everything at generation time: the prompt is
+    /// malformed and no stop sequence ever fires, so the model runs to
+    /// max-tokens emitting turn markers.
+    #[test]
+    fn phi3_ends_its_user_turn_with_end_not_eos() {
+        let prompt = ChatTemplate::Phi3.format_prompt("What is 2+2?");
+        assert_eq!(prompt, "<|user|>\nWhat is 2+2?<|end|>\n<|assistant|>\n");
+        assert_ne!(
+            ChatTemplate::Phi3.format_prompt("x"),
+            ChatTemplate::Zephyr.format_prompt("x"),
+            "Phi-3 must not collapse into the Zephyr template"
+        );
+        assert!(
+            ChatTemplate::Phi3.stop_sequences().contains(&"<|end|>"),
+            "generation would never stop"
+        );
     }
 
     #[test]

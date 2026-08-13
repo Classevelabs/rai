@@ -446,11 +446,18 @@ pub fn convert_with_progress(
 
     // Confirm every tensor exists with the shape the reader will demand, before
     // a single byte is written.
+    let layout = ProjectionLayout::detect(&store, num_layers)?;
+    layout.check_fused_tensors(&store, num_layers, &linear_dims)?;
     check_tensor(&store, "model.embed_tokens.weight", vocab, hidden)?;
     for layer in 0..num_layers {
         for (index, (name, (rows, cols))) in LAYER_LINEAR_NAMES.iter().zip(linear_dims).enumerate()
         {
-            check_tensor(&store, &layer_linear_name(layer, name), rows, cols)?;
+            // A fused projection was already checked as a whole, above; its
+            // parts have no tensor of their own to check.
+            let source = layout.source(layer, index, &linear_dims);
+            if source.row_offset == 0 && source.tensor == layer_linear_name(layer, name) {
+                check_tensor(&store, &source.tensor, rows, cols)?;
+            }
             if config.has_bias(index) {
                 check_vector(&store, &layer_bias_name(layer, name), rows)?;
             }
@@ -540,6 +547,7 @@ pub fn convert_with_progress(
         &mut store,
         &MatrixJob {
             tensor: "model.embed_tokens.weight",
+            source_row_offset: 0,
             label: "embedding",
             rows: vocab,
             cols: hidden,
@@ -560,13 +568,16 @@ pub fn convert_with_progress(
     for layer in 0..num_layers {
         let t0 = Instant::now();
         enter("layers", 1 + layer, Some((layer, num_layers)));
-        for (name, (rows, cols)) in LAYER_LINEAR_NAMES.iter().zip(linear_dims) {
+        for (index, (name, (rows, cols))) in LAYER_LINEAR_NAMES.iter().zip(linear_dims).enumerate()
+        {
             let label = format!("L{layer}.{name}");
+            let source = layout.source(layer, index, &linear_dims);
             let mse = write_matrix(
                 &mut file,
                 &mut store,
                 &MatrixJob {
-                    tensor: &layer_linear_name(layer, name),
+                    tensor: &source.tensor,
+                    source_row_offset: source.row_offset,
                     label: &label,
                     rows,
                     cols,
@@ -656,6 +667,7 @@ pub fn convert_with_progress(
             &mut store,
             &MatrixJob {
                 tensor: "lm_head.weight",
+                source_row_offset: 0,
                 label: "lm_head",
                 rows: vocab,
                 cols: hidden,
@@ -1168,15 +1180,19 @@ fn assert_exportable_architecture(
     }
 
     if let Some(store) = store {
-        if store
-            .info("model.layers.0.self_attn.q_proj.weight")
-            .is_none()
-            && num_layers > 0
-        {
+        // Either a separate q_proj or a fused qkv_proj (Phi-3) is enough; both
+        // absent means the module tree is not one this converter can walk.
+        let has_attention_weights = ["q_proj", "qkv_proj"].iter().any(|name| {
+            store
+                .info(&format!("model.layers.0.self_attn.{name}.weight"))
+                .is_some()
+        });
+        if !has_attention_weights && num_layers > 0 {
             bail!(
-                "this checkpoint does not expose model.layers.0.self_attn.q_proj.weight; the \
-                 converter supports Llama-style causal LMs (LlamaForCausalLM, \
-                 MistralForCausalLM, and architecturally identical models)."
+                "this checkpoint does not expose model.layers.0.self_attn.q_proj.weight or \
+                 model.layers.0.self_attn.qkv_proj.weight; the converter supports Llama-style \
+                 causal LMs (LlamaForCausalLM, MistralForCausalLM, Phi3ForCausalLM, and \
+                 architecturally identical models)."
             );
         }
 
@@ -1442,6 +1458,14 @@ pub fn preflight(
             attn_scale: resolve_attn_scale(hf, head_dim)?,
         };
         validate_model_config(&config)?;
+        // Studio's Check and `rai convert` are documented as running the same
+        // preflight, so the fused-projection widths are settled here too: a
+        // report saying "supported" that then failed at layer 0 on a shape
+        // would be worse than no report.
+        if let Some(store) = store.as_ref() {
+            let layout = ProjectionLayout::detect(store, num_layers)?;
+            layout.check_fused_tensors(store, num_layers, &config.projection_dims())?;
+        }
         let (section_sizes, output_bytes) = plan_sections(&config, tied)?;
         Ok(PreflightContainer {
             version: config.version(),
@@ -1535,6 +1559,9 @@ fn check_vector(store: &SafeTensorsSet, name: &str, len: usize) -> Result<()> {
 
 struct MatrixJob<'a> {
     tensor: &'a str,
+    /// First row of `tensor` to read. Non-zero only when the projection is a
+    /// slice of a fused tensor; see [`ProjectionLayout`].
+    source_row_offset: usize,
     label: &'a str,
     rows: usize,
     cols: usize,
@@ -1580,7 +1607,12 @@ fn write_matrix(file: &mut File, store: &mut SafeTensorsSet, job: &MatrixJob<'_>
     let mut row_start = 0usize;
     while row_start < rows {
         let block_rows = rows_per_block.min(rows - row_start);
-        store.read_rows(job.tensor, row_start, block_rows, &mut weights)?;
+        store.read_rows(
+            job.tensor,
+            job.source_row_offset + row_start,
+            block_rows,
+            &mut weights,
+        )?;
         codes.clear();
         codes.resize(block_rows * row_code_bytes, 0);
         let block_params =
@@ -1885,6 +1917,126 @@ fn write_header(file: &mut File, config: &RaiConfig, num_sections: u32) -> Resul
 // =============================================================================
 // Helpers
 // =============================================================================
+
+/// How a checkpoint lays out the seven projections a layer stores.
+///
+/// Most families give each projection its own tensor. Phi-3 concatenates Q, K
+/// and V into one `qkv_proj` and gate/up into one `gate_up_proj`, so the same
+/// seven matrices are row ranges of two larger ones. Nothing about the
+/// container changes: the quantizer already reads a tensor by row range, so a
+/// fused checkpoint is split during conversion and the resulting file is
+/// indistinguishable from one written from separate tensors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProjectionLayout {
+    /// `q_proj`, `k_proj`, `v_proj`, `gate_proj`, `up_proj` each stand alone.
+    Separate,
+    /// `qkv_proj` holds Q then K then V; `gate_up_proj` holds gate then up.
+    FusedQkvGateUp,
+}
+
+/// Which tensor a projection lives in, and the row it starts at.
+struct ProjectionSource {
+    tensor: String,
+    row_offset: usize,
+}
+
+impl ProjectionLayout {
+    /// Decide the layout from the tensors that are actually present.
+    ///
+    /// Detection is by tensor, not by `model_type`: a fine-tune that renames
+    /// itself still has to say where its weights are, and a family we have
+    /// never seen that happens to fuse the same way converts for free.
+    fn detect(store: &SafeTensorsSet, num_layers: u32) -> Result<Self> {
+        let fused = |layer: u32| {
+            store
+                .info(&format!("model.layers.{layer}.self_attn.qkv_proj.weight"))
+                .is_some()
+        };
+        if num_layers == 0 || !fused(0) {
+            return Ok(Self::Separate);
+        }
+        // A checkpoint that fuses only some layers would convert the rest from
+        // tensors that are not there; say so here rather than at layer 12.
+        for layer in 1..num_layers {
+            if !fused(layer) {
+                bail!(
+                    "checkpoint is inconsistent: layer 0 fuses Q/K/V into qkv_proj but layer \
+                     {layer} does not. Every layer must use the same projection layout."
+                );
+            }
+        }
+        Ok(Self::FusedQkvGateUp)
+    }
+
+    /// Where projection `index` of `layer` is read from.
+    ///
+    /// `index` is a position in [`LAYER_LINEAR_NAMES`]: q, k, v, o, gate, up,
+    /// down. The row offsets follow `Phi3Attention.forward`, which slices the
+    /// fused output as Q, then K, then V, and `Phi3MLP.forward`, which splits
+    /// the fused MLP output into gate then up.
+    fn source(self, layer: u32, index: usize, dims: &[(usize, usize); 7]) -> ProjectionSource {
+        let attn = |offset: usize| ProjectionSource {
+            tensor: format!("model.layers.{layer}.self_attn.qkv_proj.weight"),
+            row_offset: offset,
+        };
+        let mlp = |offset: usize| ProjectionSource {
+            tensor: format!("model.layers.{layer}.mlp.gate_up_proj.weight"),
+            row_offset: offset,
+        };
+        let separate = || ProjectionSource {
+            tensor: layer_linear_name(layer, LAYER_LINEAR_NAMES[index]),
+            row_offset: 0,
+        };
+        match (self, index) {
+            (Self::Separate, _) => separate(),
+            (Self::FusedQkvGateUp, 0) => attn(0),
+            (Self::FusedQkvGateUp, 1) => attn(dims[0].0),
+            (Self::FusedQkvGateUp, 2) => attn(dims[0].0 + dims[1].0),
+            (Self::FusedQkvGateUp, 4) => mlp(0),
+            (Self::FusedQkvGateUp, 5) => mlp(dims[4].0),
+            // `o_proj` and `down_proj` are never fused: they project back down,
+            // so there is nothing to concatenate them with.
+            (Self::FusedQkvGateUp, _) => separate(),
+        }
+    }
+
+    /// Confirm the fused tensors are exactly as wide as the parts they hold.
+    ///
+    /// Without this a config that disagrees with the checkpoint would silently
+    /// read V's rows as K's — a file that loads cleanly and generates nonsense,
+    /// which is the failure this converter exists to prevent.
+    fn check_fused_tensors(
+        self,
+        store: &SafeTensorsSet,
+        num_layers: u32,
+        dims: &[(usize, usize); 7],
+    ) -> Result<()> {
+        if self != Self::FusedQkvGateUp {
+            return Ok(());
+        }
+        let hidden = dims[0].1;
+        let qkv_rows = dims[0].0 + dims[1].0 + dims[2].0;
+        let gate_up_rows = dims[4].0 + dims[5].0;
+        for layer in 0..num_layers {
+            let qkv = format!("model.layers.{layer}.self_attn.qkv_proj.weight");
+            let gate_up = format!("model.layers.{layer}.mlp.gate_up_proj.weight");
+            check_tensor(store, &qkv, qkv_rows, hidden)?;
+            check_tensor(store, &gate_up, gate_up_rows, hidden)?;
+            // The bias mask names the seven projections, so a bias on a fused
+            // tensor has no slot and would be dropped without a word.
+            for name in [&qkv, &gate_up] {
+                let bias = name.replace(".weight", ".bias");
+                if store.info(&bias).is_some() {
+                    bail!(
+                        "checkpoint carries '{bias}'; biases are stored per projection and a \
+                         fused tensor has no slot for one, so it would be silently dropped."
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
 
 fn layer_linear_name(layer: u32, projection: &str) -> String {
     format!(
