@@ -83,15 +83,20 @@ file is written — never silently mis-converted.
 
 | | |
 | --- | --- |
-| **Runs** | **Qwen2 / Qwen2.5 / Qwen3 (dense)**, **Llama-3.1 / 3.2**, **Gemma and Gemma2**, Llama-2, Mistral-7B v0.1–v0.3, TinyLlama, SmolLM / SmolLM2, and fine-tunes of those (Zephyr-7B, OpenHermes-Mistral, Vicuna) |
-| **Refused** | Mixtral and other mixture-of-experts models — use dense Mistral-7B instead; Gemma3, whose layers do not share one RoPE base — use gemma-2b-it; OLMo2, whose QK norm spans all heads at once — use Llama-3.1-8B; Phi / Falcon / GPT-NeoX / MPT / GPT-2, whose module tree is not Llama-shaped — use a Llama or Mistral model of the same size; any `rope_scaling` other than `default` or `llama3` |
+| **Runs** | **Qwen2 / Qwen2.5 / Qwen3 (dense)**, **Llama-3.1 / 3.2**, **Gemma and Gemma2**, **Phi-3 / Phi-3.5**, Llama-2, Mistral-7B v0.1–v0.3, TinyLlama, SmolLM / SmolLM2, and fine-tunes of those (Zephyr-7B, OpenHermes-Mistral, Vicuna) |
+| **Refused** | Mixtral and other mixture-of-experts models — use dense Mistral-7B instead; Gemma3, whose layers do not share one RoPE base — use gemma-2b-it; OLMo2, whose QK norm spans all heads at once — use Llama-3.1-8B; Falcon / GPT-NeoX / MPT / GPT-2 / Phi-2, whose module tree is not Llama-shaped — use a Llama or Mistral model of the same size; any `rope_scaling` other than `default` or `llama3` |
 
 Point `rai convert` at your folder, or press **Check** in Studio: both run the
 same preflight, refuse before writing anything, name the blocker, and name a
 model that does work. What to use instead of a refused checkpoint, and what has
 to be in the folder, are in **[docs/MODELS.md](./docs/MODELS.md)**.
-Qwen2.5-0.5B, Qwen3-0.6B, Llama-3.2-1B, gemma-2b-it and gemma-2-2b-it were each
-converted and generated coherent text.
+Qwen2.5-0.5B, Qwen3-0.6B, Llama-3.2-1B, gemma-2b-it, gemma-2-2b-it and
+Phi-3-mini-4k-instruct were each converted and generated coherent text.
+
+A folder holding a `pytorch_model.bin` rather than `.safetensors` is not read —
+that is a Python pickle, and loading one executes whatever code the file
+carries. The error names the file and hands you the one-line command that
+converts it.
 
 ## Why
 

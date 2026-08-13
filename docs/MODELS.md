@@ -38,15 +38,19 @@ do not matter.
 | `model.safetensors` | Yes, or the shards below | Single-file checkpoints. |
 | `model-00001-of-0000N.safetensors` + `model.safetensors.index.json` | Yes, or the single file above | Sharded checkpoints; the index is what the converter walks. |
 | `tokenizer.json` | Yes | Conversion refuses without it, because the runtime needs it next to the model. It is copied there for you. |
-| `pytorch_model.bin`, `*.pth`, `*.gguf`, `*.msgpack` | Not read | A repository that ships only these will not convert today. |
+| `pytorch_model.bin`, `*.pth`, `*.pt` | Deliberately not read | Python pickles. Unpickling runs whatever code the file contains, and a checkpoint downloaded from a model hub is exactly the file that must not be able to do that. The error names yours and prints the command that converts it. |
+| `*.gguf` | Not read | llama.cpp's format, already quantized. RAI converts from the original fp16/bf16 weights so it controls the quantization itself. |
 
 Two layouts fail for reasons that have nothing to do with the architecture, and
 both are fixable where you stand:
 
 - **Weights only as `pytorch_model.bin`.** Most such models have a
-  `.safetensors` sibling revision on the Hub; take that one, or write the
-  tensors out yourself with `safetensors.torch.save_file` before pointing RAI
-  at the folder.
+  `.safetensors` sibling revision on the Hub; take that one. Otherwise convert
+  it once, in an environment that already has torch — the exact command,
+  including the `weights_only=True` that keeps the load from executing code, is
+  printed in the error. This is a deliberate limit, not a missing feature: a
+  pickle reader would put arbitrary code execution inside a binary whose whole
+  argument is an auditable dependency tree.
 - **A `tokenizer.model` and no `tokenizer.json`.** Older SentencePiece
   repositories ship only the former. Load the folder once with
   `transformers.AutoTokenizer.from_pretrained(...)` and
@@ -73,7 +77,8 @@ that this format does store.
 | Mixtral-8x7B, Mixtral-8x22B | **Refused** | `mistralai/Mistral-7B-Instruct-v0.3` | A router plus per-expert MLPs; a layer holds one gate/up/down triple. |
 | Qwen3-MoE (30B-A3B, 235B-A22B) | **Refused** | `Qwen/Qwen2.5-14B-Instruct` | Mixture-of-experts routing, independently of the dense-Qwen3 line above. |
 | Any config with `num_experts` or `num_local_experts` | **Refused** | The dense model of the same family | Same reason. |
-| Phi-2, Phi-3, Phi-3.5 | **Refused** | `meta-llama/Llama-3.2-3B-Instruct`, `mistralai/Mistral-7B-Instruct-v0.3` | Phi-3 fuses QKV into one `qkv_proj` and gate/up into one `gate_up_proj`, so the seven tensors a layer stores are not there. |
+| Phi-3, Phi-3.5 | **Converts** | — | Its fused `qkv_proj` and `gate_up_proj` are split at conversion. Convert with `--max-context 2047` or lower (see sliding windows), and run with `--chat-template phi3`. Verified: Phi-3-mini-4k-instruct converts to 2,083 MB in 22.8 s and generates. |
+| Phi-2 | **Refused** | `meta-llama/Llama-3.2-3B-Instruct` | Not a Llama-shaped module tree; unlike Phi-3 it is not a fused variant of one. |
 | Falcon | **Refused** | `mistralai/Mistral-7B-Instruct-v0.3` | No Llama-style module tree. |
 | GPT-NeoX, Pythia | **Refused** | `meta-llama/Llama-3.2-1B-Instruct` (or SmolLM2 below 1B) | No Llama-style module tree. |
 | MPT | **Refused** | `mistralai/Mistral-7B-Instruct-v0.3` | No Llama-style module tree. |
@@ -152,7 +157,7 @@ The three fields that decide it most often are `model_type`, `num_experts`, and
 
 | Field | Convert it | Do not download |
 | --- | --- | --- |
-| `model_type` | `llama`, `mistral`, `qwen2`, `qwen3`, `gemma`, `gemma2` | `mixtral`, `qwen3_moe`, `olmo2`, `gemma3`, `gemma3_text`, `phi3`, `falcon`, `mpt`, `gpt_neox`, `gpt2` |
+| `model_type` | `llama`, `mistral`, `qwen2`, `qwen3`, `gemma`, `gemma2`, `phi3` | `mixtral`, `qwen3_moe`, `olmo2`, `gemma3`, `gemma3_text`, `phi`, `falcon`, `mpt`, `gpt_neox`, `gpt2` |
 | `num_experts` / `num_local_experts` | Absent or zero | Any positive value — no exceptions, whatever the family |
 | `rope_scaling` | `null`, absent, `{"rope_type": "default"}`, or `{"rope_type": "llama3", ...}` | Any other `rope_type`, including `linear`, `dynamic`, `yarn` |
 | `sliding_window` | Absent, or at least your `--max-context` | Present and below your `--max-context` — lower the context rather than dropping the model |
@@ -226,14 +231,15 @@ and generate nonsense, so the exporter rejects it instead.
 
 ### Sliding-window models
 
-Mistral and Gemma2 declare `sliding_window: 4096`. RAI always runs full causal
-attention.
+Mistral and Gemma2 declare `sliding_window: 4096`; Phi-3-mini-4k declares
+`2047`. RAI always runs full causal attention.
 Inside the window that is identical arithmetic; past it, the two diverge. The
 exporter therefore accepts a sliding-window checkpoint up to the window length
 and refuses a longer `--max-context`, naming the window in the error. Convert
-Mistral-7B and Gemma2 with `--max-context 4096` or lower. This is the one
-refusal that needs no different model — the same folder converts at a shorter
-context, and Studio offers that as a button rather than an alternative model.
+Mistral-7B and Gemma2 with `--max-context 4096` or lower, and Phi-3-mini-4k
+with `--max-context 2047`. This is the one refusal that needs no different
+model — the same folder converts at a shorter context, and Studio offers that
+as a button rather than an alternative model.
 
 ### Shape constraints that apply to every model
 
