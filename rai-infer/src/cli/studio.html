@@ -142,6 +142,20 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);
   border:1px solid var(--line-2);border-radius:var(--r2);corner-shape:var(--squircle);padding:11px 18px;font-family:var(--mono);
   font-size:11px;letter-spacing:.08em;color:var(--fg);box-shadow:0 8px 26px #0009;z-index:9;max-width:80vw}
 .toast.bad{border-color:var(--bad);color:#F2C0B6}
+/* refusal -> next step */
+.nx{margin-top:var(--s4);padding-top:var(--s4);border-top:1px solid var(--line)}
+.nx h4{margin:0 0 10px;font-family:var(--mono);font-size:10px;letter-spacing:.15em;text-transform:uppercase;
+  color:var(--fg-3);font-weight:400}
+.alt{display:flex;gap:var(--s3);align-items:center;flex-wrap:wrap;padding:10px 0;border-bottom:1px solid var(--line)}
+.alt:last-child{border-bottom:0}
+.alt code{font-family:var(--mono);font-size:12.5px;color:var(--fg);flex:1;min-width:190px;word-break:break-all}
+.alt .why{flex-basis:100%;color:var(--fg-3);font-size:12px}
+.cmd{display:flex;gap:var(--s3);align-items:center;background:var(--sunk);border:1px solid var(--line);
+  border-radius:var(--r1);corner-shape:var(--squircle);padding:10px 13px;margin:11px 0}
+.cmd code{font-family:var(--mono);font-size:12px;color:var(--fg);flex:1;min-width:0;overflow-x:auto;white-space:pre}
+.hint{color:var(--fg-2);font-size:12.5px;margin:9px 0 0}
+.hint code{font-family:var(--mono);font-size:12px;color:var(--fg)}
+.tech{color:var(--fg-3);font-family:var(--mono);font-size:11.5px;white-space:pre-wrap;margin-top:11px}
 ::-webkit-scrollbar{width:10px;height:10px}
 ::-webkit-scrollbar-track{background:var(--bg)}
 ::-webkit-scrollbar-thumb{background:var(--line-2);border-radius:100px}
@@ -299,11 +313,18 @@ function demo(path,opts){
   if(path.startsWith("/api/models"))return{count:DEMO_MODELS.length,dirs:[],models:DEMO_MODELS};
   if(path.startsWith("/api/load"))return{loaded:true,model_name:(body.path||"model").split(/[\/]/).pop(),max_context:2048};
   if(path.startsWith("/api/inspect")){
-    const bad=/gemma-?2|gemma-?3|qwen3|mixtral/i.test(body.source||"");
+    const src=String(body.source||"");
+    /* The server answers a repository id with 501: it has no HTTP client.
+       Mirror that here so the offline page exercises the same branch. */
+    if(/^[\w.-]+\/[\w.-]+$/.test(src)){
+      const e=new Error("'"+src+"' is not a path on this machine. /api/inspect reads local checkpoints only.");
+      e.status=501;throw e;
+    }
+    const bad=/mixtral|moe|falcon|phi|neox|mpt/i.test(src);
     return bad
-      ?{source:body.source,kind:"local-config-only",supported:false,weights_checked:false,model_type:"gemma2",
-        shape:{num_layers:42,parameters_human:"9.2B"},container:null,
-        reason:"this checkpoint cannot be represented by the .raimodel format:\n  - config declares attn_logit_softcapping; logit softcapping is not supported."}
+      ?{source:body.source,kind:"local-config-only",supported:false,weights_checked:false,model_type:"mixtral",
+        shape:{num_layers:32,parameters:46700000000,parameters_human:"46.7B"},container:null,
+        reason:"this checkpoint cannot be represented by the .raimodel format:\n  - config declares num_local_experts=8; mixture-of-experts routing is not supported."}
       :{source:body.source,kind:"local-checkpoint",supported:true,weights_checked:true,model_type:"qwen2",
         shape:{num_layers:24,parameters_human:"494.0M"},
         container:{output_bytes:335026528,output_human:"319.5 MB",format_version:2},
@@ -318,7 +339,10 @@ async function api(path,opts){
   const r=await fetch(path,opts);
   const text=await r.text();
   let data=null; try{data=text?JSON.parse(text):null}catch(e){}
-  if(!r.ok)throw new Error((data&&data.error)||text||("HTTP "+r.status));
+  /* The status code carries meaning the message alone does not: 501 on
+     /api/inspect means "that is a repository id, not a folder", which the UI
+     answers with a download command rather than a red error. */
+  if(!r.ok){const err=new Error((data&&data.error)||text||("HTTP "+r.status));err.status=r.status;throw err}
   return data;
 }
 function go(id){$$(".screen").forEach(s=>s.classList.toggle("on",s.id==="s-"+id));
@@ -419,6 +443,173 @@ function logAppend(lines){
   }
   l.scrollTop=l.scrollHeight;
 }
+/* ---------- a refusal has to end in a next step ----------
+   The server says precisely why a checkpoint cannot be represented. That is
+   true and, on its own, useless: the user still has a folder and no model.
+   Map the blocker it named onto a checkpoint from the same family that this
+   format does store, at the closest size, and hand over the command that
+   fetches it. The server stays the authority on the verdict — nothing here
+   decides what is supported, it only answers a refusal the server issued. */
+const LADDERS={
+  qwen:[[0.5e9,"Qwen/Qwen2.5-0.5B-Instruct"],[1.5e9,"Qwen/Qwen2.5-1.5B-Instruct"],
+        [3e9,"Qwen/Qwen2.5-3B-Instruct"],[7e9,"Qwen/Qwen2.5-7B-Instruct"],
+        [14e9,"Qwen/Qwen2.5-14B-Instruct"],[32e9,"Qwen/Qwen2.5-32B-Instruct"]],
+  gemma:[[2.5e9,"google/gemma-2b-it"],[8.5e9,"google/gemma-7b-it"]],
+  llama:[[0.36e9,"HuggingFaceTB/SmolLM2-360M-Instruct"],[1.2e9,"meta-llama/Llama-3.2-1B-Instruct"],
+         [3.2e9,"meta-llama/Llama-3.2-3B-Instruct"],[8e9,"meta-llama/Llama-3.1-8B-Instruct"]],
+  mistral:[[7.2e9,"mistralai/Mistral-7B-Instruct-v0.3"]],
+};
+/* Parameter count if the config parsed; otherwise read the size out of the
+   folder name, which is where model names carry it. Zero means unknown. */
+function paramCount(r,source){
+  const n=r&&r.shape&&r.shape.parameters;
+  if(n)return Number(n);
+  const b=/(\d+(?:\.\d+)?)\s*b\b/i.exec(source), m=/(\d+(?:\.\d+)?)\s*m\b/i.exec(source);
+  if(b)return parseFloat(b[1])*1e9;
+  if(m)return parseFloat(m[1])*1e6;
+  return 0;
+}
+/* Closest rung by ratio, so 0.6B lands on 0.5B rather than on 1.5B. */
+function pick(family,params,why){
+  const rungs=LADDERS[family];
+  let best=rungs[Math.min(1,rungs.length-1)];
+  if(params>0){
+    let d=Infinity;
+    for(const rung of rungs){
+      const gap=Math.abs(Math.log(params/rung[0]));
+      if(gap<d){d=gap;best=rung}
+    }
+  }
+  return{id:best[1],why:why};
+}
+/* Which blocker the server named, in one plain sentence, plus what to run
+   instead. Matched on the wording the converter emits; an unrecognized
+   refusal still gets the generic answer rather than nothing. */
+function diagnose(r,source){
+  const reason=String((r&&r.reason)||""), tag=(String((r&&r.model_type)||"")+" "+source).toLowerCase();
+  const params=paramCount(r,source), qwen=/qwen/.test(tag), gemma=/gemma/.test(tag);
+  const same="Same family, same tokenizer and chat format.";
+  const near="Llama architecture at a comparable size; this is the shape the format is built around.";
+  if(/mixture-of-experts|num_experts|num_local_experts/.test(reason)){
+    /* An MoE checkpoint counts every expert in its parameter total but runs
+       only a few per token, so matching a dense model to that total would
+       propose far more compute than the model actually spends. */
+    const dense=Math.min(params||0,14e9);
+    return{plain:"This checkpoint routes each token through a set of expert MLPs. A layer here stores one gate/up/down MLP and no router, so there is nowhere for the experts to go.",
+      picks:qwen?[pick("qwen",dense,same),pick("mistral",dense,"Dense 7B with the same module tree.")]
+                :[pick("mistral",dense,"The dense Mistral-7B that Mixtral is assembled from."),pick("llama",dense,near)]};
+  }
+  const verifiedGemma={id:"google/gemma-2b-it",why:"The Gemma checkpoint verified generating on this build."};
+  /* When the converter refuses an architecture by name it also says, in plain
+     words, what that architecture does differently. Quote it rather than
+     guessing: this branch stays correct as the supported set moves. */
+  const named=/is not supported: ([^\n]+)/.exec(reason);
+  if(named)
+    return{plain:named[1].replace(/\s+/g," ").trim(),
+      picks:gemma?[pick("gemma",params,"An earlier Gemma generation, which this format does store."),verifiedGemma]
+           :qwen?[pick("qwen",params,same)]
+                :[pick("llama",params,near),pick("mistral",params,"Dense 7B with the same module tree.")]};
+  if(/QK norm|q_norm|k_norm/.test(reason))
+    return{plain:"Every attention head in this checkpoint carries its own Q and K normalization weights. A layer here has two norm vectors and both are already spoken for.",
+      picks:qwen?[pick("qwen",params,"Qwen2.5 is the previous generation of the same family and carries no per-head norms.")]
+           :gemma?[pick("gemma",params,"The first Gemma generation has no per-head norms."),verifiedGemma]
+                 :[pick("llama",params,near),pick("mistral",params,"Dense 7B alternative with the same module tree.")]};
+  if(/softcapping/.test(reason))
+    return{plain:"The config caps attention scores and final logits through a tanh. That is an extra operation in the forward pass, not an extra weight, and this format stores weights.",
+      picks:gemma?[pick("gemma",params,"The first Gemma generation has no softcapping."),verifiedGemma]
+                 :[pick("llama",params,near)]};
+  if(/rope_scaling|rope_type/.test(reason))
+    return{plain:"This checkpoint rescales rotary positions with a scheme the container does not store. It holds plain RoPE and the llama3 scheme, and nothing else.",
+      picks:[pick("llama",params,"Llama-3.1 and 3.2 use the llama3 scheme, which is stored and applied."),
+             pick("mistral",params,"Plain RoPE, no scaling.")]};
+  if(/does not expose model\.layers|LlamaForCausalLM/.test(reason))
+    return{plain:"The projections in this checkpoint are fused or named differently, so the seven tensors a layer stores are not there to read.",
+      picks:[pick("llama",params,near),pick("mistral",params,"Dense 7B with the same seven projections per layer.")]};
+  if(/lm_head\.bias/.test(reason))
+    return{plain:"This checkpoint puts a bias on the output projection. Biases are stored for the seven layer projections only, so that vector would be dropped in silence.",
+      picks:[pick("llama",params,near)]};
+  if(/inconsistent/.test(reason))
+    return{plain:"The layers of this checkpoint disagree about which projections carry biases, and one mask covers the whole file. Converting it would drop real parameters.",
+      picks:[pick("qwen",params,"Qwen2.5 biases the same projections in every layer.")]};
+  return{plain:"This checkpoint needs a weight or an operation the .raimodel container does not store.",
+    picks:[pick("llama",params,near),pick("qwen",params,"Qwen2.5, verified generating at 0.5B.")]};
+}
+/* A sliding window is not a family problem: the same checkpoint converts at a
+   shorter context. Offer that instead of an alternative model. */
+function windowFix(reason){
+  const m=/sliding_window=(\d+)/.exec(String(reason||""));
+  return m?Number(m[1]):0;
+}
+function downloadCmd(id){return "huggingface-cli download "+id+" --local-dir ./"+(id.split("/").pop()||"model")}
+function fallbackCopy(text,done){
+  const box=document.createElement("textarea");
+  box.value=text;box.style.position="fixed";box.style.opacity="0";
+  document.body.appendChild(box);box.select();
+  try{document.execCommand("copy");done()}catch(e){toast("Copy failed; select the text by hand",true)}
+  box.remove();
+}
+function copy(text,label){
+  const done=()=>toast(label||"Copied");
+  if(navigator.clipboard&&navigator.clipboard.writeText)
+    return void navigator.clipboard.writeText(text).then(done,()=>fallbackCopy(text,done));
+  fallbackCopy(text,done);
+}
+function altRow(a){
+  return `<div class="alt"><code>${esc(a.id)}</code>
+    <button class="btn sm ghost" data-alt-use="${esc(a.id)}">Use</button>
+    <button class="btn sm ghost" data-alt-cmd="${esc(a.id)}">Copy command</button>
+    <span class="why">${esc(a.why)}</span></div>`;
+}
+/* The whole answer to a refusal: the blocker in one sentence, the exact words
+   from the converter underneath it, then what to run instead. */
+function refusalPanel(r,source){
+  const win=windowFix(r&&r.reason);
+  const plain=win
+    ?"This checkpoint attends over a "+win+"-token window. RAI always runs full causal attention, so past that window the two diverge."
+    :diagnose(r,source).plain;
+  let html=`<div style="color:var(--fg);font-size:13px">${esc(plain)}</div>
+    <div class="tech">${esc((r&&r.reason)||"")}</div>
+    <div class="nx"><h4>What to do instead</h4>`;
+  if(win)return html+`<p class="hint">The same folder converts at a context of ${win} or lower. Nothing else about it is a problem.</p>
+    <p class="hint"><button class="btn sm ghost" data-ctxfix="${win}">Set context to ${win}</button></p></div>`;
+  const seen=new Set(), picks=diagnose(r,source).picks.filter(a=>a&&!seen.has(a.id)&&seen.add(a.id));
+  if(picks.length)html+=`<div>${picks.map(altRow).join("")}</div>
+    <p class="hint">Download one into a folder, then point Source at that folder. Use fills the field above; Copy command gives you the <code>huggingface-cli</code> line.</p>`;
+  return html+"</div>";
+}
+/* /api/inspect answers a repository id with 501: this build has no HTTP
+   client, so it reads folders only. That is a step, not a failure. */
+function notLocalPanel(source,message){
+  const id=source.replace(/^[\s\/]+|[\s\/]+$/g,"");
+  const dir="./"+(id.split("/").pop()||"model");
+  const cmd=downloadCmd(id);
+  return `<p class="hint">RAI inspects checkpoints on disk. This build carries no HTTP client, so it will not fetch <code>${esc(id)}</code> for you. Download it first:</p>
+    <div class="cmd"><code>${esc(cmd)}</code>
+      <button class="btn sm ghost" data-cmd="${esc(cmd)}">Copy</button></div>
+    <p class="hint">Then put that folder in Source: <code>${esc(dir)}</code>
+      <button class="btn sm ghost" data-usedir="${esc(dir)}">Use it</button></p>
+    <p class="hint">Any folder works as long as it holds <code>config.json</code>, the <code>.safetensors</code> weights, and <code>tokenizer.json</code>. Where you keep it is your choice.</p>
+    <p class="hint">If you meant a folder on this machine, this is also what an unknown path looks like. Check the spelling.</p>
+    <div class="tech">${esc(message||"")}</div>`;
+}
+/* Wire the buttons the panels above just wrote. */
+function bindNextStep(){
+  $$("[data-alt-use]").forEach(b=>b.addEventListener("click",()=>{
+    $("#src").value=b.dataset.altUse;$("#src").focus();
+    toast("Source set to "+b.dataset.altUse);
+  }));
+  $$("[data-alt-cmd]").forEach(b=>b.addEventListener("click",()=>
+    copy(downloadCmd(b.dataset.altCmd),"Download command copied")));
+  $$("[data-cmd]").forEach(b=>b.addEventListener("click",()=>copy(b.dataset.cmd,"Command copied")));
+  $$("[data-usedir]").forEach(b=>b.addEventListener("click",()=>{
+    $("#src").value=b.dataset.usedir;$("#src").focus();toast("Source set to "+b.dataset.usedir);
+  }));
+  $$("[data-ctxfix]").forEach(b=>b.addEventListener("click",()=>{
+    const want=b.dataset.ctxfix, sel=$("#ctx");
+    if(![...sel.options].some(o=>o.value===want))sel.add(new Option(want,want));
+    sel.value=want;toast("Context set to "+want+". Press Check again.");
+  }));
+}
 $("#inspectBtn").addEventListener("click",async()=>{
   const source=$("#src").value.trim();if(!source)return toast("Enter a checkpoint folder",true);
   $("#inspectSec").style.display="";$("#inspectCard").innerHTML="Checking…";
@@ -436,16 +627,25 @@ $("#inspectBtn").addEventListener("click",async()=>{
         <div><span class="lbl">Layers</span><div class="val" style="font-size:15px;margin-top:5px">${s.num_layers??"—"}</div></div>
         ${c?`<div><span class="lbl">Output</span><div class="val" style="font-size:15px;margin-top:5px;color:var(--accent)">${esc(c.output_human||"")}</div></div>`:""}
       </div>
-      <div style="color:${r.supported?"var(--fg-2)":"var(--bad)"};font-size:13px;white-space:pre-wrap">${esc(r.reason||"")}</div>
+      ${r.supported
+        ?`<div style="color:var(--fg-2);font-size:13px;white-space:pre-wrap">${esc(r.reason||"")}</div>`
+        :refusalPanel(r,source)}
       ${r.weights_checked===false?'<div class="lbl" style="margin-top:12px;text-transform:none;letter-spacing:.02em;font-size:11.5px">Config only — weight-level rules are checked when you convert.</div>':""}`;
+    bindNextStep();
     $("#convertBtn").disabled=!r.supported;
     if(r.supported&&!$("#out").value.trim()){
       const base=source.replace(/[\\/]+$/,"").split(/[\\/]/).pop().toLowerCase();
       $("#out").value=base+"-q4.raimodel";
     }
   }catch(e){
-    $("#inspectVerdict").innerHTML='<span style="color:var(--warn)">UNAVAILABLE</span>';
-    $("#inspectCard").innerHTML=`<div style="color:var(--fg-2);white-space:pre-wrap">${esc(e.message)}</div>`;
+    const notLocal=e.status===501||/not a path on this machine/.test(e.message||"");
+    $("#inspectVerdict").innerHTML=notLocal
+      ?'<span style="color:var(--warn)">NOT ON DISK</span>'
+      :'<span style="color:var(--warn)">UNAVAILABLE</span>';
+    $("#inspectCard").innerHTML=notLocal
+      ?notLocalPanel(source,e.message)
+      :`<div style="color:var(--fg-2);white-space:pre-wrap">${esc(e.message)}</div>`;
+    bindNextStep();
     $("#convertBtn").disabled=true;
   }
 });

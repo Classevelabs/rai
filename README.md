@@ -81,14 +81,22 @@ RAI runs the Llama-family decoder and the capabilities layered on top of it.
 Anything it cannot represent is refused at conversion time, by name, before a
 file is written — never silently mis-converted.
 
+<!-- FINALISE: the Landing row is a placeholder. Per-head QK norm (Qwen3,
+     OLMo2), logit softcapping (Gemma2) and possibly Gemma3-text are being
+     implemented; move each family into Runs or Refused when that work reports.
+     The same four are marked in docs/MODELS.md. -->
+
 | | |
 | --- | --- |
 | **Runs** | **Qwen2 / Qwen2.5**, **Llama-3.1 / 3.2**, **Gemma**, Llama-2, Mistral-7B v0.1–v0.3, TinyLlama, SmolLM / SmolLM2, and fine-tunes of those (Zephyr-7B, OpenHermes-Mistral, Vicuna) |
-| **Refused** | Qwen3 and OLMo2 (per-head QK norm), Gemma2 / Gemma3 (logit softcapping, QK norm), Mixtral and other MoE (router + expert weights), Phi / Falcon / GPT-NeoX (different module tree) |
+| **Refused** | Mixtral and other mixture-of-experts models — use dense Mistral-7B instead; Phi / Falcon / GPT-NeoX / MPT / GPT-2, whose module tree is not Llama-shaped — use a Llama or Mistral model of the same size; any `rope_scaling` other than `default` or `llama3` |
+| **Landing** | Qwen3, OLMo2, Gemma2, Gemma3 — verdict pending, alternatives listed in docs/MODELS.md |
 
-Qwen2.5-0.5B, Llama-3.2-1B and gemma-2b-it were each converted and generated
-coherent text; the reasons behind every row are in
-**[docs/MODELS.md](./docs/MODELS.md)**.
+Point `rai convert` at your folder, or press **Check** in Studio: both run the
+same preflight, refuse before writing anything, and name the blocker. What to
+use instead of a refused checkpoint, and what has to be in the folder, are in
+**[docs/MODELS.md](./docs/MODELS.md)**. Qwen2.5-0.5B, Llama-3.2-1B and
+gemma-2b-it were each converted and generated coherent text.
 
 ## Why
 
