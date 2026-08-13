@@ -28,6 +28,7 @@
 use anyhow::{bail, Context, Result};
 use half::f16;
 use rayon::prelude::*;
+use std::cell::Cell;
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -120,6 +121,26 @@ impl Default for ConvertOptions {
             quiet: false,
         }
     }
+}
+
+/// A progress event, emitted once per line the converter would print.
+///
+/// `rai convert` narrates itself on stdout, which is useless to a UI that is
+/// not a terminal. Every one of those lines also arrives here, tagged with the
+/// phase it belongs to and how much of the model has been written, so a caller
+/// can drive a per-layer progress bar without parsing log text.
+#[derive(Debug, Clone, Copy)]
+pub struct ConvertProgress<'a> {
+    /// Coarse phase: `planning`, `embedding`, `layers`, `final-norm`,
+    /// `lm_head`, `tokenizer`, `done`.
+    pub stage: &'a str,
+    /// Sections written so far, as a percentage of the sections planned.
+    /// Monotonic, `0.0..=100.0`.
+    pub percent: f32,
+    /// The human-readable line, byte for byte what the CLI prints.
+    pub message: &'a str,
+    /// `(layer_index, num_layers)` while quantizing layers, else `None`.
+    pub layer: Option<(u32, u32)>,
 }
 
 /// What a conversion produced.
@@ -236,6 +257,17 @@ struct GemmaFolds {
 
 /// Convert a HuggingFace checkpoint directory to `.raimodel`.
 pub fn convert(options: &ConvertOptions) -> Result<ConvertSummary> {
+    convert_with_progress(options, &|_| {})
+}
+
+/// [`convert`], with every narration line also delivered to `progress`.
+///
+/// Split out rather than added to [`ConvertOptions`] so that no existing
+/// caller's construction of that struct has to change.
+pub fn convert_with_progress(
+    options: &ConvertOptions,
+    progress: &dyn Fn(ConvertProgress<'_>),
+) -> Result<ConvertSummary> {
     let started = Instant::now();
     validate_options(options)?;
 
@@ -315,17 +347,36 @@ pub fn convert(options: &ConvertOptions) -> Result<ConvertSummary> {
             .join("tokenizer.json"),
     };
 
+    // Progress accounting: one unit per section (the embedding, each layer,
+    // the final norm, and `lm_head` when untied), so `percent` advances once
+    // per layer — the only granularity that means anything on a 7B model.
+    let total_units = (num_layers + 2 + u32::from(!tied)) as f32;
+    let done_units = Cell::new(0u32);
+    let stage = Cell::new("planning");
+    let layer_of = Cell::new(None::<(u32, u32)>);
+    let enter = |name: &'static str, done: u32, layer: Option<(u32, u32)>| {
+        stage.set(name);
+        done_units.set(done);
+        layer_of.set(layer);
+    };
+
     let log = |line: &str| {
         if !options.quiet {
             println!("{line}");
             let _ = std::io::stdout().flush();
         }
+        progress(ConvertProgress {
+            stage: stage.get(),
+            percent: 100.0 * done_units.get() as f32 / total_units,
+            message: line,
+            layer: layer_of.get(),
+        });
     };
 
     log(&format!("Output: {}", output_path.display()));
     log(&format!("Reading {}...", options.model_dir.display()));
     let mut store = SafeTensorsSet::open(&options.model_dir)?;
-    assert_exportable_architecture(&hf, &store, options.max_context, num_layers)?;
+    assert_exportable_architecture(&hf, Some(&store), options.max_context, num_layers)?;
 
     // Which projections carry biases is a property of the checkpoint, not the
     // config, so it can only be settled once the tensor namespace is open.
@@ -378,16 +429,7 @@ pub fn convert(options: &ConvertOptions) -> Result<ConvertSummary> {
     // ---- Plan the container ------------------------------------------------
     // Every section size follows from the config, so offsets can be written
     // before the data exists and each section can be streamed straight out.
-    let mut section_sizes: Vec<u64> = Vec::with_capacity(num_layers as usize + 3);
-    section_sizes.push(embedding_section_len(vocab, hidden, embed_group_size)?);
-    let layer_len = layer_section_len(&linear_dims, hidden, group_size, config.bias_mask)?;
-    for _ in 0..num_layers {
-        section_sizes.push(layer_len);
-    }
-    section_sizes.push(hidden as u64 * 4);
-    if !tied {
-        section_sizes.push(linear_section_len(vocab, hidden, group_size)?);
-    }
+    let (section_sizes, planned_total) = plan_sections(&config, tied)?;
 
     let num_sections = section_sizes.len();
     let data_start = config.header_size() + num_sections as u64 * SECTION_ENTRY_SIZE;
@@ -398,6 +440,7 @@ pub fn convert(options: &ConvertOptions) -> Result<ConvertSummary> {
         cursor += size;
     }
     let total_size = cursor;
+    debug_assert_eq!(total_size, planned_total);
 
     if let Some(parent) = output_path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -416,6 +459,7 @@ pub fn convert(options: &ConvertOptions) -> Result<ConvertSummary> {
     let quant_started = Instant::now();
 
     // ---- Section 0: embedding (8-bit) --------------------------------------
+    enter("embedding", 0, None);
     log("\n=== EMBEDDING 8-BIT ===");
     let t0 = Instant::now();
     let mse = write_matrix(
@@ -438,9 +482,11 @@ pub fn convert(options: &ConvertOptions) -> Result<ConvertSummary> {
     ));
 
     // ---- Sections 1..=L: layers --------------------------------------------
+    enter("layers", 1, None);
     log("\n=== RTN-4BIT QUANTIZATION ===");
     for layer in 0..num_layers {
         let t0 = Instant::now();
+        enter("layers", 1 + layer, Some((layer, num_layers)));
         for (name, (rows, cols)) in LAYER_LINEAR_NAMES.iter().zip(linear_dims) {
             let label = format!("L{layer}.{name}");
             let mse = write_matrix(
@@ -480,6 +526,7 @@ pub fn convert(options: &ConvertOptions) -> Result<ConvertSummary> {
             let tensor = format!("model.layers.{layer}.{suffix}.weight");
             write_f32_vector(&mut file, &mut store, &tensor, hidden, folds.norm_plus_one)?;
         }
+        enter("layers", 2 + layer, Some((layer, num_layers)));
         log(&format!(
             "  Layer {layer}/{num_layers}: {:.1}s",
             t0.elapsed().as_secs_f64()
@@ -487,6 +534,7 @@ pub fn convert(options: &ConvertOptions) -> Result<ConvertSummary> {
     }
 
     // ---- Section L+1: final norm -------------------------------------------
+    enter("final-norm", 1 + num_layers, None);
     write_f32_vector(
         &mut file,
         &mut store,
@@ -496,6 +544,7 @@ pub fn convert(options: &ConvertOptions) -> Result<ConvertSummary> {
     )?;
 
     // ---- Section L+2 (untied only): lm_head --------------------------------
+    enter("lm_head", 2 + num_layers, None);
     if tied {
         log("\n  lm_head: tied to embedding");
     } else {
@@ -528,6 +577,7 @@ pub fn convert(options: &ConvertOptions) -> Result<ConvertSummary> {
     file.flush()?;
     drop(file);
 
+    enter("tokenizer", total_units as u32, None);
     let quant_elapsed = quant_started.elapsed().as_secs_f64();
     log(&format!(
         "\nQuantization: {quant_elapsed:.1}s ({:.1} min)",
@@ -550,6 +600,7 @@ pub fn convert(options: &ConvertOptions) -> Result<ConvertSummary> {
     }
 
     let elapsed = started.elapsed();
+    enter("done", total_units as u32, None);
     log(&format!(
         "\n=== DONE in {:.1}s ({:.1} min) ===",
         elapsed.as_secs_f64(),
@@ -851,9 +902,13 @@ fn resolve_bias_mask(store: &SafeTensorsSet, num_layers: u32) -> Result<u8> {
 
 /// Mirror of `raimodel.assert_exportable_architecture`, driven by the config
 /// and the checkpoint's tensor names instead of a live torch module tree.
+///
+/// `store` is `None` when only a `config.json` is in hand (see [`preflight`]),
+/// in which case the three tensor-level rules cannot be evaluated and every
+/// config-level rule still is. Conversion itself always passes `Some`.
 fn assert_exportable_architecture(
     hf: &serde_json::Value,
-    store: &SafeTensorsSet,
+    store: Option<&SafeTensorsSet>,
     max_context: u32,
     num_layers: u32,
 ) -> Result<()> {
@@ -872,40 +927,42 @@ fn assert_exportable_architecture(
         }
     }
 
-    if store
-        .info("model.layers.0.self_attn.q_proj.weight")
-        .is_none()
-        && num_layers > 0
-    {
-        bail!(
-            "this checkpoint does not expose model.layers.0.self_attn.q_proj.weight; the \
-             converter supports Llama-style causal LMs (LlamaForCausalLM, MistralForCausalLM, \
-             and architecturally identical models)."
-        );
-    }
+    if let Some(store) = store {
+        if store
+            .info("model.layers.0.self_attn.q_proj.weight")
+            .is_none()
+            && num_layers > 0
+        {
+            bail!(
+                "this checkpoint does not expose model.layers.0.self_attn.q_proj.weight; the \
+                 converter supports Llama-style causal LMs (LlamaForCausalLM, \
+                 MistralForCausalLM, and architecturally identical models)."
+            );
+        }
 
-    // Per-layer projection biases (Qwen2/Qwen2.5) are a v2 capability now; see
-    // `resolve_bias_mask`, which is where an inconsistent set is caught. The
-    // *output* projection is a different matter: `bias_mask` covers the seven
-    // layer projections only, so an lm_head bias has nowhere to go and would be
-    // dropped in silence.
-    if store.info("lm_head.bias").is_some() {
-        problems.push(
-            "checkpoint carries lm_head.bias; the container stores biases for the seven layer \
-             projections only, so this would be silently dropped."
-                .to_string(),
-        );
-    }
+        // Per-layer projection biases (Qwen2/Qwen2.5) are a v2 capability now;
+        // see `resolve_bias_mask`, which is where an inconsistent set is
+        // caught. The *output* projection is a different matter: `bias_mask`
+        // covers the seven layer projections only, so an lm_head bias has
+        // nowhere to go and would be dropped in silence.
+        if store.info("lm_head.bias").is_some() {
+            problems.push(
+                "checkpoint carries lm_head.bias; the container stores biases for the seven \
+                 layer projections only, so this would be silently dropped."
+                    .to_string(),
+            );
+        }
 
-    let is_qk_norm =
-        |name: &str| name.contains(".self_attn.q_norm") || name.contains(".self_attn.k_norm");
-    let qk_normed = store.count_names(is_qk_norm);
-    if qk_normed > 0 {
-        let example = store.any_name(is_qk_norm).unwrap_or("");
-        problems.push(format!(
-            "{qk_normed} per-head QK norm(s) present (e.g. {example}); the format has no place \
-             to store them."
-        ));
+        let is_qk_norm =
+            |name: &str| name.contains(".self_attn.q_norm") || name.contains(".self_attn.k_norm");
+        let qk_normed = store.count_names(is_qk_norm);
+        if qk_normed > 0 {
+            let example = store.any_name(is_qk_norm).unwrap_or("");
+            problems.push(format!(
+                "{qk_normed} per-head QK norm(s) present (e.g. {example}); the format has no \
+                 place to store them."
+            ));
+        }
     }
 
     // `rope_scaling` is handled by `resolve_rope_scaling`, which accepts
@@ -955,6 +1012,228 @@ fn assert_exportable_architecture(
         );
     }
     Ok(())
+}
+
+/// What the container would store for a checkpoint the converter accepts.
+#[derive(Debug, Clone)]
+pub struct PreflightContainer {
+    /// Lowest container version that can express the model (1 or 2).
+    pub version: u32,
+    pub activation: Activation,
+    pub rope_scaling: RopeScaling,
+    /// Which of [`PROJECTION_NAMES`] carry biases. Always 0 when the weights
+    /// were not available to look at.
+    pub bias_mask: u8,
+    pub embed_scale: f32,
+    pub tied_embeddings: bool,
+    /// Exact size of the `.raimodel` this conversion would write.
+    pub output_bytes: u64,
+    pub num_sections: usize,
+}
+
+/// The result of [`preflight`]: can this checkpoint be converted, and if so
+/// into what.
+#[derive(Debug, Clone)]
+pub struct PreflightReport {
+    pub model_type: String,
+    pub architectures: Vec<String>,
+    pub hidden_size: u32,
+    pub num_layers: u32,
+    pub num_heads: u32,
+    pub num_kv_heads: u32,
+    pub head_dim: u32,
+    pub intermediate_size: u32,
+    pub vocab_size: u32,
+    pub max_position_embeddings: Option<u32>,
+    pub sliding_window: Option<u64>,
+    pub rope_theta: f32,
+    pub norm_eps: f32,
+    pub tied_embeddings: bool,
+    /// Parameter count implied by the config, in elements.
+    pub parameters: u64,
+    /// True when `rai convert` would accept this checkpoint.
+    pub supported: bool,
+    /// Why it would be accepted, or every reason it would not.
+    pub reason: String,
+    /// `None` when unsupported.
+    pub container: Option<PreflightContainer>,
+    /// False when only a `config.json` was available, so the three
+    /// tensor-level rules (`lm_head.bias`, per-head QK norms, per-layer bias
+    /// consistency) went unevaluated and a later conversion could still fail.
+    pub weights_checked: bool,
+}
+
+/// Answer "would `rai convert` accept this?" without downloading or writing
+/// weights.
+///
+/// This is the converter's own preflight, not a second implementation of it:
+/// [`resolve_head_dim`], [`resolve_activation`], [`resolve_rope_scaling`],
+/// [`assert_exportable_architecture`], [`resolve_bias_mask`] and
+/// [`validate_model_config`] are called in the order `convert` calls them, and
+/// the accept/reject answer is theirs. It exists so a user learns a 14 GB
+/// checkpoint is unsupported before downloading it, which is why `model_dir`
+/// is optional: with no weights on disk, the config-level rules still run.
+///
+/// `Err` means the config is not a transformer config at all (missing or
+/// malformed required fields). An unsupported *architecture* is a successful
+/// call with `supported: false`.
+pub fn preflight(
+    hf: &serde_json::Value,
+    model_dir: Option<&Path>,
+    group_size: u32,
+    embed_group_size: u32,
+    max_context: u32,
+) -> Result<PreflightReport> {
+    let hidden_size = required_u32(hf, "hidden_size")?;
+    let num_layers = required_u32(hf, "num_hidden_layers")?;
+    let num_heads = required_u32(hf, "num_attention_heads")?;
+    let num_kv_heads = optional_u32(hf, "num_key_value_heads")?.unwrap_or(num_heads);
+    let head_dim = resolve_head_dim(optional_u32(hf, "head_dim")?, hidden_size, num_heads)?;
+    let intermediate_size = required_u32(hf, "intermediate_size")?;
+    let vocab_size = required_u32(hf, "vocab_size")?;
+    let rope_theta = optional_f64(hf, "rope_theta")?.unwrap_or(10_000.0) as f32;
+    let norm_eps = optional_f64(hf, "rms_norm_eps")?.unwrap_or(1e-5) as f32;
+    let tied = hf
+        .get("tie_word_embeddings")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let model_type = hf
+        .get("model_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?")
+        .to_string();
+    let architectures = hf
+        .get("architectures")
+        .and_then(|v| v.as_array())
+        .map(|list| {
+            list.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Elements, not bytes: embedding + per-layer projections + norms + an
+    // untied head. The same arithmetic the shape summary is derived from.
+    let attention_dim = num_heads as u64 * head_dim as u64;
+    let kv_dim = num_kv_heads as u64 * head_dim as u64;
+    let hidden = hidden_size as u64;
+    let inter = intermediate_size as u64;
+    let per_layer =
+        hidden * attention_dim * 2 + hidden * kv_dim * 2 + hidden * inter * 3 + hidden * 2;
+    let parameters = vocab_size as u64 * hidden
+        + num_layers as u64 * per_layer
+        + hidden
+        + if tied { 0 } else { vocab_size as u64 * hidden };
+
+    let mut report = PreflightReport {
+        model_type: model_type.clone(),
+        architectures,
+        hidden_size,
+        num_layers,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        intermediate_size,
+        vocab_size,
+        max_position_embeddings: optional_u32(hf, "max_position_embeddings").ok().flatten(),
+        sliding_window: hf.get("sliding_window").and_then(|v| v.as_u64()),
+        rope_theta,
+        norm_eps,
+        tied_embeddings: tied,
+        parameters,
+        supported: false,
+        reason: String::new(),
+        container: None,
+        weights_checked: false,
+    };
+
+    let is_gemma = GEMMA_MODEL_TYPES.contains(&model_type.as_str());
+    let store = match model_dir {
+        Some(dir) => Some(SafeTensorsSet::open(dir)?),
+        None => None,
+    };
+    report.weights_checked = store.is_some();
+
+    let verdict = (|| -> Result<PreflightContainer> {
+        let activation = resolve_activation(hf, is_gemma)?;
+        let rope_scaling = resolve_rope_scaling(hf)?;
+        assert_exportable_architecture(hf, store.as_ref(), max_context, num_layers)?;
+        let bias_mask = match store.as_ref() {
+            Some(store) => resolve_bias_mask(store, num_layers)?,
+            None => 0,
+        };
+        let config = RaiConfig {
+            hidden_size,
+            num_layers,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            intermediate_size,
+            vocab_size,
+            max_context,
+            rope_theta,
+            norm_eps,
+            bits: 4,
+            group_size: u8::try_from(group_size).map_err(|_| {
+                anyhow::anyhow!("--group-size must be in 2..=254, got {group_size}")
+            })?,
+            embed_bits: 8,
+            embed_group_size: u8::try_from(embed_group_size).map_err(|_| {
+                anyhow::anyhow!("--embed-group-size must be in 2..=254, got {embed_group_size}")
+            })?,
+            activation,
+            rope_scaling,
+            bias_mask,
+            embed_scale: if is_gemma {
+                (hidden_size as f64).sqrt() as f32
+            } else {
+                1.0
+            },
+        };
+        validate_model_config(&config)?;
+        let (section_sizes, output_bytes) = plan_sections(&config, tied)?;
+        Ok(PreflightContainer {
+            version: config.version(),
+            activation,
+            rope_scaling,
+            bias_mask,
+            embed_scale: config.embed_scale,
+            tied_embeddings: tied,
+            output_bytes,
+            num_sections: section_sizes.len(),
+        })
+    })();
+
+    match verdict {
+        Ok(container) => {
+            report.reason = format!(
+                "`rai convert` accepts this checkpoint: model_type '{model_type}' converts to a \
+                 container v{} file of {} bytes ({} sections, activation {:?}, rope {:?}, \
+                 bias_mask {:#04x}, {} lm_head).{}",
+                container.version,
+                container.output_bytes,
+                container.num_sections,
+                container.activation,
+                container.rope_scaling,
+                container.bias_mask,
+                if tied { "tied" } else { "untied" },
+                if report.weights_checked {
+                    ""
+                } else {
+                    " Config-level rules only: no weights were available, so per-tensor rules \
+                      (lm_head bias, per-head QK norms, per-layer bias consistency) are still \
+                      unchecked."
+                }
+            );
+            report.supported = true;
+            report.container = Some(container);
+        }
+        Err(error) => {
+            report.reason = format!("{error:#}");
+            report.supported = false;
+        }
+    }
+    Ok(report)
 }
 
 fn truthy_number(value: &serde_json::Value) -> bool {
@@ -1232,6 +1511,34 @@ fn linear_section_len(rows: usize, cols: usize, group_size: usize) -> Result<u64
         .context("linear code bytes overflow")?
         / 2;
     Ok(8 + params + codes)
+}
+
+/// Section sizes and the resulting file size, derived from the config alone.
+///
+/// Shared with [`preflight`] so a caller can be told how large the output will
+/// be before a byte is written, without a second copy of the layout rules.
+fn plan_sections(config: &RaiConfig, tied: bool) -> Result<(Vec<u64>, u64)> {
+    let hidden = config.hidden_size as usize;
+    let vocab = config.vocab_size as usize;
+    let group_size = config.group_size as usize;
+    let embed_group_size = config.embed_group_size as usize;
+    let linear_dims = config.projection_dims();
+
+    let mut section_sizes: Vec<u64> = Vec::with_capacity(config.num_layers as usize + 3);
+    section_sizes.push(embedding_section_len(vocab, hidden, embed_group_size)?);
+    let layer_len = layer_section_len(&linear_dims, hidden, group_size, config.bias_mask)?;
+    for _ in 0..config.num_layers {
+        section_sizes.push(layer_len);
+    }
+    section_sizes.push(hidden as u64 * 4);
+    if !tied {
+        section_sizes.push(linear_section_len(vocab, hidden, group_size)?);
+    }
+
+    let total = config.header_size()
+        + section_sizes.len() as u64 * SECTION_ENTRY_SIZE
+        + section_sizes.iter().sum::<u64>();
+    Ok((section_sizes, total))
 }
 
 fn layer_section_len(
