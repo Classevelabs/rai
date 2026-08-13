@@ -19,6 +19,12 @@
 )]
 
 use half::f16;
+
+// Every rayon dispatch in this file is inside the AVX2 path, so on a target
+// without those kernels the import itself is unused. `-D warnings` is a gate
+// contributors run on their own machine, and an Apple Silicon or ARM-server
+// contributor must be able to pass it.
+#[cfg(target_arch = "x86_64")]
 use rayon::prelude::*;
 
 #[cfg(target_arch = "x86_64")]
@@ -57,61 +63,74 @@ pub fn has_avx2() -> bool {
 
 /// Wrappers to allow sending raw pointers across rayon threads.
 /// Safety: caller must ensure no data races (non-overlapping regions per thread).
-#[derive(Copy, Clone)]
-struct SendPtr(*mut f32);
-unsafe impl Send for SendPtr {}
-unsafe impl Sync for SendPtr {}
-impl SendPtr {
-    #[inline(always)]
-    fn ptr(self) -> *mut f32 {
-        self.0
+///
+/// These exist only to feed the parallel AVX2 chunk kernels. The scalar
+/// fallback walks rows on one thread and never forms a raw pointer, so the
+/// whole group is compiled out on non-x86-64 targets rather than sitting there
+/// as dead code that trips `-D warnings`.
+#[cfg(target_arch = "x86_64")]
+mod parallel_ptr {
+    use super::MAX_GROUPS;
+
+    #[derive(Copy, Clone)]
+    pub(super) struct SendPtr(pub(super) *mut f32);
+    unsafe impl Send for SendPtr {}
+    unsafe impl Sync for SendPtr {}
+    impl SendPtr {
+        #[inline(always)]
+        pub(super) fn ptr(self) -> *mut f32 {
+            self.0
+        }
+    }
+
+    #[derive(Copy, Clone)]
+    pub(super) struct SyncU8Ptr(pub(super) *const u8);
+    unsafe impl Send for SyncU8Ptr {}
+    unsafe impl Sync for SyncU8Ptr {}
+    impl SyncU8Ptr {
+        #[inline(always)]
+        pub(super) fn ptr(self) -> *const u8 {
+            self.0
+        }
+    }
+
+    #[derive(Copy, Clone)]
+    pub(super) struct SyncF32Ptr(pub(super) *const f32);
+    unsafe impl Send for SyncF32Ptr {}
+    unsafe impl Sync for SyncF32Ptr {}
+    impl SyncF32Ptr {
+        #[inline(always)]
+        pub(super) fn ptr(self) -> *const f32 {
+            self.0
+        }
+    }
+
+    #[derive(Copy, Clone)]
+    pub(super) struct SyncI8Ptr(pub(super) *const i8);
+    unsafe impl Send for SyncI8Ptr {}
+    unsafe impl Sync for SyncI8Ptr {}
+    impl SyncI8Ptr {
+        #[inline(always)]
+        pub(super) fn ptr(self) -> *const i8 {
+            self.0
+        }
+    }
+
+    /// Per-token quantization parameter arrays shared read-only by every worker.
+    #[derive(Copy, Clone)]
+    pub(super) struct SyncGroupPtr(pub(super) *const [f32; MAX_GROUPS]);
+    unsafe impl Send for SyncGroupPtr {}
+    unsafe impl Sync for SyncGroupPtr {}
+    impl SyncGroupPtr {
+        #[inline(always)]
+        pub(super) fn ptr(self) -> *const [f32; MAX_GROUPS] {
+            self.0
+        }
     }
 }
 
-#[derive(Copy, Clone)]
-struct SyncU8Ptr(*const u8);
-unsafe impl Send for SyncU8Ptr {}
-unsafe impl Sync for SyncU8Ptr {}
-impl SyncU8Ptr {
-    #[inline(always)]
-    fn ptr(self) -> *const u8 {
-        self.0
-    }
-}
-
-#[derive(Copy, Clone)]
-struct SyncF32Ptr(*const f32);
-unsafe impl Send for SyncF32Ptr {}
-unsafe impl Sync for SyncF32Ptr {}
-impl SyncF32Ptr {
-    #[inline(always)]
-    fn ptr(self) -> *const f32 {
-        self.0
-    }
-}
-
-#[derive(Copy, Clone)]
-struct SyncI8Ptr(*const i8);
-unsafe impl Send for SyncI8Ptr {}
-unsafe impl Sync for SyncI8Ptr {}
-impl SyncI8Ptr {
-    #[inline(always)]
-    fn ptr(self) -> *const i8 {
-        self.0
-    }
-}
-
-/// Per-token quantization parameter arrays shared read-only by every worker.
-#[derive(Copy, Clone)]
-struct SyncGroupPtr(*const [f32; MAX_GROUPS]);
-unsafe impl Send for SyncGroupPtr {}
-unsafe impl Sync for SyncGroupPtr {}
-impl SyncGroupPtr {
-    #[inline(always)]
-    fn ptr(self) -> *const [f32; MAX_GROUPS] {
-        self.0
-    }
-}
+#[cfg(target_arch = "x86_64")]
+use parallel_ptr::{SendPtr, SyncF32Ptr, SyncGroupPtr, SyncI8Ptr, SyncU8Ptr};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -898,6 +917,10 @@ unsafe fn lm_head_chunk_i8(
 /// Quantize f32 hidden state to i8 for use with PMADDUBSW in LM head.
 /// Uses [-63, 63] range to prevent saturation with 8-bit codes (max 255).
 /// Returns per-group scales.
+///
+/// Only the AVX2 `tied_lm_head` path needs an i8 hidden state; the scalar
+/// fallback reads f32 directly, so this is not compiled on other targets.
+#[cfg(target_arch = "x86_64")]
 fn quantize_hidden_i8(
     hidden: &[f32],
     output: &mut [i8],
@@ -1096,7 +1119,13 @@ fn lm_head_row_scalar(
 // Internal dispatch (shared input_sums, no recomputation)
 // ---------------------------------------------------------------------------
 
+// These describe the parallel AVX2 dispatch policy, which only exists on
+// x86-64; the scalar fallback walks every row on one thread. They stay visible
+// to `cfg(test)` because the reference tests size their inputs relative to
+// `PAR_THRESHOLD` and `LM_CHUNK` to force the parallel branch on AVX2 hosts.
+#[cfg(any(target_arch = "x86_64", test))]
 const LM_CHUNK: usize = 512;
+#[cfg(any(target_arch = "x86_64", test))]
 const PAR_THRESHOLD: usize = 256;
 
 /// Adaptive chunk sizing: target ~24KB per chunk to fit L1 cache (32KB).
@@ -1104,6 +1133,7 @@ const PAR_THRESHOLD: usize = 256;
 /// SmolLM (cols=256): 24576/(128)=192→clamped to 64 rows.
 /// Mistral hidden (cols=4096): 24576/(2048)=12 rows.
 /// Mistral MLP (cols=14336): 24576/(7168)=3→clamped to 4 rows.
+#[cfg(target_arch = "x86_64")]
 #[inline]
 fn chunk_rows_for(cols: usize) -> usize {
     (24_576 / (cols / 2).max(1)).clamp(4, 64)
@@ -1249,6 +1279,12 @@ fn w4a8_matvec_inner(
             return;
         }
     }
+
+    // The scalar row kernel dequantizes against the f32 input and the per-group
+    // sums, so the int8 split of the input is only ever consumed by the AVX2
+    // kernels above.
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (input_even, input_odd, input_scales);
 
     for row in 0..rows {
         output[row] = matvec_row_scalar(
@@ -1601,6 +1637,12 @@ pub fn w4a8_fused_gate_up(
 /// groups in the same order, so this changes speed and nothing else — it
 /// exists so before/after can be measured in one binary on one machine
 /// instead of across two builds under different background load.
+///
+/// x86-64 only: the switch selects between two AVX2 batch strategies, and no
+/// other target has a second strategy to select. On those targets the batched
+/// path is the scalar row loop either way, so the variable is inert and the
+/// function is not compiled rather than silently ignored.
+#[cfg(target_arch = "x86_64")]
 fn legacy_matmul_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| std::env::var("RAI_BENCH_LEGACY_MATMUL").is_ok_and(|v| v == "1"))

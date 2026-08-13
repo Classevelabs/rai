@@ -5,3 +5,18 @@
 # cmd mis-parses block structure (a nested `exit /b N` silently returns 0).
 *.cmd text eol=crlf
 *.bat text eol=crlf
+
+# Shell scripts must reach a Unix shell with LF. `* text=auto eol=lf` above
+# already does this, but these are the files where a stray CRLF is fatal rather
+# than cosmetic — `#!/usr/bin/env bash\r` makes the kernel look for an
+# interpreter named "bash\r" and report a confusing "no such file or directory"
+# against a script that plainly exists — so they are declared explicitly.
+*.sh text eol=lf
+*.command text eol=lf
+*.desktop text eol=lf
+
+# NOTE: .gitattributes cannot make a file executable. The executable bit lives
+# in the index, and a shell script checked out without it cannot be
+# double-clicked or run as ./script. Set it once per script with:
+#   git update-index --chmod=+x launchers/rai-studio.sh launchers/rai-studio.command
+# and verify with `git ls-files -s launchers/` (mode must read 100755).
