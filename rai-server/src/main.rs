@@ -12,19 +12,30 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const USAGE: &str = "\
+rai-server — a local memory service for AI tools. Stores facts, recalls them by
+meaning, and reports how confident it is. Runs on your machine; nothing leaves
+it unless you configure an external embedding provider.
+
 Usage: rai-server [rest|mcp]
 
 Modes:
   rest    Local REST API on RAI_HOST:RAI_PORT (default, 127.0.0.1:3000)
-  mcp     Model Context Protocol server on stdio
+  mcp     Model Context Protocol server on stdio, for MCP clients
 
 Options:
   -h, --help       Print this message and exit
   -V, --version    Print the version and exit
 
+Getting started:
+  rai-server rest                      serve the REST API on 127.0.0.1:3000
+  RAI_DATA_PATH=./rai.json rai-server rest    keep memories across restarts
+
 Configuration is read from the environment: RAI_HOST, RAI_PORT, RAI_API_TOKEN,
 RAI_EMBEDDING_PROVIDER, OPENAI_API_KEY, RAI_DATA_PATH, RAI_MCP_MUTATIONS_ENABLED.
-See the README for defaults and accepted values.";
+See the README for defaults and accepted values.
+
+Two defaults worth knowing: without RAI_DATA_PATH every memory is lost on exit,
+and MCP write tools stay disabled until RAI_MCP_MUTATIONS_ENABLED=true.";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
