@@ -14,26 +14,50 @@ use rai_infer::lookup::{LookupConfig, LookupDecoder};
 use rai_infer::model::{BatchScratch, InferenceWork, RaiModel};
 use rai_infer::ponder::{pondered_forward, PonderConfig, PonderStrategy};
 use rai_infer::sampler::{apply_repetition_penalty, sample_token, SamplerConfig};
-use rai_infer::self_speculative::{SelfSpecConfig, SelfSpecDecoder};
 use rai_infer::speculative::{SpeculativeConfig, SpeculativeDecoder};
 
 #[derive(Parser, Debug)]
-#[command(name = "rai-generate", about = "Edge inference with pondering")]
+#[command(
+    name = "rai-generate",
+    version,
+    about = "Generate text from a .raimodel on the CPU",
+    long_about = concat!(
+        "Generate text from a .raimodel file using CPU-only 4-bit inference. ",
+        "No GPU and no Python runtime. Convert a HuggingFace checkpoint first ",
+        "with rai-convert."
+    ),
+    after_help = concat!(
+        "EXAMPLE:\n",
+        "  rai-generate --model tinyllama-q4.raimodel --tokenizer tokenizer.json \\\n",
+        "    --chat-template zephyr --prompt \"Explain photosynthesis.\" --max-tokens 80\n",
+        "\n",
+        "Instruction-tuned models need --chat-template. Without it they usually\n",
+        "emit end-of-sequence immediately and print nothing."
+    )
+)]
 struct Args {
+    /// Path to the .raimodel file to run
     #[arg(long)]
     model: PathBuf,
+    /// Path to tokenizer.json, written beside the model at conversion time
     #[arg(long)]
     tokenizer: PathBuf,
+    /// The prompt to complete
     #[arg(long)]
     prompt: String,
+    /// Maximum number of tokens to generate
     #[arg(long, default_value = "64")]
     max_tokens: usize,
+    /// Sampling temperature; 0 always takes the most likely token
     #[arg(long, default_value = "0.7")]
     temperature: f32,
+    /// Keep only the K most likely tokens (0 disables)
     #[arg(long, default_value = "40")]
     top_k: usize,
+    /// Keep the smallest set of tokens whose probability sums to P
     #[arg(long, default_value = "0.9")]
     top_p: f32,
+    /// Penalty applied to already-generated tokens (1.0 disables)
     #[arg(long, default_value = "1.1")]
     repetition_penalty: f32,
     /// Pondering strategy: none, cfg, ensemble, cfg-ensemble, adaptive
@@ -51,10 +75,13 @@ struct Args {
     /// Entropy threshold for adaptive strategy
     #[arg(long, default_value = "3.0")]
     entropy_threshold: f32,
+    /// Context window to allocate the KV cache for, in tokens
     #[arg(long, default_value = "512")]
     max_context: usize,
+    /// Random seed; the same seed and settings reproduce the same text
     #[arg(long, default_value = "42")]
     seed: u64,
+    /// Print per-step decoding diagnostics to stderr
     #[arg(long, default_value = "false")]
     verbose: bool,
     /// Chat template: auto, none, few-shot, mistral, llama3, chatml, zephyr
@@ -66,15 +93,6 @@ struct Args {
     /// Number of draft tokens per speculative step
     #[arg(long, default_value = "6")]
     draft_k: usize,
-    /// Self-speculative: use N layers as draft (0 = disabled)
-    #[arg(long, default_value = "0")]
-    self_spec_layers: usize,
-    /// Self-speculative: number of draft tokens per step
-    #[arg(long, default_value = "8")]
-    self_spec_k: usize,
-    /// Self-speculative: layer skip mode (covers full depth instead of first-N)
-    #[arg(long)]
-    self_spec_skip: bool,
     /// Prompt-lookup speculation: draft up to N tokens copied from the context
     /// (0 = disabled). No draft model and no draft forward pass. NOTE: measured
     /// on TinyLlama-1.1B-q4 this is still ~0.7-0.9x baseline because batched
@@ -95,9 +113,6 @@ struct Args {
 const MAX_ENSEMBLE_SIZE: usize = 8;
 const MAX_SPECULATIVE_TOKENS: usize = 32;
 const MAX_LOOKUP_NGRAM: usize = 16;
-/// Below this draft-acceptance rate, self-speculative decoding cannot recover
-/// the cost of its draft forward passes and is slower than plain decoding.
-const SELF_SPEC_USEFUL_ACCEPT_RATE: f64 = 0.30;
 
 fn build_ponder_config(args: &Args) -> Result<PonderConfig> {
     validate_args(args)?;
@@ -155,25 +170,16 @@ fn validate_args(args: &Args) -> Result<()> {
             "ensemble strategies require --ensemble-n >= 2"
         );
     }
-    // The three speculative paths each own the KV cache and the decode loop,
-    // so at most one may be selected.
-    let speculative_modes = usize::from(args.draft.is_some())
-        + usize::from(args.self_spec_layers > 0)
-        + usize::from(args.lookup_k > 0);
+    // Each speculative path owns the KV cache and the decode loop, so at most
+    // one may be selected.
     ensure!(
-        speculative_modes <= 1,
-        "--draft, --self-spec-layers, and --lookup-k are mutually exclusive"
+        !(args.draft.is_some() && args.lookup_k > 0),
+        "--draft and --lookup-k are mutually exclusive"
     );
     if args.draft.is_some() {
         ensure!(
             (1..=MAX_SPECULATIVE_TOKENS).contains(&args.draft_k),
             "--draft-k must be between 1 and {MAX_SPECULATIVE_TOKENS}"
-        );
-    }
-    if args.self_spec_layers > 0 {
-        ensure!(
-            (1..=MAX_SPECULATIVE_TOKENS).contains(&args.self_spec_k),
-            "--self-spec-k must be between 1 and {MAX_SPECULATIVE_TOKENS}"
         );
     }
     if args.lookup_k > 0 {
@@ -191,7 +197,7 @@ fn validate_args(args: &Args) -> Result<()> {
             args.lookup_ngram
         );
     }
-    if args.draft.is_some() || args.self_spec_layers > 0 || args.lookup_k > 0 {
+    if args.draft.is_some() || args.lookup_k > 0 {
         ensure!(
             args.temperature > 1e-6
                 && args.top_k == 0
@@ -344,150 +350,7 @@ fn main() -> Result<()> {
         *previous_text = full_text;
     };
 
-    if args.self_spec_layers > 0 {
-        // === SELF-SPECULATIVE DECODING ===
-        let total_layers = model.config.num_layers as usize;
-        ensure!(
-            args.self_spec_layers < total_layers,
-            "--self-spec-layers must be smaller than the model's {total_layers} layers"
-        );
-        let draft_layers = args.self_spec_layers;
-
-        let spec_config = if args.self_spec_skip {
-            eprintln!(
-                "Self-speculative (layer-skip): {} of {} layers, K={}",
-                draft_layers, total_layers, args.self_spec_k
-            );
-            SelfSpecConfig::layer_skip(
-                total_layers,
-                draft_layers,
-                args.self_spec_k,
-                sampler_config.clone(),
-            )?
-        } else {
-            eprintln!(
-                "Self-speculative (early-exit): first {} of {} layers, K={}",
-                draft_layers, total_layers, args.self_spec_k
-            );
-            SelfSpecConfig::early_exit(draft_layers, args.self_spec_k, sampler_config.clone())?
-        };
-        eprintln!("Draft layers: {:?}", spec_config.draft_layer_indices);
-        eprintln!(
-            "WARNING: --self-spec-layers is experimental and measures BADLY. On \
-             TinyLlama-1.1B-q4 (i5-10300H, --self-spec-layers 11 --self-spec-k 4, \
-             context-quoting QA prompt) it accepted 0.4% of its drafts and ran at \
-             1.7 tok/s against a 25.1 tok/s baseline — roughly 15x SLOWER. An \
-             untrained early exit is a poor predictor of the full model, so both the \
-             draft passes and the verification are wasted. No K or layer count has \
-             been found where this wins; plain decoding (no flag) is faster. This \
-             run's own acceptance rate is printed in the stats below."
-        );
-        let mut decoder = SelfSpecDecoder::new(&model, max_ctx)?;
-
-        // Prefill
-        let t_prefill = Instant::now();
-        let mut pos = decoder.prefill(&prompt_tokens)?;
-        let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
-        eprintln!(
-            "\nPrefill: {} tokens in {:.1}ms ({:.1} tok/s)",
-            prompt_tokens.len(),
-            prefill_ms,
-            prompt_tokens.len() as f64 / (prefill_ms / 1000.0)
-        );
-
-        // Self-speculative decode
-        let t_decode = Instant::now();
-        let mut tokens_generated = 0;
-        let mut total_drafted = 0;
-        let mut total_accepted = 0;
-        let mut previous_text = String::new();
-
-        while tokens_generated < args.max_tokens && pos < max_ctx {
-            let last_token = *all_tokens.last().unwrap();
-            let (new_tokens, metrics) = decoder.step(pos, last_token, &spec_config, &mut rng)?;
-            ensure!(
-                !new_tokens.is_empty(),
-                "self-speculative decoder made no progress"
-            );
-
-            total_drafted += metrics.drafted;
-            total_accepted += metrics.accepted;
-
-            let mut hit_eos = false;
-            let remaining = (max_ctx - pos).min(args.max_tokens - tokens_generated);
-            for &tok in new_tokens.iter().take(remaining) {
-                if is_eos(tok) {
-                    hit_eos = true;
-                    break;
-                }
-                all_tokens.push(tok);
-                pos += 1;
-                tokens_generated += 1;
-                if tokens_generated >= args.max_tokens {
-                    break;
-                }
-            }
-
-            print_new_text(
-                &all_tokens,
-                prompt_tokens.len(),
-                &mut previous_text,
-                &tokenizer,
-            );
-
-            if args.verbose {
-                eprint!("[self:{}d/{}a]", metrics.drafted, metrics.accepted);
-            }
-
-            if hit_eos {
-                break;
-            }
-        }
-
-        let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
-        let decode_tps = tokens_generated as f64 / (decode_ms / 1000.0);
-        let accept_rate = if total_drafted > 0 {
-            total_accepted as f64 / total_drafted as f64
-        } else {
-            0.0
-        };
-
-        flush_held_text(
-            &all_tokens,
-            prompt_tokens.len(),
-            &mut previous_text,
-            &tokenizer,
-        );
-        println!();
-        eprintln!("\n--- Self-Speculative Stats ---");
-        eprintln!("Tokens: {tokens_generated}, {decode_tps:.2} tok/s");
-        eprintln!(
-            "Draft layers: {draft_layers}/{}, K={}",
-            model.config.num_layers, args.self_spec_k
-        );
-        eprintln!(
-            "Drafted: {total_drafted}, Accepted: {total_accepted}, Rate: {:.1}%",
-            accept_rate * 100.0
-        );
-        eprintln!(
-            "Avg tokens/step: {:.1}",
-            if total_drafted > 0 {
-                (total_accepted as f64 + (total_drafted as f64 / args.self_spec_k as f64))
-                    / (total_drafted as f64 / args.self_spec_k as f64)
-            } else {
-                0.0
-            }
-        );
-        if total_drafted > 0 && accept_rate < SELF_SPEC_USEFUL_ACCEPT_RATE {
-            eprintln!(
-                "Measured acceptance {:.1}% is below the {:.0}% needed for this path to pay \
-                 for its draft passes — this run was almost certainly slower than plain \
-                 decoding. Drop the flag, or try --lookup-k on context-quoting workloads.",
-                accept_rate * 100.0,
-                SELF_SPEC_USEFUL_ACCEPT_RATE * 100.0
-            );
-        }
-    } else if let Some(draft_path) = &args.draft {
+    if let Some(draft_path) = &args.draft {
         // === SPECULATIVE DECODING ===
         eprintln!("Loading draft model: {}", draft_path.display());
         let draft = RaiModel::load(draft_path).context("loading draft model")?;
@@ -885,9 +748,6 @@ mod tests {
             chat_template: "none".to_string(),
             draft: None,
             draft_k: 6,
-            self_spec_layers: 0,
-            self_spec_k: 8,
-            self_spec_skip: false,
             lookup_k: 0,
             lookup_ngram: 3,
             lookup_min_ngram: 1,
@@ -940,13 +800,7 @@ mod tests {
         exact_sampling(&mut args);
         assert!(validate_args(&args).is_ok());
 
-        // Mutually exclusive with the other two speculative paths.
-        let mut args = valid_args();
-        exact_sampling(&mut args);
-        args.lookup_k = 8;
-        args.self_spec_layers = 4;
-        assert!(validate_args(&args).is_err());
-
+        // Mutually exclusive with the draft-model path.
         let mut args = valid_args();
         exact_sampling(&mut args);
         args.lookup_k = 8;
