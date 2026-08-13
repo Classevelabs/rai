@@ -70,27 +70,41 @@ const LAYER_LINEAR_NAMES: [&str; 7] = PROJECTION_NAMES;
 /// tensor names look Llama-shaped.
 ///
 /// `gemma` came off this list in container v2: GeGLU is a stored activation
-/// code, and Gemma's two other differences are folded at conversion time (see
-/// `GemmaFolds`). `gemma2` and `gemma3` stay: softcapping and per-head QK norm
-/// are extra *operations*, not extra parameters, and there is nowhere in the
-/// forward pass to put them.
-const UNSUPPORTED_MODEL_TYPES: [(&str, &str); 3] = [
-    (
-        "gemma2",
-        "Gemma2 adds logit softcapping and per-layer sliding-window attention",
-    ),
+/// code, and Gemma's other differences are folded at conversion time (see
+/// `GemmaFolds`). `gemma2` came off it once the header gained the two softcaps
+/// and the layer section gained the sandwich norms.
+///
+/// `gemma3` stays, and the reason is not softcapping or QK norm — the container
+/// now stores both. It is the RoPE base: Gemma3 interleaves sliding and global
+/// attention layers and gives them *different* rotary bases
+/// (`rope_local_base_freq` = 10 000 for the sliding layers, `rope_theta` =
+/// 1 000 000 for the global ones; see `transformers`
+/// `models/gemma3/configuration_gemma3.py:144-150`). The header carries one
+/// `rope_theta` and the runtime builds one RoPE table from it, so five layers in
+/// six would be rotated at the wrong frequency. That is a per-layer
+/// architectural variation, not a missing parameter, so it is refused rather
+/// than approximated.
+const UNSUPPORTED_MODEL_TYPES: [(&str, &str); 2] = [
     (
         "gemma3",
-        "Gemma3 adds per-head QK norm and interleaved sliding-window attention",
+        "Gemma3 gives its sliding and global attention layers different RoPE bases \
+         (rope_local_base_freq vs rope_theta) and the container stores a single rope_theta",
     ),
     (
         "gemma3_text",
-        "Gemma3 adds per-head QK norm and interleaved sliding-window attention",
+        "Gemma3 gives its sliding and global attention layers different RoPE bases \
+         (rope_local_base_freq vs rope_theta) and the container stores a single rope_theta",
     ),
 ];
 
-/// Model families that need the container's Gemma-specific conversion folds.
-const GEMMA_MODEL_TYPES: [&str; 1] = ["gemma"];
+/// Model families that need the container's Gemma-specific conversion folds:
+/// the `1 + w` RMSNorm and the `sqrt(hidden_size)` embedding scale. Gemma2 uses
+/// both, on all four of its norms.
+const GEMMA_MODEL_TYPES: [&str; 2] = ["gemma", "gemma2"];
+
+/// Families that use Gemma2's sandwich normalization, i.e. carry
+/// `pre_feedforward_layernorm` and `post_feedforward_layernorm` per layer.
+const SANDWICH_NORM_MODEL_TYPES: [&str; 1] = ["gemma2"];
 
 /// Conversion inputs. Defaults match `export_rtn.py`.
 #[derive(Debug, Clone)]
@@ -178,6 +192,16 @@ struct RaiConfig {
     /// Bit *i*: projection *i* of [`PROJECTION_NAMES`] carries a bias.
     bias_mask: u8,
     embed_scale: f32,
+    /// Per-head `q_norm`/`k_norm` vectors are stored in every layer section.
+    has_qk_norm: bool,
+    /// Gemma2's two extra per-layer norms are stored in every layer section.
+    has_sandwich_norm: bool,
+    /// `cap` for `cap * tanh(x/cap)` on attention logits; 0.0 = disabled.
+    attn_logit_softcap: f32,
+    /// The same on output logits; 0.0 = disabled.
+    final_logit_softcap: f32,
+    /// Explicit query-key scale; 0.0 = the default `1/sqrt(head_dim)`.
+    attn_scale: f32,
 }
 
 impl RaiConfig {
@@ -191,11 +215,31 @@ impl RaiConfig {
             && self.rope_scaling == RopeScaling::None
             && self.bias_mask == 0
             && self.embed_scale == 1.0
+            && !self.has_qk_norm
+            && !self.has_sandwich_norm
+            && self.attn_logit_softcap == 0.0
+            && self.final_logit_softcap == 0.0
+            && self.attn_scale == 0.0
         {
             1
         } else {
             2
         }
+    }
+
+    /// The `flags` byte the header will carry.
+    fn flags(&self) -> u8 {
+        let mut flags = 0u8;
+        if self.bias_mask != 0 {
+            flags |= crate::format::FLAG_HAS_BIASES;
+        }
+        if self.has_qk_norm {
+            flags |= crate::format::FLAG_HAS_QK_NORM;
+        }
+        if self.has_sandwich_norm {
+            flags |= crate::format::FLAG_HAS_SANDWICH_NORM;
+        }
+        flags
     }
 
     fn header_size(&self) -> u64 {
@@ -293,8 +337,12 @@ pub fn convert_with_progress(
     let model_type = hf.get("model_type").and_then(|v| v.as_str()).unwrap_or("?");
 
     let is_gemma = GEMMA_MODEL_TYPES.contains(&model_type);
+    let has_sandwich_norm = SANDWICH_NORM_MODEL_TYPES.contains(&model_type);
     let activation = resolve_activation(&hf, is_gemma)?;
     let rope_scaling = resolve_rope_scaling(&hf)?;
+    let attn_logit_softcap = resolve_softcap(&hf, "attn_logit_softcapping")?;
+    let final_logit_softcap = resolve_softcap(&hf, "final_logit_softcapping")?;
+    let attn_scale = resolve_attn_scale(&hf, head_dim)?;
     let folds = GemmaFolds {
         norm_plus_one: is_gemma,
     };
@@ -325,6 +373,12 @@ pub fn convert_with_progress(
         rope_scaling,
         bias_mask: 0,
         embed_scale,
+        // Settled once the tensor namespace is open, below.
+        has_qk_norm: false,
+        has_sandwich_norm,
+        attn_logit_softcap,
+        final_logit_softcap,
+        attn_scale,
     };
 
     let output_path = match &options.output {
@@ -381,6 +435,7 @@ pub fn convert_with_progress(
     // Which projections carry biases is a property of the checkpoint, not the
     // config, so it can only be settled once the tensor namespace is open.
     config.bias_mask = resolve_bias_mask(&store, num_layers)?;
+    config.has_qk_norm = resolve_qk_norm(&store, num_layers, head_dim)?;
     validate_model_config(&config)?;
 
     let hidden = hidden_size as usize;
@@ -400,13 +455,24 @@ pub fn convert_with_progress(
                 check_vector(&store, &layer_bias_name(layer, name), rows)?;
             }
         }
-        for suffix in ["input_layernorm", "post_attention_layernorm"] {
-            check_vector(
-                &store,
-                &format!("model.layers.{layer}.{suffix}.weight"),
-                hidden,
-            )?;
+        check_vector(
+            &store,
+            &format!("model.layers.{layer}.input_layernorm.weight"),
+            hidden,
+        )?;
+        check_vector(
+            &store,
+            &pre_mlp_norm_name(layer, config.has_sandwich_norm),
+            hidden,
+        )?;
+        if config.has_qk_norm {
+            for name in qk_norm_names(layer) {
+                check_vector(&store, &name, head_dim as usize)?;
+            }
         }
+    }
+    if config.has_sandwich_norm {
+        check_sandwich_norms(&store, num_layers, hidden)?;
     }
     check_vector(&store, "model.norm.weight", hidden)?;
     if !tied {
@@ -418,12 +484,19 @@ pub fn convert_with_progress(
          heads={num_heads}/{num_kv_heads} head_dim={head_dim} vocab={vocab_size}"
     ));
     log(&format!(
-        "container v{}: activation={:?} rope={:?} bias_mask={:#04x} embed_scale={}",
+        "container v{}: activation={:?} rope={:?} bias_mask={:#04x} embed_scale={} \
+         flags={:#04x} (qk_norm={} sandwich_norm={}) softcap=attn:{} final:{} attn_scale={}",
         config.version(),
         config.activation,
         config.rope_scaling,
         config.bias_mask,
-        config.embed_scale
+        config.embed_scale,
+        config.flags(),
+        config.has_qk_norm,
+        config.has_sandwich_norm,
+        config.attn_logit_softcap,
+        config.final_logit_softcap,
+        config.attn_scale,
     ));
 
     // ---- Plan the container ------------------------------------------------
@@ -522,10 +595,38 @@ pub fn convert_with_progress(
                 false,
             )?;
         }
-        for suffix in ["input_layernorm", "post_attention_layernorm"] {
-            let tensor = format!("model.layers.{layer}.{suffix}.weight");
-            write_f32_vector(&mut file, &mut store, &tensor, hidden, folds.norm_plus_one)?;
+        // QK-norm block, then the sandwich block, then the two layer norms —
+        // exactly the order `format::RaiModelFile::layer` reads them in.
+        if config.has_qk_norm {
+            for name in qk_norm_names(layer) {
+                write_f32_vector(
+                    &mut file,
+                    &mut store,
+                    &name,
+                    head_dim as usize,
+                    folds.norm_plus_one,
+                )?;
+            }
         }
+        if config.has_sandwich_norm {
+            for name in sandwich_norm_names(layer) {
+                write_f32_vector(&mut file, &mut store, &name, hidden, folds.norm_plus_one)?;
+            }
+        }
+        write_f32_vector(
+            &mut file,
+            &mut store,
+            &format!("model.layers.{layer}.input_layernorm.weight"),
+            hidden,
+            folds.norm_plus_one,
+        )?;
+        write_f32_vector(
+            &mut file,
+            &mut store,
+            &pre_mlp_norm_name(layer, config.has_sandwich_norm),
+            hidden,
+            folds.norm_plus_one,
+        )?;
         enter("layers", 2 + layer, Some((layer, num_layers)));
         log(&format!(
             "  Layer {layer}/{num_layers}: {:.1}s",
@@ -900,6 +1001,145 @@ fn resolve_bias_mask(store: &SafeTensorsSet, num_layers: u32) -> Result<u8> {
     Ok(mask)
 }
 
+/// The tensor names of a layer's per-head QK norms.
+fn qk_norm_names(layer: u32) -> [String; 2] {
+    [
+        format!("model.layers.{layer}.self_attn.q_norm.weight"),
+        format!("model.layers.{layer}.self_attn.k_norm.weight"),
+    ]
+}
+
+/// The tensor names of a layer's two sandwich norms, in stored order.
+fn sandwich_norm_names(layer: u32) -> [String; 2] {
+    [
+        format!("model.layers.{layer}.post_attention_layernorm.weight"),
+        format!("model.layers.{layer}.post_feedforward_layernorm.weight"),
+    ]
+}
+
+/// The tensor supplying the norm applied to the residual stream before the MLP.
+///
+/// For a sandwich-normed model that is `pre_feedforward_layernorm`; for
+/// everything else it is `post_attention_layernorm`, which for Gemma2 means
+/// something else entirely (see `format.rs`'s layer-section documentation).
+fn pre_mlp_norm_name(layer: u32, sandwich: bool) -> String {
+    if sandwich {
+        format!("model.layers.{layer}.pre_feedforward_layernorm.weight")
+    } else {
+        format!("model.layers.{layer}.post_attention_layernorm.weight")
+    }
+}
+
+/// Decide whether this checkpoint carries per-head QK norms, insisting that
+/// every layer agrees and that both halves of every pair are present.
+///
+/// Like `resolve_bias_mask`, a partial set is refused rather than guessed at:
+/// the container stores one flag for the whole file, so exporting a checkpoint
+/// where only some layers were normed would silently change the maths of the
+/// rest.
+fn resolve_qk_norm(store: &SafeTensorsSet, num_layers: u32, head_dim: u32) -> Result<bool> {
+    if num_layers == 0 {
+        return Ok(false);
+    }
+    let present = |layer: u32| -> (bool, bool) {
+        let [q, k] = qk_norm_names(layer);
+        (store.info(&q).is_some(), store.info(&k).is_some())
+    };
+    let (q0, k0) = present(0);
+    if q0 != k0 {
+        bail!(
+            "layer 0 carries only one of self_attn.q_norm / self_attn.k_norm; the container \
+             stores the pair or neither, and normalizing one side alone would change the \
+             attention scores."
+        );
+    }
+    for layer in 1..num_layers {
+        let (q, k) = present(layer);
+        if (q, k) != (q0, k0) {
+            bail!(
+                "checkpoint is inconsistent: layer 0 {} per-head QK norms but layer {layer} \
+                 {}. The container stores one flag for the whole model.",
+                if q0 { "has" } else { "has no" },
+                if q { "does" } else { "does not" }
+            );
+        }
+    }
+    if q0 {
+        // The reader will demand exactly `head_dim` values; catching an OLMo2
+        // -style full-width norm here names the real problem instead of
+        // failing on a section size later.
+        for layer in 0..num_layers {
+            for name in qk_norm_names(layer) {
+                let info = store.require(&name)?;
+                let values: usize = info.shape.iter().product();
+                if values != head_dim as usize {
+                    bail!(
+                        "tensor '{name}' holds {values} values but head_dim is {head_dim}; this \
+                         container implements the per-head QK norm shared across heads (Qwen3, \
+                         Gemma3), not a norm over the whole projection (OLMo2)."
+                    );
+                }
+            }
+        }
+    }
+    Ok(q0)
+}
+
+/// Confirm a sandwich-normed family really carries all four norms per layer.
+fn check_sandwich_norms(store: &SafeTensorsSet, num_layers: u32, hidden: usize) -> Result<()> {
+    for layer in 0..num_layers {
+        check_vector(store, &pre_mlp_norm_name(layer, true), hidden)?;
+        for name in sandwich_norm_names(layer) {
+            check_vector(store, &name, hidden)?;
+        }
+    }
+    Ok(())
+}
+
+/// Read a logit softcap out of the config. Absent or null means disabled.
+fn resolve_softcap(hf: &serde_json::Value, key: &str) -> Result<f32> {
+    let Some(value) = hf.get(key) else {
+        return Ok(0.0);
+    };
+    if value.is_null() {
+        return Ok(0.0);
+    }
+    let cap = value
+        .as_f64()
+        .with_context(|| format!("config field {key} is not a number: {value}"))?;
+    if !cap.is_finite() || cap <= 0.0 {
+        bail!("config field {key} must be finite and positive, got {cap}");
+    }
+    Ok(cap as f32)
+}
+
+/// The query-key multiplier, stored only when it differs from the default.
+///
+/// Gemma2 sets `query_pre_attn_scalar` and attends with
+/// `query_pre_attn_scalar ** -0.5` (`models/gemma2/modeling_gemma2.py:229`).
+/// For gemma-2-2b that is 256 against a `head_dim` of 256, i.e. exactly the
+/// default, so nothing is stored and the file stays as small as it can be. For
+/// gemma-2-27b it is 144 against a `head_dim` of 128, which is a genuinely
+/// different scale — and one whose absence produces plausible-looking but worse
+/// output rather than an error, which is why it is checked rather than assumed.
+fn resolve_attn_scale(hf: &serde_json::Value, head_dim: u32) -> Result<f32> {
+    let Some(value) = hf.get("query_pre_attn_scalar") else {
+        return Ok(0.0);
+    };
+    if value.is_null() {
+        return Ok(0.0);
+    }
+    let scalar = value
+        .as_f64()
+        .context("config field query_pre_attn_scalar is not a number")?;
+    if !scalar.is_finite() || scalar <= 0.0 {
+        bail!("config field query_pre_attn_scalar must be finite and positive, got {scalar}");
+    }
+    let scale = scalar.powf(-0.5) as f32;
+    let default = 1.0 / (head_dim as f32).sqrt();
+    Ok(if scale == default { 0.0 } else { scale })
+}
+
 /// Mirror of `raimodel.assert_exportable_architecture`, driven by the config
 /// and the checkpoint's tensor names instead of a live torch module tree.
 ///
@@ -953,16 +1193,9 @@ fn assert_exportable_architecture(
             );
         }
 
-        let is_qk_norm =
-            |name: &str| name.contains(".self_attn.q_norm") || name.contains(".self_attn.k_norm");
-        let qk_normed = store.count_names(is_qk_norm);
-        if qk_normed > 0 {
-            let example = store.any_name(is_qk_norm).unwrap_or("");
-            problems.push(format!(
-                "{qk_normed} per-head QK norm(s) present (e.g. {example}); the format has no \
-                 place to store them."
-            ));
-        }
+        // Per-head QK norms (Qwen3, Gemma3) are a v2 capability now; see
+        // `resolve_qk_norm`, which is where an inconsistent or wrongly-shaped
+        // set is caught by name.
     }
 
     // `rope_scaling` is handled by `resolve_rope_scaling`, which accepts
@@ -979,15 +1212,8 @@ fn assert_exportable_architecture(
         }
     }
 
-    for attr in ["attn_logit_softcapping", "final_logit_softcapping"] {
-        if let Some(value) = hf.get(attr) {
-            if truthy_number(value) {
-                problems.push(format!(
-                    "config declares {attr}; logit softcapping is not supported."
-                ));
-            }
-        }
-    }
+    // `attn_logit_softcapping` and `final_logit_softcapping` are v2 header
+    // fields now; `resolve_softcap` refuses a non-numeric or non-positive one.
 
     let sliding_window = hf
         .get("sliding_window")
@@ -1029,6 +1255,16 @@ pub struct PreflightContainer {
     /// Exact size of the `.raimodel` this conversion would write.
     pub output_bytes: u64,
     pub num_sections: usize,
+    /// Per-head `q_norm`/`k_norm` vectors would be stored (Qwen3-shaped).
+    pub has_qk_norm: bool,
+    /// Gemma2's two extra per-layer norms would be stored.
+    pub has_sandwich_norm: bool,
+    /// Attention-logit softcap; 0.0 when the model does not cap.
+    pub attn_logit_softcap: f32,
+    /// Output-logit softcap; 0.0 when the model does not cap.
+    pub final_logit_softcap: f32,
+    /// Explicit query-key scale; 0.0 means `1/sqrt(head_dim)`.
+    pub attn_scale: f32,
 }
 
 /// The result of [`preflight`]: can this checkpoint be converted, and if so
@@ -1162,6 +1398,16 @@ pub fn preflight(
             Some(store) => resolve_bias_mask(store, num_layers)?,
             None => 0,
         };
+        let has_qk_norm = match store.as_ref() {
+            Some(store) => resolve_qk_norm(store, num_layers, head_dim)?,
+            None => false,
+        };
+        let has_sandwich_norm = SANDWICH_NORM_MODEL_TYPES.contains(&model_type.as_str());
+        if has_sandwich_norm {
+            if let Some(store) = store.as_ref() {
+                check_sandwich_norms(store, num_layers, hidden_size as usize)?;
+            }
+        }
         let config = RaiConfig {
             hidden_size,
             num_layers,
@@ -1189,6 +1435,11 @@ pub fn preflight(
             } else {
                 1.0
             },
+            has_qk_norm,
+            has_sandwich_norm,
+            attn_logit_softcap: resolve_softcap(hf, "attn_logit_softcapping")?,
+            final_logit_softcap: resolve_softcap(hf, "final_logit_softcapping")?,
+            attn_scale: resolve_attn_scale(hf, head_dim)?,
         };
         validate_model_config(&config)?;
         let (section_sizes, output_bytes) = plan_sections(&config, tied)?;
@@ -1201,6 +1452,11 @@ pub fn preflight(
             tied_embeddings: tied,
             output_bytes,
             num_sections: section_sizes.len(),
+            has_qk_norm,
+            has_sandwich_norm,
+            attn_logit_softcap: config.attn_logit_softcap,
+            final_logit_softcap: config.final_logit_softcap,
+            attn_scale: config.attn_scale,
         })
     })();
 
@@ -1209,20 +1465,25 @@ pub fn preflight(
             report.reason = format!(
                 "`rai convert` accepts this checkpoint: model_type '{model_type}' converts to a \
                  container v{} file of {} bytes ({} sections, activation {:?}, rope {:?}, \
-                 bias_mask {:#04x}, {} lm_head).{}",
+                 bias_mask {:#04x}, qk_norm {}, sandwich_norm {}, softcap attn {} / final {}, \
+                 {} lm_head).{}",
                 container.version,
                 container.output_bytes,
                 container.num_sections,
                 container.activation,
                 container.rope_scaling,
                 container.bias_mask,
+                container.has_qk_norm,
+                container.has_sandwich_norm,
+                container.attn_logit_softcap,
+                container.final_logit_softcap,
                 if tied { "tied" } else { "untied" },
                 if report.weights_checked {
                     ""
                 } else {
                     " Config-level rules only: no weights were available, so per-tensor rules \
-                      (lm_head bias, per-head QK norms, per-layer bias consistency) are still \
-                      unchecked."
+                      (lm_head bias, per-head QK norm shape and consistency, sandwich norms, \
+                      per-layer bias consistency) are still unchecked."
                 }
             );
             report.supported = true;
@@ -1526,7 +1787,7 @@ fn plan_sections(config: &RaiConfig, tied: bool) -> Result<(Vec<u64>, u64)> {
 
     let mut section_sizes: Vec<u64> = Vec::with_capacity(config.num_layers as usize + 3);
     section_sizes.push(embedding_section_len(vocab, hidden, embed_group_size)?);
-    let layer_len = layer_section_len(&linear_dims, hidden, group_size, config.bias_mask)?;
+    let layer_len = layer_section_len(&linear_dims, hidden, group_size, config)?;
     for _ in 0..config.num_layers {
         section_sizes.push(layer_len);
     }
@@ -1541,11 +1802,14 @@ fn plan_sections(config: &RaiConfig, tied: bool) -> Result<(Vec<u64>, u64)> {
     Ok((section_sizes, total))
 }
 
+/// The exact byte length of one layer section, block by block, in the order
+/// `format::RaiModelFile::layer` parses them. The reader checks this size
+/// exactly, so any disagreement here fails the export rather than corrupting it.
 fn layer_section_len(
     linear_dims: &[(usize, usize); 7],
     hidden: usize,
     group_size: usize,
-    bias_mask: u8,
+    config: &RaiConfig,
 ) -> Result<u64> {
     let mut total = 0u64;
     for &(rows, cols) in linear_dims {
@@ -1553,10 +1817,19 @@ fn layer_section_len(
     }
     // Bias block: one f32 per output row, for each declared projection.
     for (index, &(rows, _)) in linear_dims.iter().enumerate() {
-        if bias_mask & (1 << index) != 0 {
+        if config.bias_mask & (1 << index) != 0 {
             total += rows as u64 * 4;
         }
     }
+    // QK-norm block: q_norm + k_norm, head_dim f32 each.
+    if config.has_qk_norm {
+        total += 2 * config.head_dim as u64 * 4;
+    }
+    // Sandwich block: attention-output + MLP-output norms, hidden f32 each.
+    if config.has_sandwich_norm {
+        total += 2 * hidden as u64 * 4;
+    }
+    // The two hidden-sized layer norms that every version carries.
     Ok(total + 2 * hidden as u64 * 4)
 }
 
@@ -1584,11 +1857,7 @@ fn write_header(file: &mut File, config: &RaiConfig, num_sections: u32) -> Resul
     // and the v2 reader rejects a non-zero value there.
     if version >= 2 {
         header[64] = config.activation.code();
-        header[65] = if config.bias_mask != 0 {
-            crate::format::FLAG_HAS_BIASES
-        } else {
-            0
-        };
+        header[65] = config.flags();
         header[66] = config.rope_scaling.code();
         header[67] = config.bias_mask;
         if let RopeScaling::Llama3 {
@@ -1604,6 +1873,10 @@ fn write_header(file: &mut File, config: &RaiConfig, num_sections: u32) -> Resul
             header[80..84].copy_from_slice(&original_max_position.to_le_bytes());
         }
         header[84..88].copy_from_slice(&config.embed_scale.to_le_bytes());
+        header[88..92].copy_from_slice(&config.attn_logit_softcap.to_le_bytes());
+        header[92..96].copy_from_slice(&config.final_logit_softcap.to_le_bytes());
+        header[96..100].copy_from_slice(&config.attn_scale.to_le_bytes());
+        // 100..128 stays zero: the reader rejects a non-zero value there.
     }
     file.write_all(&header)?;
     Ok(())
@@ -1855,6 +2128,11 @@ mod tests {
             rope_scaling: RopeScaling::None,
             bias_mask: 0,
             embed_scale: 1.0,
+            has_qk_norm: false,
+            has_sandwich_norm: false,
+            attn_logit_softcap: 0.0,
+            final_logit_softcap: 0.0,
+            attn_scale: 0.0,
         };
         assert_eq!(config.version(), 1, "a plain Llama model must stay v1");
         assert_eq!(config.header_size(), HEADER_SIZE_V1);
@@ -1863,6 +2141,11 @@ mod tests {
             (|c: &mut RaiConfig| c.activation = Activation::GeluTanh) as fn(&mut RaiConfig),
             |c: &mut RaiConfig| c.bias_mask = 0b111,
             |c: &mut RaiConfig| c.embed_scale = 45.25,
+            |c: &mut RaiConfig| c.has_qk_norm = true,
+            |c: &mut RaiConfig| c.has_sandwich_norm = true,
+            |c: &mut RaiConfig| c.attn_logit_softcap = 50.0,
+            |c: &mut RaiConfig| c.final_logit_softcap = 30.0,
+            |c: &mut RaiConfig| c.attn_scale = 0.083_333_336,
             |c: &mut RaiConfig| {
                 c.rope_scaling = RopeScaling::Llama3 {
                     factor: 32.0,
@@ -1882,7 +2165,7 @@ mod tests {
     }
 
     #[test]
-    fn bias_block_sizing_matches_the_reader() {
+    fn optional_block_sizing_matches_the_reader() {
         let dims: [(usize, usize); 7] = [
             (64, 64),
             (32, 64),
@@ -1892,10 +2175,92 @@ mod tests {
             (128, 64),
             (64, 128),
         ];
-        let plain = layer_section_len(&dims, 64, 64, 0).unwrap();
+        let base = RaiConfig {
+            hidden_size: 64,
+            num_layers: 2,
+            num_heads: 4,
+            num_kv_heads: 2,
+            head_dim: 16,
+            intermediate_size: 128,
+            vocab_size: 96,
+            max_context: 512,
+            rope_theta: 10_000.0,
+            norm_eps: 1e-5,
+            bits: 4,
+            group_size: 64,
+            embed_bits: 8,
+            embed_group_size: 64,
+            activation: Activation::Silu,
+            rope_scaling: RopeScaling::None,
+            bias_mask: 0,
+            embed_scale: 1.0,
+            has_qk_norm: false,
+            has_sandwich_norm: false,
+            attn_logit_softcap: 0.0,
+            final_logit_softcap: 0.0,
+            attn_scale: 0.0,
+        };
+        let with = |mutate: fn(&mut RaiConfig)| {
+            let mut config = base.clone();
+            mutate(&mut config);
+            layer_section_len(&dims, 64, 64, &config).unwrap()
+        };
+        let plain = with(|_| {});
         // q, k, v biases: (64 + 32 + 32) * 4 bytes.
-        let biased = layer_section_len(&dims, 64, 64, 0b111).unwrap();
-        assert_eq!(biased - plain, (64 + 32 + 32) * 4);
+        assert_eq!(with(|c| c.bias_mask = 0b111) - plain, (64 + 32 + 32) * 4);
+        // QK norm: two head_dim vectors.
+        assert_eq!(with(|c| c.has_qk_norm = true) - plain, 2 * 16 * 4);
+        // Sandwich norm: two hidden vectors.
+        assert_eq!(with(|c| c.has_sandwich_norm = true) - plain, 2 * 64 * 4);
+    }
+
+    #[test]
+    fn softcaps_are_read_or_refused_by_name() {
+        let none = serde_json::json!({});
+        assert_eq!(
+            resolve_softcap(&none, "attn_logit_softcapping").unwrap(),
+            0.0
+        );
+        let null = serde_json::json!({ "final_logit_softcapping": serde_json::Value::Null });
+        assert_eq!(
+            resolve_softcap(&null, "final_logit_softcapping").unwrap(),
+            0.0
+        );
+        let gemma2 = serde_json::json!({
+            "attn_logit_softcapping": 50.0,
+            "final_logit_softcapping": 30.0,
+        });
+        assert_eq!(
+            resolve_softcap(&gemma2, "attn_logit_softcapping").unwrap(),
+            50.0
+        );
+        assert_eq!(
+            resolve_softcap(&gemma2, "final_logit_softcapping").unwrap(),
+            30.0
+        );
+        let bad = serde_json::json!({ "attn_logit_softcapping": -1.0 });
+        let error = resolve_softcap(&bad, "attn_logit_softcapping")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must be finite and positive"), "{error}");
+    }
+
+    #[test]
+    fn the_attention_scale_is_stored_only_when_it_differs() {
+        // gemma-2-2b: query_pre_attn_scalar 256 against head_dim 256 is exactly
+        // the default, so nothing is stored and the file stays smaller.
+        let same = serde_json::json!({ "query_pre_attn_scalar": 256 });
+        assert_eq!(resolve_attn_scale(&same, 256).unwrap(), 0.0);
+        // gemma-2-27b: 144 against head_dim 128 is a genuinely different scale.
+        let differs = serde_json::json!({ "query_pre_attn_scalar": 144 });
+        let scale = resolve_attn_scale(&differs, 128).unwrap();
+        assert_eq!(scale, (144.0f64).powf(-0.5) as f32);
+        assert_ne!(scale, 1.0 / (128.0f32).sqrt());
+        // Absent means the default.
+        assert_eq!(
+            resolve_attn_scale(&serde_json::json!({}), 128).unwrap(),
+            0.0
+        );
     }
 
     #[test]

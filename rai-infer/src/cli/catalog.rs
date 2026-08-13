@@ -375,10 +375,15 @@ mod tests {
 
     #[test]
     fn an_unsupported_architecture_is_refused_from_config_alone() {
-        let dir = scratch("gemma2");
+        // Gemma2 used to be the example here; the container gained logit
+        // softcapping and the sandwich norms, so it converts now. Gemma3 is the
+        // architecture that is still refused from the config alone, and for a
+        // reason no capability bit fixes: its sliding and global layers use
+        // different RoPE bases and the header stores one.
+        let dir = scratch("gemma3");
         let config = serde_json::json!({
-            "model_type": "gemma2",
-            "architectures": ["Gemma2ForCausalLM"],
+            "model_type": "gemma3_text",
+            "architectures": ["Gemma3ForCausalLM"],
             "hidden_size": 2304,
             "num_hidden_layers": 26,
             "num_attention_heads": 8,
@@ -386,7 +391,6 @@ mod tests {
             "head_dim": 256,
             "intermediate_size": 9216,
             "vocab_size": 256000,
-            "attn_logit_softcapping": 50.0,
         });
         std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
 
@@ -405,8 +409,8 @@ mod tests {
         );
         assert_eq!(value["supported"], false);
         let reason = value["reason"].as_str().unwrap();
-        assert!(reason.contains("gemma2"), "{reason}");
-        assert!(reason.contains("softcapping"), "{reason}");
+        assert!(reason.contains("gemma3_text"), "{reason}");
+        assert!(reason.contains("RoPE base"), "{reason}");
         assert!(value["container"].is_null());
         // The shape is still reported: the user wants to know what it *is*.
         assert_eq!(value["shape"]["num_layers"], 26);

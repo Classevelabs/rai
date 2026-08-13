@@ -608,6 +608,7 @@ fn prefill_profile(model: &RaiModel, prompt_len: usize, max_ctx: usize, eps: f32
             nh,
             nkv,
             hd,
+            rai_infer::layers::ScoreShaping::plain(hd),
         );
         t_attn += t.elapsed().as_secs_f64();
 
