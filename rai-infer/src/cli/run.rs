@@ -76,7 +76,7 @@ pub struct GenerationArgs {
     /// Print per-step decoding diagnostics to stderr
     #[arg(long, default_value = "false")]
     pub verbose: bool,
-    /// Chat template: auto, none, few-shot, mistral, llama3, chatml, zephyr
+    /// Chat template: auto, none, few-shot, mistral, llama3, chatml, zephyr, phi3
     #[arg(long, default_value = "none")]
     pub chat_template: String,
     /// Draft model for speculative decoding (e.g. smollm-135m-q4.raimodel)
@@ -155,9 +155,9 @@ pub fn validate_args(args: &GenerationArgs) -> Result<()> {
     ensure!(
         matches!(
             args.chat_template.as_str(),
-            "auto" | "none" | "few-shot" | "mistral" | "llama3" | "chatml" | "zephyr"
+            "auto" | "none" | "few-shot" | "mistral" | "llama3" | "chatml" | "zephyr" | "phi3"
         ),
-        "unknown --chat-template '{}'; expected auto, none, few-shot, mistral, llama3, chatml, or zephyr",
+        "unknown --chat-template '{}'; expected auto, none, few-shot, mistral, llama3, chatml, zephyr, or phi3",
         args.chat_template
     );
     ensure!(
@@ -704,7 +704,7 @@ pub fn run(args: &RunArgs) -> Result<()> {
             eprintln!(
                 "\nNo tokens generated: the model emitted end-of-sequence first. \
                  If this is an instruction-tuned model, pass the matching \
-                 --chat-template (auto, mistral, llama3, chatml, zephyr, few-shot)."
+                 --chat-template (auto, mistral, llama3, chatml, zephyr, phi3, few-shot)."
             );
         }
         eprintln!("\n--- Stats ---");

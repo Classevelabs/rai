@@ -26,6 +26,88 @@ use std::path::{Path, PathBuf};
 /// allocation.
 const MAX_HEADER_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Say what is wrong with a directory that holds no safetensors checkpoint,
+/// and what to do about it.
+///
+/// "Expected model.safetensors" is true and useless: the user is holding a
+/// real checkpoint in some other format and has no idea what to do next. The
+/// three cases below cover essentially every folder that reaches this point.
+///
+/// `.bin` and `.pth` are deliberately *not* read. They are Python pickles, and
+/// unpickling executes arbitrary code from the file — a checkpoint downloaded
+/// from a model hub is exactly the sort of file that must not be able to do
+/// that. Converting one costs the user a few seconds in an environment that
+/// already has torch, and keeps that capability out of this binary entirely.
+fn explain_missing_checkpoint(dir: &Path) -> String {
+    let mut pickles = Vec::new();
+    let mut gguf = Vec::new();
+    let mut subdirectories = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let lower = name.to_ascii_lowercase();
+            if entry.path().is_dir() {
+                if entry.path().join("config.json").is_file() {
+                    subdirectories.push(name);
+                }
+            } else if lower.ends_with(".bin") || lower.ends_with(".pth") || lower.ends_with(".pt") {
+                pickles.push(name);
+            } else if lower.ends_with(".gguf") {
+                gguf.push(name);
+            }
+        }
+    }
+    pickles.sort();
+    gguf.sort();
+    subdirectories.sort();
+
+    let where_it_looked = format!(
+        "no safetensors checkpoint in {}: expected model.safetensors or \
+         model.safetensors.index.json",
+        dir.display()
+    );
+
+    if !pickles.is_empty() {
+        return format!(
+            "{where_it_looked}.\n\nThis folder holds a PyTorch checkpoint ({}). It is a Python \
+             pickle, and loading one runs whatever code the file asks for, so this converter \
+             does not read them. Convert it once, in an environment that has torch:\n\n  \
+             python -c \"import torch, safetensors.torch as st; \
+             st.save_file({{k: v.contiguous() for k, v in \
+             torch.load(r'{}', map_location='cpu', weights_only=True).items()}}, \
+             r'{}')\"\n\nThen run `rai convert` on this folder again.",
+            pickles.join(", "),
+            dir.join(&pickles[0]).display(),
+            dir.join("model.safetensors").display(),
+        );
+    }
+    if !gguf.is_empty() {
+        return format!(
+            "{where_it_looked}.\n\nThis folder holds a GGUF file ({}), which is llama.cpp's \
+             format, already quantized. RAI converts from the original fp16/bf16 checkpoint so \
+             it controls the quantization itself. Download the HuggingFace repo this GGUF was \
+             built from — the one with config.json and .safetensors files.",
+            gguf.join(", "),
+        );
+    }
+    if !subdirectories.is_empty() {
+        return format!(
+            "{where_it_looked}.\n\nA subdirectory does look like a checkpoint: {}. Point \
+             `rai convert` at that instead of at its parent.",
+            subdirectories
+                .iter()
+                .map(|name| dir.join(name).display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
+    format!(
+        "{where_it_looked}.\n\nA convertible folder holds config.json, one or more \
+         .safetensors files, and tokenizer.json. If you downloaded with huggingface-cli, \
+         pass --local-dir so the files land in a plain folder rather than the blob cache."
+    )
+}
+
 /// The element types the converter can read. Everything is widened to f32.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Dtype {
@@ -121,11 +203,7 @@ impl SafeTensorsSet {
         } else if single.is_file() {
             vec![single]
         } else {
-            bail!(
-                "no safetensors checkpoint in {}: expected model.safetensors or \
-                 model.safetensors.index.json",
-                dir.display()
-            );
+            bail!("{}", explain_missing_checkpoint(dir));
         };
 
         let mut tensors: HashMap<String, TensorInfo> = HashMap::new();
@@ -383,5 +461,66 @@ fn decode_into(bytes: &[u8], dtype: Dtype, out: &mut Vec<f32>) {
                 out.push(f16::from_f32(value).to_f32());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("rai-st-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    /// The user has the model, in the wrong container. Naming the file they
+    /// have and handing them the command is the whole point: the previous
+    /// message was accurate and left them stuck.
+    #[test]
+    fn a_pytorch_checkpoint_is_named_with_the_command_that_converts_it() {
+        let dir = scratch("pickle");
+        std::fs::write(dir.join("pytorch_model.bin"), b"not really a pickle").unwrap();
+        let message = explain_missing_checkpoint(&dir);
+        assert!(message.contains("pytorch_model.bin"), "{message}");
+        assert!(message.contains("safetensors.torch"), "{message}");
+        assert!(
+            message.contains("weights_only=True"),
+            "the suggested command must not invite arbitrary code execution: {message}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_gguf_folder_is_told_to_fetch_the_original_checkpoint() {
+        let dir = scratch("gguf");
+        std::fs::write(dir.join("model-q4_k_m.gguf"), b"GGUF").unwrap();
+        let message = explain_missing_checkpoint(&dir);
+        assert!(message.contains("model-q4_k_m.gguf"), "{message}");
+        assert!(message.contains("llama.cpp"), "{message}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pointing at the parent of the snapshot directory is the single most
+    /// common way to get here, and the fix is one path away.
+    #[test]
+    fn a_checkpoint_one_level_down_is_pointed_at() {
+        let dir = scratch("nested");
+        let inner = dir.join("snapshot-abc123");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("config.json"), b"{}").unwrap();
+        let message = explain_missing_checkpoint(&dir);
+        assert!(message.contains("snapshot-abc123"), "{message}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_folder_says_what_a_checkpoint_looks_like() {
+        let dir = scratch("empty");
+        let message = explain_missing_checkpoint(&dir);
+        assert!(message.contains("config.json"), "{message}");
+        assert!(message.contains("--local-dir"), "{message}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

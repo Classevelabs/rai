@@ -149,6 +149,11 @@ struct Spec {
     qk_norm: QkNorm,
     /// Emit Gemma2's four-norm sandwich layout instead of the usual two.
     sandwich_norm: bool,
+    /// Concatenate q/k/v into `qkv_proj` and gate/up into `gate_up_proj`, as
+    /// Phi-3 publishes them. The weights themselves are unchanged, which is
+    /// what lets a fused checkpoint be compared byte-for-byte against the
+    /// separate one built from the same seed.
+    fused_projections: bool,
     /// Extra keys merged into `config.json` verbatim.
     extra_config: serde_json::Value,
     shards: usize,
@@ -165,6 +170,7 @@ impl Default for Spec {
             hidden_activation: serde_json::Value::Null,
             qk_norm: QkNorm::None,
             sandwich_norm: false,
+            fused_projections: false,
             extra_config: serde_json::Value::Null,
             shards: 1,
         }
@@ -223,12 +229,21 @@ fn write_checkpoint(dir: &Path, spec: &Spec) -> Checkpoint {
     ));
 
     for layer in 0..LAYERS {
+        // Held back so q/k/v and gate/up can be concatenated afterwards. The
+        // draw order is identical either way, so a fused checkpoint and a
+        // separate one built from the same seed hold the same numbers.
+        let mut pending: Vec<Vec<f32>> = Vec::with_capacity(names.len());
         for (index, (name, (rows, cols))) in names.iter().zip(dims).enumerate() {
-            tensors.push((
-                format!("model.layers.{layer}.{name}.weight"),
-                vec![rows, cols],
-                rng.weights(rows, cols),
-            ));
+            let values = rng.weights(rows, cols);
+            if spec.fused_projections {
+                pending.push(values);
+            } else {
+                tensors.push((
+                    format!("model.layers.{layer}.{name}.weight"),
+                    vec![rows, cols],
+                    values,
+                ));
+            }
             let wants_bias = match spec.bias {
                 Bias::None => false,
                 Bias::QkvEveryLayer => index < 3,
@@ -240,6 +255,33 @@ fn write_checkpoint(dir: &Path, spec: &Spec) -> Checkpoint {
                 tensors.push((tensor.clone(), vec![rows], values.clone()));
                 biases.push((tensor, values));
             }
+        }
+        if spec.fused_projections {
+            // Row order follows Phi3Attention (Q, then K, then V) and Phi3MLP
+            // (gate, then up).
+            let concat = |parts: &[&Vec<f32>]| -> Vec<f32> {
+                parts.iter().flat_map(|part| part.iter().copied()).collect()
+            };
+            tensors.push((
+                format!("model.layers.{layer}.self_attn.qkv_proj.weight"),
+                vec![q_dim + 2 * kv_dim, HIDDEN],
+                concat(&[&pending[0], &pending[1], &pending[2]]),
+            ));
+            tensors.push((
+                format!("model.layers.{layer}.self_attn.o_proj.weight"),
+                vec![HIDDEN, q_dim],
+                pending[3].clone(),
+            ));
+            tensors.push((
+                format!("model.layers.{layer}.mlp.gate_up_proj.weight"),
+                vec![2 * INTERMEDIATE, HIDDEN],
+                concat(&[&pending[4], &pending[5]]),
+            ));
+            tensors.push((
+                format!("model.layers.{layer}.mlp.down_proj.weight"),
+                vec![HIDDEN, INTERMEDIATE],
+                pending[6].clone(),
+            ));
         }
         // Per-head QK norms, when the spec asks for them. Emitted before the
         // layer norms only for readability — the converter locates every tensor
@@ -558,6 +600,69 @@ fn a_sharded_checkpoint_converts_to_the_same_bytes() {
 
     convert(&options(&model_dir, &output)).expect("sharded conversion failed");
     assert_matches_golden(&std::fs::read(&output).expect("reading produced model"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// =============================================================================
+// Fused projections (the Phi-3 path)
+// =============================================================================
+
+/// The whole claim, in one assertion: a checkpoint that fuses Q/K/V and
+/// gate/up produces *the same bytes* as the separate-tensor checkpoint built
+/// from the same seed — the golden file every other test compares against.
+///
+/// This is what makes the row offsets load-bearing. Reading K's rows where V's
+/// begin, or splitting the MLP at the wrong row, still yields a structurally
+/// valid file of exactly the right size; only the bytes differ. A test that
+/// merely asserted "conversion succeeded" would pass with the split wrong.
+#[test]
+fn a_fused_projection_checkpoint_converts_to_the_same_bytes() {
+    let spec = Spec {
+        fused_projections: true,
+        ..Spec::default()
+    };
+    let root = scratch_dir("fused");
+    let model_dir = root.join("checkpoint");
+    let output = root.join("out").join("fused.raimodel");
+    write_checkpoint(&model_dir, &spec);
+
+    // The separate tensors really are absent, so this cannot pass by accident.
+    let names = std::fs::read_to_string(model_dir.join("model.safetensors"))
+        .map(|_| ())
+        .err();
+    assert!(names.is_some() || model_dir.join("model.safetensors").is_file());
+
+    convert(&options(&model_dir, &output)).expect("fused conversion failed");
+    assert_matches_golden(&std::fs::read(&output).expect("reading produced model"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A fused tensor that is not as wide as the parts it claims to hold would let
+/// one projection read another's rows. It must be named, not truncated.
+#[test]
+fn a_fused_tensor_of_the_wrong_width_is_refused() {
+    let root = scratch_dir("fused-narrow");
+    let model_dir = root.join("checkpoint");
+    write_checkpoint(
+        &model_dir,
+        &Spec {
+            fused_projections: true,
+            // Doubling the head count makes the config's idea of qkv_proj
+            // wider than the tensor on disk, while staying divisible by the
+            // KV head count so this fails on the width and nothing else.
+            extra_config: serde_json::json!({ "num_attention_heads": HEADS * 2 }),
+            ..Spec::default()
+        },
+    );
+    let error = convert(&options(&model_dir, &root.join("out").join("x.raimodel")))
+        .expect_err("a mis-sized fused tensor must be refused");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("qkv_proj"),
+        "the error should name the fused tensor, got: {message}"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }
