@@ -27,6 +27,14 @@ fat LTO), rustc 1.95.0, RAI 0.2.0.
 | Output `.raimodel` | **619.5 MB** (3.55× smaller) |
 | Per-tensor quantization MSE | 6.4e-06 … 6.8e-06 (`q_proj`), 3.3e-06 (`down_proj`), 6.2e-09 (embedding) |
 
+The calibrated path was exercised on the same checkpoint:
+`export_fast.py --cal-chunks 4 --seq-len 512` took **1,780 s** (328 s
+calibration + 1,436 s quantization) and produced a byte-identical-sized
+619.5 MB / 25-section file. Both exports generate correct text; GPTQ is far
+slower to produce and needs a calibration corpus, which is the trade it makes
+for quality. This run used a deliberately small calibration set to bound the
+time, so it is a working-path demonstration, not a quality claim against RTN.
+
 ### Inference, against HuggingFace on the same machine
 
 Greedy decoding (`--temperature 0 --top-k 0 --top-p 1 --repetition-penalty 1`),
