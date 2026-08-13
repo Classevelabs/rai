@@ -66,10 +66,10 @@ that this format does store.
 | TinyLlama-1.1B | **Converts** | — | The measured reference model. |
 | SmolLM, SmolLM2 (135M / 360M / 1.7B) | **Converts** | — | `LlamaForCausalLM` with no bias and no RoPE scaling. |
 | Llama-2 / Mistral fine-tunes (Zephyr, OpenHermes, Vicuna, Nous-Hermes) | **Converts** | — | Fine-tuning changes weights, not architecture. |
-| Qwen3 (dense) | *Support landing — see below* | `Qwen/Qwen2.5-*-Instruct` at your size | Per-head QK norm; support in flight. |
-| OLMo2 | *Support landing — see below* | `meta-llama/Llama-3.1-8B-Instruct`, `mistralai/Mistral-7B-Instruct-v0.3` | Per-head QK norm; support in flight. |
-| Gemma2 | *Support landing — see below* | `google/gemma-2b-it`, `google/gemma-7b-it` | Logit softcapping; support in flight. |
-| Gemma3, Gemma3-text | *Support landing — see below* | `google/gemma-2b-it` | Verdict pending; a refusal names the exact blocker. |
+| Qwen3 (dense: 0.6B, 1.7B, 4B, 8B, 14B, 32B) | **Converts** | — | Per-head QK norm is stored in the v2 layer section. Verified: Qwen3-0.6B converts to 399 MB and generates. |
+| Gemma2 (2B, 9B, 27B) | **Converts** | — | Logit softcapping and the two block-output norms are stored. Convert with `--max-context 4096` or lower (see sliding windows). Verified: gemma-2-2b-it converts to 1.70 GB and generates. |
+| OLMo2 | **Refused** | `meta-llama/Llama-3.1-8B-Instruct`, `mistralai/Mistral-7B-Instruct-v0.3` | Its QK norm spans all heads at once rather than one head, and it has no `input_layernorm`. Two separate gaps; see below. |
+| Gemma3, Gemma3-text | **Refused** | `google/gemma-2b-it` | Its sliding and global layers use different RoPE bases; the header stores one. See below. |
 | Mixtral-8x7B, Mixtral-8x22B | **Refused** | `mistralai/Mistral-7B-Instruct-v0.3` | A router plus per-expert MLPs; a layer holds one gate/up/down triple. |
 | Qwen3-MoE (30B-A3B, 235B-A22B) | **Refused** | `Qwen/Qwen2.5-14B-Instruct` | Mixture-of-experts routing, independently of the dense-Qwen3 line above. |
 | Any config with `num_experts` or `num_local_experts` | **Refused** | The dense model of the same family | Same reason. |
@@ -84,37 +84,43 @@ that this format does store.
 A refusal is a hard error at export, never a warning, and never a file that
 loads cleanly and generates nonsense.
 
-### Four families in flight
+### Two families that look close but are not
 
-<!-- FINALISE: per-head QK norm (Qwen3, OLMo2) and logit softcapping (Gemma2),
-     possibly Gemma3-text, are being implemented. Replace each line below with
-     the verdict once that work reports, and set the matching table rows. -->
+Qwen3 and Gemma2 look like near neighbours of models RAI already ran, and they
+are — they convert now. OLMo2 and Gemma3 look equally close and are not. The
+difference is worth stating, because the family name does not tell you.
 
-**Support is landing for these four. The verdict below is not set yet — set it
-when the architecture work reports.**
-
-- **Qwen3 (dense: 0.6B, 1.7B, 4B, 8B, 14B, 32B)** — per-head QK norm support is
-  being implemented. *Verdict: pending.* If it is refused, use
-  `Qwen/Qwen2.5-0.5B-Instruct` for Qwen3-0.6B, `Qwen/Qwen2.5-1.5B-Instruct` for
-  1.7B, `Qwen/Qwen2.5-3B-Instruct` for 4B, `Qwen/Qwen2.5-7B-Instruct` for 8B,
-  `Qwen/Qwen2.5-14B-Instruct` for 14B, `Qwen/Qwen2.5-32B-Instruct` for 32B.
-- **OLMo2 (7B, 13B)** — same per-head QK norm work. *Verdict: pending.* If it is
-  refused, use `meta-llama/Llama-3.1-8B-Instruct` or
+- **OLMo2 (7B, 13B).** It has `q_norm` and `k_norm`, the same tensor names
+  Qwen3 uses, so it reads as the same feature. It is not. Qwen3's norm is one
+  `head_dim`-long vector applied inside each head; OLMo2's is
+  `num_heads * head_dim` long and applied to the whole projection output before
+  the tensor is ever split into heads. Different arithmetic, not a different
+  size. OLMo2 also has no `input_layernorm` at all — it normalizes after each
+  block rather than before, and a layer here stores two norms in the pre-block
+  positions. Two independent gaps. Use `meta-llama/Llama-3.1-8B-Instruct` or
   `mistralai/Mistral-7B-Instruct-v0.3`.
-- **Gemma2 (2B, 9B, 27B)** — logit softcapping support is being implemented.
-  *Verdict: pending.* If it is refused, use `google/gemma-2b-it` (the Gemma
-  checkpoint verified generating) or `google/gemma-7b-it`.
-- **Gemma3, Gemma3-text (1B, 4B, 12B, 27B)** — needs more than the work in
-  flight covers; its sliding and global attention layers do not share one RoPE
-  base. *Verdict: pending.* If it is refused, use `google/gemma-2b-it`.
+- **Gemma3, Gemma3-text (1B, 4B, 12B, 27B).** Per-head QK norm and softcapping
+  are both stored now, so neither is what stops it. Gemma3 interleaves local
+  and global attention layers that use *different RoPE bases* —
+  `rope_local_base_freq` of 10,000 against `rope_theta` of 1,000,000. The
+  header stores one theta and the runtime builds one rotary table, so five
+  layers in six would rotate at the wrong frequency: a file that loads cleanly
+  and degrades quietly. That needs per-layer RoPE tables, not a flag. Use
+  `google/gemma-2b-it`.
 
 Studio does not read this page: it reports whatever the server's preflight
-says, so the moment a family is accepted it stops being offered an alternative.
+says, so a family that becomes supported stops being offered an alternative.
 
 ### What has actually been run
 
-Qwen2.5-0.5B-Instruct, Llama-3.2-1B-Instruct, and gemma-2b-it were each
-converted and generated coherent text. TinyLlama-1.1B-Chat is the one
+Qwen2.5-0.5B-Instruct, Llama-3.2-1B-Instruct, gemma-2b-it, **Qwen3-0.6B** and
+**gemma-2-2b-it** were each converted and generated coherent text. The last two
+are the checkpoints that exercise the capabilities added for them: Qwen3-0.6B
+writes 399 MB with the QK-norm flag set, gemma-2-2b-it writes 1.70 GB with the
+sandwich-norm flag and both softcaps. Their stored norm vectors were also read
+back from the container at documented byte offsets and compared against the
+source `.safetensors` — bit-exact, so the capability is stored correctly and
+not merely accepted. TinyLlama-1.1B-Chat is the one
 checkpoint measured end to end: 2,200 MB of fp16 weights become a 619.5 MB
 `.raimodel` in 7.6 s at 22.9 MB peak RSS, and decode 21.8 tok/s
 ([BENCHMARKS.md](../BENCHMARKS.md)). Zephyr-7B-beta and SmolLM2-1.7B-Instruct
@@ -146,7 +152,7 @@ The three fields that decide it most often are `model_type`, `num_experts`, and
 
 | Field | Convert it | Do not download |
 | --- | --- | --- |
-| `model_type` | `llama`, `mistral`, `qwen2`, `gemma` | `mixtral`, `qwen3_moe`, `phi3`, `falcon`, `mpt`, `gpt_neox`, `gpt2` — and see the four families in flight for `qwen3`, `olmo2`, `gemma2`, `gemma3` |
+| `model_type` | `llama`, `mistral`, `qwen2`, `qwen3`, `gemma`, `gemma2` | `mixtral`, `qwen3_moe`, `olmo2`, `gemma3`, `gemma3_text`, `phi3`, `falcon`, `mpt`, `gpt_neox`, `gpt2` |
 | `num_experts` / `num_local_experts` | Absent or zero | Any positive value — no exceptions, whatever the family |
 | `rope_scaling` | `null`, absent, `{"rope_type": "default"}`, or `{"rope_type": "llama3", ...}` | Any other `rope_type`, including `linear`, `dynamic`, `yarn` |
 | `sliding_window` | Absent, or at least your `--max-context` | Present and below your `--max-context` — lower the context rather than dropping the model |
@@ -159,10 +165,14 @@ stores, and it collects every problem it finds before failing. The error names
 the count, the first offending tensor, and the reason, one bullet per problem:
 
 ```
-this checkpoint cannot be represented by the .raimodel format:
-  - 56 per-head QK norm(s) present (e.g. model.layers.0.self_attn.q_norm);
-    the format has no place to store them.
+tensor 'model.layers.0.self_attn.q_norm.weight' holds 4096 values but
+head_dim is 128; this container implements the per-head QK norm shared
+across heads (Qwen3, Gemma3), not a norm over the whole projection (OLMo2).
 ```
+
+That is the OLMo2 case, and it is deliberately specific: the tensor has the
+name RAI supports and the wrong width, which a message saying only
+"unsupported architecture" would have hidden.
 
 It fails before calibration, so a refusal costs seconds, not hours.
 
@@ -186,23 +196,29 @@ which only the Python path implements.
 
 The `.raimodel` container stores exactly this and nothing else:
 
-- a header holding the architecture dimensions, `rope_theta`, `norm_eps`, the
-  activation code, the RoPE scaling parameters, the bias mask, and the
-  embedding scale
+- a header holding the architecture dimensions, **one** `rope_theta`,
+  `norm_eps`, the activation code, the RoPE scaling parameters, the bias mask,
+  the embedding scale, the two logit softcaps, and the attention scale
 - one 8-bit quantized embedding table
 - per layer: seven 4-bit projections (`q`, `k`, `v`, `o`, `gate`, `up`,
-  `down`), an optional f32 bias vector per projection, and two f32 RMSNorm
-  weight vectors
+  `down`), an optional f32 bias vector per projection, an optional pair of
+  `head_dim`-long f32 QK norm vectors, an optional pair of hidden-sized f32
+  block-output norms, and two f32 RMSNorm weight vectors
 - one final f32 RMSNorm
 - an optional 4-bit `lm_head` (omitted when the head is tied to the embedding)
 
-<!-- FINALISE: if per-head QK norm lands, the per-layer list above gains two
-     more f32 norm vectors and this section needs the same edit. -->
+Each optional block is *absent* rather than zero-length when unused, which is
+why a model needing none of them still writes a file byte-identical to what
+earlier versions produced.
 
 The kernels implement exactly this and nothing else: RMSNorm as `x / rms * w`,
-rotary embeddings from one theta with an optional `llama3` frequency rescale,
-full causal attention with grouped-query head mapping, and a gated MLP with
-either a SiLU or a GeLU-tanh gate.
+applied per token or per head; rotary embeddings from **one** theta with an
+optional `llama3` frequency rescale; full causal attention with grouped-query
+head mapping, an optional non-default scale and an optional `tanh` softcap on
+the scores; and a gated MLP with either a SiLU or a GeLU-tanh gate.
+
+The emphasis on *one* theta is where Gemma3 falls out: a model that rotates
+different layers at different frequencies has nowhere to say so.
 
 A model needing a weight or an operation outside those two lists has nowhere to
 put it. It would be dropped at export and the resulting file would load cleanly
@@ -210,12 +226,14 @@ and generate nonsense, so the exporter rejects it instead.
 
 ### Sliding-window models
 
-Mistral declares `sliding_window: 4096`. RAI always runs full causal attention.
+Mistral and Gemma2 declare `sliding_window: 4096`. RAI always runs full causal
+attention.
 Inside the window that is identical arithmetic; past it, the two diverge. The
 exporter therefore accepts a sliding-window checkpoint up to the window length
 and refuses a longer `--max-context`, naming the window in the error. Convert
-Mistral-7B with `--max-context 4096` or lower. This is the one refusal that
-needs no different model — the same folder converts at a shorter context.
+Mistral-7B and Gemma2 with `--max-context 4096` or lower. This is the one
+refusal that needs no different model — the same folder converts at a shorter
+context, and Studio offers that as a button rather than an alternative model.
 
 ### Shape constraints that apply to every model
 
@@ -241,28 +259,23 @@ again.
 Each of these is tractable. None is free. They are listed roughly in ascending
 cost.
 
-### Per-head QK norm — Qwen3, OLMo2, and half of Gemma3
+### Full-width QK norm — OLMo2
 
-<!-- FINALISE: in flight. Rewrite this subsection as shipped capability if it
-     lands, or leave it here if it does not. -->
+RAI stores a `head_dim`-long norm applied inside each head. OLMo2 needs a
+`num_heads * head_dim`-long norm applied to the projection output before it is
+split into heads. That is a different kernel, not a wider vector, and it would
+need its own flag so the two cannot be confused at load time. OLMo2 would also
+need pre-norm made optional, since it has no `input_layernorm` — a structural
+change to the layer, not a stored weight.
 
-Two more f32 norm vectors per layer, each `head_dim` long, applied to Q and K
-per head after projection and before RoPE. The layer section grows by
-`2 * head_dim * 4` bytes and the reader grows two more `RMSNormWeights` views.
-The existing `rms_norm` kernel does the arithmetic unchanged; it is called per
-head instead of per token. Cost: a header flag and two extra section fields.
-This is the cheapest of the remaining maths changes, and it is the work
-currently in flight.
+### Per-layer RoPE tables — Gemma3
 
-### Logit softcapping — Gemma2
-
-<!-- FINALISE: in flight, same as above. -->
-
-`softcap * tanh(x / softcap)` applied to the attention scores and again to the
-final logits, with the two cap values carried in the header. No new parameters,
-but two new points in the forward pass and a `tanh` over the whole vocabulary
-on every step. Gemma2 also interleaves sliding-window and full attention layers,
-which the KV cache and the attention kernel currently have no way to express.
+Gemma3 rotates its local and global attention layers at different bases. The
+header carries one `rope_theta` and the runtime builds one table shared by
+every layer, so this needs a second stored base, a per-layer selector, and two
+live tables in memory. The arithmetic is already implemented; what is missing
+is the ability to say "this layer, not that one", which touches the header, the
+layer section, and the attention entry points at once.
 
 ### YaRN and other RoPE schemes — long-context fine-tunes
 

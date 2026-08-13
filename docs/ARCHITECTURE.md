@@ -31,15 +31,21 @@ The `.raimodel` file is a flat little-endian binary:
 - Header: magic `RAIM`, format version, architecture dimensions, `rope_theta`,
   `norm_eps`, and the quantization configuration — 64 bytes at container v1.
   Version 2 extends it to 128 bytes and adds the activation code, the `llama3`
-  RoPE rescaling parameters, the per-projection bias mask, and the embedding
-  scale. A converter emits v1 whenever none of those is needed, so pre-v2
+  RoPE rescaling parameters, the per-projection bias mask, the embedding scale,
+  a capability flag byte, the attention and final logit softcaps, and the
+  attention scale. Bytes 100..128 are reserved and must be zero, so a reader
+  refuses a file written by a future version rather than misreading it. A
+  converter emits v1 whenever none of the v2 fields is needed, so pre-v2
   checkpoints still produce identical bytes.
 - Section index table: 16 bytes per section, offset and size.
 - Section 0: 8-bit quantized embedding table.
 - Sections 1..N: one per transformer layer, each holding seven 4-bit
   projections (`q`, `k`, `v`, `o`, `gate`, `up`, `down`), then one f32 bias
-  vector per bit set in the header's `bias_mask`, then two f32 RMSNorm weight
-  vectors.
+  vector per bit set in the header's `bias_mask`, then — when the matching
+  flag is set — a `head_dim`-long f32 QK norm pair and a hidden-sized f32
+  block-output norm pair, then two f32 RMSNorm weight vectors. Each optional
+  block is absent rather than zero-length when its flag is clear, which is what
+  keeps unaffected models byte-identical.
 - Section N+1: final RMSNorm weights (f32).
 - Section N+2: 4-bit `lm_head`, present when the head is not tied to the
   embedding table.
