@@ -74,6 +74,7 @@ impl fmt::Display for ChatHttpError {
 #[derive(Parser, Debug)]
 #[command(
     name = "rai-chat",
+    version,
     about = "Chat with any .raimodel — edge inference with pondering"
 )]
 struct Args {

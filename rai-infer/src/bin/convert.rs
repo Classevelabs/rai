@@ -14,6 +14,7 @@ use rai_infer::convert::{convert, ConvertOptions};
 #[derive(Parser, Debug)]
 #[command(
     name = "rai-convert",
+    version,
     about = "Convert a HuggingFace checkpoint to .raimodel (round-to-nearest 4-bit)"
 )]
 struct Args {
