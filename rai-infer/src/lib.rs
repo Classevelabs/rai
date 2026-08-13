@@ -1,10 +1,15 @@
 pub mod chat_template;
+#[cfg(feature = "cli")]
+pub mod convert;
 pub mod format;
 pub mod gemm;
 pub mod kv_cache;
 pub mod layers;
+pub mod lookup;
 pub mod model;
 pub mod ponder;
+#[cfg(feature = "cli")]
+pub mod safetensors;
 pub mod sampler;
 pub mod self_speculative;
 pub mod speculative;

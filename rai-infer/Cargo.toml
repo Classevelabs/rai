@@ -52,6 +52,11 @@ memmap2 = { version = "0.9", optional = true }
 serde_json = "1"
 
 [[bin]]
+name = "rai-convert"
+path = "src/bin/convert.rs"
+required-features = ["cli"]
+
+[[bin]]
 name = "rai-generate"
 path = "src/bin/generate.rs"
 required-features = ["cli"]
