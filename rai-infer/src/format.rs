@@ -21,7 +21,7 @@
 //! | offset  | type | field |
 //! |---------|------|-------|
 //! | 64      | u8   | `activation` — 0 = SiLU/SwiGLU, 1 = GeLU-tanh/GeGLU |
-//! | 65      | u8   | `flags` — bit 0: projection biases; bit 1: per-head QK norms |
+//! | 65      | u8   | `flags` — bit 0: projection biases; bit 1: per-head QK norms; bit 2: sandwich norms; bit 3: full-width QK norms; bit 4: post-norm placement |
 //! | 66      | u8   | `rope_type` — 0 = default, 1 = llama3 |
 //! | 67      | u8   | `bias_mask` — bit *i* set: projection *i* carries a bias |
 //! | 68..72  | f32  | `rope_factor` |
@@ -48,14 +48,20 @@
 //!    as f32 rather than quantized: they are `rows` values against a matrix of
 //!    `rows * cols`, so the space is noise and the quantization error would not
 //!    be;
-//! 3. the **QK-norm block** — present when `flags` bit 1 is set: exactly two
-//!    `head_dim * 4`-byte f32 vectors, `q_norm` then `k_norm`. They sit here,
-//!    after the biases and before the layer norms, so that the two hidden-sized
-//!    RMSNorm vectors every version has always remain the tail of the section;
+//! 3. the **QK-norm block** — present when `flags` bit 1 *or* bit 3 is set:
+//!    exactly two f32 vectors, `q_norm` then `k_norm`. Bit 1 makes them
+//!    `head_dim` values each, applied inside every head; bit 3 makes them
+//!    `attention_dim` and `kv_dim`, applied to the whole projection before it
+//!    is split into heads. They sit here, after the biases and before the
+//!    layer norms, so that the two hidden-sized RMSNorm vectors every version
+//!    has always remain the tail of the section;
 //! 4. the **sandwich-norm block** — present when `flags` bit 2 is set: two
 //!    `hidden_size * 4`-byte f32 vectors, `attn_out_norm` then `mlp_out_norm`,
 //!    applied to the attention and MLP *outputs* before the residual add;
-//! 5. the two `hidden_size * 4`-byte RMSNorm vectors, input then pre-MLP.
+//! 5. the two `hidden_size * 4`-byte RMSNorm vectors, input then pre-MLP —
+//!    or, when `flags` bit 4 is set, the attention-output and MLP-output norms
+//!    of a post-norm model such as OLMo2, which has no pre-block norm at all.
+//!    Same storage, applied at a different point in the block.
 //!
 //! Note the naming: slot 5's second vector is whichever norm the reference model
 //! applies to the residual stream before the MLP — `post_attention_layernorm`
@@ -105,13 +111,37 @@ pub const NUM_PROJECTIONS: usize = PROJECTION_NAMES.len();
 /// `flags` bit 0: the layer sections carry bias vectors.
 pub const FLAG_HAS_BIASES: u8 = 0x01;
 /// `flags` bit 1: the layer sections carry per-head `q_norm`/`k_norm` vectors,
-/// applied to each attention head before RoPE (Qwen3, Gemma3, OLMo2-style).
+/// each `head_dim` long, applied inside each attention head before RoPE
+/// (Qwen3, Gemma3).
 pub const FLAG_HAS_QK_NORM: u8 = 0x02;
 /// `flags` bit 2: the layer sections carry the two extra "sandwich" norms that
 /// Gemma2 applies to the attention and MLP outputs before the residual add.
 pub const FLAG_HAS_SANDWICH_NORM: u8 = 0x04;
+/// `flags` bit 3: the layer sections carry `q_norm`/`k_norm` sized over the
+/// *whole* projection (`attention_dim` and `kv_dim`), applied before the
+/// tensor is split into heads — the OLMo2 shape.
+///
+/// This is deliberately a separate bit from [`FLAG_HAS_QK_NORM`] rather than a
+/// length the reader infers. The two are different arithmetic: a joint norm
+/// takes one RMS across every head, a per-head norm takes one per head. A file
+/// that set the wrong bit would load, run, and be subtly wrong, so the pair is
+/// mutually exclusive and a file setting both is refused.
+pub const FLAG_HAS_FULL_QK_NORM: u8 = 0x08;
+/// `flags` bit 4: the two hidden-sized norms at the tail of a layer section
+/// are applied to the *outputs* of the attention and MLP blocks before the
+/// residual add, instead of to the residual stream before them — the OLMo2
+/// post-norm shape, which has no pre-block norm at all.
+///
+/// Storage is unchanged: the same two vectors, applied at a different point.
+/// Mutually exclusive with [`FLAG_HAS_SANDWICH_NORM`], which means a model
+/// carries *both* pre- and post-block norms.
+pub const FLAG_POST_NORM: u8 = 0x10;
 /// Every `flags` bit this reader understands.
-const KNOWN_FLAGS: u8 = FLAG_HAS_BIASES | FLAG_HAS_QK_NORM | FLAG_HAS_SANDWICH_NORM;
+const KNOWN_FLAGS: u8 = FLAG_HAS_BIASES
+    | FLAG_HAS_QK_NORM
+    | FLAG_HAS_SANDWICH_NORM
+    | FLAG_HAS_FULL_QK_NORM
+    | FLAG_POST_NORM;
 /// Every `bias_mask` bit this reader understands (one per projection).
 const KNOWN_BIAS_MASK: u8 = 0x7F;
 const MAX_MODEL_FILE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
@@ -183,6 +213,13 @@ pub struct ModelConfig {
     /// True when every layer section carries the two extra Gemma2 "sandwich"
     /// norms applied to the attention and MLP outputs. False for v1 files.
     pub has_sandwich_norm: bool,
+    /// True when the `q_norm`/`k_norm` pair spans the whole projection rather
+    /// than one head (OLMo2). Never true at the same time as `has_qk_norm`.
+    pub has_full_qk_norm: bool,
+    /// True when the two tail norms apply to block outputs rather than to the
+    /// residual stream before each block (OLMo2). Never true at the same time
+    /// as `has_sandwich_norm`.
+    pub post_norm: bool,
     /// `cap` in `cap * tanh(x / cap)` applied to attention logits before the
     /// softmax. `0.0` disables it, which is every model but Gemma2.
     pub attn_logit_softcap: f32,
@@ -509,9 +546,17 @@ impl RaiModelFile {
             // length, and finite throughout.
             let head_dim = self.config.head_dim as usize;
             let hidden = self.config.hidden_size as usize;
+            // A full-width pair is two different widths under GQA, which is
+            // exactly why the wrong flag cannot merely be "the same block".
+            let (q_norm_values, k_norm_values) = if self.config.has_full_qk_norm {
+                (self.config.attention_dim(), self.config.kv_dim())
+            } else {
+                (head_dim, head_dim)
+            };
+            let any_qk_norm = self.config.has_qk_norm || self.config.has_full_qk_norm;
             for (declared, vector, values, name) in [
-                (self.config.has_qk_norm, refs.q_norm, head_dim, "q_norm"),
-                (self.config.has_qk_norm, refs.k_norm, head_dim, "k_norm"),
+                (any_qk_norm, refs.q_norm, q_norm_values, "q_norm"),
+                (any_qk_norm, refs.k_norm, k_norm_values, "k_norm"),
                 (
                     self.config.has_sandwich_norm,
                     refs.attn_out_norm,
@@ -686,6 +731,12 @@ impl RaiModelFile {
         let (q_norm, k_norm) = if self.config.has_qk_norm {
             let q = take_vector(&mut offset, head_dim, "q_norm")?;
             let k = take_vector(&mut offset, head_dim, "k_norm")?;
+            (Some(q), Some(k))
+        } else if self.config.has_full_qk_norm {
+            // OLMo2 norms the whole projection, so the two vectors are the
+            // projection widths and differ from each other under GQA.
+            let q = take_vector(&mut offset, self.config.attention_dim(), "q_norm")?;
+            let k = take_vector(&mut offset, self.config.kv_dim(), "k_norm")?;
             (Some(q), Some(k))
         } else {
             (None, None)
@@ -880,6 +931,8 @@ fn parse_header(data: &[u8]) -> Result<HeaderInfo> {
         embed_scale: 1.0,
         has_qk_norm: false,
         has_sandwich_norm: false,
+        has_full_qk_norm: false,
+        post_norm: false,
         attn_logit_softcap: 0.0,
         final_logit_softcap: 0.0,
         attn_scale: 0.0,
@@ -955,6 +1008,28 @@ fn read_v2_capabilities(data: &[u8], config: &mut ModelConfig) -> Result<()> {
     config.bias_mask = bias_mask;
     config.has_qk_norm = flags & FLAG_HAS_QK_NORM != 0;
     config.has_sandwich_norm = flags & FLAG_HAS_SANDWICH_NORM != 0;
+    config.has_full_qk_norm = flags & FLAG_HAS_FULL_QK_NORM != 0;
+    config.post_norm = flags & FLAG_POST_NORM != 0;
+    // Each pair describes the same storage two incompatible ways. Refusing
+    // here is the difference between a rejected file and one that loads and
+    // is quietly wrong: with both QK bits set the section size is ambiguous,
+    // and with both norm-placement bits set the forward pass is.
+    if config.has_qk_norm && config.has_full_qk_norm {
+        bail!(
+            "header sets both per-head and full-width QK norm ({:#04x} | {:#04x}); they \
+             describe different arithmetic and only one can be true",
+            FLAG_HAS_QK_NORM,
+            FLAG_HAS_FULL_QK_NORM
+        );
+    }
+    if config.has_sandwich_norm && config.post_norm {
+        bail!(
+            "header sets both sandwich norms and post-norm placement ({:#04x} | {:#04x}); \
+             sandwich means pre- and post-block norms, post-norm means no pre-block norm",
+            FLAG_HAS_SANDWICH_NORM,
+            FLAG_POST_NORM
+        );
+    }
 
     let rope_type = data[66];
     let factor = f32::from_le_bytes(data[68..72].try_into().unwrap());
@@ -1235,6 +1310,8 @@ mod tests {
             embed_scale: 1.0,
             has_qk_norm: false,
             has_sandwich_norm: false,
+            has_full_qk_norm: false,
+            post_norm: false,
             attn_logit_softcap: 0.0,
             final_logit_softcap: 0.0,
             attn_scale: 0.0,
@@ -1742,7 +1819,10 @@ mod tests {
         for (label, patch, needle) in [
             (
                 "flags",
-                Box::new(|h: &mut [u8]| h[65] = 0x08) as Box<dyn Fn(&mut [u8])>,
+                // The lowest bit above KNOWN_FLAGS. Raise this as capabilities
+                // are added; a bit that has since become real would make this
+                // case pass for the wrong reason.
+                Box::new(|h: &mut [u8]| h[65] = 0x20) as Box<dyn Fn(&mut [u8])>,
                 "set bits this reader does not implement",
             ),
             (

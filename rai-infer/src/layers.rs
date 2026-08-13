@@ -287,12 +287,31 @@ impl ScoreShaping {
     }
 }
 
-/// The per-head query/key norms a layer applies before RoPE.
+/// The query/key norms a layer applies before RoPE.
 #[derive(Debug, Clone, Copy)]
 pub struct QkNorm<'a> {
     pub q: &'a [f32],
     pub k: &'a [f32],
     pub eps: f32,
+    /// True for OLMo2, which norms the whole projection at once instead of
+    /// each head separately.
+    pub full_width: bool,
+}
+
+impl QkNorm<'_> {
+    /// Normalize one projection's output in place.
+    ///
+    /// The two shapes differ only in how the vector is chunked: per-head takes
+    /// one RMS per head, full-width takes one across every head at once.
+    /// Expressing the second as a single chunk keeps both on the same kernel,
+    /// so the two cannot drift apart as that kernel changes.
+    pub fn apply(&self, values: &mut [f32], weight: &[f32], heads: usize, head_dim: usize) {
+        if self.full_width {
+            rms_norm_heads(values, 1, heads * head_dim, weight, self.eps);
+        } else {
+            rms_norm_heads(values, heads, head_dim, weight, self.eps);
+        }
+    }
 }
 
 /// AVX2 RMSNorm: SIMD sum-of-squares + SIMD multiply.
@@ -1183,8 +1202,8 @@ pub fn gqa_attention_decode(
     //     RoPE, which is where `q_norm(q_proj(x).view(..., head_dim))` sits in
     //     the reference model — see `rms_norm_heads`. V is never normed.
     if let Some(norm) = qk_norm {
-        rms_norm_heads(&mut work.q, num_heads, head_dim, norm.q, norm.eps);
-        rms_norm_heads(&mut work.k, num_kv_heads, head_dim, norm.k, norm.eps);
+        norm.apply(&mut work.q, norm.q, num_heads, head_dim);
+        norm.apply(&mut work.k, norm.k, num_kv_heads, head_dim);
     }
 
     // 2. Apply RoPE to Q (num_heads heads) and K (num_kv_heads heads)
@@ -1611,8 +1630,8 @@ pub fn compute_attention(
     );
     // Per-head QK norm, before RoPE (see `rms_norm_heads`).
     if let Some(norm) = qk_norm {
-        rms_norm_heads(q, num_heads, head_dim, norm.q, norm.eps);
-        rms_norm_heads(k, num_kv_heads, head_dim, norm.k, norm.eps);
+        norm.apply(q, norm.q, num_heads, head_dim);
+        norm.apply(k, norm.k, num_kv_heads, head_dim);
     }
 
     // Apply RoPE

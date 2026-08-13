@@ -128,9 +128,12 @@ enum QkNorm {
     EveryLayer,
     /// `q_norm` alone on layer 0: a checkpoint no single flag can describe.
     QOnLayerZeroOnly,
-    /// The pair on every layer but sized over the whole projection rather than
-    /// one head — the OLMo2 shape, which this container does not implement.
+    /// The pair on every layer, sized over the whole projection rather than
+    /// one head — the OLMo2 shape. Under GQA the two are different lengths.
     FullWidthEveryLayer,
+    /// A q_norm that is neither `head_dim` nor `num_heads * head_dim`, which
+    /// matches no shape this container implements.
+    NonsenseWidthEveryLayer,
 }
 
 /// What the synthetic checkpoint should look like.
@@ -149,6 +152,10 @@ struct Spec {
     qk_norm: QkNorm,
     /// Emit Gemma2's four-norm sandwich layout instead of the usual two.
     sandwich_norm: bool,
+    /// Emit OLMo2's post-norm layout: no `input_layernorm` anywhere, and the
+    /// two norms are `post_attention_layernorm` and
+    /// `post_feedforward_layernorm` applied to the block outputs.
+    post_norm: bool,
     /// Concatenate q/k/v into `qkv_proj` and gate/up into `gate_up_proj`, as
     /// Phi-3 publishes them. The weights themselves are unchanged, which is
     /// what lets a fused checkpoint be compared byte-for-byte against the
@@ -170,6 +177,7 @@ impl Default for Spec {
             hidden_activation: serde_json::Value::Null,
             qk_norm: QkNorm::None,
             sandwich_norm: false,
+            post_norm: false,
             fused_projections: false,
             extra_config: serde_json::Value::Null,
             shards: 1,
@@ -286,20 +294,25 @@ fn write_checkpoint(dir: &Path, spec: &Spec) -> Checkpoint {
         // Per-head QK norms, when the spec asks for them. Emitted before the
         // layer norms only for readability — the converter locates every tensor
         // by name, so the order in the safetensors file is irrelevant.
-        let qk_len = match spec.qk_norm {
-            QkNorm::FullWidthEveryLayer => q_dim,
-            _ => spec.head_dim,
+        // A full-width pair is two *different* lengths under grouped-query
+        // attention, which is the detail that makes it a distinct shape rather
+        // than a longer version of the per-head one.
+        let qk_lens = match spec.qk_norm {
+            QkNorm::FullWidthEveryLayer => (q_dim, kv_dim),
+            QkNorm::NonsenseWidthEveryLayer => (q_dim + 2, q_dim + 2),
+            _ => (spec.head_dim, spec.head_dim),
         };
-        let qk_sides: &[&str] = match (spec.qk_norm, layer) {
+        let qk_sides: &[(&str, usize)] = match (spec.qk_norm, layer) {
             (QkNorm::None, _) => &[],
-            (QkNorm::QOnLayerZeroOnly, 0) => &["q_norm"],
+            (QkNorm::QOnLayerZeroOnly, 0) => &[("q_norm", 0)],
             (QkNorm::QOnLayerZeroOnly, _) => &[],
-            _ => &["q_norm", "k_norm"],
+            _ => &[("q_norm", 0), ("k_norm", 1)],
         };
-        for side in qk_sides {
-            let values = rng.norm(qk_len);
+        for (side, which) in qk_sides {
+            let len = if *which == 0 { qk_lens.0 } else { qk_lens.1 };
+            let values = rng.norm(len);
             let tensor = format!("model.layers.{layer}.self_attn.{side}.weight");
-            tensors.push((tensor.clone(), vec![qk_len], values.clone()));
+            tensors.push((tensor.clone(), vec![len], values.clone()));
             norms.push((tensor, values));
         }
         // Gemma2 replaces the two-norm layout with four: `input_layernorm` and
@@ -313,6 +326,11 @@ fn write_checkpoint(dir: &Path, spec: &Spec) -> Checkpoint {
                 "post_attention_layernorm",
                 "post_feedforward_layernorm",
             ]
+        } else if spec.post_norm {
+            // OLMo2: no input_layernorm at all. Both norms act on block
+            // outputs, so an exporter that put them in the pre-block slots
+            // would produce a file that loads and is wrong.
+            &["post_attention_layernorm", "post_feedforward_layernorm"]
         } else {
             &["input_layernorm", "post_attention_layernorm"]
         };
@@ -1352,11 +1370,21 @@ fn the_new_capabilities_keep_batched_and_sequential_identical() {
     for (label, spec) in [
         ("qwen3", qwen3_spec()),
         ("gemma2", gemma2_spec()),
+        ("olmo2", olmo2_spec()),
         (
             "both",
             Spec {
                 qk_norm: QkNorm::EveryLayer,
                 ..gemma2_spec()
+            },
+        ),
+        // Post-norm placement without the full-width norms, so the placement
+        // branch is exercised on its own in both paths.
+        (
+            "post-norm-only",
+            Spec {
+                post_norm: true,
+                ..Spec::default()
             },
         ),
     ] {
@@ -1392,17 +1420,155 @@ fn a_partial_or_wrongly_shaped_qk_norm_set_is_refused() {
         "error should name the missing half: {error}"
     );
 
-    // OLMo2 norms the whole projection, not each head. Refusing it by name is
-    // the difference between "unsupported" and "silently wrong".
-    let full_width = Spec {
-        qk_norm: QkNorm::FullWidthEveryLayer,
+    // A width matching neither shape is still refused, and the message has to
+    // name both widths it would have accepted or the reader cannot act on it.
+    let nonsense = Spec {
+        qk_norm: QkNorm::NonsenseWidthEveryLayer,
         ..Spec::default()
     };
-    let error = convert_error("qk-full-width", &full_width);
+    let error = convert_error("qk-nonsense", &nonsense);
     assert!(
-        error.contains("head_dim") && error.contains("OLMo2"),
-        "error should name the shape mismatch: {error}"
+        error.contains("head_dim") && error.contains("num_heads*head_dim"),
+        "error should name both supported widths: {error}"
     );
+}
+
+/// The exact OLMo2 shape: projection-wide QK norms and post-norm placement.
+fn olmo2_spec() -> Spec {
+    Spec {
+        model_type: "olmo2",
+        qk_norm: QkNorm::FullWidthEveryLayer,
+        post_norm: true,
+        ..Spec::default()
+    }
+}
+
+#[test]
+fn an_olmo2_shaped_checkpoint_stores_full_width_norms_and_post_norm_placement() {
+    let (root, output, checkpoint) = convert_spec("olmo2", &olmo2_spec());
+
+    let header = header_bytes(&output);
+    assert_eq!(header[4], 2, "OLMo2 needs container v2");
+    assert_eq!(
+        header[65], 0x18,
+        "flags should declare full-width QK norms (0x08) and post-norm (0x10)"
+    );
+
+    let file = RaiModelFile::open(&output).expect("the produced model must load");
+    assert!(file.config.has_full_qk_norm);
+    assert!(file.config.post_norm);
+    assert!(
+        !file.config.has_qk_norm,
+        "the per-head flag must not also be set"
+    );
+    assert!(!file.config.has_sandwich_norm);
+
+    // The two QK vectors are different lengths under GQA. Reading them back at
+    // the documented offsets is what proves the writer and reader agree about
+    // a block whose halves are not the same size.
+    let layer = file.layer(0).expect("layer 0");
+    let q_norm = layer.q_norm.expect("q_norm present");
+    let k_norm = layer.k_norm.expect("k_norm present");
+    assert_eq!(q_norm.len(), HEADS * HEAD_DIM * 4);
+    assert_eq!(k_norm.len(), KV_HEADS * HEAD_DIM * 4);
+
+    // And the stored values are the checkpoint's, not some other norm's.
+    for (name, expected) in &checkpoint.norms {
+        if name == "model.layers.0.self_attn.q_norm.weight" {
+            let stored = rai_infer::format::read_f32_vector(q_norm);
+            assert_eq!(&stored, expected, "q_norm values");
+        }
+        if name == "model.layers.0.self_attn.k_norm.weight" {
+            let stored = rai_infer::format::read_f32_vector(k_norm);
+            assert_eq!(&stored, expected, "k_norm values");
+        }
+    }
+
+    // The tail norms must be OLMo2's own post-block norms. If the exporter had
+    // reached for input_layernorm it would have failed to find one; if it had
+    // put them in the sandwich block the placement flag would be wrong.
+    let stored_input = rai_infer::format::read_norm_weights(&layer.input_layernorm);
+    let expected_post_attn = checkpoint
+        .norms
+        .iter()
+        .find(|(name, _)| name == "model.layers.0.post_attention_layernorm.weight")
+        .map(|(_, values)| values.clone())
+        .expect("fixture writes post_attention_layernorm");
+    assert_eq!(
+        stored_input, expected_post_attn,
+        "tail slot 0 must hold post_attention_layernorm for a post-norm model"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Post-norm is a placement, so nothing about the file's *size* changes when
+/// it is wrong — only the arithmetic. The only proof it reaches the forward
+/// pass is that it moves the logits away from the identical-storage pre-norm
+/// model built from the same seed.
+#[test]
+fn post_norm_placement_changes_the_output() {
+    let mut pre_norm = olmo2_spec();
+    pre_norm.post_norm = false;
+    pre_norm.model_type = "llama";
+    let (root_a, pre, _) = convert_spec("olmo2-pre", &pre_norm);
+    let (root_b, post, _) = convert_spec("olmo2-post", &olmo2_spec());
+
+    // Same section sizes: this is a placement change, not a storage change.
+    assert_eq!(
+        std::fs::metadata(&pre).unwrap().len(),
+        std::fs::metadata(&post).unwrap().len(),
+        "post-norm must not change the file size"
+    );
+
+    let tokens = [1usize, 5, 9, 13];
+    let before = run_forward(&RaiModel::load(&pre).unwrap(), &tokens);
+    let after = run_forward(&RaiModel::load(&post).unwrap(), &tokens);
+    let max_diff = before
+        .iter()
+        .zip(&after)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_diff > 1e-3,
+        "post-norm placement should change the logits, max diff was {max_diff:e}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root_a);
+    let _ = std::fs::remove_dir_all(&root_b);
+}
+
+/// A file claiming both QK-norm shapes, or both norm placements, describes its
+/// own layout two incompatible ways. The reader must refuse rather than pick.
+#[test]
+fn contradictory_capability_flags_are_refused() {
+    let (root, output, _) = convert_spec("olmo2-flags", &olmo2_spec());
+    let good = std::fs::read(&output).expect("reading model");
+
+    for (label, flags, needle) in [
+        (
+            "both QK shapes",
+            0x0A_u8,
+            "both per-head and full-width QK norm",
+        ),
+        (
+            "both placements",
+            0x14_u8,
+            "both sandwich norms and post-norm",
+        ),
+    ] {
+        let mut bytes = good.clone();
+        bytes[65] = flags;
+        let broken = output.with_extension(format!("{}.raimodel", flags));
+        std::fs::write(&broken, &bytes).expect("writing mutated model");
+        let error = match RaiModelFile::open(&broken) {
+            Ok(_) => panic!("{label}: contradictory flags must be refused"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(error.contains(needle), "{label}: got {error}");
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

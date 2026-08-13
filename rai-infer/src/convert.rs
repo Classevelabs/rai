@@ -196,6 +196,12 @@ struct RaiConfig {
     has_qk_norm: bool,
     /// Gemma2's two extra per-layer norms are stored in every layer section.
     has_sandwich_norm: bool,
+    /// `q_norm`/`k_norm` span the whole projection rather than one head
+    /// (OLMo2). Never set together with `has_qk_norm`.
+    has_full_qk_norm: bool,
+    /// The two tail norms apply to block outputs, not to the residual stream
+    /// before each block (OLMo2). Never set together with `has_sandwich_norm`.
+    post_norm: bool,
     /// `cap` for `cap * tanh(x/cap)` on attention logits; 0.0 = disabled.
     attn_logit_softcap: f32,
     /// The same on output logits; 0.0 = disabled.
@@ -217,6 +223,8 @@ impl RaiConfig {
             && self.embed_scale == 1.0
             && !self.has_qk_norm
             && !self.has_sandwich_norm
+            && !self.has_full_qk_norm
+            && !self.post_norm
             && self.attn_logit_softcap == 0.0
             && self.final_logit_softcap == 0.0
             && self.attn_scale == 0.0
@@ -238,6 +246,12 @@ impl RaiConfig {
         }
         if self.has_sandwich_norm {
             flags |= crate::format::FLAG_HAS_SANDWICH_NORM;
+        }
+        if self.has_full_qk_norm {
+            flags |= crate::format::FLAG_HAS_FULL_QK_NORM;
+        }
+        if self.post_norm {
+            flags |= crate::format::FLAG_POST_NORM;
         }
         flags
     }
@@ -376,6 +390,8 @@ pub fn convert_with_progress(
         // Settled once the tensor namespace is open, below.
         has_qk_norm: false,
         has_sandwich_norm,
+        has_full_qk_norm: false,
+        post_norm: false,
         attn_logit_softcap,
         final_logit_softcap,
         attn_scale,
@@ -435,7 +451,22 @@ pub fn convert_with_progress(
     // Which projections carry biases is a property of the checkpoint, not the
     // config, so it can only be settled once the tensor namespace is open.
     config.bias_mask = resolve_bias_mask(&store, num_layers)?;
-    config.has_qk_norm = resolve_qk_norm(&store, num_layers, head_dim)?;
+    let qk_norm = resolve_qk_norm(
+        &store,
+        num_layers,
+        head_dim,
+        config.attention_dim(),
+        config.kv_dim(),
+    )?;
+    config.has_qk_norm = qk_norm == QkNormKind::PerHead;
+    config.has_full_qk_norm = qk_norm == QkNormKind::FullWidth;
+    config.post_norm = resolve_post_norm(&store, num_layers)?;
+    if config.post_norm && config.has_sandwich_norm {
+        bail!(
+            "checkpoint has no input_layernorm but its model_type is sandwich-normed; those \
+             describe incompatible layer shapes and the converter cannot tell which is meant."
+        );
+    }
     validate_model_config(&config)?;
 
     let hidden = hidden_size as usize;
@@ -462,16 +493,9 @@ pub fn convert_with_progress(
                 check_vector(&store, &layer_bias_name(layer, name), rows)?;
             }
         }
-        check_vector(
-            &store,
-            &format!("model.layers.{layer}.input_layernorm.weight"),
-            hidden,
-        )?;
-        check_vector(
-            &store,
-            &pre_mlp_norm_name(layer, config.has_sandwich_norm),
-            hidden,
-        )?;
+        for name in tail_norm_names(layer, config.has_sandwich_norm, config.post_norm) {
+            check_vector(&store, &name, hidden)?;
+        }
         if config.has_qk_norm {
             for name in qk_norm_names(layer) {
                 check_vector(&store, &name, head_dim as usize)?;
@@ -608,15 +632,14 @@ pub fn convert_with_progress(
         }
         // QK-norm block, then the sandwich block, then the two layer norms —
         // exactly the order `format::RaiModelFile::layer` reads them in.
-        if config.has_qk_norm {
-            for name in qk_norm_names(layer) {
-                write_f32_vector(
-                    &mut file,
-                    &mut store,
-                    &name,
-                    head_dim as usize,
-                    folds.norm_plus_one,
-                )?;
+        if config.has_qk_norm || config.has_full_qk_norm {
+            let (q_len, k_len) = if config.has_full_qk_norm {
+                (config.attention_dim(), config.kv_dim())
+            } else {
+                (head_dim as usize, head_dim as usize)
+            };
+            for (name, len) in qk_norm_names(layer).into_iter().zip([q_len, k_len]) {
+                write_f32_vector(&mut file, &mut store, &name, len, folds.norm_plus_one)?;
             }
         }
         if config.has_sandwich_norm {
@@ -624,20 +647,9 @@ pub fn convert_with_progress(
                 write_f32_vector(&mut file, &mut store, &name, hidden, folds.norm_plus_one)?;
             }
         }
-        write_f32_vector(
-            &mut file,
-            &mut store,
-            &format!("model.layers.{layer}.input_layernorm.weight"),
-            hidden,
-            folds.norm_plus_one,
-        )?;
-        write_f32_vector(
-            &mut file,
-            &mut store,
-            &pre_mlp_norm_name(layer, config.has_sandwich_norm),
-            hidden,
-            folds.norm_plus_one,
-        )?;
+        for name in tail_norm_names(layer, config.has_sandwich_norm, config.post_norm) {
+            write_f32_vector(&mut file, &mut store, &name, hidden, folds.norm_plus_one)?;
+        }
         enter("layers", 2 + layer, Some((layer, num_layers)));
         log(&format!(
             "  Layer {layer}/{num_layers}: {:.1}s",
@@ -1029,6 +1041,64 @@ fn sandwich_norm_names(layer: u32) -> [String; 2] {
     ]
 }
 
+/// The tensors supplying a layer's two tail norms, in stored order.
+///
+/// For a pre-norm model these are the norms applied to the residual stream
+/// before the attention and MLP blocks. For a post-norm model (OLMo2) the same
+/// two slots hold the norms applied to those blocks' *outputs* — there is no
+/// pre-block norm to store, so the slots are reused rather than left empty and
+/// two more added.
+fn tail_norm_names(layer: u32, sandwich: bool, post_norm: bool) -> [String; 2] {
+    if post_norm {
+        return sandwich_norm_names(layer);
+    }
+    [
+        format!("model.layers.{layer}.input_layernorm.weight"),
+        pre_mlp_norm_name(layer, sandwich),
+    ]
+}
+
+/// Decide whether this checkpoint is post-normed, from the tensors present.
+///
+/// A post-norm model has no `input_layernorm` anywhere and does have both
+/// output norms. Anything in between — some layers pre-normed, an output norm
+/// missing — is refused rather than guessed, because the flag covers the whole
+/// file and the wrong answer changes every layer's arithmetic.
+fn resolve_post_norm(store: &SafeTensorsSet, num_layers: u32) -> Result<bool> {
+    if num_layers == 0 {
+        return Ok(false);
+    }
+    let has_input_norm = |layer: u32| {
+        store
+            .info(&format!("model.layers.{layer}.input_layernorm.weight"))
+            .is_some()
+    };
+    if has_input_norm(0) {
+        return Ok(false);
+    }
+    for layer in 1..num_layers {
+        if has_input_norm(layer) {
+            bail!(
+                "checkpoint is inconsistent: layer 0 has no input_layernorm but layer {layer} \
+                 does. The container stores one norm placement for the whole model."
+            );
+        }
+    }
+    for layer in 0..num_layers {
+        for name in sandwich_norm_names(layer) {
+            if store.info(&name).is_none() {
+                bail!(
+                    "layer {layer} has no input_layernorm and no '{name}' either, so there is \
+                     no norm to apply to the block. This converter implements pre-norm models \
+                     and OLMo2-style post-norm models, which carry post_attention_layernorm \
+                     and post_feedforward_layernorm."
+                );
+            }
+        }
+    }
+    Ok(true)
+}
+
 /// The tensor supplying the norm applied to the residual stream before the MLP.
 ///
 /// For a sandwich-normed model that is `pre_feedforward_layernorm`; for
@@ -1049,9 +1119,15 @@ fn pre_mlp_norm_name(layer: u32, sandwich: bool) -> String {
 /// the container stores one flag for the whole file, so exporting a checkpoint
 /// where only some layers were normed would silently change the maths of the
 /// rest.
-fn resolve_qk_norm(store: &SafeTensorsSet, num_layers: u32, head_dim: u32) -> Result<bool> {
+fn resolve_qk_norm(
+    store: &SafeTensorsSet,
+    num_layers: u32,
+    head_dim: u32,
+    attention_dim: usize,
+    kv_dim: usize,
+) -> Result<QkNormKind> {
     if num_layers == 0 {
-        return Ok(false);
+        return Ok(QkNormKind::None);
     }
     let present = |layer: u32| -> (bool, bool) {
         let [q, k] = qk_norm_names(layer);
@@ -1076,25 +1152,52 @@ fn resolve_qk_norm(store: &SafeTensorsSet, num_layers: u32, head_dim: u32) -> Re
             );
         }
     }
-    if q0 {
-        // The reader will demand exactly `head_dim` values; catching an OLMo2
-        // -style full-width norm here names the real problem instead of
-        // failing on a section size later.
-        for layer in 0..num_layers {
-            for name in qk_norm_names(layer) {
-                let info = store.require(&name)?;
-                let values: usize = info.shape.iter().product();
-                if values != head_dim as usize {
-                    bail!(
-                        "tensor '{name}' holds {values} values but head_dim is {head_dim}; this \
-                         container implements the per-head QK norm shared across heads (Qwen3, \
-                         Gemma3), not a norm over the whole projection (OLMo2)."
-                    );
-                }
-            }
-        }
+    if !q0 {
+        return Ok(QkNormKind::None);
     }
-    Ok(q0)
+
+    // Same tensor names, two different operations. The width is what tells
+    // them apart, so it is read rather than inferred from `model_type`: a
+    // fine-tune that renames itself still has to store one shape or the other.
+    let head_dim = head_dim as usize;
+    let [q_name, _] = qk_norm_names(0);
+    let q_values: usize = store.require(&q_name)?.shape.iter().product();
+    let kind = if q_values == head_dim {
+        QkNormKind::PerHead
+    } else if q_values == attention_dim {
+        QkNormKind::FullWidth
+    } else {
+        bail!(
+            "tensor '{q_name}' holds {q_values} values, which is neither head_dim ({head_dim}, \
+             a per-head norm as Qwen3 uses) nor num_heads*head_dim ({attention_dim}, a \
+             projection-wide norm as OLMo2 uses); the container implements those two shapes."
+        );
+    };
+    // `head_dim == attention_dim` only when there is one head, in which case
+    // the two shapes coincide and either reading is correct.
+    let (q_expected, k_expected) = match kind {
+        QkNormKind::PerHead => (head_dim, head_dim),
+        QkNormKind::FullWidth => (attention_dim, kv_dim),
+        QkNormKind::None => unreachable!("returned above"),
+    };
+    for layer in 0..num_layers {
+        let [q, k] = qk_norm_names(layer);
+        check_vector(store, &q, q_expected)?;
+        check_vector(store, &k, k_expected)?;
+    }
+    Ok(kind)
+}
+
+/// Which of the two QK-norm shapes a checkpoint carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QkNormKind {
+    None,
+    /// One `head_dim` vector applied inside each head, before RoPE (Qwen3).
+    PerHead,
+    /// Vectors spanning the whole Q and K projections, applied before the
+    /// tensor is split into heads (OLMo2). Under grouped-query attention the
+    /// two are different lengths.
+    FullWidth,
 }
 
 /// Confirm a sandwich-normed family really carries all four norms per layer.
@@ -1275,6 +1378,11 @@ pub struct PreflightContainer {
     pub has_qk_norm: bool,
     /// Gemma2's two extra per-layer norms would be stored.
     pub has_sandwich_norm: bool,
+    /// QK norms span the whole projection rather than one head (OLMo2).
+    pub has_full_qk_norm: bool,
+    /// The two tail norms apply to block outputs, not the residual stream
+    /// before them (OLMo2).
+    pub post_norm: bool,
     /// Attention-logit softcap; 0.0 when the model does not cap.
     pub attn_logit_softcap: f32,
     /// Output-logit softcap; 0.0 when the model does not cap.
@@ -1414,11 +1522,20 @@ pub fn preflight(
             Some(store) => resolve_bias_mask(store, num_layers)?,
             None => 0,
         };
-        let has_qk_norm = match store.as_ref() {
-            Some(store) => resolve_qk_norm(store, num_layers, head_dim)?,
+        let attention_dim = num_heads as usize * head_dim as usize;
+        let kv_dim = num_kv_heads as usize * head_dim as usize;
+        let qk_norm = match store.as_ref() {
+            Some(store) => resolve_qk_norm(store, num_layers, head_dim, attention_dim, kv_dim)?,
+            None => QkNormKind::None,
+        };
+        let has_qk_norm = qk_norm == QkNormKind::PerHead;
+        let has_full_qk_norm = qk_norm == QkNormKind::FullWidth;
+        let post_norm = match store.as_ref() {
+            Some(store) => resolve_post_norm(store, num_layers)?,
             None => false,
         };
-        let has_sandwich_norm = SANDWICH_NORM_MODEL_TYPES.contains(&model_type.as_str());
+        let has_sandwich_norm =
+            SANDWICH_NORM_MODEL_TYPES.contains(&model_type.as_str()) && !post_norm;
         if has_sandwich_norm {
             if let Some(store) = store.as_ref() {
                 check_sandwich_norms(store, num_layers, hidden_size as usize)?;
@@ -1453,6 +1570,8 @@ pub fn preflight(
             },
             has_qk_norm,
             has_sandwich_norm,
+            has_full_qk_norm,
+            post_norm,
             attn_logit_softcap: resolve_softcap(hf, "attn_logit_softcapping")?,
             final_logit_softcap: resolve_softcap(hf, "final_logit_softcapping")?,
             attn_scale: resolve_attn_scale(hf, head_dim)?,
@@ -1478,6 +1597,8 @@ pub fn preflight(
             num_sections: section_sizes.len(),
             has_qk_norm,
             has_sandwich_norm,
+            has_full_qk_norm,
+            post_norm,
             attn_logit_softcap: config.attn_logit_softcap,
             final_logit_softcap: config.final_logit_softcap,
             attn_scale: config.attn_scale,
@@ -1853,9 +1974,12 @@ fn layer_section_len(
             total += rows as u64 * 4;
         }
     }
-    // QK-norm block: q_norm + k_norm, head_dim f32 each.
+    // QK-norm block: q_norm + k_norm. Per-head is head_dim f32 each;
+    // full-width is the two projection widths, which differ under GQA.
     if config.has_qk_norm {
         total += 2 * config.head_dim as u64 * 4;
+    } else if config.has_full_qk_norm {
+        total += (config.attention_dim() + config.kv_dim()) as u64 * 4;
     }
     // Sandwich block: attention-output + MLP-output norms, hidden f32 each.
     if config.has_sandwich_norm {
@@ -2282,6 +2406,8 @@ mod tests {
             embed_scale: 1.0,
             has_qk_norm: false,
             has_sandwich_norm: false,
+            has_full_qk_norm: false,
+            post_norm: false,
             attn_logit_softcap: 0.0,
             final_logit_softcap: 0.0,
             attn_scale: 0.0,
@@ -2348,6 +2474,8 @@ mod tests {
             embed_scale: 1.0,
             has_qk_norm: false,
             has_sandwich_norm: false,
+            has_full_qk_norm: false,
+            post_norm: false,
             attn_logit_softcap: 0.0,
             final_logit_softcap: 0.0,
             attn_scale: 0.0,
