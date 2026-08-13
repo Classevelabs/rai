@@ -81,22 +81,17 @@ RAI runs the Llama-family decoder and the capabilities layered on top of it.
 Anything it cannot represent is refused at conversion time, by name, before a
 file is written — never silently mis-converted.
 
-<!-- FINALISE: the Landing row is a placeholder. Per-head QK norm (Qwen3,
-     OLMo2), logit softcapping (Gemma2) and possibly Gemma3-text are being
-     implemented; move each family into Runs or Refused when that work reports.
-     The same four are marked in docs/MODELS.md. -->
-
 | | |
 | --- | --- |
-| **Runs** | **Qwen2 / Qwen2.5**, **Llama-3.1 / 3.2**, **Gemma**, Llama-2, Mistral-7B v0.1–v0.3, TinyLlama, SmolLM / SmolLM2, and fine-tunes of those (Zephyr-7B, OpenHermes-Mistral, Vicuna) |
-| **Refused** | Mixtral and other mixture-of-experts models — use dense Mistral-7B instead; Phi / Falcon / GPT-NeoX / MPT / GPT-2, whose module tree is not Llama-shaped — use a Llama or Mistral model of the same size; any `rope_scaling` other than `default` or `llama3` |
-| **Landing** | Qwen3, OLMo2, Gemma2, Gemma3 — verdict pending, alternatives listed in docs/MODELS.md |
+| **Runs** | **Qwen2 / Qwen2.5 / Qwen3 (dense)**, **Llama-3.1 / 3.2**, **Gemma and Gemma2**, Llama-2, Mistral-7B v0.1–v0.3, TinyLlama, SmolLM / SmolLM2, and fine-tunes of those (Zephyr-7B, OpenHermes-Mistral, Vicuna) |
+| **Refused** | Mixtral and other mixture-of-experts models — use dense Mistral-7B instead; Gemma3, whose layers do not share one RoPE base — use gemma-2b-it; OLMo2, whose QK norm spans all heads at once — use Llama-3.1-8B; Phi / Falcon / GPT-NeoX / MPT / GPT-2, whose module tree is not Llama-shaped — use a Llama or Mistral model of the same size; any `rope_scaling` other than `default` or `llama3` |
 
 Point `rai convert` at your folder, or press **Check** in Studio: both run the
-same preflight, refuse before writing anything, and name the blocker. What to
-use instead of a refused checkpoint, and what has to be in the folder, are in
-**[docs/MODELS.md](./docs/MODELS.md)**. Qwen2.5-0.5B, Llama-3.2-1B and
-gemma-2b-it were each converted and generated coherent text.
+same preflight, refuse before writing anything, name the blocker, and name a
+model that does work. What to use instead of a refused checkpoint, and what has
+to be in the folder, are in **[docs/MODELS.md](./docs/MODELS.md)**.
+Qwen2.5-0.5B, Qwen3-0.6B, Llama-3.2-1B, gemma-2b-it and gemma-2-2b-it were each
+converted and generated coherent text.
 
 ## Why
 
@@ -111,7 +106,7 @@ captured in `Cargo.lock`.
   unpacking happens on the fly inside the GEMM inner loop. No fp32 weight copy
   ever exists in RAM.
 - **One flat model file.** The `.raimodel` format is a single binary blob with
-  a 64-byte header. The loader validates its structure after one heap read and
+  a 128-byte header. The loader validates its structure after one heap read and
   then exposes borrowed views over the in-memory sections.
 - **A lean library.** `--no-default-features` builds the inference library —
   format reader, kernels, model, sampling, speculative decoding — against

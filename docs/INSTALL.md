@@ -179,14 +179,15 @@ overwrite a different tokenizer already sitting there.
 ### Refusals
 
 Both paths fail with the reason named rather than writing a file that loads
-cleanly and generates nonsense. `rai convert` refuses per-head QK norms (Qwen3,
-OLMo2, Gemma3), mixture-of-experts routing, logit softcapping (Gemma2),
-`rope_type` values other than `default` and `llama3`, activations other than
-SiLU and GeLU-tanh, and any module tree that is not Llama-style. The Python
-exporters refuse all of those plus projection bias vectors (Qwen2/2.5), every
-`rope_scaling` type (Llama-3.1/3.2), and every Gemma variant. See
-[MODELS.md](./MODELS.md) for what each refusal means and what it would take to
-lift it.
+cleanly and generates nonsense. `rai convert` refuses mixture-of-experts
+routing, a QK norm spanning all heads at once (OLMo2), per-layer RoPE bases
+(Gemma3), `rope_type` values other than `default` and `llama3`, activations
+other than SiLU and GeLU-tanh, and any module tree that is not Llama-style.
+Per-head QK norms (Qwen3) and logit softcapping (Gemma2) are stored and
+converted — they are no longer refusals. The Python exporters refuse all of the
+above plus projection bias vectors (Qwen2/2.5), every `rope_scaling` type
+(Llama-3.1/3.2), and every Gemma variant. See [MODELS.md](./MODELS.md) for what
+each refusal means, what to use instead, and what it would take to lift it.
 
 ### Downloading on Windows
 
