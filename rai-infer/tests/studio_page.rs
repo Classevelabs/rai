@@ -44,14 +44,31 @@ fn no_javascript_string_literal_spans_a_line_break() {
 fn the_page_is_structurally_complete() {
     assert!(PAGE.starts_with("<!DOCTYPE html>"), "missing doctype");
     assert!(PAGE.trim_end().ends_with("</html>"), "page is truncated");
-    assert_eq!(PAGE.matches("<script>").count(), 1, "expected one script block");
+    assert_eq!(
+        PAGE.matches("<script>").count(),
+        1,
+        "expected one script block"
+    );
     assert_eq!(PAGE.matches("</script>").count(), 1);
-    assert_eq!(PAGE.matches("<style>").count(), 1, "expected one style block");
+    assert_eq!(
+        PAGE.matches("<style>").count(),
+        1,
+        "expected one style block"
+    );
     assert_eq!(PAGE.matches("</style>").count(), 1);
     for id in [
-        "s-library", "s-convert", "s-run", "modelList", "convertBtn", "inspectBtn", "sendBtn",
+        "s-library",
+        "s-convert",
+        "s-run",
+        "modelList",
+        "convertBtn",
+        "inspectBtn",
+        "sendBtn",
     ] {
-        assert!(PAGE.contains(&format!("id=\"{id}\"")), "missing element #{id}");
+        assert!(
+            PAGE.contains(&format!("id=\"{id}\"")),
+            "missing element #{id}"
+        );
     }
 }
 
@@ -60,7 +77,13 @@ fn the_page_is_structurally_complete() {
 /// runtime and the feature would silently not work.
 #[test]
 fn the_page_loads_nothing_from_the_network() {
-    for pattern in ["src=\"http", "href=\"http", "@import", "fonts.googleapis", "cdn."] {
+    for pattern in [
+        "src=\"http",
+        "href=\"http",
+        "@import",
+        "fonts.googleapis",
+        "cdn.",
+    ] {
         assert!(
             !PAGE.contains(pattern),
             "page references an external resource ({pattern}); the CSP forbids it"
