@@ -1,0 +1,23 @@
+[Desktop Entry]
+# Template. Replace @LAUNCHER_DIR@ with the absolute path of the directory
+# holding rai-studio.sh, the rai binary and your .raimodel file, then install:
+#
+#   sed "s|@LAUNCHER_DIR@|$PWD|g" rai-studio.desktop \
+#     > ~/.local/share/applications/rai-studio.desktop
+#   chmod +x rai-studio.sh
+#   update-desktop-database ~/.local/share/applications 2>/dev/null || true
+#
+# Terminal=true is deliberate: the window is where the server's progress and
+# any error message appear, and closing it stops the server.
+Type=Application
+Version=1.0
+Name=RAI Studio
+GenericName=Local language model chat
+Comment=Chat with a local .raimodel on the CPU — no GPU, no cloud
+Exec=@LAUNCHER_DIR@/rai-studio.sh
+Path=@LAUNCHER_DIR@
+Icon=utilities-terminal
+Terminal=true
+Categories=Development;Science;Utility;
+Keywords=llm;ai;inference;chat;offline;
+StartupNotify=false

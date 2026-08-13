@@ -1,5 +1,7 @@
 pub mod chat_template;
 #[cfg(feature = "cli")]
+pub mod cli;
+#[cfg(feature = "cli")]
 pub mod convert;
 pub mod format;
 pub mod gemm;
