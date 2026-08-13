@@ -2,7 +2,7 @@
 //!
 //! This is the body of the old `rai-chat` binary, moved into the library so
 //! that one `rai` binary can host it. The server binds loopback only and
-//! rejects any request whose `Host` header is not `localhost`/`127.0.0.1` at
+//! rejects any request whose `Host` header is not a loopback name at
 //! the bound port, which is what stops a web page in the user's browser from
 //! driving the local model via DNS rebinding. Every `POST` additionally
 //! requires a same-origin `Origin` (when the browser sends one) and a JSON
@@ -602,20 +602,12 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         options: args.options.clone(),
     };
 
-    let addr = format!("127.0.0.1:{}", args.options.port);
-    let server = Server::http(&addr)
-        .map_err(|e| anyhow::anyhow!("cannot listen on {addr}: {e}"))
-        .with_context(|| {
-            format!(
-                "another process may already be using port {}; pass --port to pick another",
-                args.options.port
-            )
-        })?;
-    let bound_port = server
+    let server = bind_loopback(args.options.port)?;
+    let bound = server
         .server_addr()
         .to_ip()
-        .ok_or_else(|| anyhow::anyhow!("server did not bind an IP socket"))?
-        .port();
+        .ok_or_else(|| anyhow::anyhow!("server did not bind an IP socket"))?;
+    let bound_port = bound.port();
     eprintln!("\n  Chat UI: http://localhost:{bound_port}\n");
     eprintln!("  Press Ctrl+C to stop.\n");
 
@@ -1101,13 +1093,49 @@ fn respond_json_error(request: tiny_http::Request, error: &ChatHttpError) {
     let _ = request.respond(response);
 }
 
+/// Listen on loopback, trying both address families.
+///
+/// `127.0.0.1` is tried first because that is what the printed URL and the
+/// launchers assume. The IPv6 fallback matters on machines where `localhost`
+/// resolves only to `::1` — the IPv4-only bind left Studio unreachable there
+/// with a connection refused, not an error message. Both are loopback, so
+/// neither is reachable from another machine.
+fn bind_loopback(port: u16) -> Result<Server> {
+    let v4 = format!("127.0.0.1:{port}");
+    match Server::http(&v4) {
+        Ok(server) => Ok(server),
+        Err(v4_error) => {
+            let v6 = format!("[::1]:{port}");
+            Server::http(&v6)
+                .map_err(|v6_error| {
+                    anyhow::anyhow!("cannot listen on {v4} ({v4_error}) or {v6} ({v6_error})")
+                })
+                .with_context(|| {
+                    format!(
+                        "another process may already be using port {port}; \
+                         pass --port to pick another"
+                    )
+                })
+        }
+    }
+}
+
+/// Loopback host forms a browser can produce for our own port.
+///
+/// `[::1]` is here because the bind can land on IPv6 (see [`bind_loopback`]),
+/// and because a browser resolving `localhost` to `::1` sends the bracketed
+/// literal when the user typed it. It is still loopback: allowing it does not
+/// widen who can reach the server, which is what the `Host` check defends.
 fn is_allowed_host(host: &str, port: u16) -> bool {
-    host.eq_ignore_ascii_case(&format!("localhost:{port}")) || host == format!("127.0.0.1:{port}")
+    host.eq_ignore_ascii_case(&format!("localhost:{port}"))
+        || host == format!("127.0.0.1:{port}")
+        || host == format!("[::1]:{port}")
 }
 
 fn is_allowed_origin(origin: &str, port: u16) -> bool {
     origin.eq_ignore_ascii_case(&format!("http://localhost:{port}"))
         || origin == format!("http://127.0.0.1:{port}")
+        || origin == format!("http://[::1]:{port}")
 }
 
 /// Split `"/api/convert/abc?since=4"` into `("/api/convert/abc", "since=4")`.
@@ -1198,6 +1226,30 @@ mod tests {
         assert!(is_allowed_origin("http://127.0.0.1:8090", 8090));
         assert!(!is_allowed_host("attacker.example:8090", 8090));
         assert!(!is_allowed_origin("https://attacker.example", 8090));
+    }
+
+    /// The server may bind IPv6 loopback, and a browser may resolve
+    /// `localhost` to `::1`; neither is a way in from another machine.
+    #[test]
+    fn ipv6_loopback_is_allowed_and_other_hosts_still_are_not() {
+        assert!(is_allowed_host("[::1]:8090", 8090));
+        assert!(is_allowed_origin("http://[::1]:8090", 8090));
+        // A different port is a different server, loopback or not.
+        assert!(!is_allowed_host("[::1]:9999", 8090));
+        assert!(!is_allowed_origin("http://[::1]:9999", 8090));
+        // Not every IPv6 literal is loopback.
+        assert!(!is_allowed_host("[::ffff:1.2.3.4]:8090", 8090));
+        assert!(!is_allowed_host("[2001:db8::1]:8090", 8090));
+    }
+
+    /// Port 0 asks the OS for a free port, so this binds without racing a
+    /// fixed port, and proves the returned server is reachable at loopback.
+    #[test]
+    fn bind_loopback_binds_a_loopback_address() {
+        let server = bind_loopback(0).expect("loopback bind");
+        let address = server.server_addr().to_ip().expect("ip socket");
+        assert!(address.ip().is_loopback(), "bound {address}, not loopback");
+        assert_ne!(address.port(), 0, "port 0 should resolve to a real port");
     }
 
     #[test]
