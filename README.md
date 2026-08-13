@@ -15,22 +15,33 @@ Built by [ClassEve](https://classeve.com). Licensed under Apache-2.0.
 
 ## Measured performance
 
-TinyLlama-1.1B-Chat, converted from the fp16 checkpoint and decoded greedily
-against HuggingFace `transformers` on the same machine — an Intel i5-10300H
-(4 cores / 8 threads), 2026-08-09, RAI 0.2.0:
+Measured on an Intel i5-10300H (4 cores / 8 threads), 2026-08-09, RAI 0.2.0.
+Full method, roofline, and the results that came out negative are in
+[BENCHMARKS.md](./BENCHMARKS.md).
 
-| | RAI 0.2.0 (4-bit) | transformers 5.15 fp32 (CPU) |
+**Converting a checkpoint** — `rai-convert` streams `.safetensors`, so peak
+memory does not grow with the model:
+
+| | `export_rtn.py` (PyTorch) | **`rai-convert`** |
 | --- | --- | --- |
-| Decode, 91 tokens | **21.8 tok/s** | 4.3 tok/s |
-| Relative speed | **5.1×** | 1× |
-| Peak process RSS | **629 MB** | fp32 weights alone are ~4.4 GB |
-| Model on disk | **619.5 MB** | 2,200 MB |
-| Load time | **0.33 s** | ~2 s |
+| TinyLlama-1.1B | 188.8 s, 4,981 MB RAM | **7.6 s, 22.9 MB RAM** |
+| Zephyr-7B | needs ~29 GB — will not run | **82.6 s, 26.3 MB RAM** |
 
-Conversion of the whole 1.1B model took **47.0 s**. The environment is pinned
-in `rai-infer/scripts/requirements-lock.txt`. Method, per-tensor quantization
-error, output-quality comparison, and the measured (negative) result for
-self-speculative decoding are in [BENCHMARKS.md](./BENCHMARKS.md).
+Both produce byte-identical output. A 7B model converts on a 16 GB laptop.
+
+**Running a model** — greedy decoding, same machine:
+
+| | TinyLlama-1.1B (619 MB) | Zephyr-7B (3.9 GB) |
+| --- | --- | --- |
+| Decode | **21.8 tok/s** | **2.96 tok/s** |
+| Peak RSS | 629 MB | ~4.0 GB |
+| Load (warm) | 0.33 s | — |
+
+HuggingFace `transformers` fp32 runs the same TinyLlama checkpoint at 4.3 tok/s
+on this machine, so RAI is **5.1× faster in 1/7th the memory**. Prefill is
+**~1.3× faster** than 0.1.0 after the batched-GEMM rewrite, and prompt-lookup
+decoding adds **1.12–1.20×** on context-quoting workloads (off by default; it
+is slower on original prose, and BENCHMARKS.md says by how much).
 
 ## Quickstart
 
