@@ -10,6 +10,7 @@
 use crate::format::QuantizedLinear;
 use crate::gemm::{has_avx2, w4a8_fused_gate_up, w4a8_fused_qkv, w4a8_matvec};
 use crate::kv_cache::KVCache;
+use rayon::prelude::*;
 
 /// Upper bound on the precomputed RoPE cos/sin table allocation.
 ///
@@ -626,71 +627,26 @@ pub fn gqa_attention_decode(
         kv_cache.store(layer_idx, pos, &work.k, &work.v);
     }
 
-    // 4. Scaled dot-product attention with GQA
-    let scale = 1.0 / (head_dim as f32).sqrt();
-    let heads_per_kv = num_heads / num_kv_heads;
+    // 4. Scaled dot-product attention with GQA.
+    //
+    // Query heads are independent, and this is the one decode cost that grows
+    // with context (measured: 0.6% of a decode step at pos=8, 7.7% at pos=512
+    // on TinyLlama-1.1B), so it is spread across the pool rather than run on
+    // one core. `scores` is one flat buffer sliced per head, which keeps the
+    // parallel path allocation-free.
     work.attn_out.resize(hidden, 0.0);
-    work.scores.resize(pos + 1, 0.0);
-
-    for qh in 0..num_heads {
-        let kvh = qh / heads_per_kv;
-        let q_head = &work.q[qh * head_dim..(qh + 1) * head_dim];
-
-        // Compute attention scores and weighted value sum (SIMD-accelerated)
-        let out_head = &mut work.attn_out[qh * head_dim..(qh + 1) * head_dim];
-        #[cfg(target_arch = "x86_64")]
-        {
-            if has_avx2() && head_dim.is_multiple_of(8) {
-                unsafe {
-                    attention_head_avx2(
-                        q_head,
-                        out_head,
-                        &mut work.scores,
-                        kv_cache,
-                        layer_idx,
-                        kvh,
-                        pos,
-                        head_dim,
-                        scale,
-                    );
-                }
-                continue;
-            }
-        }
-
-        // Scalar fallback
-        let mut max_score = f32::NEG_INFINITY;
-        for t in 0..=pos {
-            let k_cached = kv_cache.get_k(layer_idx, kvh, t, head_dim);
-            let mut dot = 0.0f32;
-            for d in 0..head_dim {
-                dot += q_head[d] * k_cached[d];
-            }
-            work.scores[t] = dot * scale;
-            if work.scores[t] > max_score {
-                max_score = work.scores[t];
-            }
-        }
-        let mut sum_exp = 0.0f32;
-        for t in 0..=pos {
-            work.scores[t] = (work.scores[t] - max_score).exp();
-            sum_exp += work.scores[t];
-        }
-        let inv_sum = 1.0 / sum_exp;
-        for t in 0..=pos {
-            work.scores[t] *= inv_sum;
-        }
-        for d in 0..head_dim {
-            out_head[d] = 0.0;
-        }
-        for t in 0..=pos {
-            let v_cached = kv_cache.get_v(layer_idx, kvh, t, head_dim);
-            let score = work.scores[t];
-            for d in 0..head_dim {
-                out_head[d] += score * v_cached[d];
-            }
-        }
-    }
+    work.scores.resize(num_heads * (pos + 1), 0.0);
+    attention_all_heads(
+        &mut work.attn_out,
+        &mut work.scores,
+        &work.q,
+        kv_cache,
+        layer_idx,
+        pos,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+    );
 
     // 5. Output projection
     w4a8_matvec(
@@ -827,6 +783,198 @@ unsafe fn attention_head_avx2(
     }
 }
 
+/// One query head of scaled dot-product attention over the cached K/V.
+///
+/// Both the decode path ([`gqa_attention_decode`]) and the batched path
+/// ([`compute_attention`]) funnel through here, so the SIMD kernel and its
+/// scalar fallback are defined once instead of once per caller.
+///
+/// `scores` is scratch for `pos + 1` values and is fully overwritten.
+#[inline]
+fn attention_head(
+    q_head: &[f32],
+    out_head: &mut [f32],
+    scores: &mut [f32],
+    kv_cache: &KVCache,
+    layer_idx: usize,
+    kvh: usize,
+    pos: usize,
+    head_dim: usize,
+    scale: f32,
+) {
+    debug_assert_eq!(q_head.len(), head_dim, "query head length mismatch");
+    debug_assert_eq!(out_head.len(), head_dim, "attention head output mismatch");
+    debug_assert!(scores.len() > pos, "score scratch is too small");
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2() && head_dim.is_multiple_of(8) {
+            // SAFETY: `has_avx2()` gates AVX2+FMA, `head_dim` is a multiple of
+            // 8, the head buffers hold `head_dim` values, `scores` holds more
+            // than `pos` values, and the callers assert the cache dimensions
+            // and the filled watermark covering `0..=pos`.
+            unsafe {
+                attention_head_avx2(
+                    q_head, out_head, scores, kv_cache, layer_idx, kvh, pos, head_dim, scale,
+                );
+            }
+            return;
+        }
+    }
+
+    let mut max_score = f32::NEG_INFINITY;
+    for t in 0..=pos {
+        let k_cached = kv_cache.get_k(layer_idx, kvh, t, head_dim);
+        let mut dot = 0.0f32;
+        for d in 0..head_dim {
+            dot += q_head[d] * k_cached[d];
+        }
+        scores[t] = dot * scale;
+        if scores[t] > max_score {
+            max_score = scores[t];
+        }
+    }
+    let mut sum_exp = 0.0f32;
+    for t in 0..=pos {
+        scores[t] = (scores[t] - max_score).exp();
+        sum_exp += scores[t];
+    }
+    let inv_sum = 1.0 / sum_exp;
+    for t in 0..=pos {
+        scores[t] *= inv_sum;
+    }
+    for d in 0..head_dim {
+        out_head[d] = 0.0;
+    }
+    for t in 0..=pos {
+        let v_cached = kv_cache.get_v(layer_idx, kvh, t, head_dim);
+        let score = scores[t];
+        for d in 0..head_dim {
+            out_head[d] += score * v_cached[d];
+        }
+    }
+}
+
+/// Context length at which spreading decode attention across the rayon pool
+/// starts paying for the dispatch.
+///
+/// Query heads are independent, and attention is the one decode cost that
+/// grows with context, so parallelizing it looks free — it is not. Measured
+/// per-head decode attention on TinyLlama-1.1B (32 heads, 22 layers, isolated
+/// A/B in one binary):
+///
+/// | pos | serial      | parallel   |
+/// |-----|-------------|------------|
+/// |   8 |  488–548 μs |  3372 μs   |  parallel ~6× *worse*
+/// | 512 | 14.7–20.8 ms| 11.3 ms    |  parallel ~1.3–1.8× better
+///
+/// At 32 tiny work items the rayon split costs ~130 μs per layer, which swamps
+/// the whole attention phase at short context. Break-even sits near pos≈130;
+/// this threshold keeps a 2× margin above it so the common short-context case
+/// never pays. The numbers came off a heavily contended machine — re-tune on a
+/// quiet one before trusting the exact constant.
+const PARALLEL_ATTENTION_MIN_POS: usize = 256;
+
+/// All query heads of single-position decode attention.
+///
+/// Runs serially below [`PARALLEL_ATTENTION_MIN_POS`] and across the rayon
+/// pool above it. `scores` is one flat `num_heads * (pos + 1)` buffer sliced
+/// per head, which keeps the parallel path allocation-free. Heads never
+/// interact, so both paths are bit-identical.
+///
+/// # Panics
+/// Panics if the buffers are smaller than the head dimensions imply.
+#[inline]
+fn attention_all_heads(
+    attn_out: &mut [f32],
+    scores: &mut [f32],
+    q: &[f32],
+    kv_cache: &KVCache,
+    layer_idx: usize,
+    pos: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+) {
+    let row = pos + 1;
+    let hidden = num_heads * head_dim;
+    assert!(attn_out.len() >= hidden, "attention output is too small");
+    assert!(q.len() >= hidden, "attention query buffer is too small");
+    assert!(
+        scores.len() >= num_heads * row,
+        "attention score scratch is too small"
+    );
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let heads_per_kv = num_heads / num_kv_heads;
+
+    if pos < PARALLEL_ATTENTION_MIN_POS || crate::gemm::serial_decode_attention_enabled() {
+        for qh in 0..num_heads {
+            attention_head(
+                &q[qh * head_dim..(qh + 1) * head_dim],
+                &mut attn_out[qh * head_dim..(qh + 1) * head_dim],
+                &mut scores[qh * row..(qh + 1) * row],
+                kv_cache,
+                layer_idx,
+                qh / heads_per_kv,
+                pos,
+                head_dim,
+                scale,
+            );
+        }
+        return;
+    }
+
+    attn_out[..hidden]
+        .par_chunks_mut(head_dim)
+        .zip(scores[..num_heads * row].par_chunks_mut(row))
+        .enumerate()
+        .for_each(|(qh, (out_head, head_scores))| {
+            attention_head(
+                &q[qh * head_dim..(qh + 1) * head_dim],
+                out_head,
+                head_scores,
+                kv_cache,
+                layer_idx,
+                qh / heads_per_kv,
+                pos,
+                head_dim,
+                scale,
+            );
+        });
+}
+
+/// Profiling hook: runs the whole per-position decode attention phase exactly
+/// as `gqa_attention_decode` does, so `profile-fwd` times the shipping code
+/// path instead of a copy that drifts from it.
+///
+/// # Panics
+/// Panics if the buffers are smaller than the head dimensions imply.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn attention_all_heads_for_profiling(
+    attn_out: &mut [f32],
+    scores: &mut [f32],
+    q: &[f32],
+    kv_cache: &KVCache,
+    layer_idx: usize,
+    pos: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+) {
+    attention_all_heads(
+        attn_out,
+        scores,
+        q,
+        kv_cache,
+        layer_idx,
+        pos,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+    );
+}
+
 /// Standalone attention for batched forward: takes pre-computed Q, K, V,
 /// applies RoPE, stores K/V in cache, computes attention, writes output.
 /// Does NOT do QKV or O projections (those are batched separately).
@@ -897,52 +1045,101 @@ pub fn compute_attention(
         let kvh = qh / heads_per_kv;
         let q_head = &q[qh * head_dim..(qh + 1) * head_dim];
         let out_head = &mut attn_out[qh * head_dim..(qh + 1) * head_dim];
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            if has_avx2() && head_dim.is_multiple_of(8) {
-                unsafe {
-                    attention_head_avx2(
-                        q_head, out_head, scores, kv_cache, layer_idx, kvh, pos, head_dim, scale,
-                    );
-                }
-                continue;
-            }
-        }
-
-        // Scalar fallback
-        let mut max_score = f32::NEG_INFINITY;
-        for t in 0..=pos {
-            let k_cached = kv_cache.get_k(layer_idx, kvh, t, head_dim);
-            let mut dot = 0.0f32;
-            for d in 0..head_dim {
-                dot += q_head[d] * k_cached[d];
-            }
-            scores[t] = dot * scale;
-            if scores[t] > max_score {
-                max_score = scores[t];
-            }
-        }
-        let mut sum_exp = 0.0f32;
-        for t in 0..=pos {
-            scores[t] = (scores[t] - max_score).exp();
-            sum_exp += scores[t];
-        }
-        let inv_sum = 1.0 / sum_exp;
-        for t in 0..=pos {
-            scores[t] *= inv_sum;
-        }
-        for d in 0..head_dim {
-            out_head[d] = 0.0;
-        }
-        for t in 0..=pos {
-            let v_cached = kv_cache.get_v(layer_idx, kvh, t, head_dim);
-            let score = scores[t];
-            for d in 0..head_dim {
-                out_head[d] += score * v_cached[d];
-            }
-        }
+        attention_head(
+            q_head, out_head, scores, kv_cache, layer_idx, kvh, pos, head_dim, scale,
+        );
     }
+}
+
+/// Attention for a whole batch of query positions against an already-populated
+/// KV cache, parallel over tokens.
+///
+/// The batched forward used to interleave "store this token's K/V" with
+/// "attend for this token", which forced the entire attention phase to run
+/// sequentially — for a 300-token prefill that is 300 serial attention calls
+/// per layer on one core. Once every token's K/V is stored up front, token `b`
+/// still reads only positions `0..=b`, so the causal structure is unchanged
+/// and the reads become independent.
+///
+/// `q` must already have RoPE applied and the cache must already hold every
+/// position in `positions`. Each token's arithmetic is identical to the
+/// sequential path, so results are bit-identical.
+///
+/// # Panics
+/// Panics if any dimension is zero, `num_heads` is not divisible by
+/// `num_kv_heads`, or the buffers do not match `positions.len()` tokens.
+pub fn attend_batch(
+    attn_out: &mut [f32], // [batch * num_heads * head_dim]
+    q: &[f32],            // [batch * num_heads * head_dim], RoPE applied
+    kv_cache: &KVCache,
+    layer_idx: usize,
+    positions: &[usize],
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+) {
+    assert!(
+        num_heads > 0 && num_kv_heads > 0 && head_dim > 0,
+        "attention dimensions must be non-zero"
+    );
+    assert!(
+        num_heads.is_multiple_of(num_kv_heads),
+        "query heads must be divisible by KV heads"
+    );
+    let q_dim = num_heads
+        .checked_mul(head_dim)
+        .expect("attention dimensions overflow");
+    let batch = positions.len();
+    assert_eq!(
+        attn_out.len(),
+        batch * q_dim,
+        "batched attention output length mismatch"
+    );
+    assert_eq!(q.len(), batch * q_dim, "batched query length mismatch");
+    assert!(
+        kv_cache.supports_attention(layer_idx, num_kv_heads, 0, head_dim),
+        "KV cache dimensions do not match attention"
+    );
+
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let heads_per_kv = num_heads / num_kv_heads;
+
+    let attend_token = |out_tok: &mut [f32], q_tok: &[f32], pos: usize| {
+        // Per-token scratch: the sequential path shared one buffer, which
+        // is exactly what prevented this loop from being parallel.
+        let mut scores = vec![0.0f32; pos + 1];
+        for qh in 0..num_heads {
+            let kvh = qh / heads_per_kv;
+            attention_head(
+                &q_tok[qh * head_dim..(qh + 1) * head_dim],
+                &mut out_tok[qh * head_dim..(qh + 1) * head_dim],
+                &mut scores,
+                kv_cache,
+                layer_idx,
+                kvh,
+                pos,
+                head_dim,
+                scale,
+            );
+        }
+    };
+
+    if crate::gemm::serial_batch_attention_enabled() {
+        for b in 0..batch {
+            let (out_tok, q_tok) = (
+                &mut attn_out[b * q_dim..(b + 1) * q_dim],
+                &q[b * q_dim..(b + 1) * q_dim],
+            );
+            attend_token(out_tok, q_tok, positions[b]);
+        }
+        return;
+    }
+
+    attn_out
+        .par_chunks_mut(q_dim)
+        .zip(q.par_chunks(q_dim))
+        .zip(positions.par_iter())
+        .for_each(|((out_tok, q_tok), &pos)| attend_token(out_tok, q_tok, pos));
 }
 
 /// Reusable workspace for attention to avoid per-call allocations.

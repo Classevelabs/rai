@@ -101,6 +101,18 @@ impl SyncI8Ptr {
     }
 }
 
+/// Per-token quantization parameter arrays shared read-only by every worker.
+#[derive(Copy, Clone)]
+struct SyncGroupPtr(*const [f32; MAX_GROUPS]);
+unsafe impl Send for SyncGroupPtr {}
+unsafe impl Sync for SyncGroupPtr {}
+impl SyncGroupPtr {
+    #[inline(always)]
+    fn ptr(self) -> *const [f32; MAX_GROUPS] {
+        self.0
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -504,6 +516,251 @@ unsafe fn matvec_chunk_i8(
         let dot = _mm_cvtss_f32(_mm_add_ss(s, hi));
 
         *output.add(local) = dot + zero_corr;
+    }
+}
+
+/// One weight row against `T` tokens, sharing a single unpack of the weights.
+///
+/// The 4-bit codes are unpacked once per 32-byte block and reused by all `T`
+/// tokens, so the load/AND/shift work that dominated the single-token inner
+/// loop is paid once per tile instead of once per token.
+///
+/// Each token accumulates over the same groups in the same order as
+/// [`matvec_chunk_i8`], so the results are bit-identical to the single-token
+/// kernel — this is a scheduling change, not a numerical one.
+///
+/// # Safety
+/// - Must only be called after `has_avx2()` returned true (AVX2+FMA+F16C).
+/// - `nib_row` must point at `cols / 2` readable bytes for this row.
+/// - `w_scales`/`w_zeros` must hold `num_groups` decoded values for this row.
+/// - `input_even`/`input_odd` must hold `num_tokens * half_cols` int8 values
+///   and `input_f32` `num_tokens * cols` floats, token-major.
+/// - `input_scales`/`input_sums` must point at `num_tokens` arrays.
+/// - `t_base + T <= num_tokens`, and `output` must be valid for the
+///   `t * rows + row` writes those tokens imply.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn matmul_row_tile<const T: usize>(
+    output: *mut f32,
+    nib_row: *const u8,
+    w_scales: &[f32; MAX_GROUPS],
+    w_zeros: &[f32; MAX_GROUPS],
+    input_f32: *const f32,
+    input_even: *const i8,
+    input_odd: *const i8,
+    input_scales: *const [f32; MAX_GROUPS],
+    input_sums: *const [f32; MAX_GROUPS],
+    t_base: usize,
+    row: usize,
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+    num_groups: usize,
+) {
+    let half_cols = cols / 2;
+    let mask_0f = _mm256_set1_epi8(0x0F);
+    let ones_16 = _mm256_set1_epi16(1);
+    let mut float_acc = [_mm256_setzero_ps(); T];
+
+    for g in 0..num_groups {
+        let col_start = g * group_size;
+        let actual_gs = ((g + 1) * group_size).min(cols) - col_start;
+        let nib_off = col_start / 2;
+        let chunks64 = actual_gs / 64;
+
+        let mut iacc = [_mm256_setzero_si256(); T];
+
+        // Unpack each 32-byte weight block once, consume it T times.
+        for c in 0..chunks64 {
+            let raw = _mm256_loadu_si256(nib_row.add(nib_off + c * 32) as *const __m256i);
+            let lo = _mm256_and_si256(raw, mask_0f);
+            let hi = _mm256_and_si256(_mm256_srli_epi16(raw, 4), mask_0f);
+            for j in 0..T {
+                let base = (t_base + j) * half_cols + nib_off + c * 32;
+                let inp_e = _mm256_loadu_si256(input_even.add(base) as *const __m256i);
+                let inp_o = _mm256_loadu_si256(input_odd.add(base) as *const __m256i);
+                let prod_e = _mm256_maddubs_epi16(lo, inp_e);
+                let prod_o = _mm256_maddubs_epi16(hi, inp_o);
+                let combined = _mm256_add_epi16(prod_e, prod_o);
+                iacc[j] = _mm256_add_epi32(iacc[j], _mm256_madd_epi16(combined, ones_16));
+            }
+        }
+
+        let simd_done = chunks64 * 64;
+        let has_block32 = simd_done + 32 <= actual_gs;
+        let simd_done2 = simd_done + if has_block32 { 32 } else { 0 };
+
+        for j in 0..T {
+            let t = t_base + j;
+            let combined_scale = w_scales[g] * (*input_scales.add(t)).get_unchecked(g);
+            float_acc[j] = _mm256_add_ps(
+                float_acc[j],
+                _mm256_mul_ps(_mm256_cvtepi32_ps(iacc[j]), _mm256_set1_ps(combined_scale)),
+            );
+
+            if has_block32 {
+                let mask128 = _mm_set1_epi8(0x0F);
+                let ones128 = _mm_set1_epi16(1);
+                let raw = _mm_loadu_si128(nib_row.add(nib_off + simd_done / 2) as *const __m128i);
+                let lo = _mm_and_si128(raw, mask128);
+                let hi = _mm_and_si128(_mm_srli_epi16(raw, 4), mask128);
+                let base = t * half_cols + nib_off + simd_done / 2;
+                let inp_e = _mm_loadu_si128(input_even.add(base) as *const __m128i);
+                let inp_o = _mm_loadu_si128(input_odd.add(base) as *const __m128i);
+                let prod_e = _mm_maddubs_epi16(lo, inp_e);
+                let prod_o = _mm_maddubs_epi16(hi, inp_o);
+                let combined = _mm_add_epi16(prod_e, prod_o);
+                let sums = _mm_madd_epi16(combined, ones128);
+                let tail_f = _mm_mul_ps(_mm_cvtepi32_ps(sums), _mm_set1_ps(combined_scale));
+                float_acc[j] = _mm256_add_ps(
+                    float_acc[j],
+                    _mm256_insertf128_ps(_mm256_setzero_ps(), tail_f, 0),
+                );
+            }
+
+            if simd_done2 < actual_gs {
+                let tok_f32 = input_f32.add(t * cols);
+                let mut tail_acc = 0.0f32;
+                let mut tc = simd_done2;
+                while tc + 1 < actual_gs {
+                    let b = *nib_row.add(nib_off + tc / 2);
+                    tail_acc += (b & 0x0F) as f32 * *tok_f32.add(col_start + tc)
+                        + (b >> 4) as f32 * *tok_f32.add(col_start + tc + 1);
+                    tc += 2;
+                }
+                let tail_v =
+                    _mm256_set_ps(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, w_scales[g] * tail_acc);
+                float_acc[j] = _mm256_add_ps(float_acc[j], tail_v);
+            }
+        }
+    }
+
+    for j in 0..T {
+        let t = t_base + j;
+        let hi128 = _mm256_extractf128_ps(float_acc[j], 1);
+        let lo128 = _mm256_castps256_ps128(float_acc[j]);
+        let s128 = _mm_add_ps(lo128, hi128);
+        let shuf = _mm_movehdup_ps(s128);
+        let s = _mm_add_ps(s128, shuf);
+        let hi = _mm_movehl_ps(s, s);
+        let dot = _mm_cvtss_f32(_mm_add_ss(s, hi));
+
+        let sums = &*input_sums.add(t);
+        let mut zero_corr = 0.0f32;
+        for g in 0..num_groups {
+            zero_corr += w_zeros[g] * sums.get_unchecked(g);
+        }
+        *output.add(t * rows + row) = dot + zero_corr;
+    }
+}
+
+/// AVX2 W4A8 batched chunk processor: weight-stationary across the whole batch.
+///
+/// Driving [`matvec_chunk_i8`] once per token made the batch pay three
+/// token-independent costs `num_tokens` times over: the per-row f16 scale/zero
+/// decode, the row prefetch, and the unpacking of every 4-bit weight block.
+/// This hoists the first two out of the token loop entirely and amortizes the
+/// third across a tile of four tokens.
+///
+/// # Safety
+/// Same buffer contract as [`matmul_row_tile`], for every row in
+/// `start_row..start_row + chunk_len`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn matmul_chunk_i8(
+    output: *mut f32,
+    nibble_data: *const u8,
+    group_params: &[u8],
+    input_f32: *const f32,
+    input_even: *const i8,
+    input_odd: *const i8,
+    input_scales: *const [f32; MAX_GROUPS],
+    input_sums: *const [f32; MAX_GROUPS],
+    start_row: usize,
+    chunk_len: usize,
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+    num_groups: usize,
+    num_tokens: usize,
+) {
+    let row_bytes = cols / 2;
+    let pf_dist: usize = if row_bytes > 2048 { 1 } else { 3 };
+    let gp_ptr = group_params.as_ptr();
+
+    // Hoisted out of the row loop: these are 512 bytes each, and re-declaring
+    // them per row costs a 1 KB stack memset for every row in the chunk. Only
+    // the first `num_groups` entries are ever read, and every row overwrites
+    // exactly those before use.
+    let mut w_scales = [0.0f32; MAX_GROUPS];
+    let mut w_zeros = [0.0f32; MAX_GROUPS];
+
+    for local in 0..chunk_len {
+        let row = start_row + local;
+        let nib_row = nibble_data.add(row * row_bytes);
+
+        // Prefetch once per row. The single-token kernel re-issued this for
+        // every token, hammering L1 with lines it had already pulled in.
+        if local + pf_dist < chunk_len {
+            let pf_nib = nibble_data.add((row + pf_dist) * row_bytes);
+            let mut pf = 0;
+            while pf < row_bytes {
+                _mm_prefetch(pf_nib.add(pf) as *const i8, _MM_HINT_T0);
+                pf += 64;
+            }
+        }
+
+        // Decode this row's f16 scale/zero pairs once for the whole batch.
+        let row_param_base = row * num_groups * 4;
+        for g in 0..num_groups {
+            let bits = (gp_ptr.add(row_param_base + g * 4) as *const u32).read_unaligned();
+            let v = _mm_cvtsi32_si128(bits as i32);
+            let f = _mm_cvtph_ps(v);
+            w_scales[g] = _mm_cvtss_f32(f);
+            w_zeros[g] = _mm_cvtss_f32(_mm_shuffle_ps(f, f, 1));
+        }
+
+        let mut t = 0usize;
+        while t + 4 <= num_tokens {
+            matmul_row_tile::<4>(
+                output,
+                nib_row,
+                &w_scales,
+                &w_zeros,
+                input_f32,
+                input_even,
+                input_odd,
+                input_scales,
+                input_sums,
+                t,
+                row,
+                rows,
+                cols,
+                group_size,
+                num_groups,
+            );
+            t += 4;
+        }
+        while t < num_tokens {
+            matmul_row_tile::<1>(
+                output,
+                nib_row,
+                &w_scales,
+                &w_zeros,
+                input_f32,
+                input_even,
+                input_odd,
+                input_scales,
+                input_sums,
+                t,
+                row,
+                rows,
+                cols,
+                group_size,
+                num_groups,
+            );
+            t += 1;
+        }
     }
 }
 
@@ -1336,6 +1593,38 @@ pub fn w4a8_fused_gate_up(
     }
 }
 
+/// Benchmark-only A/B switch for the batched GEMM restructure.
+///
+/// Set `RAI_BENCH_LEGACY_MATMUL=1` to drive a batch through the single-token
+/// kernel once per token, the way [`w4a8_matmul`] worked before the
+/// weight-stationary rewrite. Both paths compute each token over the same
+/// groups in the same order, so this changes speed and nothing else — it
+/// exists so before/after can be measured in one binary on one machine
+/// instead of across two builds under different background load.
+fn legacy_matmul_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("RAI_BENCH_LEGACY_MATMUL").is_ok_and(|v| v == "1"))
+}
+
+/// Benchmark-only A/B switch for the parallel prefill attention phase.
+///
+/// Set `RAI_BENCH_SERIAL_ATTN=1` to attend one token at a time, as the batched
+/// forward did before the store-then-attend split. Numerically identical.
+pub fn serial_batch_attention_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("RAI_BENCH_SERIAL_ATTN").is_ok_and(|v| v == "1"))
+}
+
+/// Benchmark-only A/B switch for parallel decode attention.
+///
+/// Set `RAI_BENCH_SERIAL_DECODE_ATTN=1` to run the per-head decode attention
+/// loop on one core, as it did before. Numerically identical: query heads do
+/// not interact.
+pub fn serial_decode_attention_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("RAI_BENCH_SERIAL_DECODE_ATTN").is_ok_and(|v| v == "1"))
+}
+
 /// Configure the rayon thread pool for optimal inference performance.
 /// Call once at program start. Respects RAYON_NUM_THREADS env var for tuning;
 /// defaults to physical core count + 1.
@@ -1426,43 +1715,66 @@ pub fn w4a8_matmul(
 
             let out_ptr = SendPtr(output.as_mut_ptr());
             let nib_ptr = SyncU8Ptr(nibble_data.as_ptr());
+            let inp_f32_ptr = SyncF32Ptr(input.as_ptr());
+            let inp_even_ptr = SyncI8Ptr(all_even_flat.as_ptr());
+            let inp_odd_ptr = SyncI8Ptr(all_odd_flat.as_ptr());
+            let scales_ptr = SyncGroupPtr(all_scales.as_ptr());
+            let sums_ptr = SyncGroupPtr(all_sums.as_ptr());
 
-            // Collect per-token pointers for send across rayon threads
-            let inp_f32_ptrs: Vec<SyncF32Ptr> = (0..num_tokens)
-                .map(|t| SyncF32Ptr(input[t * cols..].as_ptr()))
-                .collect();
-            let inp_even_ptrs: Vec<SyncI8Ptr> = (0..num_tokens)
-                .map(|t| SyncI8Ptr(all_even_flat[t * half_cols..].as_ptr()))
-                .collect();
-            let inp_odd_ptrs: Vec<SyncI8Ptr> = (0..num_tokens)
-                .map(|t| SyncI8Ptr(all_odd_flat[t * half_cols..].as_ptr()))
-                .collect();
+            if legacy_matmul_enabled() {
+                // Benchmark-only: drive the batch through the single-token
+                // kernel once per token, as this function did before the
+                // weight-stationary rewrite.
+                (0..num_chunks).into_par_iter().for_each(|ci| {
+                    let start = ci * cr;
+                    let len = cr.min(rows - start);
+                    for t in 0..num_tokens {
+                        unsafe {
+                            matvec_chunk_i8(
+                                out_ptr.ptr().add(t * rows + start),
+                                nib_ptr.ptr(),
+                                group_params,
+                                inp_f32_ptr.ptr().add(t * cols),
+                                inp_even_ptr.ptr().add(t * half_cols),
+                                inp_odd_ptr.ptr().add(t * half_cols),
+                                &*scales_ptr.ptr().add(t),
+                                &*sums_ptr.ptr().add(t),
+                                start,
+                                len,
+                                cols,
+                                group_size,
+                                num_groups,
+                            );
+                        }
+                    }
+                });
+                return;
+            }
 
-            // Weight-stationary parallel dispatch: each thread processes a chunk of rows
-            // for ALL tokens before moving on. Weight data stays in L1/L2.
+            // Weight-stationary parallel dispatch: each thread takes a chunk of
+            // rows and drives the whole batch through it, so the weight data it
+            // pulls into L1 is unpacked once and reused by every token.
             (0..num_chunks).into_par_iter().for_each(|ci| {
                 let start = ci * cr;
                 let len = cr.min(rows - start);
-
-                // Process all tokens through this weight chunk (weight-stationary)
-                for t in 0..num_tokens {
-                    unsafe {
-                        matvec_chunk_i8(
-                            out_ptr.ptr().add(t * rows + start),
-                            nib_ptr.ptr(),
-                            group_params,
-                            inp_f32_ptrs[t].ptr(),
-                            inp_even_ptrs[t].ptr(),
-                            inp_odd_ptrs[t].ptr(),
-                            &all_scales[t],
-                            &all_sums[t],
-                            start,
-                            len,
-                            cols,
-                            group_size,
-                            num_groups,
-                        );
-                    }
+                unsafe {
+                    matmul_chunk_i8(
+                        out_ptr.ptr(),
+                        nib_ptr.ptr(),
+                        group_params,
+                        inp_f32_ptr.ptr(),
+                        inp_even_ptr.ptr(),
+                        inp_odd_ptr.ptr(),
+                        scales_ptr.ptr(),
+                        sums_ptr.ptr(),
+                        start,
+                        len,
+                        rows,
+                        cols,
+                        group_size,
+                        num_groups,
+                        num_tokens,
+                    );
                 }
             });
             return;
