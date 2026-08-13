@@ -228,7 +228,8 @@ fn decode_profile(model: &RaiModel, pos: usize, max_ctx: usize, iters: usize) ->
 
     let (mut kv_cache, _) = warm_cache(model, pos, max_ctx)?;
     let file = model.file_ref();
-    let rope = rai_infer::layers::RoPETable::new(hd, max_ctx, cfg.rope_theta);
+    let rope =
+        rai_infer::layers::RoPETable::with_scaling(hd, max_ctx, cfg.rope_theta, cfg.rope_scaling);
 
     let mut hidden = vec![0.0f32; hs];
     let mut normed = vec![0.0f32; hs];
@@ -362,6 +363,8 @@ fn decode_profile(model: &RaiModel, pos: usize, max_ctx: usize, iters: usize) ->
                 &layer.up_proj,
                 &layer.down_proj,
                 &mut mlp_work,
+                cfg.activation,
+                &Default::default(),
             );
             t_mlp += t.elapsed().as_secs_f64();
 
@@ -480,7 +483,8 @@ fn prefill_profile(model: &RaiModel, prompt_len: usize, max_ctx: usize, eps: f32
     // generate.rs prefills all but the final prompt token.
     let batch = (prompt_len - 1).min(max_ctx - 1);
     let file = model.file_ref();
-    let rope = rai_infer::layers::RoPETable::new(hd, max_ctx, cfg.rope_theta);
+    let rope =
+        rai_infer::layers::RoPETable::with_scaling(hd, max_ctx, cfg.rope_theta, cfg.rope_scaling);
 
     let mut norm_weights = Vec::with_capacity(nl);
     for i in 0..nl {
@@ -662,7 +666,10 @@ fn prefill_profile(model: &RaiModel, prompt_len: usize, max_ctx: usize, eps: f32
 
         let t = Instant::now();
         for b in 0..batch {
-            rai_infer::layers::silu_mul_inplace(
+            // The model's own activation, so a GeGLU model is not profiled
+            // as if it ran SwiGLU.
+            rai_infer::layers::glu_mul_inplace(
+                cfg.activation,
                 &mut gate_batch[b * inter..(b + 1) * inter],
                 &up_batch[b * inter..(b + 1) * inter],
                 inter,

@@ -1,2 +1,7 @@
 * text=auto eol=lf
 *.raimodel binary
+
+# Windows batch files must reach cmd.exe with CRLF: with LF-only line endings
+# cmd mis-parses block structure (a nested `exit /b N` silently returns 0).
+*.cmd text eol=crlf
+*.bat text eol=crlf

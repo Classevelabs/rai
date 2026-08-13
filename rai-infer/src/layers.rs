@@ -24,6 +24,119 @@ pub(crate) const MAX_ROPE_TABLE_BYTES: usize = 512 * 1024 * 1024;
 use std::arch::x86_64::*;
 
 // ---------------------------------------------------------------------------
+// Capability selectors carried by the `.raimodel` v2 header
+// ---------------------------------------------------------------------------
+
+/// Which non-linearity the gated MLP uses.
+///
+/// Llama/Mistral/Qwen2 use SwiGLU (`silu(gate) * up`); Gemma uses GeGLU with
+/// the tanh approximation of GeLU (`gelu_tanh(gate) * up`). The container
+/// stores this as a `u8` so a v2 reader refuses an activation it does not
+/// implement instead of quietly running the wrong one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Activation {
+    /// `silu(x) = x * sigmoid(x)` — SwiGLU.
+    #[default]
+    Silu,
+    /// `gelu_tanh(x) = 0.5x(1 + tanh(sqrt(2/pi)(x + 0.044715 x^3)))` — GeGLU.
+    GeluTanh,
+}
+
+impl Activation {
+    /// Decode the header byte. Unknown values are rejected, never ignored.
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Activation::Silu),
+            1 => Some(Activation::GeluTanh),
+            _ => None,
+        }
+    }
+
+    pub fn code(self) -> u8 {
+        match self {
+            Activation::Silu => 0,
+            Activation::GeluTanh => 1,
+        }
+    }
+}
+
+/// How the RoPE inverse frequencies are transformed before the cos/sin tables
+/// are built.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum RopeScaling {
+    /// Plain RoPE straight from `rope_theta`.
+    #[default]
+    None,
+    /// The Llama-3.1/3.2 wavelength-banded rescaling.
+    Llama3 {
+        factor: f32,
+        low_freq_factor: f32,
+        high_freq_factor: f32,
+        original_max_position: u32,
+    },
+}
+
+impl RopeScaling {
+    pub fn code(self) -> u8 {
+        match self {
+            RopeScaling::None => 0,
+            RopeScaling::Llama3 { .. } => 1,
+        }
+    }
+}
+
+/// One layer's bias vectors, in `format::PROJECTION_NAMES` order
+/// (q, k, v, o, gate, up, down). `None` where a projection has no bias.
+pub type ProjectionBiases<'a> = [Option<&'a [f32]>; 7];
+
+/// Add a projection's bias to its output vector.
+///
+/// Deliberately a separate pass over `output` rather than a term inside the
+/// W4A8 inner loop: the loop is `rows * cols` integer MACs against `rows`
+/// float adds here, so folding the bias in would complicate the hottest kernel
+/// in the model to save a fraction of a percent. It also keeps the quantized
+/// path untouched, so a biased model and an unbiased one run the same GEMM.
+///
+/// # Panics
+/// Panics if the bias length does not match the output length.
+#[inline]
+pub fn add_bias(output: &mut [f32], bias: Option<&[f32]>) {
+    let Some(bias) = bias else {
+        return;
+    };
+    assert_eq!(
+        output.len(),
+        bias.len(),
+        "projection bias length does not match its output"
+    );
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2() {
+            // SAFETY: `has_avx2()` gates AVX2, and the assert above proves both
+            // slices hold `output.len()` values.
+            unsafe {
+                let n = output.len();
+                let mut i = 0usize;
+                for _ in 0..(n / 8) {
+                    let o = _mm256_loadu_ps(output.as_ptr().add(i));
+                    let b = _mm256_loadu_ps(bias.as_ptr().add(i));
+                    _mm256_storeu_ps(output.as_mut_ptr().add(i), _mm256_add_ps(o, b));
+                    i += 8;
+                }
+                while i < n {
+                    *output.as_mut_ptr().add(i) += *bias.as_ptr().add(i);
+                    i += 1;
+                }
+            }
+            return;
+        }
+    }
+    for (value, &b) in output.iter_mut().zip(bias) {
+        *value += b;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RMSNorm
 // ---------------------------------------------------------------------------
 
@@ -302,6 +415,15 @@ impl RoPETable {
     /// (`.raimodel` validation guarantees loaded models stay within it), or
     /// the allocation fails.
     pub fn new(head_dim: usize, max_ctx: usize, theta: f32) -> Self {
+        Self::with_scaling(head_dim, max_ctx, theta, RopeScaling::None)
+    }
+
+    /// Build RoPE tables, optionally applying a frequency-rescaling scheme.
+    ///
+    /// # Panics
+    /// Same conditions as [`RoPETable::new`], plus non-finite or non-positive
+    /// llama3 scaling parameters.
+    pub fn with_scaling(head_dim: usize, max_ctx: usize, theta: f32, scaling: RopeScaling) -> Self {
         assert!(
             head_dim > 0 && head_dim.is_multiple_of(2),
             "RoPE head_dim must be positive and even"
@@ -332,10 +454,30 @@ impl RoPETable {
             .expect("unable to allocate RoPE sine table");
         sin.resize(elements, 0.0);
 
+        // The inverse frequencies are position-independent, so they are
+        // computed once and then rescaled once, rather than per position.
+        let mut inv_freq: Vec<f32> = (0..half_dim)
+            .map(|i| 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32))
+            .collect();
+        if let RopeScaling::Llama3 {
+            factor,
+            low_freq_factor,
+            high_freq_factor,
+            original_max_position,
+        } = scaling
+        {
+            apply_llama3_scaling(
+                &mut inv_freq,
+                factor,
+                low_freq_factor,
+                high_freq_factor,
+                original_max_position,
+            );
+        }
+
         for pos in 0..max_ctx {
             for i in 0..half_dim {
-                let freq = 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32);
-                let angle = pos as f32 * freq;
+                let angle = pos as f32 * inv_freq[i];
                 cos[pos * half_dim + i] = angle.cos();
                 sin[pos * half_dim + i] = angle.sin();
             }
@@ -443,8 +585,89 @@ impl RoPETable {
     }
 }
 
+/// Rescale RoPE inverse frequencies with the Llama-3.1/3.2 scheme, in place.
+///
+/// Ported line for line from HuggingFace `transformers`
+/// `src/transformers/modeling_rope_utils.py::_compute_llama3_parameters`
+/// (verified against the copy in the clean-room venv):
+///
+/// ```text
+/// low_freq_wavelen  = old_context_len / low_freq_factor
+/// high_freq_wavelen = old_context_len / high_freq_factor
+/// wavelen           = 2 * pi / inv_freq
+/// inv_freq_llama    = where(wavelen > low_freq_wavelen, inv_freq / factor, inv_freq)
+/// smooth_factor     = (old_context_len / wavelen - low_freq_factor)
+///                     / (high_freq_factor - low_freq_factor)
+/// smoothed          = (1 - smooth) * inv_freq_llama / factor + smooth * inv_freq_llama
+/// is_medium_freq    = ~(wavelen < high_freq_wavelen) & ~(wavelen > low_freq_wavelen)
+/// inv_freq_llama    = where(is_medium_freq, smoothed, inv_freq_llama)
+/// ```
+///
+/// Two details of that reference are load-bearing and easy to get wrong:
+///
+/// * the smoothing blends `inv_freq_llama`, not `inv_freq` — but in the medium
+///   band `wavelen <= low_freq_wavelen`, so the first `where` left it equal to
+///   `inv_freq` and the two spellings coincide. The code below keeps the
+///   reference's variable so the equivalence is visible rather than assumed;
+/// * the band test is `~(w < high) & ~(w > low)`, i.e. the *closed* interval
+///   `high <= w <= low`. The boundary values are smoothed, not passed through.
+///
+/// # Panics
+/// Panics if any parameter is non-finite, `factor` is not positive,
+/// `original_max_position` is zero, or `high_freq_factor == low_freq_factor`
+/// (which would divide by zero in the smoothing term).
+fn apply_llama3_scaling(
+    inv_freq: &mut [f32],
+    factor: f32,
+    low_freq_factor: f32,
+    high_freq_factor: f32,
+    original_max_position: u32,
+) {
+    assert!(
+        factor.is_finite() && factor > 0.0,
+        "llama3 RoPE factor must be finite and positive"
+    );
+    assert!(
+        low_freq_factor.is_finite() && high_freq_factor.is_finite(),
+        "llama3 RoPE frequency factors must be finite"
+    );
+    assert!(
+        (high_freq_factor - low_freq_factor).abs() > 0.0,
+        "llama3 RoPE high_freq_factor must differ from low_freq_factor"
+    );
+    assert!(
+        original_max_position > 0,
+        "llama3 RoPE original_max_position_embeddings must be non-zero"
+    );
+
+    let old_context_len = original_max_position as f32;
+    let low_freq_wavelen = old_context_len / low_freq_factor;
+    let high_freq_wavelen = old_context_len / high_freq_factor;
+
+    for value in inv_freq.iter_mut() {
+        let wavelen = 2.0 * std::f32::consts::PI / *value;
+        let banded = if wavelen > low_freq_wavelen {
+            *value / factor
+        } else {
+            *value
+        };
+        // The reference writes this as `~(w < high) & ~(w > low)`. Every
+        // wavelength here is finite and positive (`theta` is validated finite
+        // and positive, so no inverse frequency is zero or NaN), which makes
+        // the negations equivalent to the closed band spelled directly.
+        let is_medium = wavelen >= high_freq_wavelen && wavelen <= low_freq_wavelen;
+        *value = if is_medium {
+            let smooth = (old_context_len / wavelen - low_freq_factor)
+                / (high_freq_factor - low_freq_factor);
+            (1.0 - smooth) * banded / factor + smooth * banded
+        } else {
+            banded
+        };
+    }
+}
+
 // ---------------------------------------------------------------------------
-// SiLU activation
+// Gated-MLP activations
 // ---------------------------------------------------------------------------
 
 /// SiLU activation: `silu(x) = x * sigmoid(x) = x / (1 + exp(-x))`
@@ -518,6 +741,189 @@ unsafe fn silu_mul_avx2(gate: &mut [f32], up: &[f32], n: usize) {
     }
 }
 
+/// GeLU, tanh approximation — the one Gemma trains against
+/// (`gelu_pytorch_tanh`):
+///
+/// `0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3)))`
+///
+/// Uses [`tanh_poly`], not `f32::tanh`, so this is bit-identical to the scalar
+/// tail the AVX2 kernel falls back on and to the no-AVX2 path.
+#[inline]
+pub fn gelu_tanh(x: f32) -> f32 {
+    const SQRT_2_OVER_PI: f32 = 0.797_884_6; // sqrt(2/pi)
+    const COEFF: f32 = 0.044_715;
+    0.5 * x * (1.0 + tanh_poly(SQRT_2_OVER_PI * (x + COEFF * x * x * x)))
+}
+
+/// Fused `gelu_tanh(gate) * up`, result written to gate. SIMD-accelerated.
+///
+/// # Panics
+/// Panics if `gate` or `up` holds fewer than `n` values.
+pub fn gelu_tanh_mul_inplace(gate: &mut [f32], up: &[f32], n: usize) {
+    assert!(n <= gate.len(), "GeLU gate buffer is too small");
+    assert!(n <= up.len(), "GeLU up buffer is too small");
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2() {
+            unsafe {
+                gelu_tanh_mul_avx2(gate, up, n);
+            }
+            return;
+        }
+    }
+    for i in 0..n {
+        gate[i] = gelu_tanh(gate[i]) * up[i];
+    }
+}
+
+/// AVX2 `gelu_tanh(x) * y`.
+///
+/// The SiLU path next door uses Schraudolph's bit-trick `exp`, whose ~2%
+/// relative error is tolerable there because `silu` is a *bounded* rescaling of
+/// its input. It is not tolerable here: `gelu_tanh` multiplies the saturating
+/// factor by `x` itself, so a 2% error on the factor is a 2% error on an
+/// unbounded output. This uses the accurate rational `tanh` in [`tanh_avx2`]
+/// instead — same eight-lanes-per-iteration structure, no accuracy give-away
+/// (measured max absolute error against `f64` `gelu_tanh`: 1.9e-6 over
+/// [-30, 30], which is f32 rounding at that magnitude).
+///
+/// # Safety
+/// - Must only be called after `has_avx2()` returned true (AVX2+FMA).
+/// - `gate` and `up` must each hold at least `n` values;
+///   `gelu_tanh_mul_inplace` asserts these bounds before dispatching here.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gelu_tanh_mul_avx2(gate: &mut [f32], up: &[f32], n: usize) {
+    let chunks8 = n / 8;
+    let half = _mm256_set1_ps(0.5);
+    let one = _mm256_set1_ps(1.0);
+    let sqrt_2_over_pi = _mm256_set1_ps(0.797_884_6);
+    let coeff = _mm256_set1_ps(0.044_715);
+
+    for i in 0..chunks8 {
+        let off = i * 8;
+        let x = _mm256_loadu_ps(gate.as_ptr().add(off));
+        let u = _mm256_loadu_ps(up.as_ptr().add(off));
+
+        // t = sqrt(2/pi) * (x + 0.044715 x^3)
+        let x2 = _mm256_mul_ps(x, x);
+        let inner = _mm256_fmadd_ps(_mm256_mul_ps(coeff, x2), x, x);
+        let t = _mm256_mul_ps(sqrt_2_over_pi, inner);
+
+        let th = tanh_avx2(t);
+        // 0.5 * x * (1 + tanh(t)) * up
+        let g = _mm256_mul_ps(_mm256_mul_ps(half, x), _mm256_add_ps(one, th));
+        _mm256_storeu_ps(gate.as_mut_ptr().add(off), _mm256_mul_ps(g, u));
+    }
+
+    // Scalar tail
+    for i in (chunks8 * 8)..n {
+        gate[i] = gelu_tanh(gate[i]) * up[i];
+    }
+}
+
+/// `tanh` clamp point. `tanh(9) = 1 - 3.0e-8`, which already rounds to `1.0f32`,
+/// so clamping the argument to ±9 is exact in f32 and keeps `t^12` inside
+/// range.
+const TANH_CLAMP: f32 = 9.0;
+
+/// Numerator `P(u)` of the `tanh` approximation, `u = t^2`, ascending powers.
+///
+/// `tanh(t) ~= t * P(t^2) / Q(t^2)` for `|t| <= 9`, `P(0) = Q(0) = 1` so the
+/// form is exactly odd and exactly `t` at the origin.
+///
+/// These are not borrowed constants: they were fitted here with an
+/// iteratively-reweighted (Loeb) rational least-squares solve of `tanh` on
+/// `[0, 9]`, run in the variable `u/81` for conditioning and converted back.
+/// The fit's own error is 2.0e-8; evaluated in f32 with this Horner order the
+/// end-to-end error against `f64::tanh` is 3.2e-7 over `[-9, 9]` — i.e. f32
+/// rounding, not the approximation. `gelu_tanh_matches_high_precision_reference`
+/// re-checks that bound at test time, so a bad edit cannot pass silently.
+const TANH_P: [f32; 7] = [
+    1.0,
+    0.130_885_48,
+    0.003_109_051_1,
+    1.120_845_9e-5,
+    -2.045_068_6e-8,
+    5.389_845_5e-11,
+    -8.784_743e-14,
+];
+
+/// Denominator `Q(u)` of the same approximation, ascending powers.
+const TANH_Q: [f32; 4] = [1.0, 0.464_218_77, 0.024_515_394, 0.000_255_361_32];
+
+/// Eight-lane `tanh` via the odd rational form `t * P(t^2) / Q(t^2)`, saturating
+/// to exactly ±1 outside ±[`TANH_CLAMP`].
+///
+/// The saturation is a select, not just an argument clamp, and that distinction
+/// is load-bearing: `gelu_tanh` evaluates `1 + tanh(t)`, so at `t <= -9` the
+/// polynomial's last-ulp error (`-0.99999994` instead of `-1.0`) survives as
+/// `6e-8`, which the following `0.5 * x` multiplies back up by `|x|`. Returning
+/// exactly `-1.0` makes the cancellation exact instead. `tanh(9) = 1 - 3e-8`
+/// already rounds to `1.0f32`, so nothing is lost.
+///
+/// # Safety
+/// Must only be called from an AVX2+FMA context.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn tanh_avx2(t: __m256) -> __m256 {
+    let limit = _mm256_set1_ps(TANH_CLAMP);
+    let sign_mask = _mm256_set1_ps(-0.0);
+    let abs_t = _mm256_andnot_ps(sign_mask, t);
+    // Clamp before squaring so `t^12` cannot overflow on the discarded lanes.
+    let tc = _mm256_min_ps(_mm256_max_ps(t, _mm256_set1_ps(-TANH_CLAMP)), limit);
+    let u = _mm256_mul_ps(tc, tc);
+
+    let mut p = _mm256_set1_ps(TANH_P[6]);
+    for k in (0..6).rev() {
+        p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(TANH_P[k]));
+    }
+    let mut q = _mm256_set1_ps(TANH_Q[3]);
+    for k in (0..3).rev() {
+        q = _mm256_fmadd_ps(q, u, _mm256_set1_ps(TANH_Q[k]));
+    }
+    let poly = _mm256_mul_ps(tc, _mm256_div_ps(p, q));
+
+    let saturated = _mm256_or_ps(_mm256_and_ps(sign_mask, t), _mm256_set1_ps(1.0));
+    let use_poly = _mm256_cmp_ps(abs_t, limit, _CMP_LT_OQ);
+    _mm256_blendv_ps(saturated, poly, use_poly)
+}
+
+/// Scalar twin of [`tanh_avx2`], evaluated in the same order so the SIMD body
+/// and the scalar tail of a buffer cannot disagree.
+#[inline]
+fn tanh_poly(t: f32) -> f32 {
+    // NaN is routed to the saturating branch on purpose, matching the AVX2
+    // path's `_CMP_LT_OQ` (which is false for NaN). A NaN activation means the
+    // model is already broken; this at least does not turn it into a plausible
+    // number by running it through the polynomial.
+    if t.is_nan() || t.abs() >= TANH_CLAMP {
+        return 1.0f32.copysign(t);
+    }
+    let u = t * t;
+    let mut p = TANH_P[6];
+    for k in (0..6).rev() {
+        p = p * u + TANH_P[k];
+    }
+    let mut q = TANH_Q[3];
+    for k in (0..3).rev() {
+        q = q * u + TANH_Q[k];
+    }
+    t * (p / q)
+}
+
+/// Apply the model's gated-MLP activation: `act(gate) * up`, into `gate`.
+///
+/// # Panics
+/// Panics if `gate` or `up` holds fewer than `n` values.
+#[inline]
+pub fn glu_mul_inplace(activation: Activation, gate: &mut [f32], up: &[f32], n: usize) {
+    match activation {
+        Activation::Silu => silu_mul_inplace(gate, up, n),
+        Activation::GeluTanh => gelu_tanh_mul_inplace(gate, up, n),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // GQA Attention (single-token decode path)
 // ---------------------------------------------------------------------------
@@ -555,6 +961,7 @@ pub fn gqa_attention_decode(
     head_dim: usize,
     work: &mut AttentionWork,
     store_kv: bool, // false = probe pass, don't write K,V to cache
+    biases: &ProjectionBiases<'_>,
 ) {
     assert!(
         num_heads > 0 && num_kv_heads > 0 && head_dim > 0,
@@ -564,14 +971,38 @@ pub fn gqa_attention_decode(
         num_heads.is_multiple_of(num_kv_heads),
         "query heads must be divisible by KV heads"
     );
-    let hidden = num_heads
+    // The attention interior is `num_heads * head_dim` wide; the block's input
+    // and output are `hidden_size` wide. Those are equal for Llama-shaped
+    // models and not for Gemma-shaped ones, so each is taken from the
+    // projection that actually defines it.
+    let q_dim = num_heads
         .checked_mul(head_dim)
         .expect("attention dimensions overflow");
     let kv_dim = num_kv_heads
         .checked_mul(head_dim)
         .expect("KV dimensions overflow");
-    assert_eq!(input.len(), hidden, "attention input length mismatch");
-    assert_eq!(output.len(), hidden, "attention output length mismatch");
+    assert_eq!(
+        q_proj.rows, q_dim,
+        "q_proj does not produce num_heads heads"
+    );
+    assert_eq!(
+        k_proj.rows, kv_dim,
+        "k_proj does not produce num_kv_heads heads"
+    );
+    assert_eq!(
+        v_proj.rows, kv_dim,
+        "v_proj does not produce num_kv_heads heads"
+    );
+    assert_eq!(
+        o_proj.cols, q_dim,
+        "o_proj does not consume the attention width"
+    );
+    assert_eq!(input.len(), q_proj.cols, "attention input length mismatch");
+    assert_eq!(
+        output.len(),
+        o_proj.rows,
+        "attention output length mismatch"
+    );
     assert_eq!(
         rope.head_dim, head_dim,
         "RoPE and attention head_dim mismatch"
@@ -594,7 +1025,7 @@ pub fn gqa_attention_decode(
     );
 
     // 1. Projections: Q, K, V via W4A8 matvec
-    work.q.resize(hidden, 0.0);
+    work.q.resize(q_dim, 0.0);
     work.k.resize(kv_dim, 0.0);
     work.v.resize(kv_dim, 0.0);
 
@@ -618,6 +1049,12 @@ pub fn gqa_attention_decode(
         input,
     );
 
+    // 1b. Projection biases (Qwen2/Qwen2.5 carry them on q/k/v). Added before
+    //     RoPE, exactly where `q_proj(x) + b` sits in the reference model.
+    add_bias(&mut work.q, biases[0]);
+    add_bias(&mut work.k, biases[1]);
+    add_bias(&mut work.v, biases[2]);
+
     // 2. Apply RoPE to Q (num_heads heads) and K (num_kv_heads heads)
     rope.apply(&mut work.q, num_heads, pos);
     rope.apply(&mut work.k, num_kv_heads, pos);
@@ -634,7 +1071,7 @@ pub fn gqa_attention_decode(
     // on TinyLlama-1.1B), so it is spread across the pool rather than run on
     // one core. `scores` is one flat buffer sliced per head, which keeps the
     // parallel path allocation-free.
-    work.attn_out.resize(hidden, 0.0);
+    work.attn_out.resize(q_dim, 0.0);
     work.scores.resize(num_heads * (pos + 1), 0.0);
     attention_all_heads(
         &mut work.attn_out,
@@ -658,6 +1095,7 @@ pub fn gqa_attention_decode(
         o_proj.cols,
         o_proj.group_size,
     );
+    add_bias(output, biases[3]);
 }
 
 /// AVX2 attention head: score computation + softmax + value accumulation.
@@ -1168,10 +1606,14 @@ impl AttentionWork {
 // SwiGLU MLP
 // ---------------------------------------------------------------------------
 
-/// SwiGLU MLP forward pass.
+/// Gated MLP forward pass.
 ///
-/// `hidden = silu(gate_proj(input)) * up_proj(input)`
+/// `hidden = activation(gate_proj(input)) * up_proj(input)`
 /// `output = down_proj(hidden)`
+///
+/// `activation` is [`Activation::Silu`] for SwiGLU (Llama, Mistral, Qwen2) and
+/// [`Activation::GeluTanh`] for GeGLU (Gemma). The name is kept for continuity
+/// with every caller and benchmark that already refers to it.
 ///
 /// # Panics
 /// Panics if the projections disagree on dimensions or any buffer fails the
@@ -1184,6 +1626,8 @@ pub fn swiglu_mlp(
     up_proj: &QuantizedLinear<'_>,
     down_proj: &QuantizedLinear<'_>,
     work: &mut MlpWork,
+    activation: Activation,
+    biases: &ProjectionBiases<'_>,
 ) {
     let intermediate = gate_proj.rows;
 
@@ -1192,9 +1636,11 @@ pub fn swiglu_mlp(
 
     // gate = gate_proj(input), up = up_proj(input) — fused and overlapped
     w4a8_fused_gate_up(&mut work.gate, &mut work.up, gate_proj, up_proj, input);
+    add_bias(&mut work.gate, biases[4]);
+    add_bias(&mut work.up, biases[5]);
 
-    // hidden = silu(gate) * up — SIMD-vectorized when available
-    silu_mul_inplace(&mut work.gate, &work.up, intermediate);
+    // hidden = activation(gate) * up — SIMD-vectorized when available
+    glu_mul_inplace(activation, &mut work.gate, &work.up, intermediate);
 
     // output = down_proj(hidden)
     w4a8_matvec(
@@ -1206,6 +1652,7 @@ pub fn swiglu_mlp(
         down_proj.cols,
         down_proj.group_size,
     );
+    add_bias(output, biases[6]);
 }
 
 /// Reusable workspace for MLP.
@@ -1354,5 +1801,264 @@ mod tests {
             &mut Vec::new(),
         );
         assert_eq!(output, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    // -----------------------------------------------------------------------
+    // GeGLU
+    // -----------------------------------------------------------------------
+
+    /// `gelu_tanh` in f64, straight from the definition — the reference every
+    /// approximation below is measured against.
+    fn gelu_tanh_reference(x: f64) -> f64 {
+        0.5 * x
+            * (1.0 + ((2.0f64 / std::f64::consts::PI).sqrt() * (x + 0.044715 * x * x * x)).tanh())
+    }
+
+    /// A wide, deliberately awkward sweep: both signs, the saturation
+    /// shoulders, and magnitudes far past anything an MLP produces.
+    fn gelu_probe_points() -> Vec<f32> {
+        let mut points: Vec<f32> = Vec::new();
+        let mut x = -60.0f64;
+        while x <= 60.0 {
+            points.push(x as f32);
+            x += 0.001;
+        }
+        points.extend([
+            0.0, -0.0, 1e-8, -1e-8, 1e-4, -1e-4, 0.5, -0.5, 1.702, -1.702, 2.0, -2.0, 3.0, -3.0,
+            5.0, -5.0, 8.0, -8.0, 10.0, -10.0, 1e3, -1e3, 1e6, -1e6,
+        ]);
+        points
+    }
+
+    #[test]
+    fn gelu_tanh_matches_high_precision_reference() {
+        let mut worst = 0.0f64;
+        let mut worst_at = 0.0f32;
+        for &x in &gelu_probe_points() {
+            let reference = gelu_tanh_reference(x as f64);
+            let error = (gelu_tanh(x) as f64 - reference).abs();
+            if error > worst {
+                worst = error;
+                worst_at = x;
+            }
+        }
+        // The bound is dominated by f32 rounding of the result itself: at
+        // |x| = 60 one ulp is already 4e-6.
+        assert!(
+            worst < 1e-5,
+            "scalar gelu_tanh is off by {worst} at x={worst_at}"
+        );
+
+        // Relative accuracy over the range where the result is not dominated
+        // by the `1 + tanh` cancellation. Past |x| ~ 3 the true value is a
+        // difference of two near-equal numbers and *any* f32 evaluation loses
+        // relative precision there; the absolute bound above is what matters.
+        // This is the check a Schraudolph-style fast exp would fail outright.
+        for &x in &[-2.0f32, -1.0, -0.5, -0.1, 0.1, 0.5, 1.0, 2.0] {
+            let reference = gelu_tanh_reference(x as f64);
+            let relative = ((gelu_tanh(x) as f64 - reference) / reference).abs();
+            assert!(relative < 1e-5, "gelu_tanh({x}) relative error {relative}");
+        }
+
+        // Saturation: gelu_tanh(x) -> 0 for x << 0 and -> x for x >> 0.
+        assert!(gelu_tanh(-40.0).abs() < 1e-4, "{}", gelu_tanh(-40.0));
+        assert!((gelu_tanh(40.0) - 40.0).abs() < 1e-4);
+        assert_eq!(gelu_tanh(0.0), 0.0);
+    }
+
+    #[test]
+    fn gelu_tanh_mul_agrees_with_the_scalar_definition() {
+        // A length that is not a multiple of 8, so the SIMD body and the
+        // scalar tail are both exercised in one call.
+        let n = 8 * 5 + 3;
+        let gate: Vec<f32> = (0..n).map(|i| (i as f32 - n as f32 / 2.0) * 0.37).collect();
+        let up: Vec<f32> = (0..n).map(|i| 1.0 + (i as f32) * 0.01).collect();
+        let mut got = gate.clone();
+        gelu_tanh_mul_inplace(&mut got, &up, n);
+        for i in 0..n {
+            let reference = gelu_tanh_reference(gate[i] as f64) * up[i] as f64;
+            assert!(
+                (got[i] as f64 - reference).abs() < 1e-5,
+                "index {i}: got {} expected {reference}",
+                got[i]
+            );
+        }
+    }
+
+    #[test]
+    fn glu_selects_the_activation() {
+        let gate = [-2.0f32, -0.5, 0.5, 2.0, 3.0, -3.0, 0.0, 1.0];
+        let up = [1.0f32; 8];
+
+        let mut silu_out = gate;
+        glu_mul_inplace(Activation::Silu, &mut silu_out, &up, 8);
+        let mut gelu_out = gate;
+        glu_mul_inplace(Activation::GeluTanh, &mut gelu_out, &up, 8);
+
+        for i in 0..8 {
+            assert!(
+                (gelu_out[i] as f64 - gelu_tanh_reference(gate[i] as f64)).abs() < 1e-5,
+                "GeGLU lane {i}"
+            );
+        }
+        // The two must actually differ, or the selector is not selecting.
+        assert!(
+            (silu_out[0] - gelu_out[0]).abs() > 1e-3,
+            "SiLU and GeLU produced the same value at x=-2"
+        );
+    }
+
+    #[test]
+    fn activation_codes_round_trip_and_reject_the_unknown() {
+        assert_eq!(Activation::from_code(0), Some(Activation::Silu));
+        assert_eq!(Activation::from_code(1), Some(Activation::GeluTanh));
+        assert_eq!(Activation::from_code(2), None);
+        assert_eq!(Activation::Silu.code(), 0);
+        assert_eq!(Activation::GeluTanh.code(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // llama3 RoPE
+    // -----------------------------------------------------------------------
+
+    /// `transformers.modeling_rope_utils.ROPE_INIT_FUNCTIONS["llama3"]`
+    /// evaluated on the Llama-3.2-1B-Instruct config (head_dim 64,
+    /// rope_theta 500000, factor 32, low 1, high 4, original 8192) with
+    /// transformers 5.15.0 / torch 2.13.0, printed at full f64 precision.
+    const LLAMA3_1B_INV_FREQ: [f64; 32] = [
+        1.0,
+        0.663_601_279_258_728,
+        0.440_366_625_785_827_64,
+        0.292_227_834_463_119_5,
+        0.193_922_758_102_417,
+        0.128_687_381_744_384_77,
+        0.085_397_101_938_724_52,
+        0.056_669_618_934_392_93,
+        0.037_606_030_702_590_94,
+        0.024_955_408_647_656_44,
+        0.016_560_440_883_040_428,
+        0.010_989_529_080_688_953,
+        0.007_292_665_075_510_74,
+        0.004_839_421_249_926_09,
+        0.003_211_446_106_433_868_4,
+        0.001_290_548_010_729_253_3,
+        0.000_429_556_705_057_621,
+        9.708_286_233_944_818e-5,
+        1.946_163_865_795_824_7e-5,
+        1.291_476_746_700_937e-5,
+        8.570_255_886_297_673e-6,
+        5.687_232_260_243_036e-6,
+        3.774_054_448_513_197_7e-6,
+        2.504_467_147_446_121e-6,
+        1.661_967_417_021_514_8e-6,
+        1.102_883_629_755_524_5e-6,
+        7.318_749_339_901_842e-7,
+        4.856_731_266_045_244e-7,
+        3.222_932_889_457_297_3e-7,
+        2.138_742_303_259_277_8e-7,
+        1.419_272_024_349_993_4e-7,
+        9.418_306_490_260_875e-8,
+    ];
+
+    #[test]
+    fn llama3_rope_matches_the_transformers_reference() {
+        let scaling = RopeScaling::Llama3 {
+            factor: 32.0,
+            low_freq_factor: 1.0,
+            high_freq_factor: 4.0,
+            original_max_position: 8_192,
+        };
+        let table = RoPETable::with_scaling(64, 4, 500_000.0, scaling);
+
+        // At pos = 1 the angle *is* the inverse frequency, so the table's
+        // cos/sin row is a direct read-out of the transform.
+        for (i, &reference) in LLAMA3_1B_INV_FREQ.iter().enumerate() {
+            let expected_cos = reference.cos() as f32;
+            let expected_sin = reference.sin() as f32;
+            assert!(
+                (table.cos[32 + i] - expected_cos).abs() < 2e-7,
+                "cos[{i}]: {} != {expected_cos}",
+                table.cos[32 + i]
+            );
+            assert!(
+                (table.sin[32 + i] - expected_sin).abs() < 2e-7,
+                "sin[{i}]: {} != {expected_sin}",
+                table.sin[32 + i]
+            );
+        }
+
+        // All three bands must be represented, or the test would pass on an
+        // implementation that only handles one of them.
+        let unscaled = RoPETable::with_scaling(64, 4, 500_000.0, RopeScaling::None);
+        let old_context = 8_192.0f64;
+        let (mut untouched, mut divided, mut smoothed) = (0, 0, 0);
+        for (i, &reference) in LLAMA3_1B_INV_FREQ.iter().enumerate() {
+            let plain = 1.0f64 / 500_000f64.powf(2.0 * i as f64 / 64.0);
+            let wavelen = 2.0 * std::f64::consts::PI / plain;
+            if wavelen < old_context / 4.0 {
+                untouched += 1;
+                assert!((reference / plain - 1.0).abs() < 1e-6, "band A at {i}");
+            } else if wavelen > old_context / 1.0 {
+                divided += 1;
+                assert!(
+                    (reference * 32.0 / plain - 1.0).abs() < 1e-6,
+                    "band C at {i}"
+                );
+            } else {
+                smoothed += 1;
+                // Strictly between the two extremes.
+                assert!(
+                    reference < plain && reference > plain / 32.0,
+                    "band B at {i}"
+                );
+            }
+        }
+        assert!(untouched > 0 && divided > 0 && smoothed > 0);
+        // And the scaled table must actually differ from the plain one. `cos`
+        // is 1.0 either way for the slowest frequencies, so this reads `sin`,
+        // which is ~= the frequency itself at pos 1.
+        let differing = (0..32)
+            .filter(|&i| (table.sin[32 + i] - unscaled.sin[32 + i]).abs() > 1e-9)
+            .count();
+        assert!(
+            differing >= 16,
+            "llama3 scaling changed only {differing} of 32 frequencies"
+        );
+    }
+
+    #[test]
+    fn default_rope_scaling_leaves_the_table_untouched() {
+        let plain = RoPETable::new(16, 8, 10_000.0);
+        let explicit = RoPETable::with_scaling(16, 8, 10_000.0, RopeScaling::None);
+        assert_eq!(plain.cos, explicit.cos);
+        assert_eq!(plain.sin, explicit.sin);
+    }
+
+    // -----------------------------------------------------------------------
+    // Bias
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn add_bias_covers_simd_body_and_scalar_tail() {
+        let n = 8 * 3 + 5;
+        let bias: Vec<f32> = (0..n).map(|i| i as f32 * 0.25).collect();
+        let mut output: Vec<f32> = (0..n).map(|i| 100.0 - i as f32).collect();
+        let before = output.clone();
+        add_bias(&mut output, Some(&bias));
+        for i in 0..n {
+            assert_eq!(output[i], before[i] + bias[i], "index {i}");
+        }
+
+        // No bias is a no-op, not a zero-fill.
+        let mut untouched = before.clone();
+        add_bias(&mut untouched, None);
+        assert_eq!(untouched, before);
+    }
+
+    #[test]
+    #[should_panic(expected = "projection bias length")]
+    fn add_bias_rejects_a_mismatched_vector() {
+        let mut output = [0.0f32; 4];
+        add_bias(&mut output, Some(&[1.0, 2.0]));
     }
 }

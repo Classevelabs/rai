@@ -80,3 +80,8 @@ required-features = ["cli"]
 name = "bw-bench"
 path = "src/bin/bw_bench.rs"
 required-features = ["cli"]
+
+[[bin]]
+name = "rai"
+path = "src/bin/rai.rs"
+required-features = ["cli"]

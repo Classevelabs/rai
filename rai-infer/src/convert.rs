@@ -33,6 +33,8 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::format::PROJECTION_NAMES;
+use crate::layers::{Activation, RopeScaling};
 use crate::safetensors::SafeTensorsSet;
 
 /// Smallest positive (subnormal) f16; scales are clamped to at least this so a
@@ -40,9 +42,9 @@ use crate::safetensors::SafeTensorsSet;
 /// `float(np.nextafter(np.float16(0), np.float16(1)))`.
 const MIN_F16_SCALE: f64 = 5.960464477539063e-8;
 
-const HEADER_SIZE: u64 = 64;
+const HEADER_SIZE_V1: u64 = 64;
+const HEADER_SIZE_V2: u64 = 128;
 const SECTION_ENTRY_SIZE: u64 = 16;
-const FORMAT_VERSION: u32 = 1;
 
 // Reader limits, mirrored so a bad export fails before any work is done.
 const MAX_HIDDEN_SIZE: u32 = 65_536;
@@ -58,36 +60,36 @@ const MAX_ROPE_TABLE_BYTES: u64 = 512 * 1024 * 1024;
 const BLOCK_ELEMENTS: usize = 2 << 20;
 
 /// The seven quantized projections in every layer, in section order.
-const LAYER_LINEAR_NAMES: [&str; 7] = [
-    "q_proj",
-    "k_proj",
-    "v_proj",
-    "o_proj",
-    "gate_proj",
-    "up_proj",
-    "down_proj",
-];
+///
+/// Taken from the reader so the writer cannot drift from the layout the reader
+/// parses — this is also the bit order of the v2 header's `bias_mask`.
+const LAYER_LINEAR_NAMES: [&str; 7] = PROJECTION_NAMES;
 
 /// Architectures whose maths this container cannot express even though their
 /// tensor names look Llama-shaped.
-const UNSUPPORTED_MODEL_TYPES: [(&str, &str); 4] = [
-    (
-        "gemma",
-        "Gemma scales embeddings by sqrt(hidden) and its RMSNorm applies (1 + weight)",
-    ),
+///
+/// `gemma` came off this list in container v2: GeGLU is a stored activation
+/// code, and Gemma's two other differences are folded at conversion time (see
+/// `GemmaFolds`). `gemma2` and `gemma3` stay: softcapping and per-head QK norm
+/// are extra *operations*, not extra parameters, and there is nowhere in the
+/// forward pass to put them.
+const UNSUPPORTED_MODEL_TYPES: [(&str, &str); 3] = [
     (
         "gemma2",
-        "Gemma2 adds logit softcapping and (1 + weight) RMSNorm",
+        "Gemma2 adds logit softcapping and per-layer sliding-window attention",
     ),
     (
         "gemma3",
-        "Gemma3 adds per-head QK norm and (1 + weight) RMSNorm",
+        "Gemma3 adds per-head QK norm and interleaved sliding-window attention",
     ),
     (
         "gemma3_text",
-        "Gemma3 adds per-head QK norm and (1 + weight) RMSNorm",
+        "Gemma3 adds per-head QK norm and interleaved sliding-window attention",
     ),
 ];
+
+/// Model families that need the container's Gemma-specific conversion folds.
+const GEMMA_MODEL_TYPES: [&str; 1] = ["gemma"];
 
 /// Conversion inputs. Defaults match `export_rtn.py`.
 #[derive(Debug, Clone)]
@@ -150,6 +152,86 @@ struct RaiConfig {
     group_size: u8,
     embed_bits: u8,
     embed_group_size: u8,
+    activation: Activation,
+    rope_scaling: RopeScaling,
+    /// Bit *i*: projection *i* of [`PROJECTION_NAMES`] carries a bias.
+    bias_mask: u8,
+    embed_scale: f32,
+}
+
+impl RaiConfig {
+    /// The lowest container version that can express this model.
+    ///
+    /// v1 stays the answer whenever nothing new is used, so every checkpoint
+    /// that converted before this change still produces the same bytes it
+    /// always did — that is what `convert_matches_python` pins.
+    fn version(&self) -> u32 {
+        if self.activation == Activation::Silu
+            && self.rope_scaling == RopeScaling::None
+            && self.bias_mask == 0
+            && self.embed_scale == 1.0
+        {
+            1
+        } else {
+            2
+        }
+    }
+
+    fn header_size(&self) -> u64 {
+        if self.version() >= 2 {
+            HEADER_SIZE_V2
+        } else {
+            HEADER_SIZE_V1
+        }
+    }
+
+    fn attention_dim(&self) -> usize {
+        self.num_heads as usize * self.head_dim as usize
+    }
+
+    fn kv_dim(&self) -> usize {
+        self.num_kv_heads as usize * self.head_dim as usize
+    }
+
+    fn has_bias(&self, index: usize) -> bool {
+        self.bias_mask & (1 << index) != 0
+    }
+
+    /// `(rows, cols)` of the seven layer projections, in section order.
+    /// Must agree with `format::ModelConfig::projection_dims`.
+    fn projection_dims(&self) -> [(usize, usize); 7] {
+        let hidden = self.hidden_size as usize;
+        let inter = self.intermediate_size as usize;
+        let q_dim = self.attention_dim();
+        let kv_dim = self.kv_dim();
+        [
+            (q_dim, hidden),
+            (kv_dim, hidden),
+            (kv_dim, hidden),
+            (hidden, q_dim),
+            (inter, hidden),
+            (inter, hidden),
+            (hidden, inter),
+        ]
+    }
+}
+
+/// The two Gemma differences that are folded into stored weights rather than
+/// given a runtime code path.
+///
+/// * **RMSNorm.** Gemma computes `x/rms * (1 + w)`; the shipped kernel computes
+///   `x/rms * w` (`layers.rs::rms_norm`, verified). Storing `w' = 1 + w` makes
+///   the existing kernel exactly right, so no reader change and no flag.
+/// * **Embedding scale.** Gemma multiplies the *input* embedding by
+///   `sqrt(hidden_size)`. This one is deliberately **not** folded, despite
+///   looking like the same kind of trick: Gemma ties `lm_head` to the embedding
+///   table, and the tied output projection uses the unscaled weights. A folded
+///   table would inflate every logit by ~45x. It is carried in the v2 header's
+///   `embed_scale` and applied at lookup time instead.
+#[derive(Debug, Clone, Copy, Default)]
+struct GemmaFolds {
+    /// Add 1.0 to every RMSNorm weight before writing it.
+    norm_plus_one: bool,
 }
 
 /// Convert a HuggingFace checkpoint directory to `.raimodel`.
@@ -178,7 +260,21 @@ pub fn convert(options: &ConvertOptions) -> Result<ConvertSummary> {
         .unwrap_or(true);
     let model_type = hf.get("model_type").and_then(|v| v.as_str()).unwrap_or("?");
 
-    let config = RaiConfig {
+    let is_gemma = GEMMA_MODEL_TYPES.contains(&model_type);
+    let activation = resolve_activation(&hf, is_gemma)?;
+    let rope_scaling = resolve_rope_scaling(&hf)?;
+    let folds = GemmaFolds {
+        norm_plus_one: is_gemma,
+    };
+    // sqrt(hidden_size), computed in f64 and rounded once, so the value in the
+    // header is the nearest f32 to the true normalizer.
+    let embed_scale = if is_gemma {
+        (hidden_size as f64).sqrt() as f32
+    } else {
+        1.0
+    };
+
+    let mut config = RaiConfig {
         hidden_size,
         num_layers,
         num_heads,
@@ -193,8 +289,11 @@ pub fn convert(options: &ConvertOptions) -> Result<ConvertSummary> {
         group_size: options.group_size as u8,
         embed_bits: 8,
         embed_group_size: options.embed_group_size as u8,
+        activation,
+        rope_scaling,
+        bias_mask: 0,
+        embed_scale,
     };
-    validate_model_config(&config)?;
 
     let output_path = match &options.output {
         Some(path) => path.clone(),
@@ -228,28 +327,27 @@ pub fn convert(options: &ConvertOptions) -> Result<ConvertSummary> {
     let mut store = SafeTensorsSet::open(&options.model_dir)?;
     assert_exportable_architecture(&hf, &store, options.max_context, num_layers)?;
 
-    let kv_dim = (num_kv_heads * head_dim) as usize;
+    // Which projections carry biases is a property of the checkpoint, not the
+    // config, so it can only be settled once the tensor namespace is open.
+    config.bias_mask = resolve_bias_mask(&store, num_layers)?;
+    validate_model_config(&config)?;
+
     let hidden = hidden_size as usize;
-    let inter = intermediate_size as usize;
     let vocab = vocab_size as usize;
     let group_size = options.group_size as usize;
     let embed_group_size = options.embed_group_size as usize;
-    let linear_dims: [(usize, usize); 7] = [
-        (hidden, hidden),
-        (kv_dim, hidden),
-        (kv_dim, hidden),
-        (hidden, hidden),
-        (inter, hidden),
-        (inter, hidden),
-        (hidden, inter),
-    ];
+    let linear_dims = config.projection_dims();
 
     // Confirm every tensor exists with the shape the reader will demand, before
     // a single byte is written.
     check_tensor(&store, "model.embed_tokens.weight", vocab, hidden)?;
     for layer in 0..num_layers {
-        for (name, (rows, cols)) in LAYER_LINEAR_NAMES.iter().zip(linear_dims) {
+        for (index, (name, (rows, cols))) in LAYER_LINEAR_NAMES.iter().zip(linear_dims).enumerate()
+        {
             check_tensor(&store, &layer_linear_name(layer, name), rows, cols)?;
+            if config.has_bias(index) {
+                check_vector(&store, &layer_bias_name(layer, name), rows)?;
+            }
         }
         for suffix in ["input_layernorm", "post_attention_layernorm"] {
             check_vector(
@@ -266,7 +364,15 @@ pub fn convert(options: &ConvertOptions) -> Result<ConvertSummary> {
 
     log(&format!(
         "{model_type}: {num_layers}L h={hidden_size} inter={intermediate_size} \
-         heads={num_heads}/{num_kv_heads} vocab={vocab_size}"
+         heads={num_heads}/{num_kv_heads} head_dim={head_dim} vocab={vocab_size}"
+    ));
+    log(&format!(
+        "container v{}: activation={:?} rope={:?} bias_mask={:#04x} embed_scale={}",
+        config.version(),
+        config.activation,
+        config.rope_scaling,
+        config.bias_mask,
+        config.embed_scale
     ));
 
     // ---- Plan the container ------------------------------------------------
@@ -274,7 +380,7 @@ pub fn convert(options: &ConvertOptions) -> Result<ConvertSummary> {
     // before the data exists and each section can be streamed straight out.
     let mut section_sizes: Vec<u64> = Vec::with_capacity(num_layers as usize + 3);
     section_sizes.push(embedding_section_len(vocab, hidden, embed_group_size)?);
-    let layer_len = layer_section_len(&linear_dims, hidden, group_size)?;
+    let layer_len = layer_section_len(&linear_dims, hidden, group_size, config.bias_mask)?;
     for _ in 0..num_layers {
         section_sizes.push(layer_len);
     }
@@ -284,7 +390,7 @@ pub fn convert(options: &ConvertOptions) -> Result<ConvertSummary> {
     }
 
     let num_sections = section_sizes.len();
-    let data_start = HEADER_SIZE + num_sections as u64 * SECTION_ENTRY_SIZE;
+    let data_start = config.header_size() + num_sections as u64 * SECTION_ENTRY_SIZE;
     let mut offsets = Vec::with_capacity(num_sections);
     let mut cursor = data_start;
     for size in &section_sizes {
@@ -357,9 +463,22 @@ pub fn convert(options: &ConvertOptions) -> Result<ConvertSummary> {
                 ));
             }
         }
+        // Bias block, in projection order, immediately after the seven linears.
+        for (index, name) in LAYER_LINEAR_NAMES.iter().enumerate() {
+            if !config.has_bias(index) {
+                continue;
+            }
+            write_f32_vector(
+                &mut file,
+                &mut store,
+                &layer_bias_name(layer, name),
+                linear_dims[index].0,
+                false,
+            )?;
+        }
         for suffix in ["input_layernorm", "post_attention_layernorm"] {
             let tensor = format!("model.layers.{layer}.{suffix}.weight");
-            write_norm(&mut file, &mut store, &tensor, hidden)?;
+            write_f32_vector(&mut file, &mut store, &tensor, hidden, folds.norm_plus_one)?;
         }
         log(&format!(
             "  Layer {layer}/{num_layers}: {:.1}s",
@@ -368,7 +487,13 @@ pub fn convert(options: &ConvertOptions) -> Result<ConvertSummary> {
     }
 
     // ---- Section L+1: final norm -------------------------------------------
-    write_norm(&mut file, &mut store, "model.norm.weight", hidden)?;
+    write_f32_vector(
+        &mut file,
+        &mut store,
+        "model.norm.weight",
+        hidden,
+        folds.norm_plus_one,
+    )?;
 
     // ---- Section L+2 (untied only): lm_head --------------------------------
     if tied {
@@ -503,18 +628,24 @@ fn validate_model_config(config: &RaiConfig) -> Result<()> {
             config.num_kv_heads
         );
     }
-    let projected = config.num_heads as u64 * config.head_dim as u64;
-    if projected != config.hidden_size as u64 {
+    // `num_heads * head_dim` may differ from `hidden_size` (Gemma). Mirror of
+    // the reader's `validate_config`.
+    let attention_dim = config.num_heads as u64 * config.head_dim as u64;
+    if attention_dim > MAX_INTERMEDIATE_SIZE as u64 {
         bail!(
-            "hidden_size {} does not equal num_heads * head_dim ({projected})",
-            config.hidden_size
+            "num_heads * head_dim is {attention_dim}; the reader's maximum is \
+             {MAX_INTERMEDIATE_SIZE}"
         );
+    }
+    if !attention_dim.is_multiple_of(2) {
+        bail!("num_heads * head_dim must be even for packed 4-bit kernels, got {attention_dim}");
     }
 
     let group_size = config.group_size as usize;
     let max_linear_groups = (config.hidden_size as usize)
         .div_ceil(group_size)
-        .max((config.intermediate_size as usize).div_ceil(group_size));
+        .max((config.intermediate_size as usize).div_ceil(group_size))
+        .max((attention_dim as usize).div_ceil(group_size));
     if max_linear_groups > MAX_GEMM_GROUPS {
         bail!(
             "group_size {group_size} needs {max_linear_groups} quantization groups for \
@@ -556,26 +687,166 @@ fn validate_model_config(config: &RaiConfig) -> Result<()> {
     Ok(())
 }
 
-/// Mirror of `raimodel.resolve_head_dim`.
+/// Resolve `head_dim`, honouring an explicit config value.
+///
+/// A decoupled `head_dim` (`num_heads * head_dim != hidden_size`, as Gemma
+/// uses) is no longer refused: `q_proj` is stored `[num_heads*head_dim, hidden]`
+/// and `o_proj` `[hidden, num_heads*head_dim]`, so the attention block still
+/// reads and writes hidden-sized vectors and only its interior changes width.
+/// When the config omits `head_dim` the derived value must divide exactly —
+/// silently truncating would misdescribe the model.
 fn resolve_head_dim(config_head_dim: Option<u32>, hidden_size: u32, num_heads: u32) -> Result<u32> {
     if num_heads == 0 {
         bail!("num_attention_heads must be greater than zero");
     }
     match config_head_dim {
-        Some(head_dim) if head_dim != 0 => {
-            if num_heads as u64 * head_dim as u64 != hidden_size as u64 {
+        Some(head_dim) if head_dim != 0 => Ok(head_dim),
+        _ => {
+            if !hidden_size.is_multiple_of(num_heads) {
                 bail!(
-                    "model config declares head_dim={head_dim} with num_heads={num_heads}, so \
-                     num_heads * head_dim = {} != hidden_size {hidden_size}. The .raimodel \
-                     format cannot represent a decoupled head_dim yet; this model cannot be \
-                     exported.",
-                    num_heads as u64 * head_dim as u64
+                    "model config omits head_dim and hidden_size {hidden_size} is not divisible \
+                     by num_attention_heads {num_heads}"
                 );
             }
-            Ok(head_dim)
+            Ok(hidden_size / num_heads)
         }
-        _ => Ok(hidden_size / num_heads),
     }
+}
+
+/// Pick the gated-MLP activation from the config.
+///
+/// Gemma trains against `gelu_pytorch_tanh` and, in older checkpoints, leaves
+/// `hidden_activation` null with a misleading `hidden_act: "gelu"` — the
+/// reference model resolves that to `gelu_pytorch_tanh`, so this does too.
+/// Anything else is refused by name rather than run as SiLU.
+fn resolve_activation(hf: &serde_json::Value, is_gemma: bool) -> Result<Activation> {
+    let declared = hf
+        .get("hidden_activation")
+        .and_then(|v| v.as_str())
+        .or_else(|| hf.get("hidden_act").and_then(|v| v.as_str()));
+    match (is_gemma, declared) {
+        // Gemma with hidden_activation unset: transformers warns and uses
+        // gelu_pytorch_tanh, ignoring hidden_act.
+        (true, None) => Ok(Activation::GeluTanh),
+        (true, Some("gelu")) if hf.get("hidden_activation").is_none_or(|v| v.is_null()) => {
+            Ok(Activation::GeluTanh)
+        }
+        (_, Some("gelu_pytorch_tanh")) => Ok(Activation::GeluTanh),
+        (false, None | Some("silu") | Some("swish")) => Ok(Activation::Silu),
+        (_, Some(other)) => bail!(
+            "config declares hidden activation '{other}'; the container stores SiLU/SwiGLU and \
+             GeLU-tanh/GeGLU only, and running the wrong one would silently produce a different \
+             model."
+        ),
+    }
+}
+
+/// Read `rope_scaling` into the container's representation.
+///
+/// transformers >= 5 normalizes plain RoPE into `{"rope_type": "default"}`, so
+/// the field's presence means nothing on its own. Anything other than absent,
+/// null, "default" or "llama3" is refused: the reader would otherwise build a
+/// table for the wrong positions.
+fn resolve_rope_scaling(hf: &serde_json::Value) -> Result<RopeScaling> {
+    let Some(scaling) = hf.get("rope_scaling") else {
+        return Ok(RopeScaling::None);
+    };
+    if scaling.is_null() {
+        return Ok(RopeScaling::None);
+    }
+    let Some(object) = scaling.as_object() else {
+        bail!("config field rope_scaling is not an object: {scaling}");
+    };
+    let rope_type = object
+        .get("rope_type")
+        .or_else(|| object.get("type"))
+        .and_then(|v| v.as_str());
+    match rope_type {
+        None | Some("default") => Ok(RopeScaling::None),
+        Some("llama3") => {
+            let number = |key: &str| -> Result<f64> {
+                object
+                    .get(key)
+                    .and_then(serde_json::Value::as_f64)
+                    .with_context(|| {
+                        format!("rope_scaling declares rope_type 'llama3' but has no numeric {key}")
+                    })
+            };
+            let factor = number("factor")?;
+            let low_freq_factor = number("low_freq_factor")?;
+            let high_freq_factor = number("high_freq_factor")?;
+            let original = object
+                .get("original_max_position_embeddings")
+                .and_then(serde_json::Value::as_u64)
+                .or_else(|| hf.get("max_position_embeddings").and_then(|v| v.as_u64()))
+                .context(
+                    "rope_scaling declares rope_type 'llama3' but neither it nor the config \
+                     provides original_max_position_embeddings",
+                )?;
+            for (name, value) in [
+                ("factor", factor),
+                ("low_freq_factor", low_freq_factor),
+                ("high_freq_factor", high_freq_factor),
+            ] {
+                if !value.is_finite() || value <= 0.0 {
+                    bail!("rope_scaling {name} must be finite and positive, got {value}");
+                }
+            }
+            if (high_freq_factor - low_freq_factor).abs() == 0.0 {
+                bail!("rope_scaling high_freq_factor must differ from low_freq_factor");
+            }
+            let original = u32::try_from(original)
+                .context("rope_scaling original_max_position_embeddings does not fit in a u32")?;
+            if original == 0 || original > MAX_CONTEXT {
+                bail!(
+                    "rope_scaling original_max_position_embeddings must be in 1..={MAX_CONTEXT}, \
+                     got {original}"
+                );
+            }
+            Ok(RopeScaling::Llama3 {
+                factor: factor as f32,
+                low_freq_factor: low_freq_factor as f32,
+                high_freq_factor: high_freq_factor as f32,
+                original_max_position: original,
+            })
+        }
+        Some(other) => bail!(
+            "config declares rope_scaling type '{other}'; the container stores plain RoPE and \
+             the llama3 scheme only, so positions would be wrong."
+        ),
+    }
+}
+
+/// Work out which projections carry biases, and insist every layer agrees.
+///
+/// A checkpoint where only some layers are biased is not a model this (or any)
+/// exporter should guess at: the container stores one mask for the whole file,
+/// so a partial set would mean silently dropping real parameters.
+fn resolve_bias_mask(store: &SafeTensorsSet, num_layers: u32) -> Result<u8> {
+    if num_layers == 0 {
+        return Ok(0);
+    }
+    let mask_for = |layer: u32| -> u8 {
+        let mut mask = 0u8;
+        for (index, name) in LAYER_LINEAR_NAMES.iter().enumerate() {
+            if store.info(&layer_bias_name(layer, name)).is_some() {
+                mask |= 1 << index;
+            }
+        }
+        mask
+    };
+    let mask = mask_for(0);
+    for layer in 1..num_layers {
+        let other = mask_for(layer);
+        if other != mask {
+            bail!(
+                "checkpoint is inconsistent: layer 0 has projection biases {mask:#04x} but layer \
+                 {layer} has {other:#04x}. The container stores one bias mask for the whole \
+                 model, so exporting this would drop real parameters."
+            );
+        }
+    }
+    Ok(mask)
 }
 
 /// Mirror of `raimodel.assert_exportable_architecture`, driven by the config
@@ -613,21 +884,17 @@ fn assert_exportable_architecture(
         );
     }
 
-    let is_projection_bias = |name: &str| {
-        name.starts_with("model.layers.")
-            && name.ends_with("_proj.bias")
-            && LAYER_LINEAR_NAMES
-                .iter()
-                .any(|proj| name.ends_with(&format!(".{proj}.bias")))
-    };
-    let biased = store.count_names(is_projection_bias);
-    if biased > 0 {
-        let example = store.any_name(is_projection_bias).unwrap_or("");
-        problems.push(format!(
-            "{biased} projection(s) carry bias vectors (e.g. {example}); the format stores \
-             weights only, so the biases would be silently dropped. Qwen2/Qwen2.5 are the \
-             common case here."
-        ));
+    // Per-layer projection biases (Qwen2/Qwen2.5) are a v2 capability now; see
+    // `resolve_bias_mask`, which is where an inconsistent set is caught. The
+    // *output* projection is a different matter: `bias_mask` covers the seven
+    // layer projections only, so an lm_head bias has nowhere to go and would be
+    // dropped in silence.
+    if store.info("lm_head.bias").is_some() {
+        problems.push(
+            "checkpoint carries lm_head.bias; the container stores biases for the seven layer \
+             projections only, so this would be silently dropped."
+                .to_string(),
+        );
     }
 
     let is_qk_norm =
@@ -641,29 +908,8 @@ fn assert_exportable_architecture(
         ));
     }
 
-    // transformers >= 5 normalizes plain RoPE into {"rope_type": "default"}, so
-    // the field's presence means nothing on its own.
-    if let Some(scaling) = hf.get("rope_scaling") {
-        if !scaling.is_null() {
-            let rope_type = if let Some(object) = scaling.as_object() {
-                object
-                    .get("rope_type")
-                    .or_else(|| object.get("type"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned)
-            } else {
-                Some(scaling.to_string())
-            };
-            match rope_type.as_deref() {
-                None | Some("default") => {}
-                Some(other) => problems.push(format!(
-                    "config declares rope_scaling type '{other}'; the reader builds a plain RoPE \
-                     table from rope_theta alone, so positions would be wrong. Llama-3.1/3.2 \
-                     (rope_type 'llama3') are the common case here."
-                )),
-            }
-        }
-    }
+    // `rope_scaling` is handled by `resolve_rope_scaling`, which accepts
+    // default and llama3 and refuses every other scheme by name.
 
     for attr in ["num_experts", "num_local_experts"] {
         if let Some(value) = hf.get(attr) {
@@ -925,25 +1171,34 @@ fn quantize_row(
     Ok(squared_error)
 }
 
-/// Write one RMSNorm vector as little-endian f32.
-fn write_norm(
+/// Write one unquantized vector (an RMSNorm weight or a projection bias) as
+/// little-endian f32.
+///
+/// `plus_one` implements the Gemma RMSNorm fold: Gemma's norm is
+/// `x/rms * (1 + w)` while `layers.rs::rms_norm` computes `x/rms * w`, so
+/// storing `1 + w` makes the shipped kernel exactly right and costs the format
+/// nothing. The addition happens in f32 after the checkpoint's f16 cast, which
+/// is the same order `(1.0 + weight.float())` uses in the reference model.
+fn write_f32_vector(
     file: &mut File,
     store: &mut SafeTensorsSet,
     tensor: &str,
-    hidden: usize,
+    len: usize,
+    plus_one: bool,
 ) -> Result<()> {
-    let weights = store.read_all(tensor, hidden)?;
-    if weights.len() != hidden {
+    let weights = store.read_all(tensor, len)?;
+    if weights.len() != len {
         bail!(
-            "tensor '{tensor}' has {} values, expected {hidden}",
+            "tensor '{tensor}' has {} values, expected {len}",
             weights.len()
         );
     }
-    let mut bytes = Vec::with_capacity(hidden * 4);
+    let mut bytes = Vec::with_capacity(len * 4);
     for (index, value) in weights.iter().enumerate() {
         if !value.is_finite() {
             bail!("{tensor} weight {index} is non-finite");
         }
+        let value = if plus_one { 1.0 + *value } else { *value };
         bytes.extend_from_slice(&value.to_le_bytes());
     }
     file.write_all(&bytes)?;
@@ -983,18 +1238,26 @@ fn layer_section_len(
     linear_dims: &[(usize, usize); 7],
     hidden: usize,
     group_size: usize,
+    bias_mask: u8,
 ) -> Result<u64> {
     let mut total = 0u64;
     for &(rows, cols) in linear_dims {
         total += linear_section_len(rows, cols, group_size)?;
     }
+    // Bias block: one f32 per output row, for each declared projection.
+    for (index, &(rows, _)) in linear_dims.iter().enumerate() {
+        if bias_mask & (1 << index) != 0 {
+            total += rows as u64 * 4;
+        }
+    }
     Ok(total + 2 * hidden as u64 * 4)
 }
 
 fn write_header(file: &mut File, config: &RaiConfig, num_sections: u32) -> Result<()> {
-    let mut header = [0u8; HEADER_SIZE as usize];
+    let version = config.version();
+    let mut header = vec![0u8; config.header_size() as usize];
     header[0..4].copy_from_slice(b"RAIM");
-    header[4..8].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+    header[4..8].copy_from_slice(&version.to_le_bytes());
     header[8..12].copy_from_slice(&config.hidden_size.to_le_bytes());
     header[12..16].copy_from_slice(&config.num_layers.to_le_bytes());
     header[16..20].copy_from_slice(&config.num_heads.to_le_bytes());
@@ -1010,6 +1273,31 @@ fn write_header(file: &mut File, config: &RaiConfig, num_sections: u32) -> Resul
     header[50] = config.embed_bits;
     header[51] = config.embed_group_size;
     header[52..56].copy_from_slice(&num_sections.to_le_bytes());
+    // 56..64 stays zero in both versions: it is the v1 header's reserved tail
+    // and the v2 reader rejects a non-zero value there.
+    if version >= 2 {
+        header[64] = config.activation.code();
+        header[65] = if config.bias_mask != 0 {
+            crate::format::FLAG_HAS_BIASES
+        } else {
+            0
+        };
+        header[66] = config.rope_scaling.code();
+        header[67] = config.bias_mask;
+        if let RopeScaling::Llama3 {
+            factor,
+            low_freq_factor,
+            high_freq_factor,
+            original_max_position,
+        } = config.rope_scaling
+        {
+            header[68..72].copy_from_slice(&factor.to_le_bytes());
+            header[72..76].copy_from_slice(&low_freq_factor.to_le_bytes());
+            header[76..80].copy_from_slice(&high_freq_factor.to_le_bytes());
+            header[80..84].copy_from_slice(&original_max_position.to_le_bytes());
+        }
+        header[84..88].copy_from_slice(&config.embed_scale.to_le_bytes());
+    }
     file.write_all(&header)?;
     Ok(())
 }
@@ -1019,11 +1307,24 @@ fn write_header(file: &mut File, config: &RaiConfig, num_sections: u32) -> Resul
 // =============================================================================
 
 fn layer_linear_name(layer: u32, projection: &str) -> String {
-    let block = match projection {
+    format!(
+        "model.layers.{layer}.{}.{projection}.weight",
+        projection_block(projection)
+    )
+}
+
+fn layer_bias_name(layer: u32, projection: &str) -> String {
+    format!(
+        "model.layers.{layer}.{}.{projection}.bias",
+        projection_block(projection)
+    )
+}
+
+fn projection_block(projection: &str) -> &'static str {
+    match projection {
         "gate_proj" | "up_proj" | "down_proj" => "mlp",
         _ => "self_attn",
-    };
-    format!("model.layers.{layer}.{block}.{projection}.weight")
+    }
 }
 
 fn default_output_name(model_dir: &Path) -> Result<String> {
@@ -1141,11 +1442,141 @@ mod tests {
     }
 
     #[test]
-    fn head_dim_disagreement_is_rejected() {
+    fn head_dim_is_taken_from_the_config_when_declared() {
         assert_eq!(resolve_head_dim(None, 64, 4).unwrap(), 16);
         assert_eq!(resolve_head_dim(Some(16), 64, 4).unwrap(), 16);
-        let error = resolve_head_dim(Some(32), 64, 4).unwrap_err().to_string();
-        assert!(error.contains("decoupled head_dim"), "{error}");
+        // Decoupled: 4 * 32 = 128 against a 64-wide hidden state. Gemma does
+        // this, and the container now stores it.
+        assert_eq!(resolve_head_dim(Some(32), 64, 4).unwrap(), 32);
+        // Without an explicit head_dim the division must be exact.
+        let error = resolve_head_dim(None, 66, 4).unwrap_err().to_string();
+        assert!(error.contains("not divisible"), "{error}");
+    }
+
+    #[test]
+    fn activation_is_resolved_per_family() {
+        let gemma = serde_json::json!({
+            "model_type": "gemma", "hidden_act": "gelu", "hidden_activation": null
+        });
+        assert_eq!(
+            resolve_activation(&gemma, true).unwrap(),
+            Activation::GeluTanh
+        );
+        let gemma_explicit = serde_json::json!({ "hidden_activation": "gelu_pytorch_tanh" });
+        assert_eq!(
+            resolve_activation(&gemma_explicit, true).unwrap(),
+            Activation::GeluTanh
+        );
+        let llama = serde_json::json!({ "hidden_act": "silu" });
+        assert_eq!(resolve_activation(&llama, false).unwrap(), Activation::Silu);
+        assert_eq!(
+            resolve_activation(&serde_json::json!({}), false).unwrap(),
+            Activation::Silu
+        );
+        // An exact-erf GeLU is a different function and must not be run as the
+        // tanh approximation.
+        let exact = serde_json::json!({ "hidden_activation": "gelu" });
+        let error = resolve_activation(&exact, true).unwrap_err().to_string();
+        assert!(error.contains("hidden activation 'gelu'"), "{error}");
+    }
+
+    #[test]
+    fn rope_scaling_is_resolved_or_refused_by_name() {
+        assert_eq!(
+            resolve_rope_scaling(&serde_json::json!({})).unwrap(),
+            RopeScaling::None
+        );
+        assert_eq!(
+            resolve_rope_scaling(&serde_json::json!({ "rope_scaling": null })).unwrap(),
+            RopeScaling::None
+        );
+        assert_eq!(
+            resolve_rope_scaling(
+                &serde_json::json!({ "rope_scaling": { "rope_type": "default" } })
+            )
+            .unwrap(),
+            RopeScaling::None
+        );
+        let llama3 = serde_json::json!({ "rope_scaling": {
+            "rope_type": "llama3", "factor": 32.0, "low_freq_factor": 1.0,
+            "high_freq_factor": 4.0, "original_max_position_embeddings": 8192
+        }});
+        assert_eq!(
+            resolve_rope_scaling(&llama3).unwrap(),
+            RopeScaling::Llama3 {
+                factor: 32.0,
+                low_freq_factor: 1.0,
+                high_freq_factor: 4.0,
+                original_max_position: 8_192,
+            }
+        );
+        let yarn = serde_json::json!({ "rope_scaling": { "rope_type": "yarn", "factor": 4.0 } });
+        let error = resolve_rope_scaling(&yarn).unwrap_err().to_string();
+        assert!(error.contains("rope_scaling type 'yarn'"), "{error}");
+    }
+
+    #[test]
+    fn container_version_is_the_lowest_that_fits() {
+        let mut config = RaiConfig {
+            hidden_size: 64,
+            num_layers: 2,
+            num_heads: 4,
+            num_kv_heads: 2,
+            head_dim: 16,
+            intermediate_size: 128,
+            vocab_size: 96,
+            max_context: 512,
+            rope_theta: 10_000.0,
+            norm_eps: 1e-5,
+            bits: 4,
+            group_size: 64,
+            embed_bits: 8,
+            embed_group_size: 64,
+            activation: Activation::Silu,
+            rope_scaling: RopeScaling::None,
+            bias_mask: 0,
+            embed_scale: 1.0,
+        };
+        assert_eq!(config.version(), 1, "a plain Llama model must stay v1");
+        assert_eq!(config.header_size(), HEADER_SIZE_V1);
+
+        for mutate in [
+            (|c: &mut RaiConfig| c.activation = Activation::GeluTanh) as fn(&mut RaiConfig),
+            |c: &mut RaiConfig| c.bias_mask = 0b111,
+            |c: &mut RaiConfig| c.embed_scale = 45.25,
+            |c: &mut RaiConfig| {
+                c.rope_scaling = RopeScaling::Llama3 {
+                    factor: 32.0,
+                    low_freq_factor: 1.0,
+                    high_freq_factor: 4.0,
+                    original_max_position: 8_192,
+                }
+            },
+        ] {
+            let mut probe = config.clone();
+            mutate(&mut probe);
+            assert_eq!(probe.version(), 2);
+            assert_eq!(probe.header_size(), HEADER_SIZE_V2);
+        }
+        config.bias_mask = 0b111;
+        assert_eq!(config.version(), 2);
+    }
+
+    #[test]
+    fn bias_block_sizing_matches_the_reader() {
+        let dims: [(usize, usize); 7] = [
+            (64, 64),
+            (32, 64),
+            (32, 64),
+            (64, 64),
+            (128, 64),
+            (128, 64),
+            (64, 128),
+        ];
+        let plain = layer_section_len(&dims, 64, 64, 0).unwrap();
+        // q, k, v biases: (64 + 32 + 32) * 4 bytes.
+        let biased = layer_section_len(&dims, 64, 64, 0b111).unwrap();
+        assert_eq!(biased - plain, (64 + 32 + 32) * 4);
     }
 
     #[test]

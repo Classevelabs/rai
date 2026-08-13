@@ -7,13 +7,25 @@
 use anyhow::{ensure, Context, Result};
 use std::path::Path;
 
-use crate::format::{self, ModelConfig, RaiModelFile};
+use crate::format::{self, ModelConfig, RaiModelFile, NUM_PROJECTIONS};
 use crate::gemm::{embed_lookup, tied_lm_head, w4a8_matmul, w4a8_matvec};
 use crate::kv_cache::KVCache;
 use crate::layers::{
-    attend_batch, gqa_attention_decode, rms_norm, rms_norm_with_residual, silu_mul_inplace,
-    swiglu_mlp, vec_add, AttentionWork, MlpWork, RoPETable,
+    add_bias, attend_batch, glu_mul_inplace, gqa_attention_decode, rms_norm,
+    rms_norm_with_residual, swiglu_mlp, vec_add, AttentionWork, MlpWork, ProjectionBiases,
+    RoPETable,
 };
+
+/// One layer's decoded bias vectors, indexed in `format::PROJECTION_NAMES`
+/// order. Decoded once at load time for the same reason the norm vectors are:
+/// the file buffer is a `Vec<u8>` with no alignment guarantee at an arbitrary
+/// section offset, and the hot path wants `&[f32]`.
+pub type LayerBiases = [Option<Vec<f32>>; NUM_PROJECTIONS];
+
+/// A `LayerBiases` with nothing set — the shape every v1 model has.
+fn no_biases() -> LayerBiases {
+    Default::default()
+}
 
 pub struct RaiModel {
     pub config: ModelConfig,
@@ -21,6 +33,7 @@ pub struct RaiModel {
     rope: RoPETable,
     layer_input_norms: Vec<Vec<f32>>,
     layer_post_attn_norms: Vec<Vec<f32>>,
+    layer_biases: Vec<LayerBiases>,
     final_norm_weights: Vec<f32>,
     /// True if the model has a separate (untied) lm_head.
     pub has_separate_lm_head: bool,
@@ -30,21 +43,28 @@ impl RaiModel {
     pub fn load(path: &Path) -> Result<Self> {
         let file = RaiModelFile::open(path).context("loading .raimodel")?;
         let config = file.config.clone();
-        let rope = RoPETable::new(
+        let rope = RoPETable::with_scaling(
             config.head_dim as usize,
             config.max_context as usize,
             config.rope_theta,
+            config.rope_scaling,
         );
 
         let num_layers = config.num_layers as usize;
         let mut layer_input_norms = Vec::with_capacity(num_layers);
         let mut layer_post_attn_norms = Vec::with_capacity(num_layers);
+        let mut layer_biases = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
             let layer = file
                 .layer(i)
                 .with_context(|| format!("parsing layer {i}"))?;
             layer_input_norms.push(format::read_norm_weights(&layer.input_layernorm));
             layer_post_attn_norms.push(format::read_norm_weights(&layer.post_attn_layernorm));
+            let mut biases = no_biases();
+            for (index, slot) in biases.iter_mut().enumerate() {
+                *slot = layer.biases[index].map(format::read_f32_vector);
+            }
+            layer_biases.push(biases);
         }
         let final_norm = file.final_norm()?;
         let final_norm_weights = format::read_norm_weights(&final_norm);
@@ -56,6 +76,7 @@ impl RaiModel {
             rope,
             layer_input_norms,
             layer_post_attn_norms,
+            layer_biases,
             final_norm_weights,
             has_separate_lm_head,
         })
@@ -64,6 +85,14 @@ impl RaiModel {
     /// Access the underlying file for direct layer access (profiling).
     pub fn file_ref(&self) -> &RaiModelFile {
         &self.file
+    }
+
+    /// Borrow layer `li`'s bias vectors in `format::PROJECTION_NAMES` order.
+    /// Every entry is `None` for a model without biases, and the kernels then
+    /// skip the add entirely.
+    fn biases_for(&self, li: usize) -> ProjectionBiases<'_> {
+        let stored = &self.layer_biases[li];
+        std::array::from_fn(|index| stored[index].as_deref())
     }
 
     /// Allocate a KV cache for this model. Errors (rather than aborting) when
@@ -118,6 +147,18 @@ impl RaiModel {
             embed.hidden_size,
             embed.group_size,
         );
+        // Gemma multiplies the input embedding by sqrt(hidden_size). This is
+        // applied here rather than folded into the stored table on purpose:
+        // Gemma also *ties* lm_head to that same table, and `tied_lm_head`
+        // must see the unscaled weights or every logit comes out ~45x too
+        // large. A folded table would be correct on the way in and wrong on
+        // the way out, which no test of the embedding alone would catch.
+        if self.config.embed_scale != 1.0 {
+            let scale = self.config.embed_scale;
+            for value in output[..embed.hidden_size].iter_mut() {
+                *value *= scale;
+            }
+        }
         Ok(())
     }
 
@@ -147,6 +188,7 @@ impl RaiModel {
 
         for li in 0..nl {
             let layer = self.file.layer(li)?;
+            let biases = self.biases_for(li);
 
             // Attention block
             rms_norm_with_residual(
@@ -172,6 +214,7 @@ impl RaiModel {
                 hd,
                 &mut scratch.attn_work,
                 store_kv,
+                &biases,
             );
             vec_add(hidden, &scratch.residual, &scratch.attn_out);
 
@@ -190,6 +233,8 @@ impl RaiModel {
                 &layer.up_proj,
                 &layer.down_proj,
                 &mut scratch.mlp_work,
+                self.config.activation,
+                &biases,
             );
             vec_add(hidden, &scratch.residual, &scratch.mlp_out);
         }
@@ -311,6 +356,7 @@ impl RaiModel {
 
         for &li in layer_indices {
             let layer = self.file.layer(li)?;
+            let biases = self.biases_for(li);
 
             rms_norm_with_residual(
                 &mut scratch.normed,
@@ -335,6 +381,7 @@ impl RaiModel {
                 hd,
                 &mut scratch.attn_work,
                 true,
+                &biases,
             );
             vec_add(hidden, &scratch.residual, &scratch.attn_out);
 
@@ -352,6 +399,8 @@ impl RaiModel {
                 &layer.up_proj,
                 &layer.down_proj,
                 &mut scratch.mlp_work,
+                self.config.activation,
+                &biases,
             );
             vec_add(hidden, &scratch.residual, &scratch.mlp_out);
         }
@@ -445,6 +494,15 @@ impl RaiModel {
                 layer.v_proj.group_size,
             );
 
+            // 2b. Projection biases, added outside the quantized inner loop.
+            //     Cost is `batch * rows` adds against `batch * rows * cols`
+            //     multiply-accumulates, so keeping it separate is free and
+            //     leaves the W4A8 kernels untouched.
+            let biases = self.biases_for(li);
+            add_bias_batch(&mut bs.q_batch, biases[0], q_dim, batch);
+            add_bias_batch(&mut bs.k_batch, biases[1], kv_dim, batch);
+            add_bias_batch(&mut bs.v_batch, biases[2], kv_dim, batch);
+
             // 3a. RoPE + KV store for every token first. This is cheap and
             //     inherently sequential (the cache forbids gaps).
             for b in 0..batch {
@@ -486,6 +544,7 @@ impl RaiModel {
                 batch,
                 layer.o_proj.group_size,
             );
+            add_bias_batch(&mut bs.o_out, biases[3], hs, batch);
 
             // 5. Add residual
             for b in 0..batch {
@@ -524,10 +583,13 @@ impl RaiModel {
                 batch,
                 layer.up_proj.group_size,
             );
+            add_bias_batch(&mut bs.gate_batch, biases[4], inter, batch);
+            add_bias_batch(&mut bs.up_batch, biases[5], inter, batch);
 
-            // 8. SiLU(gate) * up per token
+            // 8. act(gate) * up per token
             for b in 0..batch {
-                silu_mul_inplace(
+                glu_mul_inplace(
+                    self.config.activation,
                     &mut bs.gate_batch[b * inter..(b + 1) * inter],
                     &bs.up_batch[b * inter..(b + 1) * inter],
                     inter,
@@ -545,6 +607,7 @@ impl RaiModel {
                 batch,
                 layer.down_proj.group_size,
             );
+            add_bias_batch(&mut bs.mlp_out, biases[6], hs, batch);
 
             // 10. Add residual
             for b in 0..batch {
@@ -623,6 +686,20 @@ impl RaiModel {
     /// Access RoPE table (for self-speculative decoder).
     pub fn rope(&self) -> &RoPETable {
         &self.rope
+    }
+}
+
+/// Add a bias to every token's slice of a batched activation buffer.
+///
+/// Delegates to the same [`add_bias`] the single-token decode path uses, on a
+/// slice of the same length starting at a multiple of `row`, so the batched and
+/// sequential paths stay bit-identical (see `tests/model_invariants.rs`).
+fn add_bias_batch(buffer: &mut [f32], bias: Option<&[f32]>, row: usize, batch: usize) {
+    let Some(bias) = bias else {
+        return;
+    };
+    for b in 0..batch {
+        add_bias(&mut buffer[b * row..(b + 1) * row], Some(bias));
     }
 }
 
