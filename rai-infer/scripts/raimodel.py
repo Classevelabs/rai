@@ -620,3 +620,161 @@ def copy_tokenizer_json(src_path, dst_path):
         )
     shutil.copy2(src_path, dst_path)
     return True
+
+
+# ---------------------------------------------------------------------------
+# HuggingFace loading and architecture compatibility
+#
+# torch/transformers are imported lazily inside these functions so this module
+# keeps its numpy-only import contract (test_raimodel.py runs without them).
+# ---------------------------------------------------------------------------
+
+# Architectures whose maths this container cannot express even though their
+# module tree looks Llama-shaped.
+_UNSUPPORTED_MODEL_TYPES = {
+    "gemma": "Gemma scales embeddings by sqrt(hidden) and its RMSNorm applies (1 + weight)",
+    "gemma2": "Gemma2 adds logit softcapping and (1 + weight) RMSNorm",
+    "gemma3": "Gemma3 adds per-head QK norm and (1 + weight) RMSNorm",
+    "gemma3_text": "Gemma3 adds per-head QK norm and (1 + weight) RMSNorm",
+}
+
+
+def load_hf_causal_lm(model_path, dtype_name="float16"):
+    """Load a causal LM for weight extraction, on CPU, without `accelerate`.
+
+    Export only ever reads weights, so it deliberately avoids `device_map`
+    (which requires the optional `accelerate` package) and passes the dtype
+    keyword under the name the installed transformers expects: `dtype` from
+    5.0 onward, `torch_dtype` before it.
+    """
+    import torch
+    import transformers
+    from transformers import AutoModelForCausalLM
+
+    dtype = getattr(torch, dtype_name)
+    try:
+        major = int(str(transformers.__version__).split(".", 1)[0])
+    except (TypeError, ValueError):
+        major = 5
+    kwargs = {"dtype": dtype} if major >= 5 else {"torch_dtype": dtype}
+    model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
+    return model.eval()
+
+
+def _iter_export_linears(layer):
+    """The seven projections this format stores, as (name, module) pairs."""
+    attn = layer.self_attn
+    mlp = layer.mlp
+    return (
+        ("q_proj", attn.q_proj),
+        ("k_proj", attn.k_proj),
+        ("v_proj", attn.v_proj),
+        ("o_proj", attn.o_proj),
+        ("gate_proj", mlp.gate_proj),
+        ("up_proj", mlp.up_proj),
+        ("down_proj", mlp.down_proj),
+    )
+
+
+def assert_exportable_architecture(model, config, max_context):
+    """Refuse to export a model the .raimodel format cannot represent.
+
+    The container stores exactly: an 8-bit embedding table, seven 4-bit
+    projections and two RMSNorm weight vectors per layer, a final RMSNorm, and
+    an optional 4-bit lm_head — with full causal attention and plain RoPE.
+    Anything carrying state outside that set (bias vectors, QK norms, RoPE
+    scaling, MoE routers, logit softcapping) would be silently dropped and
+    produce a model that loads cleanly and generates nonsense, so every such
+    case is a hard error here instead.
+
+    Raises RuntimeError listing every problem found.
+    """
+    problems = []
+
+    model_type = getattr(config, "model_type", None)
+    if model_type in _UNSUPPORTED_MODEL_TYPES:
+        problems.append(
+            f"model_type '{model_type}' is not supported: "
+            f"{_UNSUPPORTED_MODEL_TYPES[model_type]}, which this format does not store."
+        )
+
+    layers = getattr(getattr(model, "model", None), "layers", None)
+    if layers is None:
+        raise RuntimeError(
+            "this checkpoint does not expose model.model.layers; the exporter supports "
+            "Llama-style causal LMs (LlamaForCausalLM, MistralForCausalLM, and "
+            "architecturally identical models)."
+        )
+
+    biased = []
+    qk_normed = []
+    for index, layer in enumerate(layers):
+        try:
+            linears = _iter_export_linears(layer)
+        except AttributeError as error:
+            raise RuntimeError(
+                f"layer {index} does not expose the expected Llama-style projections "
+                f"({error}); this architecture is not supported."
+            ) from error
+        for name, linear in linears:
+            if getattr(linear, "bias", None) is not None:
+                biased.append(f"layer {index}.{name}")
+        for norm_attr in ("q_norm", "k_norm"):
+            if getattr(layer.self_attn, norm_attr, None) is not None:
+                qk_normed.append(f"layer {index}.self_attn.{norm_attr}")
+
+    if biased:
+        problems.append(
+            f"{len(biased)} projection(s) carry bias vectors (e.g. {biased[0]}); the "
+            f"format stores weights only, so the biases would be silently dropped. "
+            f"Qwen2/Qwen2.5 are the common case here."
+        )
+    if qk_normed:
+        problems.append(
+            f"{len(qk_normed)} per-head QK norm(s) present (e.g. {qk_normed[0]}); the "
+            f"format has no place to store them."
+        )
+
+    # transformers >= 5 normalizes plain RoPE into {"rope_type": "default"},
+    # so the presence of the field means nothing on its own — only a scaling
+    # type the reader cannot reproduce is a blocker.
+    rope_scaling = getattr(config, "rope_scaling", None)
+    if rope_scaling:
+        if isinstance(rope_scaling, dict):
+            rope_type = rope_scaling.get("rope_type") or rope_scaling.get("type")
+        else:
+            rope_type = str(rope_scaling)
+        if rope_type not in (None, "default"):
+            problems.append(
+                f"config declares rope_scaling type '{rope_type}'; the reader builds a plain "
+                f"RoPE table from rope_theta alone, so positions would be wrong. "
+                f"Llama-3.1/3.2 (rope_type 'llama3') are the common case here."
+            )
+
+    for attr in ("num_experts", "num_local_experts"):
+        if getattr(config, attr, None):
+            problems.append(
+                f"config declares {attr}={getattr(config, attr)}; mixture-of-experts "
+                f"routing is not supported."
+            )
+            break
+
+    for attr in ("attn_logit_softcapping", "final_logit_softcapping"):
+        if getattr(config, attr, None):
+            problems.append(f"config declares {attr}; logit softcapping is not supported.")
+
+    sliding_window = getattr(config, "sliding_window", None)
+    uses_sliding = getattr(config, "use_sliding_window", True)
+    if sliding_window and uses_sliding and max_context > sliding_window:
+        problems.append(
+            f"config declares sliding_window={sliding_window} but --max-context is "
+            f"{max_context}; the reader always uses full causal attention, so exports "
+            f"beyond the window would diverge. Re-run with --max-context {sliding_window} "
+            f"or lower."
+        )
+
+    if problems:
+        raise RuntimeError(
+            "this checkpoint cannot be represented by the .raimodel format:\n  - "
+            + "\n  - ".join(problems)
+        )

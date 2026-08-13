@@ -7,7 +7,19 @@ versioning for its pre-1.0 releases.
 ## [0.2.0] - Unreleased
 
 ### Added
-
+- Chat templates `chatml` (`<|im_start|>`) and `zephyr` (`<|user|>`), with
+  auto-detection for ChatML. Zephyr-style models (TinyLlama-Chat) need the
+  template passed explicitly because their markers are plain text, not
+  vocabulary tokens.
+- Exporter preflight that refuses checkpoints the `.raimodel` format cannot
+  represent — projection bias vectors (Qwen2/2.5), per-head QK norms (Qwen3,
+  Gemma3), RoPE scaling (Llama-3.1/3.2), mixture-of-experts routing, logit
+  softcapping, Gemma's modified RMSNorm, and non-Llama module trees. These
+  previously exported "successfully" and generated nonsense.
+- `rai-infer/scripts/requirements-lock.txt`: exact dependency versions verified
+  to convert a real model end to end.
+- `rai-generate` explains itself when a model emits end-of-sequence immediately
+  instead of printing nothing at all.
 - rai-infer test coverage: parallel-path GEMM reference tests (fused QKV,
   fused gate/up, and the tied LM head against dequantized references above the
   rayon threshold), chat-template unit tests with an in-memory tokenizer stub,
@@ -118,6 +130,10 @@ versioning for its pre-1.0 releases.
   language.
 
 ### Fixed
+- The export scripts no longer require the optional `accelerate` package: they
+  load weights on CPU without `device_map`, and pass the dtype keyword under the
+  name the installed transformers expects (`dtype` from 5.0, `torch_dtype`
+  before it). A clean environment previously failed at the first step.
 
 - Corrected JSON-RPC notification handling and MCP tool annotations.
 - Made durable memory mutations atomic at the application boundary.

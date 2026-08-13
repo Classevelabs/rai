@@ -1,4 +1,70 @@
-# Historical benchmark record
+# Benchmark record
+
+This file has two parts. The **verified run** below was measured end to end on
+a named machine on 2026-08-09 with the environment recorded in
+`rai-infer/scripts/requirements-lock.txt`, and is the only section that should
+be quoted as evidence. Everything after it is the older, author-reported
+development record, kept for context and explicitly not reproduced.
+
+## Verified run — TinyLlama-1.1B-Chat, 2026-08-09
+
+**Machine:** Intel Core i5-10300H (4 cores / 8 threads, AVX2 + FMA + F16C),
+15.8 GB RAM, Windows 11. **Build:** `cargo build --release` (`target-cpu=native`,
+fat LTO), rustc 1.95.0, RAI 0.2.0.
+**Model:** `TinyLlama/TinyLlama-1.1B-Chat-v1.0` (22 layers, hidden 2048, 32 heads
+/ 4 KV heads, intermediate 5632, vocab 32,000, untied `lm_head`), exported with
+`export_rtn.py` (round-to-nearest 4-bit linears, group size 128, 8-bit embedding).
+
+### Conversion
+
+| Metric | Value |
+| --- | --- |
+| Conversion time (whole model) | **47.0 s** |
+| — quantizing 22 layers | 38.2 s |
+| — embedding (8-bit) | 2.9 s |
+| — `lm_head` (4-bit) | 2.5 s |
+| Source checkpoint (fp16 safetensors) | 2,200 MB |
+| Output `.raimodel` | **619.5 MB** (3.55× smaller) |
+| Per-tensor quantization MSE | 6.4e-06 … 6.8e-06 (`q_proj`), 3.3e-06 (`down_proj`), 6.2e-09 (embedding) |
+
+### Inference, against HuggingFace on the same machine
+
+Greedy decoding (`--temperature 0 --top-k 0 --top-p 1 --repetition-penalty 1`),
+identical prompt, identical generated length (91 tokens).
+
+| Metric | RAI 0.2.0 (4-bit) | transformers 5.15 fp32 (CPU) |
+| --- | --- | --- |
+| Decode speed, 91 tokens | **21.8 tok/s** (21.55 / 21.84 / 22.06, n=3) | 4.3 tok/s (3.95 / 4.66, n=2) |
+| Relative speed | **5.1×** | 1× |
+| Peak process RSS | **629 MB** | fp32 weights alone are ~4.4 GB |
+| Model load time | 0.33 s | ~2 s |
+
+Shorter generations run faster because attention cost grows with context:
+40–45-token runs measured 29.4–33.0 tok/s on the same build. Prefill is
+compute-bound rather than bandwidth-bound — a 301-token prompt took 6.33 s
+(47.6 tok/s), which is the time-to-first-token to expect for long prompts on
+four cores.
+
+### Output quality
+
+Against the fp32 reference on identical greedy prompts, the 4-bit model
+reproduced the substantive content: "The capital of France is" → *Paris*;
+"Water boils at a temperature of" → *100°C (212°F)*; `def fibonacci(n):` →
+the same recursive implementation the fp32 model emits (differing only in
+indent width). Continuations diverge after several tokens, which is expected:
+under greedy decoding any single differing logit changes the rest of the text.
+No perplexity sweep has been run, so no perplexity claim is made.
+
+### Self-speculative decoding: measured, and not currently useful
+
+Early-exit self-speculation (`--self-spec-layers 11 --self-spec-k 4`) on this
+model achieved a **2.2% draft acceptance rate**, which made generation
+**slower** (5.6 tok/s versus 21.8 tok/s baseline). The first-N-layers draft is
+too weak a predictor of the full model without a trained early-exit head. The
+feature remains available and correct, but it is not a speedup on this model
+and should not be presented as one.
+
+## Historical record (not reproduced)
 
 The numbers below are historical, author-reported measurements from development
 on a described but not uniquely identified **4-core / 8-thread laptop-class
