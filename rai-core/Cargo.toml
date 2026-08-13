@@ -1,4 +1,16 @@
+# NOT PART OF THE RAI PRODUCT (decided 2026-08-13).
+#
+# RAI is a CPU-only LLM inference engine: rai-infer plus rai-compress.
+# This crate belongs to a separate memory/reasoning service that shares
+# the workspace and nothing else — rai-server imports rai-infer zero
+# times and cannot run a model.
+#
+# Publishing it under the RAI name told developers on crates.io that the
+# product was something it is not. 0.1.0 is YANKED and publish is
+# disabled so it cannot go back by accident.
+# Memory, embedding and reasoning primitives. NOT part of the RAI product.
 [package]
+publish = false
 name = "classeve-rai-core"
 version.workspace = true
 edition.workspace = true

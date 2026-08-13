@@ -123,8 +123,17 @@ captured in `Cargo.lock`.
 | --- | --- |
 | `rai-infer` | The inference engine: `.raimodel` loader and writer, AVX2 W4A8 GEMM kernels, transformer layers (RMSNorm, RoPE, GQA, SwiGLU/GeGLU), KV cache, sampling, speculative decoding, and the `rai` binary (behind the default-on `cli` feature; `--no-default-features` builds the lean library) |
 | `rai-compress` | Quantization and compression research toolkit. Its Rust GPTQ implementation is independent of the Python `.raimodel` export pipeline; RC/HRC/SAC report modeled sizes and serialize no artifact. Nothing here is on the inference path. |
-| `rai-server` | REST + MCP server exposing the RAI memory/reasoning layer to HTTP clients and MCP-capable agents |
-| `rai-core` | Memory, embedding, and reasoning primitives used by `rai-server` |
+
+**RAI is `rai-infer` and `rai-compress`.** The three crates below are a separate
+memory/reasoning service that only shares this workspace. They are **not part of
+the RAI product**, are not published to crates.io (0.1.0 yanked 2026-08-13,
+`publish = false` set), and `rai-server` imports `rai-infer` zero times — it
+cannot run a model.
+
+| Not part of RAI | Purpose |
+| --- | --- |
+| `rai-server` | REST + MCP server for the memory/reasoning layer |
+| `rai-core` | Memory, embedding and reasoning primitives used by `rai-server` |
 | `rem-nra` | Resonance-memory backend used by `rai-core` |
 
 The inference and memory-service paths are separate. `rai run` and `rai serve`
