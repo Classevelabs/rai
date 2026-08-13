@@ -62,6 +62,10 @@ pub struct RaiModel {
     pub config: ModelConfig,
     file: RaiModelFile,
     rope: RoPETable,
+    /// The second rotary table, for models whose layers do not all share one
+    /// base (Gemma3). `None` when `global_layer_stride` is 0, which is every
+    /// other model.
+    rope_local: Option<RoPETable>,
     layer_input_norms: Vec<Vec<f32>>,
     layer_post_attn_norms: Vec<Vec<f32>>,
     layer_biases: Vec<LayerBiases>,
@@ -97,6 +101,24 @@ impl RaiModel {
             config.rope_scaling,
         )
         .context("building the RoPE table")?;
+        // Gemma3 rotates its sliding layers at a different base from its
+        // global ones. Two tables cost one extra allocation at load and
+        // nothing per token; approximating with one would leave five layers in
+        // six rotating at the wrong frequency, which degrades quality without
+        // ever failing.
+        let rope_local = if config.global_layer_stride > 0 {
+            Some(
+                RoPETable::with_scaling(
+                    config.head_dim as usize,
+                    config.max_context as usize,
+                    config.rope_local_theta,
+                    config.rope_scaling,
+                )
+                .context("building the local RoPE table")?,
+            )
+        } else {
+            None
+        };
 
         let num_layers = config.num_layers as usize;
         let mut layer_input_norms = Vec::with_capacity(num_layers);
@@ -141,6 +163,7 @@ impl RaiModel {
             config,
             file,
             rope,
+            rope_local,
             layer_input_norms,
             layer_post_attn_norms,
             layer_biases,
@@ -149,6 +172,20 @@ impl RaiModel {
             shaping,
             has_separate_lm_head,
         })
+    }
+
+    /// The rotary table layer `li` rotates with.
+    ///
+    /// The stride comes from the header, so a caller cannot pick the wrong
+    /// table for a layer: `(li + 1) % stride == 0` is a global layer and uses
+    /// the primary base, exactly as `Gemma3Config` assigns `full_attention`.
+    fn rope_for(&self, li: usize) -> &RoPETable {
+        match &self.rope_local {
+            Some(local) if !(li + 1).is_multiple_of(self.config.global_layer_stride as usize) => {
+                local
+            }
+            _ => &self.rope,
+        }
     }
 
     /// Access the underlying file for direct layer access (profiling).
@@ -353,7 +390,7 @@ impl RaiModel {
                 &layer.k_proj,
                 &layer.v_proj,
                 &layer.o_proj,
-                &self.rope,
+                self.rope_for(li),
                 kv_cache,
                 li,
                 pos,
@@ -538,7 +575,7 @@ impl RaiModel {
                 &layer.k_proj,
                 &layer.v_proj,
                 &layer.o_proj,
-                &self.rope,
+                self.rope_for(li),
                 kv_cache,
                 li,
                 pos,
@@ -708,9 +745,9 @@ impl RaiModel {
             //     inherently sequential (the cache forbids gaps).
             for b in 0..batch {
                 let pos = positions[b];
-                self.rope
+                self.rope_for(li)
                     .apply(&mut bs.q_batch[b * q_dim..(b + 1) * q_dim], nh, pos);
-                self.rope
+                self.rope_for(li)
                     .apply(&mut bs.k_batch[b * kv_dim..(b + 1) * kv_dim], nkv, pos);
                 kv_cache.store(
                     li,

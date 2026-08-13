@@ -6,6 +6,7 @@
 //! - `ChatML`: `<|im_start|>user ... <|im_start|>assistant` (Qwen, many others)
 //! - `Zephyr`: `<|user|> ... </s> <|assistant|>` (TinyLlama-Chat, Zephyr, StableLM)
 //! - `Phi3`: `<|user|> ... <|end|> <|assistant|>` (Phi-3, Phi-3.5)
+//! - `Gemma`: `<start_of_turn>user ... <start_of_turn>model` (Gemma 1/2/3)
 //! - `FewShot`: Simple few-shot prompt for base models (SmolLM-135M etc.)
 //! - `None`: Raw prompt passthrough
 
@@ -31,6 +32,8 @@ pub enum ChatTemplate {
     /// produces a prompt shape it was never trained on and leaves generation
     /// with a stop sequence the model never emits.
     Phi3,
+    /// Gemma 1/2/3: `<start_of_turn>user ... <end_of_turn><start_of_turn>model`.
+    Gemma,
 }
 
 impl ChatTemplate {
@@ -58,6 +61,9 @@ impl ChatTemplate {
             }
             ChatTemplate::Zephyr => format!("<|user|>\n{user_message}</s>\n<|assistant|>\n"),
             ChatTemplate::Phi3 => format!("<|user|>\n{user_message}<|end|>\n<|assistant|>\n"),
+            ChatTemplate::Gemma => {
+                format!("<start_of_turn>user\n{user_message}<end_of_turn>\n<start_of_turn>model\n")
+            }
         }
     }
 
@@ -71,7 +77,19 @@ impl ChatTemplate {
             ChatTemplate::ChatML => &["<|im_end|>", "<|im_start|>"],
             ChatTemplate::Zephyr => &["</s>", "<|user|>"],
             ChatTemplate::Phi3 => &["<|end|>", "<|user|>", "<|endoftext|>"],
+            ChatTemplate::Gemma => &["<end_of_turn>", "<start_of_turn>"],
         }
+    }
+
+    /// Whether the tokenizer should prepend its beginning-of-sequence token.
+    ///
+    /// Most templates spell their own opening marker into the prompt text
+    /// (`<s>` for Mistral, `<|begin_of_text|>` for Llama-3), so asking the
+    /// tokenizer for one as well would emit it twice. Gemma's reference
+    /// template starts with a `<bos>` that is *not* part of the turn markers,
+    /// and Gemma without it degrades badly rather than failing outright.
+    pub fn prepends_bos(&self) -> bool {
+        matches!(self, ChatTemplate::Gemma)
     }
 
     /// Display name for the UI.
@@ -84,6 +102,7 @@ impl ChatTemplate {
             ChatTemplate::ChatML => "ChatML",
             ChatTemplate::Zephyr => "Zephyr",
             ChatTemplate::Phi3 => "Phi-3",
+            ChatTemplate::Gemma => "Gemma",
         }
     }
 
@@ -94,6 +113,12 @@ impl ChatTemplate {
     /// itself has no tokenizer dependency.
     #[cfg(feature = "cli")]
     pub fn auto_detect(tokenizer: &tokenizers::Tokenizer) -> Self {
+        // Gemma's turn markers are unique to it, so the order does not matter
+        // for correctness; it goes first because the check is one lookup and a
+        // Gemma tokenizer carries no other family's sentinel.
+        if tokenizer.token_to_id("<start_of_turn>").is_some() {
+            return ChatTemplate::Gemma;
+        }
         // Check for Mistral-Instruct sentinel: [INST] token
         if tokenizer.token_to_id("[INST]").is_some() {
             return ChatTemplate::MistralInstruct;
@@ -138,6 +163,7 @@ impl ChatTemplate {
             "chatml" => ChatTemplate::ChatML,
             "zephyr" => ChatTemplate::Zephyr,
             "phi3" => ChatTemplate::Phi3,
+            "gemma" => ChatTemplate::Gemma,
             _ => {
                 eprintln!("warning: unknown chat template '{s}'; using auto-detect");
                 Self::auto_detect(tokenizer)
@@ -225,6 +251,20 @@ mod tests {
     fn format_prompt_zephyr_closes_the_user_turn_and_opens_the_assistant_turn() {
         let prompt = ChatTemplate::Zephyr.format_prompt("What is 2+2?");
         assert_eq!(prompt, "<|user|>\nWhat is 2+2?</s>\n<|assistant|>\n");
+    }
+
+    #[test]
+    fn gemma_uses_its_own_turn_markers() {
+        assert_eq!(
+            ChatTemplate::Gemma.format_prompt("What is 2+2?"),
+            "<start_of_turn>user
+What is 2+2?<end_of_turn>
+<start_of_turn>model
+"
+        );
+        assert!(ChatTemplate::Gemma
+            .stop_sequences()
+            .contains(&"<end_of_turn>"));
     }
 
     /// Phi-3 and Zephyr differ by one token, and picking the wrong one costs
