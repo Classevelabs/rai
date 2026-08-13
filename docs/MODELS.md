@@ -72,11 +72,11 @@ that this format does store.
 | Llama-2 / Mistral fine-tunes (Zephyr, OpenHermes, Vicuna, Nous-Hermes) | **Converts** | — | Fine-tuning changes weights, not architecture. |
 | Qwen3 (dense: 0.6B, 1.7B, 4B, 8B, 14B, 32B) | **Converts** | — | Per-head QK norm is stored in the v2 layer section. Verified: Qwen3-0.6B converts to 399 MB and generates. |
 | Gemma2 (2B, 9B, 27B) | **Converts** | — | Logit softcapping and the two block-output norms are stored. Convert with `--max-context 4096` or lower (see sliding windows). Verified: gemma-2-2b-it converts to 1.70 GB and generates. |
-| OLMo2 | **Refused** | `meta-llama/Llama-3.1-8B-Instruct`, `mistralai/Mistral-7B-Instruct-v0.3` | Its QK norm spans all heads at once rather than one head, and it has no `input_layernorm`. Two separate gaps; see below. |
-| Gemma3, Gemma3-text | **Refused** | `google/gemma-2b-it` | Its sliding and global layers use different RoPE bases; the header stores one. See below. |
-| Mixtral-8x7B, Mixtral-8x22B | **Refused** | `mistralai/Mistral-7B-Instruct-v0.3` | A router plus per-expert MLPs; a layer holds one gate/up/down triple. |
-| Qwen3-MoE (30B-A3B, 235B-A22B) | **Refused** | `Qwen/Qwen2.5-14B-Instruct` | Mixture-of-experts routing, independently of the dense-Qwen3 line above. |
-| Any config with `num_experts` or `num_local_experts` | **Refused** | The dense model of the same family | Same reason. |
+| OLMo2 | **Converts** | — | Projection-wide QK norms and post-norm placement are both stored. Verified: OLMo-2-1B-Instruct converts in 47.2 s to 898 MB and generates. |
+| Gemma3, Gemma3-text | **Converts** | — | Both RoPE bases and the layer stride are stored. Convert with `--max-context 512` or lower (its sliding window), and run with `--chat-template gemma`. Verified: gemma-3-1b-it converts in 41.5 s to 660 MB and generates. |
+| Mixtral-8x7B, Mixtral-8x22B | **Converts** | — | Router and every expert are stored. A 4-bit Mixtral-8x7B is ~24 GB on disk and needs that much RAM to run — check before you start. |
+| Qwen3-MoE (30B-A3B, 235B-A22B) | **Converts** | — | Routed experts are stored. Verified on OLMoE-1B-7B (64 experts, 8 per token): converts in 121.3 s to 3.5 GB and generates. |
+| Any config with `shared_expert_intermediate_size` or `n_shared_experts` | **Refused** | The same family without a shared expert | A shared expert runs for *every* token alongside the routed ones; the container stores routed experts only, so dropping it would remove a pathway rather than degrade one. |
 | Phi-3, Phi-3.5 | **Converts** | — | Its fused `qkv_proj` and `gate_up_proj` are split at conversion. Convert with `--max-context 2047` or lower (see sliding windows), and run with `--chat-template phi3`. Verified: Phi-3-mini-4k-instruct converts to 2,083 MB in 22.8 s and generates. |
 | Phi-2 | **Refused** | `meta-llama/Llama-3.2-3B-Instruct` | Not a Llama-shaped module tree; unlike Phi-3 it is not a fused variant of one. |
 | Falcon | **Refused** | `mistralai/Mistral-7B-Instruct-v0.3` | No Llama-style module tree. |
@@ -89,37 +89,38 @@ that this format does store.
 A refusal is a hard error at export, never a warning, and never a file that
 loads cleanly and generates nonsense.
 
-### Two families that look close but are not
+### Where the line falls now
 
-Qwen3 and Gemma2 look like near neighbours of models RAI already ran, and they
-are — they convert now. OLMo2 and Gemma3 look equally close and are not. The
-difference is worth stating, because the family name does not tell you.
+Nothing is refused for its `model_type` any more. What is refused is refused
+for something a checkpoint *contains*:
 
-- **OLMo2 (7B, 13B).** It has `q_norm` and `k_norm`, the same tensor names
-  Qwen3 uses, so it reads as the same feature. It is not. Qwen3's norm is one
-  `head_dim`-long vector applied inside each head; OLMo2's is
-  `num_heads * head_dim` long and applied to the whole projection output before
-  the tensor is ever split into heads. Different arithmetic, not a different
-  size. OLMo2 also has no `input_layernorm` at all — it normalizes after each
-  block rather than before, and a layer here stores two norms in the pre-block
-  positions. Two independent gaps. Use `meta-llama/Llama-3.1-8B-Instruct` or
-  `mistralai/Mistral-7B-Instruct-v0.3`.
-- **Gemma3, Gemma3-text (1B, 4B, 12B, 27B).** Per-head QK norm and softcapping
-  are both stored now, so neither is what stops it. Gemma3 interleaves local
-  and global attention layers that use *different RoPE bases* —
-  `rope_local_base_freq` of 10,000 against `rope_theta` of 1,000,000. The
-  header stores one theta and the runtime builds one rotary table, so five
-  layers in six would rotate at the wrong frequency: a file that loads cleanly
-  and degrades quietly. That needs per-layer RoPE tables, not a flag. Use
-  `google/gemma-2b-it`.
+- **A shared expert.** A routed mixture-of-experts model converts; one that
+  also runs a shared expert for every token does not. That expert has no slot,
+  and leaving it out removes a pathway rather than degrading one.
+- **A RoPE scheme other than `default` or `llama3`.** `yarn`, `linear` and
+  `dynamic` each compute inverse frequencies differently. Getting one wrong
+  shows up as quality loss at long context, not as a failure, so it is refused.
+- **An `lm_head` bias.** Biases are stored for the seven layer projections
+  only, so it would be dropped in silence.
+- **A module tree that is not Llama-shaped.** Falcon, GPT-NeoX, MPT, GPT-2 and
+  Phi-2 do not expose the tensors a layer stores. Phi-3 *is* a fused Llama tree,
+  which is why it converts and Phi-2 does not.
+
+Two families illustrate why the family name never settles it. OLMo2 carries
+`q_norm`/`k_norm` — the same tensor names Qwen3 uses — but sized over the whole
+projection and applied before the split into heads: different arithmetic, not a
+longer vector. Both are stored, under different flags, and which one a
+checkpoint has is read from the stored width rather than guessed from its name.
+Gemma3 looked like it needed the same QK norm; it did not. It needed two RoPE
+bases, because its sliding and global layers rotate at different frequencies —
+a difference that produces a model which loads, runs, and is quietly worse.
 
 Studio does not read this page: it reports whatever the server's preflight
 says, so a family that becomes supported stops being offered an alternative.
 
 ### What has actually been run
 
-Qwen2.5-0.5B-Instruct, Llama-3.2-1B-Instruct, gemma-2b-it, **Qwen3-0.6B** and
-**gemma-2-2b-it** were each converted and generated coherent text. The last two
+Qwen2.5-0.5B-Instruct, Llama-3.2-1B-Instruct, gemma-2b-it, **Qwen3-0.6B**, **gemma-2-2b-it**, **gemma-3-1b-it**, **Phi-3-mini-4k-instruct**, **OLMo-2-1B-Instruct** and **OLMoE-1B-7B-Instruct** were each converted and generated coherent text. The last two
 are the checkpoints that exercise the capabilities added for them: Qwen3-0.6B
 writes 399 MB with the QK-norm flag set, gemma-2-2b-it writes 1.70 GB with the
 sandwich-norm flag and both softcaps. Their stored norm vectors were also read
@@ -157,8 +158,9 @@ The three fields that decide it most often are `model_type`, `num_experts`, and
 
 | Field | Convert it | Do not download |
 | --- | --- | --- |
-| `model_type` | `llama`, `mistral`, `qwen2`, `qwen3`, `gemma`, `gemma2`, `phi3` | `mixtral`, `qwen3_moe`, `olmo2`, `gemma3`, `gemma3_text`, `phi`, `falcon`, `mpt`, `gpt_neox`, `gpt2` |
-| `num_experts` / `num_local_experts` | Absent or zero | Any positive value — no exceptions, whatever the family |
+| `model_type` | `llama`, `mistral`, `qwen2`, `qwen3`, `qwen3_moe`, `gemma`, `gemma2`, `gemma3`, `gemma3_text`, `phi3`, `olmo2`, `olmoe`, `mixtral` | `phi`, `falcon`, `mpt`, `gpt_neox`, `gpt2` |
+| `num_experts` / `num_local_experts` | Any value — routed experts convert | — |
+| `shared_expert_intermediate_size` | Absent or zero | Any positive value: a shared expert has no slot |
 | `rope_scaling` | `null`, absent, `{"rope_type": "default"}`, or `{"rope_type": "llama3", ...}` | Any other `rope_type`, including `linear`, `dynamic`, `yarn` |
 | `sliding_window` | Absent, or at least your `--max-context` | Present and below your `--max-context` — lower the context rather than dropping the model |
 | `hidden_act` / `hidden_activation` | `silu`, `swish`, `gelu_pytorch_tanh`, or absent | Any other named activation |
