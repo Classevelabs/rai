@@ -11,7 +11,11 @@
   --ok:#5AA37E; --warn:#C9922F; --bad:#C2503C;
   --mono:ui-monospace,"SF Mono","Cascadia Mono","Segoe UI Mono",Menlo,Consolas,monospace;
   --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
-  --r1:6px; --r2:9px; --r3:13px;
+  /* Continuous ('squircle') corners. corner-shape is progressive:
+     browsers without it fall back to these arc radii, which are set
+     generously so the shapes still read soft rather than clipped. */
+  --r1:12px; --r2:16px; --r3:22px; --r4:28px;
+  --squircle:superellipse(1.8);
   --s2:8px; --s3:12px; --s4:16px; --s5:24px; --s6:32px; --s7:44px;
 }
 *{box-sizing:border-box}
@@ -39,7 +43,7 @@ h1{margin:0;font-family:var(--mono);font-size:21px;font-weight:700;letter-spacin
 .rail{width:58px;flex:0 0 58px;border-right:1px solid var(--line);background:var(--panel);
   display:flex;flex-direction:column;align-items:center;padding:var(--s3) 0;gap:4px}
 .rail button{width:40px;height:40px;display:grid;place-items:center;background:none;border:0;
-  color:var(--fg-3);cursor:pointer;border-radius:var(--r2);position:relative}
+  color:var(--fg-3);cursor:pointer;border-radius:var(--r2);corner-shape:var(--squircle);position:relative}
 .rail button:hover{color:var(--fg-2);background:var(--panel-2)}
 .rail button[aria-current=true]{color:var(--accent);background:var(--wash)}
 .rail button[aria-current=true]::before{content:"";position:absolute;left:-13px;top:11px;bottom:11px;
@@ -53,7 +57,7 @@ main{flex:1;overflow-y:auto;min-width:0}
 .head .grow{flex:1}
 /* metric strip */
 .metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(172px,1fr));gap:var(--s3);margin-bottom:var(--s6)}
-.metric{background:var(--panel);border:1px solid var(--line);border-radius:var(--r3);padding:var(--s4) var(--s5)}
+.metric{background:var(--panel);border:1px solid var(--line);border-radius:var(--r3);corner-shape:var(--squircle);padding:var(--s4) var(--s5)}
 .metric .lbl{display:block;margin-bottom:9px}
 .metric .n{font-family:var(--mono);font-size:27px;font-weight:700;letter-spacing:-.03em;line-height:1;
   font-variant-numeric:tabular-nums}
@@ -66,10 +70,10 @@ main{flex:1;overflow-y:auto;min-width:0}
   border-bottom:1px solid var(--line);margin-bottom:var(--s4)}
 .sec>header .lbl{color:var(--fg-2)}
 .sec>header .count{margin-left:auto;font-family:var(--mono);font-size:10px;letter-spacing:.14em;color:var(--fg-3)}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r3);padding:var(--s5)}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r3);corner-shape:var(--squircle);padding:var(--s5)}
 /* buttons */
 .btn{font-family:var(--mono);font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;font-weight:600;
-  padding:11px 18px;border:1px solid transparent;border-radius:var(--r1);background:var(--accent);color:#fff;
+  padding:11px 18px;border:1px solid transparent;border-radius:var(--r1);corner-shape:var(--squircle);background:var(--accent);color:#fff;
   cursor:pointer;display:inline-flex;align-items:center;gap:9px;transition:background .12s}
 .btn:hover:not(:disabled){background:var(--accent-hi)}
 .btn:disabled{background:var(--panel-3);color:var(--fg-3);cursor:not-allowed}
@@ -79,20 +83,20 @@ main{flex:1;overflow-y:auto;min-width:0}
 .btn svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
 /* inputs */
 .field{display:flex;flex-direction:column;gap:7px;min-width:0}
-input,select,textarea{background:var(--sunk);border:1px solid var(--line-2);border-radius:var(--r1);
+input,select,textarea{background:var(--sunk);border:1px solid var(--line-2);border-radius:var(--r1);corner-shape:var(--squircle);
   color:var(--fg);font-family:var(--mono);font-size:13px;padding:11px 13px;width:100%}
 input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--wash)}
 .row{display:flex;gap:var(--s3);align-items:flex-end;flex-wrap:wrap}
 .row>*{flex:1;min-width:130px}
 .row>.fixed{flex:0 0 auto;min-width:0}
-.seg{display:inline-flex;border:1px solid var(--line-2);border-radius:var(--r1);overflow:hidden}
+.seg{display:inline-flex;border:1px solid var(--line-2);border-radius:var(--r1);corner-shape:var(--squircle);overflow:hidden}
 .seg button{font-family:var(--mono);font-size:10px;letter-spacing:.13em;text-transform:uppercase;
   padding:9px 15px;background:none;border:0;color:var(--fg-3);cursor:pointer}
 .seg button[aria-pressed=true]{background:var(--wash);color:var(--accent)}
 .seg button+button{border-left:1px solid var(--line-2)}
 /* model rows */
 .mrow{display:grid;grid-template-columns:1fr auto auto;gap:var(--s4);align-items:center;
-  padding:var(--s4);border:1px solid var(--line);border-radius:var(--r2);background:var(--panel);margin-bottom:var(--s2)}
+  padding:var(--s4);border:1px solid var(--line);border-radius:var(--r2);corner-shape:var(--squircle);background:var(--panel);margin-bottom:var(--s2)}
 .mrow:hover{background:var(--panel-2);border-color:var(--line-2)}
 .mrow.active{border-color:var(--accent-dim);background:var(--wash)}
 .nm{font-family:var(--mono);font-size:13.5px;font-weight:600;display:flex;align-items:center;gap:9px;flex-wrap:wrap}
@@ -113,7 +117,7 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);
 .stage[data-state=done] .t{color:var(--fg-2)} .stage[data-state=done] .s{color:var(--ok)}
 .bar{height:4px;background:var(--panel-3);border-radius:100px;overflow:hidden}
 .bar span{display:block;height:100%;background:var(--accent);width:0;border-radius:100px;transition:width .3s}
-.log{background:var(--sunk);border:1px solid var(--line);border-radius:var(--r2);padding:var(--s3) var(--s4);
+.log{background:var(--sunk);border:1px solid var(--line);border-radius:var(--r2);corner-shape:var(--squircle);padding:var(--s3) var(--s4);
   font-family:var(--mono);font-size:11.5px;line-height:1.8;color:var(--fg-3);height:186px;overflow-y:auto;white-space:pre-wrap}
 .log .hl{color:var(--accent)} .log .dim{color:var(--fg-3)} .log .err{color:var(--bad)}
 /* chat */
@@ -123,7 +127,7 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);
 .msg{max-width:76ch;margin-bottom:var(--s5)}
 .msg .who{font-family:var(--mono);font-size:9.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--fg-3);margin-bottom:7px}
 .msg.me{margin-left:auto} .msg.me .who{text-align:right}
-.msg.me .bub{background:var(--panel-2);border:1px solid var(--line);border-radius:var(--r3);
+.msg.me .bub{background:var(--panel-2);border:1px solid var(--line);border-radius:var(--r3);corner-shape:var(--squircle);
   padding:10px 15px;display:inline-block}
 .msg.ai .bub{white-space:pre-wrap}
 .composer{border-top:1px solid var(--line);background:var(--panel);padding:var(--s4) var(--s7)}
@@ -135,7 +139,7 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);
 .empty{text-align:center;padding:var(--s7) var(--s4);color:var(--fg-3);
   border:1px dashed var(--line-2);border-radius:var(--r3)}
 .toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--panel-2);
-  border:1px solid var(--line-2);border-radius:var(--r2);padding:11px 18px;font-family:var(--mono);
+  border:1px solid var(--line-2);border-radius:var(--r2);corner-shape:var(--squircle);padding:11px 18px;font-family:var(--mono);
   font-size:11px;letter-spacing:.08em;color:var(--fg);box-shadow:0 8px 26px #0009;z-index:9;max-width:80vw}
 .toast.bad{border-color:var(--bad);color:#F2C0B6}
 ::-webkit-scrollbar{width:10px;height:10px}
@@ -264,7 +268,54 @@ let INFO=null, MODELS=[], JOB=null, BUSY=false;
 
 function toast(msg,bad){const t=document.createElement("div");t.className="toast"+(bad?" bad":"");
   t.textContent=msg;document.body.appendChild(t);setTimeout(()=>t.remove(),bad?6000:3000)}
+/* When this page is opened directly from disk rather than served by
+   `rai serve`, there is no API to talk to. Rather than showing a wall of
+   network errors, fall back to a small fixed dataset so the interface can be
+   reviewed offline. Anything served over http talks to the real server and
+   surfaces real errors. */
+const DEMO = location.protocol !== "http:" && location.protocol !== "https:";
+const DEMO_MODELS=[
+ {name:"qwen2.5-0.5b-q4.raimodel",path:"qwen2.5-0.5b-q4.raimodel",size_bytes:335026528,size_human:"319.5 MB",
+  readable:true,loaded:true,tokenizer_present:true,
+  header:{hidden_size:896,num_layers:24,num_heads:14,num_kv_heads:2,vocab_size:151936,format_version:2,
+    activation:"silu",rope_type:"none",has_biases:true,tied_lm_head:true}},
+ {name:"gemma-2b-it-q4.raimodel",path:"gemma-2b-it-q4.raimodel",size_bytes:1610196400,size_human:"1.5 GB",
+  readable:true,loaded:false,tokenizer_present:true,
+  header:{hidden_size:2048,num_layers:18,num_heads:8,num_kv_heads:1,vocab_size:256000,format_version:2,
+    activation:"gelu_tanh",rope_type:"none",has_biases:false,tied_lm_head:true}},
+ {name:"llama-3.2-1b-q4.raimodel",path:"llama-3.2-1b-q4.raimodel",size_bytes:796262400,size_human:"759.4 MB",
+  readable:true,loaded:false,tokenizer_present:true,
+  header:{hidden_size:2048,num_layers:16,num_heads:32,num_kv_heads:8,vocab_size:128256,format_version:2,
+    activation:"silu",rope_type:"llama3",has_biases:false,tied_lm_head:true}},
+ {name:"zephyr-7b-q4.raimodel",path:"zephyr-7b-q4.raimodel",size_bytes:4107104256,size_human:"3.6 GB",
+  readable:true,loaded:false,tokenizer_present:true,
+  header:{hidden_size:4096,num_layers:32,num_heads:32,num_kv_heads:8,vocab_size:32000,format_version:1,
+    activation:"silu",rope_type:"none",has_biases:false,tied_lm_head:false}},
+];
+function demo(path,opts){
+  const body=opts&&opts.body?JSON.parse(opts.body):{};
+  if(path.startsWith("/api/info"))return{loaded:true,model_name:"qwen2.5-0.5b-q4.raimodel",max_context:2048,
+    chat_template:"ChatML",format_version:2};
+  if(path.startsWith("/api/models"))return{count:DEMO_MODELS.length,dirs:[],models:DEMO_MODELS};
+  if(path.startsWith("/api/load"))return{loaded:true,model_name:(body.path||"model").split(/[\/]/).pop(),max_context:2048};
+  if(path.startsWith("/api/inspect")){
+    const bad=/gemma-?2|gemma-?3|qwen3|mixtral/i.test(body.source||"");
+    return bad
+      ?{source:body.source,kind:"local-config-only",supported:false,weights_checked:false,model_type:"gemma2",
+        shape:{num_layers:42,parameters_human:"9.2B"},container:null,
+        reason:"this checkpoint cannot be represented by the .raimodel format:
+  - config declares attn_logit_softcapping; logit softcapping is not supported."}
+      :{source:body.source,kind:"local-checkpoint",supported:true,weights_checked:true,model_type:"qwen2",
+        shape:{num_layers:24,parameters_human:"494.0M"},
+        container:{output_bytes:335026528,output_human:"319.5 MB",format_version:2},
+        reason:"`rai convert` accepts this checkpoint: model_type 'qwen2' converts to a container v2 file of 335026528 bytes (26 sections)."};
+  }
+  if(path.startsWith("/api/chat"))return{text:"This interface is running without a server, so this reply is canned. Start it with `rai serve` to generate for real.",
+    tokens:24,tok_per_sec:13.8,prefill_ms:212};
+  throw new Error("not available offline");
+}
 async function api(path,opts){
+  if(DEMO){await new Promise(r=>setTimeout(r,140));return demo(path,opts)}
   const r=await fetch(path,opts);
   const text=await r.text();
   let data=null; try{data=text?JSON.parse(text):null}catch(e){}
@@ -405,12 +456,33 @@ $("#convertBtn").addEventListener("click",async()=>{
   $("#convertBtn").disabled=true;$("#resultSec").style.display="none";
   $("#log").textContent="Starting…";BUSY=true;paintEngine();
   try{
+    if(DEMO){demoConvert();return}
     const j=await api("/api/convert",{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({source,output,group_size:+$("#gs").value,embed_group_size:+$("#egs").value,max_context:+$("#ctx").value})});
     JOB={id:j.job_id,cursor:0};pollJob();
   }catch(e){BUSY=false;paintEngine();$("#convertBtn").disabled=false;toast(e.message,true);
     logAppend([e.message]);}
 });
+
+function demoConvert(){
+  const order=["planning","embedding","layers","final-norm","lm_head","tokenizer"];
+  let pct=0,layer=0,si=0;
+  const t=setInterval(()=>{
+    pct=Math.min(100,pct+2.4);
+    si = pct<6?0 : pct<12?1 : pct<84?2 : pct<90?3 : pct<96?4 : 5;
+    if(si===2){const want=Math.floor((pct-12)/72*24);
+      while(layer<want){layer++;logAppend([`  L${String(layer).padStart(2,"0")}.q_proj: [896x896] mse=9.39e-07`])}}
+    $("#bar").style.width=pct+"%";
+    $("#pctTxt").textContent=Math.round(pct)+"%"+(si===2?` · LAYER ${layer}/24`:"");
+    paintStages(order[si],pct);
+    if(pct>=100){clearInterval(t);paintStages("done",100);$("#pctTxt").textContent="DONE";
+      logAppend(["=== DONE in 4.1s ==="]);
+      $("#resultSec").style.display="";
+      $("#rSize").textContent="319.5 MB";$("#rSections").textContent="26 sections";
+      $("#rTime").textContent="4.1 s";$("#rRam").textContent="30.7 MB";
+      BUSY=false;paintEngine();$("#convertBtn").disabled=false;toast("Converted 319.5 MB");}
+  },80);
+}
 async function pollJob(){
   if(!JOB)return;
   let s;
