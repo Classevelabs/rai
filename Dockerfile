@@ -1,7 +1,7 @@
 # Two images from one file:
 #
 #   docker build -t rai-server .                 -> MCP/REST memory server (default)
-#   docker build --target cli -t rai-cli .       -> rai-convert / rai-generate
+#   docker build --target cli -t rai-cli .       -> the `rai` inference CLI
 #
 # The stages are split so the default build stays exactly as cheap as it was:
 # Docker only builds the stages the chosen target depends on, so asking for the
@@ -45,28 +45,25 @@ RUN apt-get update \
 # than this image and are deliberately not baked into it.
 #
 #   docker run --rm -v "$PWD:/work" -w /work rai-cli \
-#     rai-convert --model ./TinyLlama-1.1B-Chat-v1.0 --output ./tinyllama.raimodel
+#     rai convert ./TinyLlama-1.1B-Chat-v1.0 -o ./tinyllama.raimodel
 #
 #   docker run --rm -v "$PWD:/work" -w /work rai-cli \
-#     rai-generate --model ./tinyllama.raimodel --tokenizer ./tokenizer.json \
-#                  --chat-template zephyr --prompt "Hello"
+#     rai run ./tinyllama.raimodel --chat-template zephyr --prompt "Hello"
 #
-# rai-chat is deliberately NOT in this image. It hard-binds 127.0.0.1 and
-# rejects any request whose Host/Origin is not localhost, which is the right
-# behaviour for a local UI and makes it unreachable through published container
-# ports. Shipping it here would only produce a connection that always refuses.
-# Run rai-chat from the release archive on the host instead.
+# `rai serve` is reachable from this image only in principle. It hard-binds
+# 127.0.0.1 and rejects any request whose Host/Origin is not localhost, which is
+# the right behaviour for a local UI and makes it unreachable through published
+# container ports. Run `rai serve` on the host instead.
 FROM base AS cli
 
-COPY --from=build-cli /src/target/release/rai-convert /usr/local/bin/rai-convert
-COPY --from=build-cli /src/target/release/rai-generate /usr/local/bin/rai-generate
+COPY --from=build-cli /src/target/release/rai /usr/local/bin/rai
 
 LABEL org.opencontainers.image.source="https://github.com/Classevelabs/rai" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.title="RAI inference CLI"
 
 USER 10001:10001
-CMD ["rai-generate", "--help"]
+CMD ["rai", "--help"]
 
 # Default target — keep this stage last so a bare `docker build .` still
 # produces the MCP server image CI smoke-tests.

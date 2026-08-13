@@ -94,19 +94,40 @@ const MAX_CONTEXT: u32 = 1_000_000;
 /// Model configuration extracted from the header.
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
+    /// Width of the residual stream.
     pub hidden_size: u32,
+    /// Number of transformer blocks, and so of layer sections in the file.
     pub num_layers: u32,
+    /// Query heads per attention block.
     pub num_heads: u32,
+    /// Key/value heads per attention block. Equal to `num_heads` for plain
+    /// multi-head attention, smaller for grouped-query attention; `num_heads`
+    /// is always a multiple of it.
     pub num_kv_heads: u32,
+    /// Width of one attention head. Usually `hidden_size / num_heads`, but
+    /// decoupled values are allowed — only the interior of the attention block
+    /// changes width. Always a multiple of 8, which the SIMD kernels require.
     pub head_dim: u32,
+    /// Width of the gated MLP's hidden layer.
     pub intermediate_size: u32,
+    /// Number of rows in the embedding table.
     pub vocab_size: u32,
+    /// Positions the RoPE table was built for. The KV cache may be allocated
+    /// smaller than this, never larger.
     pub max_context: u32,
+    /// Base of the rotary position embedding's geometric frequency series.
     pub rope_theta: f32,
+    /// Denominator epsilon in RMSNorm, keeping it finite for a zero vector.
     pub norm_eps: f32,
+    /// Bits per weight in the layer projections and `lm_head`. Always 4.
     pub bits: u8,
+    /// Columns sharing one scale/zero pair in the 4-bit linears. A row carries
+    /// at most [`MAX_GROUPS`] groups, which is what bounds `hidden_size`
+    /// and `intermediate_size` for a given group size.
     pub group_size: u8,
+    /// Bits per weight in the embedding table. Always 8.
     pub embed_bits: u8,
+    /// Columns sharing one scale/zero pair in the embedding table.
     pub embed_group_size: u8,
     /// Container version the file was written at (1 or 2).
     pub version: u32,
@@ -668,7 +689,13 @@ fn parse_header(data: &[u8]) -> Result<HeaderInfo> {
     }
 
     if data[0..4] != MAGIC {
-        bail!("invalid magic bytes");
+        // The first error anyone who points this at the wrong file will see,
+        // so it says what it found rather than only that it was wrong.
+        bail!(
+            "not a .raimodel file: expected magic {:?}, found {:?}",
+            String::from_utf8_lossy(&MAGIC),
+            String::from_utf8_lossy(&data[0..4])
+        );
     }
     let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
     let header_size = match version {

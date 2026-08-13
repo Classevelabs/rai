@@ -1880,7 +1880,10 @@ pub fn tied_lm_head(
     assert!(hidden.len() >= hidden_size, "hidden buffer is too small");
     assert!(logits.len() >= vocab_size, "logit buffer is too small");
     let num_groups = hidden_size.div_ceil(group_size);
-    assert!(num_groups <= MAX_GROUPS);
+    assert!(
+        num_groups <= MAX_GROUPS,
+        "quantization groups exceed the kernel maximum"
+    );
     assert!(
         embed_data.len()
             >= vocab_size

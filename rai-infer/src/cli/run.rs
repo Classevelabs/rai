@@ -20,8 +20,12 @@ use crate::ponder::{pondered_forward, PonderConfig, PonderStrategy};
 use crate::sampler::{apply_repetition_penalty, sample_token, SamplerConfig};
 use crate::speculative::{SpeculativeConfig, SpeculativeDecoder};
 
+/// Upper bound on `--ensemble-n`; each pass is a full forward pass.
 pub const MAX_ENSEMBLE_SIZE: usize = 8;
+/// Upper bound on `--draft-k` and `--lookup-k`. Verification batches every
+/// drafted token, so an over-long draft costs more than it can win back.
 pub const MAX_SPECULATIVE_TOKENS: usize = 32;
+/// Upper bound on `--lookup-ngram`, the longest context suffix matched first.
 pub const MAX_LOOKUP_NGRAM: usize = 16;
 
 /// Everything except the model and tokenizer paths, so that `rai run` (model as
@@ -82,10 +86,10 @@ pub struct GenerationArgs {
     #[arg(long, default_value = "6")]
     pub draft_k: usize,
     /// Prompt-lookup speculation: draft up to N tokens copied from the context
-    /// (0 = disabled). No draft model and no draft forward pass. NOTE: measured
-    /// on TinyLlama-1.1B-q4 this is still ~0.7-0.9x baseline because batched
-    /// verification barely amortises weight reads in this engine; small K (1-2)
-    /// is closest to break-even and large K is much worse.
+    /// (0 = disabled). No draft model and no draft forward pass. Measured on
+    /// TinyLlama-1.1B-q4 at K=2: 1.12-1.20x when the output quotes the context
+    /// (summarisation, RAG, code editing) and 0.74-0.88x on original prose.
+    /// Off by default because the loss is as real as the gain.
     #[arg(long, default_value = "0")]
     pub lookup_k: usize,
     /// Prompt-lookup: longest suffix n-gram to match first

@@ -119,8 +119,10 @@ jobs:
           fi
 
           cat > notes.md <<'NOTES'
-          Prebuilt binaries for x86-64 Linux, Windows, and macOS (Intel):
-          `rai-convert`, `rai-generate`, `rai-chat`, and `rai-server`.
+          Prebuilt binaries for x86-64 Linux, Windows, and macOS (Intel): the
+          `rai` inference CLI (`convert`, `run`, `serve`, `models`) and
+          `rai-server`, plus the deprecated `rai-convert`, `rai-generate`, and
+          `rai-chat` wrappers.
 
           **Verify your download before running it.** Fetch `SHA256SUMS` from
           this release, put it next to the archive, and run:
@@ -232,8 +234,10 @@ jobs:
           if [ "${RUNNER_OS}" = "Windows" ]; then ext=".exe"; fi
 
           # Every one of these is a user-facing product binary. A missing one is
-          # a broken release, not a smaller archive — fail loudly.
-          for bin in rai-convert rai-generate rai-chat rai-server; do
+          # a broken release, not a smaller archive — fail loudly. `rai` is the
+          # CLI the documentation and the launchers use; the three legacy names
+          # are deprecated wrappers kept so existing scripts keep working.
+          for bin in rai rai-server rai-convert rai-generate rai-chat; do
             src="target/release/${bin}${ext}"
             if [ ! -f "$src" ]; then
               echo "::error::expected release binary $src was not produced"
@@ -242,16 +246,25 @@ jobs:
             cp "$src" "$stage/"
           done
 
-          cp LICENSE NOTICE README.md "$stage/"
+          # INSTALL.md is referenced from RUNNING.txt below, and the launchers
+          # are useless if they are not next to the binary they start.
+          cp LICENSE NOTICE README.md INSTALL.md "$stage/"
+          cp -r launchers "$stage/"
 
           cat > "$stage/RUNNING.txt" <<RUNNING
           RAI ${VERSION} — ${TARGET}
 
           WHAT IS IN HERE
-            rai-convert   turn a HuggingFace checkpoint into a .raimodel file
-            rai-generate  generate text from a .raimodel on the CPU
-            rai-chat      serve a local chat UI over HTTP (default 127.0.0.1:8090)
+            rai           the inference CLI:
+                            rai convert <model-dir>     checkpoint -> .raimodel
+                            rai run <model.raimodel>    generate text
+                            rai serve <model.raimodel>  local chat UI (:8090)
+                            rai models [dir]            what is on this machine
             rai-server    local REST + MCP memory service
+            launchers/    double-click scripts that start the chat UI
+
+            rai-convert, rai-generate and rai-chat are deprecated wrappers over
+            the same code, kept so existing scripts keep working. Use rai.
 
           BEFORE YOU RUN ANYTHING
             Verify the download against the release's SHA256SUMS:
@@ -264,12 +277,11 @@ jobs:
 
           SIXTY-SECOND FIRST RUN
             1) Convert a checkpoint you already have on disk. No Python is
-               needed; rai-convert writes tokenizer.json beside the model.
-                 rai-convert --model /path/to/TinyLlama-1.1B-Chat-v1.0 \\
-                   --output tinyllama-q4.raimodel
-            2) Generate:
-                 rai-generate --model tinyllama-q4.raimodel \\
-                   --tokenizer tokenizer.json \\
+               needed; rai convert writes tokenizer.json beside the model.
+                 rai convert /path/to/TinyLlama-1.1B-Chat-v1.0 \\
+                   -o tinyllama-q4.raimodel
+            2) Generate. The tokenizer beside the model is found for you:
+                 rai run tinyllama-q4.raimodel \\
                    --chat-template zephyr \\
                    --prompt "Explain photosynthesis in simple terms."
 
@@ -284,7 +296,7 @@ jobs:
             runs, on scalar code, slower.
 
           NO GPU IS REQUIRED, AND NOTHING PHONES HOME
-            rai-chat and rai-server listen on loopback only. rai-server sends
+            rai serve and rai-server listen on loopback only. rai-server sends
             data off the machine only if you configure an external embedding
             provider yourself.
 

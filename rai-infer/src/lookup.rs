@@ -4,10 +4,10 @@
 //! `n` tokens of the sequence, find the most recent EARLIER occurrence of that
 //! same n-gram, and propose the tokens that followed it. Drafting therefore
 //! costs a slice scan rather than a forward pass, which is the whole point —
-//! the measured failure of the early-exit self-speculative path (0.4-2.2%
-//! acceptance on TinyLlama-1.1B, 4-15x slower than plain decoding) is that its
-//! draft is both expensive AND a poor predictor. A free draft only has to be
-//! right sometimes to win.
+//! the measured failure of the early-exit self-speculative path (0.4%
+//! acceptance on TinyLlama-1.1B, ~15x slower than plain decoding; see
+//! BENCHMARKS.md) is that its draft is both expensive AND a poor predictor. A
+//! free draft only has to be right sometimes to win.
 //!
 //! Verification is the existing exact algorithm, unchanged: the target model
 //! scores `[last_token, draft...]` in ONE batched forward pass, each draft

@@ -118,7 +118,7 @@ impl ChatTemplate {
             "chatml" => ChatTemplate::ChatML,
             "zephyr" => ChatTemplate::Zephyr,
             _ => {
-                eprintln!("Warning: unknown chat template '{s}', using auto-detect");
+                eprintln!("warning: unknown chat template '{s}'; using auto-detect");
                 Self::auto_detect(tokenizer)
             }
         }

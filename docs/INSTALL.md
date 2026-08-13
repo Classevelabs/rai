@@ -6,18 +6,16 @@ binaries on `PATH`, and a first generation. This page is the reference: build
 requirements, source installs, the container, and model conversion.
 
 RAI is distributed as prebuilt release archives, its public source repository,
-and five crates.io packages. The currently published v0.1.0 artifacts predate
-the unreleased hardening work in this checkout; do not describe an untagged
-checkout as the published crate release.
+and five crates.io packages.
 
 ## Requirements
 
-- Rust 1.87 or newer. This repository pins Rust 1.95.0 for repeatable checks.
+- Rust 1.87 or newer. This repository pins 1.95.0 for repeatable checks, which
+  `rustup` installs automatically from `rust-toolchain.toml`.
 - x86-64 with AVX2, FMA, and F16C for the optimized inference path. Scalar
-  fallbacks exist, but ARM acceleration is not implemented.
-- Python 3.9+ for calibrated (GPTQ) model export and draft-model training.
-  Round-to-nearest conversion runs through the `rai-convert` binary and needs
-  no Python. See [Converting a model](#converting-a-model).
+  fallbacks exist; ARM acceleration is not implemented.
+- Python 3.9+ for calibrated (GPTQ) export and draft-model training. The `rai`
+  binary converts without it. See [Converting a model](#converting-a-model).
 
 ## Source checkout
 
@@ -26,6 +24,10 @@ git clone https://github.com/Classevelabs/rai.git
 cd rai
 cargo build --workspace --release --locked
 ```
+
+That produces `rai` (the whole command-line surface) and `rai-server` (the
+memory service), plus the deprecated `rai-convert` / `rai-generate` /
+`rai-chat` wrappers.
 
 The repository's `.cargo/config.toml` uses `target-cpu=native`; binaries built
 that way are for the build machine and die with SIGILL on any CPU that lacks an
@@ -43,22 +45,22 @@ compile-time baseline.
 Install the two end-user binary crates from a checkout:
 
 ```bash
-cargo install --locked --path rai-infer     # rai-convert, rai-generate, rai-chat
+cargo install --locked --path rai-infer     # rai, and the deprecated wrappers
 cargo install --locked --path rai-server    # rai-server
 ```
 
-The public v0.1.0 crates can be installed explicitly with:
+The published crates can be installed by name:
 
 ```bash
-cargo install classeve-rai-infer --version 0.1.0 --locked
-cargo install classeve-rai-server --version 0.1.0 --locked
+cargo install classeve-rai-infer --locked
+cargo install classeve-rai-server --locked
 ```
 
 ## Container
 
 The container is an amd64/x86-64-v3 MCP stdio image and runs as a non-root
 user. It does not expose a REST port because the built-in REST listener is
-intentionally loopback-only.
+loopback-only.
 
 ```bash
 docker build -t rai-server .
@@ -70,77 +72,69 @@ Persisted memory must be mounted at a path writable by UID 10001 and explicitly
 configured with `RAI_DATA_PATH`. Set `RAI_MCP_MUTATIONS_ENABLED=true` only when
 the launching MCP client should be allowed to modify that state.
 
-The same `Dockerfile` also builds an inference-CLI image, which carries
-`rai-convert` and `rai-generate` and no server:
+The same `Dockerfile` also builds an inference-CLI image carrying `rai` and no
+server:
 
 ```bash
 docker build --target cli -t rai-cli .
 docker run --rm -v "$PWD:/work" -w /work rai-cli \
-  rai-convert --model ./TinyLlama-1.1B-Chat-v1.0 --output ./tinyllama.raimodel
+  rai convert ./TinyLlama-1.1B-Chat-v1.0 -o ./tinyllama.raimodel
 ```
 
-Models are mounted, never baked in. `rai-chat` is not in that image on purpose:
-it binds 127.0.0.1 and rejects non-localhost `Host`/`Origin` headers, so a
-published container port would only ever refuse the connection. Run `rai-chat`
-on the host.
+Models are mounted, never baked in. `rai serve` is not exposed from that image
+on purpose: it binds 127.0.0.1 and rejects non-localhost `Host`/`Origin`
+headers, so a published container port would only ever refuse the connection.
+Run `rai serve` on the host.
 
 Both images default to `x86-64-v3`. Pass
 `--build-arg RUST_TARGET_CPU=x86-64-v2` for the portable floor the release
 archives use.
 
-## Verification
-
-See [RELEASE_READINESS.md](./RELEASE_READINESS.md) for the complete candidate
-gate. A successful local build alone is not release approval.
-
 ## Converting a model
 
-**Check compatibility first.** RAI runs plain Llama- and Mistral-architecture
-checkpoints. Qwen, Gemma, Llama-3.1/3.2, and mixture-of-experts models are
-refused at export. [docs/MODELS.md](./MODELS.md) has the full table, named
-checkpoints in both columns, and a recipe for checking a model's `config.json`
-before you download its weights.
-
-Two conversion paths produce the same `.raimodel` format:
+**Check compatibility first.** [MODELS.md](./MODELS.md) has the full table,
+named checkpoints in both columns, and a recipe for checking a model's
+`config.json` before you download its weights. It also records the one place
+the two conversion paths differ: `rai convert` writes container v2 and handles
+Qwen2/2.5, Llama-3.1/3.2, and Gemma; the Python exporters write container v1
+and refuse all three.
 
 | Path | Tool | Needs | Use it when |
 | --- | --- | --- | --- |
-| Round-to-nearest | `rai-convert` | Nothing beyond the RAI build | Default. No Python, no torch. |
-| Round-to-nearest | `export_rtn.py` | Python, torch, transformers | You already have the Python environment set up. |
-| GPTQ (calibrated) | `export_raimodel.py`, `export_fast.py` | Python, torch, transformers, datasets, and a calibration corpus | You want the calibrated quantization and can spend the time. |
+| Round-to-nearest | `rai convert` | Nothing beyond the RAI build | Default. No Python, no torch. |
+| Round-to-nearest | `export_rtn.py` | Python, torch, transformers | You want the reference implementation to compare against. |
+| GPTQ (calibrated) | `export_raimodel.py`, `export_fast.py` | Python, torch, transformers, datasets, and a calibration corpus | You want calibrated quantization and can spend the time. |
 
-### Default path: `rai-convert` (no Python)
+### Default path: `rai convert` (no Python)
 
-`rai-convert` is built with the workspace and reads a HuggingFace checkpoint
-directory directly, so round-to-nearest conversion needs no Python
-installation, no torch, and no virtual environment.
+`rai convert` reads a HuggingFace checkpoint directory directly and streams the
+`.safetensors` tensor by tensor, so peak memory does not grow with the model —
+a 7B checkpoint converts on a 16 GB machine.
 
 ```bash
 cargo build --workspace --release --locked
 
-./target/release/rai-convert --model /path/to/TinyLlama-1.1B-Chat-v1.0
+./target/release/rai convert /path/to/TinyLlama-1.1B-Chat-v1.0
 ```
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--model <hf-dir>` | required | Directory holding `config.json`, the safetensors weights, and the tokenizer |
-| `--output <file>` | derived from the model name | Destination `.raimodel` path |
-| `--group-size 128` | 128 | Columns per quantization group for the 4-bit linears |
-| `--embed-group-size 64` | 64 | Columns per quantization group for the 8-bit embedding table |
-| `--max-context 2048` | 2048 | Context length baked into the RoPE table |
+| `<MODEL_DIR>` | required | Positional: directory holding `config.json`, the safetensors weights, and `tokenizer.json` |
+| `-o`, `--output <FILE>` | `<dirname lowercased>-q4.raimodel` | Destination `.raimodel` path |
+| `--group-size <N>` | 128 | Columns per quantization group for the 4-bit linears |
+| `--embed-group-size <N>` | 64 | Columns per quantization group for the 8-bit embedding table |
+| `--max-context <TOKENS>` | 2048 | Context length baked into the RoPE table |
+| `--tokenizer-out <FILE>` | next to the output | Where `tokenizer.json` is copied |
+| `--quiet` | off | Suppress progress output |
 
 Raise `--group-size` for models whose `hidden_size` or `intermediate_size`
 exceeds 16,384; see the shape constraints in
-[docs/MODELS.md](./MODELS.md#shape-constraints-that-apply-to-every-model).
+[MODELS.md](./MODELS.md#shape-constraints-that-apply-to-every-model).
 Lower `--max-context` for sliding-window models such as Mistral-7B.
 
 ### Calibrated path: the Python exporters
 
-GPTQ needs a calibration corpus and a torch runtime. The Python exporters also
-remain the reference implementation of the format. This sequence was verified
-end to end on 2026-08-09 (Windows 11, Python 3.11) converting
-TinyLlama-1.1B-Chat; the measured results are in
-[BENCHMARKS.md](../BENCHMARKS.md).
+GPTQ needs a calibration corpus and a torch runtime.
 
 ```bash
 python -m venv .venv
@@ -155,7 +149,7 @@ installs `accelerate`: the exporters read weights on CPU and do not use
 `device_map`. No GPU is required.
 
 ```bash
-# Round-to-nearest, the Python equivalent of rai-convert
+# Round-to-nearest, the Python equivalent of `rai convert`
 python rai-infer/scripts/export_rtn.py \
   --model /path/to/TinyLlama-1.1B-Chat-v1.0 \
   --output tinyllama-1.1b-q4.raimodel
@@ -166,24 +160,26 @@ python rai-infer/scripts/export_raimodel.py \
   --output tinyllama-1.1b-gptq.raimodel
 ```
 
-`export_rtn.py` takes well under a minute for a 1B model. `export_raimodel.py`
-and `export_fast.py` run GPTQ instead: they need calibration data and far more
-time. On the measured TinyLlama run, round-to-nearest took 47 s and a
-deliberately short GPTQ run took 1,780 s.
+`rai convert` and `export_rtn.py` produce byte-identical output for the same
+checkpoint and options. On TinyLlama-1.1B the Rust path took 7.6 s against
+188.8 s for the Python one, in 22.9 MB of RAM against 4,981 MB
+([BENCHMARKS.md](../BENCHMARKS.md)). GPTQ is far slower than either: it needs
+calibration data and a Cholesky inverse per layer.
 
 Every path writes `tokenizer.json` next to the model file and refuses to
 overwrite a different tokenizer already sitting there.
 
 ### Refusals
 
-Both paths enforce the same architecture preflight and fail with the reason
-named rather than writing a file that loads cleanly and generates nonsense:
-bias vectors on the attention or MLP projections (Qwen2/Qwen2.5), per-head QK
-norms (Qwen3, Gemma3, OLMo2), RoPE scaling of any type other than `default`
-(Llama-3.1/3.2), mixture-of-experts routing, logit softcapping, Gemma's
-modified RMSNorm, a decoupled `head_dim`, and any module tree that is not
-Llama-style. See [docs/MODELS.md](./MODELS.md) for what each refusal means and
-what it would take to lift it.
+Both paths fail with the reason named rather than writing a file that loads
+cleanly and generates nonsense. `rai convert` refuses per-head QK norms (Qwen3,
+OLMo2, Gemma3), mixture-of-experts routing, logit softcapping (Gemma2),
+`rope_type` values other than `default` and `llama3`, activations other than
+SiLU and GeLU-tanh, and any module tree that is not Llama-style. The Python
+exporters refuse all of those plus projection bias vectors (Qwen2/2.5), every
+`rope_scaling` type (Llama-3.1/3.2), and every Gemma variant. See
+[MODELS.md](./MODELS.md) for what each refusal means and what it would take to
+lift it.
 
 ### Downloading on Windows
 
@@ -204,7 +200,7 @@ Passing a bare instruction makes the model emit end-of-sequence immediately and
 produce no output at all:
 
 ```bash
-rai-generate --model tinyllama-1.1b-q4.raimodel --tokenizer tokenizer.json \
+rai run tinyllama-1.1b-q4.raimodel \
   --chat-template zephyr --prompt "Explain photosynthesis in simple terms."
 ```
 

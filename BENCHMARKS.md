@@ -28,12 +28,12 @@ quiet machine, it says so.
 | SmolLM2-1.7B-Instruct | Llama, tied | 3,422 MB fp16 | **963.0 MB** | 26 |
 | Zephyr-7B-beta | Mistral, untied lm_head | 14,000 MB fp16 | **3,917.7 MB** | 35 |
 
-### Conversion: `rai-convert` versus the Python exporter
+### Conversion: `rai convert` versus the Python exporter
 
-`rai-convert` reads `.safetensors` directly and streams tensor by tensor, so
+`rai convert` reads `.safetensors` directly and streams tensor by tensor, so
 peak memory does not grow with the model.
 
-| | `export_rtn.py` (torch) | **`rai-convert`** |
+| | `export_rtn.py` (torch) | **`rai convert`** |
 | --- | --- | --- |
 | TinyLlama-1.1B wall time | 188.8 s | **7.6 s** (24.8×) |
 | TinyLlama-1.1B peak RSS | 4,980.9 MB | **22.9 MB** (217×) |
@@ -288,18 +288,19 @@ python3 rai-infer/scripts/export_raimodel.py \
 
 cargo build --workspace --release
 
-# Per-operation forward-pass profiler (expects the model path above)
-./target/release/profile-fwd
+MODEL=rai-infer/scripts/smollm-135m-q4.raimodel
 
-# Memory bandwidth benchmark
-./target/release/bw-bench
+# Per-operation forward-pass profiler
+./target/release/profile-fwd --model "$MODEL"
+
+# Memory bandwidth benchmark (--model enables the mmap read section)
+./target/release/bw-bench --model "$MODEL"
 
 # GEMM microbenchmark
 ./target/release/gemm-bench
 
 # End-to-end decode timing
-./target/release/rai-generate \
-  --model rai-infer/scripts/smollm-135m-q4.raimodel \
+./target/release/rai run "$MODEL" \
   --tokenizer rai-infer/scripts/tokenizer.json \
   --prompt "The future of computing is" --max-tokens 128
 

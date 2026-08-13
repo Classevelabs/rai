@@ -39,7 +39,7 @@ pub async fn run_mcp_stdio(state: AppState, mutations_enabled: bool) {
             Frame::TooLarge => Some(JsonRpcResponse::error(
                 Value::Null,
                 -32600,
-                format!("Request exceeds the {MAX_MCP_FRAME_BYTES}-byte limit"),
+                format!("request exceeds the {MAX_MCP_FRAME_BYTES}-byte limit"),
             )),
         };
 
@@ -226,7 +226,7 @@ async fn handle_request(
                 return Some(JsonRpcResponse::error(
                     id,
                     -32602,
-                    format!("Unknown tool: {tool_name}"),
+                    format!("unknown tool '{tool_name}'"),
                 ));
             }
 
@@ -341,17 +341,19 @@ async fn handle_tool_call(
             Err(error) => tool_error("memory health", &error),
         },
 
-        _ => ToolCallResult::error("Unknown tool".to_string()),
+        _ => ToolCallResult::error(format!("unknown tool '{tool_name}'")),
     }
 }
 
 fn required_text<'a>(args: &'a Value, field: &str) -> Result<&'a str, ToolCallResult> {
     let Some(object) = args.as_object() else {
-        return Err(ToolCallResult::error("Arguments must be an object".into()));
+        return Err(ToolCallResult::error(
+            "arguments must be a JSON object".into(),
+        ));
     };
     if object.len() != 1 || !object.contains_key(field) {
         return Err(ToolCallResult::error(format!(
-            "Expected exactly the '{field}' parameter"
+            "expected exactly the '{field}' parameter"
         )));
     }
     let Some(value) = object.get(field).and_then(Value::as_str) else {
@@ -364,11 +366,13 @@ fn required_text<'a>(args: &'a Value, field: &str) -> Result<&'a str, ToolCallRe
 
 fn required_concepts(args: &Value) -> Result<Vec<String>, ToolCallResult> {
     let Some(object) = args.as_object() else {
-        return Err(ToolCallResult::error("Arguments must be an object".into()));
+        return Err(ToolCallResult::error(
+            "arguments must be a JSON object".into(),
+        ));
     };
     if object.len() != 1 || !object.contains_key("concepts") {
         return Err(ToolCallResult::error(
-            "Expected exactly the 'concepts' parameter".into(),
+            "expected exactly the 'concepts' parameter".into(),
         ));
     }
     let Some(values) = object.get("concepts").and_then(Value::as_array) else {
@@ -412,7 +416,7 @@ fn tool_error(operation: &str, error: &RaiError) -> ToolCallResult {
     match error {
         RaiError::InvalidInput(message) => ToolCallResult::error(message.clone()),
         RaiError::CapacityExhausted { .. } => ToolCallResult::error(format!(
-            "{error}. Remove memories or raise the configured capacity before storing again."
+            "{error}; remove memories or raise the configured capacity before storing again"
         )),
         other => {
             log::error!("MCP {operation} failed: {other}");

@@ -19,10 +19,10 @@ Measured on an Intel i5-10300H (4 cores / 8 threads), 2026-08-09, RAI 0.2.0.
 Full method, roofline, and the results that came out negative are in
 [BENCHMARKS.md](./BENCHMARKS.md).
 
-**Converting a checkpoint** — `rai-convert` streams `.safetensors`, so peak
+**Converting a checkpoint** — `rai convert` streams `.safetensors`, so peak
 memory does not grow with the model:
 
-| | `export_rtn.py` (PyTorch) | **`rai-convert`** |
+| | `export_rtn.py` (PyTorch) | **`rai convert`** |
 | --- | --- | --- |
 | TinyLlama-1.1B | 188.8 s, 4,981 MB RAM | **7.6 s, 22.9 MB RAM** |
 | Zephyr-7B | needs ~29 GB — will not run | **82.6 s, 26.3 MB RAM** |
@@ -38,10 +38,10 @@ Both produce byte-identical output. A 7B model converts on a 16 GB laptop.
 | Load (warm) | 0.33 s | — |
 
 HuggingFace `transformers` fp32 runs the same TinyLlama checkpoint at 4.3 tok/s
-on this machine, so RAI is **5.1× faster in 1/7th the memory**. Prefill is
-**~1.3× faster** than 0.1.0 after the batched-GEMM rewrite, and prompt-lookup
-decoding adds **1.12–1.20×** on context-quoting workloads (off by default; it
-is slower on original prose, and BENCHMARKS.md says by how much).
+on this machine, so RAI is **5.1× faster in 1/7th the memory**. The batched-GEMM
+rewrite made prefill **~1.3× faster**, and prompt-lookup decoding adds
+**1.12–1.20×** on context-quoting workloads (off by default; it is slower on
+original prose, and BENCHMARKS.md says by how much).
 
 ## Quickstart
 
@@ -109,8 +109,10 @@ captured in `Cargo.lock`.
   format reader, kernels, model, sampling, speculative decoding — against
   `half`, `rayon`, `anyhow`, and `rand` alone. The CLI, tokenizer, and chat
   server sit behind the default-on `cli` feature.
-- **Speculative decoding.** Draft-model and prompt-lookup modes with exact
-  target-model verification, so the output distribution is unchanged.
+- **Speculative decoding.** Draft-model and prompt-lookup modes. Both accept or
+  reject each drafted token against the target model's own sampled
+  distribution, with a correction sample on rejection; a seeded statistical
+  smoke test guards that path.
 - **Local serving.** An HTTP chat server with a built-in web UI, plus a REST +
   MCP server so agentic tools (e.g. Claude Desktop, Claude Code) can use RAI
   as a tool backend.
@@ -119,15 +121,15 @@ captured in `Cargo.lock`.
 
 | Crate | Purpose |
 | --- | --- |
-| `rai-infer` | The inference engine: `.raimodel` loader, AVX2 W4A8 GEMM kernels, transformer layers (RMSNorm, RoPE, GQA, SwiGLU), KV cache, sampling, speculative decoding, CLI + HTTP chat binaries (behind the default-on `cli` feature; `--no-default-features` builds the lean library) |
+| `rai-infer` | The inference engine: `.raimodel` loader and writer, AVX2 W4A8 GEMM kernels, transformer layers (RMSNorm, RoPE, GQA, SwiGLU/GeGLU), KV cache, sampling, speculative decoding, and the `rai` binary (behind the default-on `cli` feature; `--no-default-features` builds the lean library) |
 | `rai-compress` | Quantization and compression research toolkit. Its Rust GPTQ implementation is independent of the Python `.raimodel` export pipeline; RC/HRC/SAC report modeled sizes and serialize no artifact. Nothing here is on the inference path. |
 | `rai-server` | REST + MCP server exposing the RAI memory/reasoning layer to HTTP clients and MCP-capable agents |
 | `rai-core` | Memory, embedding, and reasoning primitives used by `rai-server` |
 | `rem-nra` | Resonance-memory backend used by `rai-core` |
 
-The inference and memory-service paths are separate. `rai-generate` and
-`rai-chat` load `.raimodel` files through `rai-infer`; `rai-server` does not run
-those models. Instead, its REST/MCP adapters call `rai-core`, which obtains an
+The inference and memory-service paths are separate. `rai run` and `rai serve`
+load `.raimodel` files through `rai-infer`; `rai-server` does not run those
+models. Instead, its REST/MCP adapters call `rai-core`, which obtains an
 embedding from the configured provider and stores/queries state through
 `rem-nra`. `AppState` serializes REST stores and opted-in MCP stores to
 `RAI_DATA_PATH`.
@@ -138,9 +140,9 @@ embedding from the configured provider and stores/queries state through
 | --- | --- |
 | Rust | 1.87+; the repository pins 1.95.0, edition 2021 |
 | CPU | x86-64 with AVX2, FMA, and F16C for optimized paths; scalar fallbacks otherwise |
-| OS | Linux, Windows, or macOS (the release candidate must pass CI on each) |
+| OS | Linux, Windows, or macOS |
 | GPU at runtime | **Not required** |
-| Python | Calibrated (GPTQ) export and draft-model preparation. `rai-convert` does round-to-nearest conversion without it. |
+| Python | Calibrated (GPTQ) export and draft-model preparation only. `rai convert` does round-to-nearest conversion without it. |
 
 > `.cargo/config.toml` builds with `target-cpu=native` so the kernels use
 > everything your CPU offers. That binary is for the machine that built it: run
@@ -156,14 +158,11 @@ embedding from the configured provider and stores/queries state through
 cargo build --workspace --release --locked
 ```
 
-The repository and v0.1.0 release are already public, and all five
-`classeve-rai-*` v0.1.0 crates are on crates.io. This checkout contains
-unreleased changes; building it does not change the published v0.1.0 artifacts.
-See [installation](./docs/INSTALL.md) and the
-[release-readiness gate](./docs/RELEASE_READINESS.md). No container image is
-currently published; the `Dockerfile` builds an MCP stdio image from source by
-default, and `docker build --target cli .` builds an inference-CLI image
-carrying `rai-convert` and `rai-generate` instead.
+That produces `rai` and `rai-server`, plus the deprecated `rai-convert`,
+`rai-generate`, and `rai-chat` wrappers. See [installation](./docs/INSTALL.md)
+for source installs and the container. No container image is published; the
+`Dockerfile` builds an MCP stdio image from source by default, and
+`docker build --target cli .` builds an image carrying the `rai` CLI instead.
 
 Development checks:
 
@@ -180,9 +179,7 @@ RAI runs models in its own `.raimodel` format. Two paths produce it:
 
 ```bash
 # Round-to-nearest — no Python, no torch
-./target/release/rai-convert \
-  --model /path/to/Mistral-7B-Instruct-v0.3 \
-  --max-context 4096
+rai convert /path/to/Mistral-7B-Instruct-v0.3 --max-context 4096
 
 # GPTQ, calibrated — needs the Python environment and a calibration corpus
 python3 rai-infer/scripts/export_raimodel.py \
@@ -191,73 +188,76 @@ python3 rai-infer/scripts/export_raimodel.py \
 ```
 
 Both write the model file plus a `tokenizer.json` alongside it, and both refuse
-architectures the format cannot represent. Check
-[docs/MODELS.md](./docs/MODELS.md) before downloading a checkpoint;
+architectures the format cannot represent. They do not cover the same models:
+`rai convert` writes container v2 and handles Qwen2/2.5, Llama-3.1/3.2, and
+Gemma, while the Python exporters write container v1 and refuse all three.
+Check [docs/MODELS.md](./docs/MODELS.md) before downloading a checkpoint;
 [docs/INSTALL.md](./docs/INSTALL.md#converting-a-model) has every flag.
-HuggingFace model and dataset revisions are not pinned by the exporters, so
-record the exact revisions and arguments for reproducible work.
+HuggingFace model and dataset revisions are not pinned by the Python exporters,
+so record the exact revisions and arguments for reproducible work.
 
 ## Running
 
 ### Generate text
 
 ```bash
-./target/release/rai-generate \
-  --model smollm-135m-q4.raimodel \
-  --tokenizer tokenizer.json \
+rai run smollm-135m-q4.raimodel \
   --prompt "The future of computing is" \
   --max-tokens 64 \
   --temperature 0.7
 ```
+
+`--tokenizer` defaults to the `tokenizer.json` written beside the model at
+conversion time; pass it explicitly only for a model that was moved away from
+its tokenizer.
 
 Sampling controls: `--temperature`, `--top-k`, `--top-p`,
 `--repetition-penalty`, `--seed`. Test-time compute ("pondering") strategies:
 `--ponder-strategy cfg|ensemble|cfg-ensemble|adaptive` with
 `--guidance-scale`, `--ensemble-n`, `--noise-sigma`, `--entropy-threshold`.
 
-Set `RAYON_NUM_THREADS` to cap the inference worker count used by `rai-generate`
-and `rai-chat`; it defaults to Rayon's own choice and does not affect
-`rai-server`.
+Set `RAYON_NUM_THREADS` to cap the inference worker count used by `rai run` and
+`rai serve`; it defaults to Rayon's own choice and does not affect `rai-server`.
 
 ### Speculative decoding
 
+Two modes, mutually exclusive. Both verify against the target model and are
+gated on exact sampling (`--top-k 0 --top-p 1 --repetition-penalty 1`), so
+verification uses the distribution the target actually produced.
+
 ```bash
 # Draft-model speculation: a small model proposes, the big model verifies
-./target/release/rai-generate \
-  --model mistral-7b-q4.raimodel \
-  --tokenizer tokenizer.json \
+rai run mistral-7b-q4.raimodel \
   --draft mistral-draft-100m-q4.raimodel \
   --draft-k 6 \
+  --top-k 0 --top-p 1 --repetition-penalty 1 \
   --prompt "Explain speculative decoding in one paragraph."
 
-# Self-speculative: the model's own first N layers act as the draft
-./target/release/rai-generate \
-  --model mistral-7b-q4.raimodel \
-  --tokenizer tokenizer.json \
-  --self-spec-layers 8 --self-spec-k 8 \
-  --prompt "Hello"
+# Prompt-lookup: the draft is copied from the context, so there is no draft
+# model and no draft forward pass
+rai run tinyllama-q4.raimodel \
+  --lookup-k 2 \
+  --top-k 0 --top-p 1 --repetition-penalty 1 \
+  --prompt "Summarise the passage above."
 ```
 
-Draft and target must share a tokenizer. The verification algorithm is intended
-to preserve the target distribution, but exact equivalence is not a marketing
-claim until retained golden outputs and statistical tests demonstrate it.
-`rai-infer/scripts/train_draft.py` is an experimental distillation helper for
-compatible Mistral-family teachers; its throughput projections are not release
-benchmarks.
+Draft and target must share a tokenizer. Prompt-lookup is off by default: it is
+a gain only when the output reuses the context, and BENCHMARKS.md records both
+the gain and the loss. `rai-infer/scripts/train_draft.py` is an experimental
+distillation helper for compatible Mistral-family teachers; its throughput
+projections are not release benchmarks.
 
 ### Chat over HTTP
 
 ```bash
-./target/release/rai-chat \
-  --model smollm-135m-q4.raimodel \
-  --tokenizer tokenizer.json \
-  --port 8090
+rai serve smollm-135m-q4.raimodel --port 8090
 ```
 
 Open `http://localhost:8090` for the built-in web UI, or POST to `/api/chat`
-(JSON) for programmatic access. `--chat-template auto|mistral|llama3|few-shot`
-selects prompt formatting. The chat server binds to `127.0.0.1` only and limits
-request bodies to 64 KiB.
+(JSON) for programmatic access.
+`--chat-template auto|none|few-shot|mistral|llama3|chatml|zephyr` selects prompt
+formatting. The chat server binds to `127.0.0.1` only and limits request bodies
+to 64 KiB.
 
 ### REST + MCP server
 
@@ -378,8 +378,8 @@ Common startup failures are deliberate safeguards: use a loopback
 `openai` provider, and make `RAI_DATA_PATH` a writable file path rather than a
 directory. A model that fails to load should be regenerated and treated as
 untrusted until its header, dimensions, offsets, and file length are verified.
-See [installation](./docs/INSTALL.md), [operations](./docs/OPERATIONS.md), and
-[release readiness](./docs/RELEASE_READINESS.md) for the full runbooks.
+See [installation](./docs/INSTALL.md) and [operations](./docs/OPERATIONS.md)
+for the full runbooks.
 
 ## The `.raimodel` format
 
@@ -387,7 +387,7 @@ A single flat, little-endian binary file:
 
 ```text
 ┌─────────────────────────────────────────────┐
-│ Header (64 bytes)                           │  magic "RAIM", version,
+│ Header (64 bytes at v1, 128 at v2)          │  magic "RAIM", version,
 │                                             │  architecture hyperparameters,
 │                                             │  quantization config
 ├─────────────────────────────────────────────┤
@@ -401,13 +401,20 @@ A single flat, little-endian binary file:
 ```
 
 Each layer section holds seven 4-bit projections — `q`, `k`, `v`, `o`, `gate`,
-`up`, `down` — followed by two f32 RMSNorm weight vectors. Linear weights carry
-per-group (128-column by default) f16 scale/zero parameters and are packed two
-codes per byte in the layout the AVX2 kernels consume. The embedding table is
-8-bit quantized. Scale/zero parameters are round-tripped through f16 at export
-time so the reader and the exporter use the same stored values. The header
-carries the architecture dimensions plus `rope_theta` and `norm_eps`; there is
-no field for anything else, which is what makes the compatibility list in
+`up`, `down` — then any f32 bias vectors the header's `bias_mask` declares, then
+two f32 RMSNorm weight vectors. Linear weights carry per-group (128-column by
+default) f16 scale/zero parameters and are packed two codes per byte in the
+layout the AVX2 kernels consume. The embedding table is 8-bit quantized.
+Scale/zero parameters are round-tripped through f16 at export time so the reader
+and the exporter use the same stored values.
+
+Version 1 holds the architecture dimensions, `rope_theta`, and `norm_eps`.
+Version 2 extends the header to 128 bytes and adds the activation code, the
+`llama3` RoPE rescaling parameters, the bias mask, and the embedding scale — the
+four fields that brought Qwen2/2.5, Llama-3.1/3.2, and Gemma inside the
+supported set. A converter emits v1 whenever none of them is needed, so files
+that converted before v2 still produce the same bytes. There is no field for
+anything beyond that, which is what makes the compatibility list in
 [docs/MODELS.md](./docs/MODELS.md) what it is.
 
 The loader performs one read of the whole file into heap memory, validates the
@@ -419,44 +426,40 @@ a general performance advantage over `mmap`.
 ## More measurements
 
 The headline table is at the top of this file. Beyond it, BENCHMARKS.md records
-what shorter and longer runs cost on the same machine: 40–45-token generations
-measured 29.4–33.0 tok/s, and a 301-token prompt prefilled in 6.33 s
-(47.6 tok/s), which is the time-to-first-token to expect for long prompts on
-four cores. Per-tensor quantization MSE ranged from 6.4e-06 (`q_proj`) to
-6.2e-09 (embedding).
+the roofline analysis (decode reaches 45% of this machine's 26.4 GB/s memory
+ceiling), the batched-GEMM prefill rewrite, and the per-tensor quantization
+error, which ranged from 6.4e-06 (`q_proj`) to 6.2e-09 (the 8-bit embedding).
 
-Self-speculative decoding was measured and is not a speedup on this model:
-`--self-spec-layers 11 --self-spec-k 4` achieved a 2.2% draft acceptance rate
-and ran at 5.6 tok/s against the 21.8 tok/s baseline. The feature is correct
-and available; it is not presented as a win.
-
-An older author-run measurement reported ~195 tokens/s for SmolLM-135M, but its
-raw output and environment were not retained; it is kept in BENCHMARKS.md as
-historical context, not as release evidence.
+It also records what was measured and rejected, so nobody re-derives it:
+self-speculative early exit reached 0.4% draft acceptance and ran roughly 15×
+slower than plain decoding, so it is not in the CLI — the library
+implementation remains for use with a trained exit head. An older author-run
+measurement reported ~195 tokens/s for SmolLM-135M, but its raw output and
+environment were not retained; it is kept as historical context, not as release
+evidence.
 
 See [BENCHMARKS.md](./BENCHMARKS.md) for the full method and the
 quantization-quality comparison.
 
 ## Project status
 
-RAI is young software, released because it is useful and readable — not
-because it is finished. Interfaces may change. Current state:
+RAI is pre-1.0 and interfaces may change. What that means concretely:
 
-- One measured end-to-end conversion and decode run exists (TinyLlama-1.1B,
-  BENCHMARKS.md). This repository does not retain a release qualification
-  matrix or model fixtures across the rest of the supported list.
-- The architecture coverage is deliberately narrow and enforced at conversion
-  time. [docs/MODELS.md](./docs/MODELS.md) states what is out and what each
-  addition would cost.
-- Historical quantization experiments used Hessian-weighted output error
-  against an FP16 reference (see BENCHMARKS.md); reproducible perplexity and
-  quality sweeps are still needed.
+- One end-to-end conversion and decode run is measured (TinyLlama-1.1B,
+  BENCHMARKS.md). The rest of the supported list is verified by architecture
+  and, for Qwen2.5-0.5B, Llama-3.2-1B, and gemma-2b-it, by a coherent
+  generation — not by a retained qualification matrix.
+- Architecture coverage is deliberately narrow and enforced at conversion time.
+  [docs/MODELS.md](./docs/MODELS.md) states what is out and what each addition
+  would cost.
+- Quantization quality is measured as Hessian-weighted output error
+  (BENCHMARKS.md). No perplexity sweep has been run, so no perplexity claim is
+  made.
 - The optimized paths are x86-64. A scalar fallback exists; ARM NEON kernels
   are future work.
-- The memory/reasoning service and RC/HRC/SAC compression paths are research
-  prototypes; do not rely on their confidence, crowding, or modeled-size outputs
-  as validated product guarantees. The memory service has no training of any
-  kind, and its crowding report cannot detect semantic contradiction.
+- The memory/reasoning service and the RC/HRC/SAC compression paths are
+  research prototypes. Their confidence, crowding, and modeled-size outputs are
+  not validated guarantees.
 
 Issues and PRs are welcome. See [SECURITY.md](./SECURITY.md),
 [SUPPORT.md](./SUPPORT.md), and [CONTRIBUTING.md](./CONTRIBUTING.md).
