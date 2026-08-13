@@ -83,15 +83,17 @@ file is written — never silently mis-converted.
 
 | | |
 | --- | --- |
-| **Runs** | **Qwen2 / Qwen2.5 / Qwen3 (dense)**, **Llama-3.1 / 3.2**, **Gemma and Gemma2**, **Phi-3 / Phi-3.5**, Llama-2, Mistral-7B v0.1–v0.3, TinyLlama, SmolLM / SmolLM2, and fine-tunes of those (Zephyr-7B, OpenHermes-Mistral, Vicuna) |
-| **Refused** | Mixtral and other mixture-of-experts models — use dense Mistral-7B instead; Gemma3, whose layers do not share one RoPE base — use gemma-2b-it; OLMo2, whose QK norm spans all heads at once — use Llama-3.1-8B; Falcon / GPT-NeoX / MPT / GPT-2 / Phi-2, whose module tree is not Llama-shaped — use a Llama or Mistral model of the same size; any `rope_scaling` other than `default` or `llama3` |
+| **Runs** | **Llama-2 / 3 / 3.1 / 3.2**, **Mistral-7B**, **Qwen2 / 2.5 / 3 (dense)**, **Gemma / Gemma2 / Gemma3**, **Phi-3 / 3.5**, **OLMo2**, **mixture-of-experts models** (OLMoE, Mixtral, Qwen3-MoE), TinyLlama, SmolLM / SmolLM2, and fine-tunes of all of them |
+| **Refused** | Models with a *shared* expert running alongside the routed ones; `rope_scaling` other than `default` or `llama3` (`yarn`, `linear`, `dynamic`); an `lm_head` bias; and module trees that are not Llama-shaped — Falcon, GPT-NeoX, MPT, GPT-2, Phi-2. Each refusal names the blocker and a model that works. |
 
 Point `rai convert` at your folder, or press **Check** in Studio: both run the
 same preflight, refuse before writing anything, name the blocker, and name a
 model that does work. What to use instead of a refused checkpoint, and what has
 to be in the folder, are in **[docs/MODELS.md](./docs/MODELS.md)**.
-Qwen2.5-0.5B, Qwen3-0.6B, Llama-3.2-1B, gemma-2b-it, gemma-2-2b-it and
-Phi-3-mini-4k-instruct were each converted and generated coherent text.
+Every family above was converted **and generated coherent text** on the
+machine in the benchmarks: Qwen2.5-0.5B, Qwen3-0.6B, Llama-3.2-1B, gemma-2b-it,
+gemma-2-2b-it, gemma-3-1b-it, Phi-3-mini-4k-instruct, OLMo-2-1B-Instruct and
+OLMoE-1B-7B-Instruct (6.9B parameters, 64 experts, 8 routed per token).
 
 A folder holding a `pytorch_model.bin` rather than `.safetensors` is not read —
 that is a Python pickle, and loading one executes whatever code the file
