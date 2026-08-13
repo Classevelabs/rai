@@ -50,25 +50,30 @@ is slower on original prose, and BENCHMARKS.md says by how much).
 cargo build --workspace --release --locked
 
 # 2. Convert a checkpoint — no Python required
-./target/release/rai-convert \
-  --model /path/to/TinyLlama-1.1B-Chat-v1.0 \
-  --output tinyllama-1.1b-q4.raimodel
+rai convert /path/to/Qwen2.5-0.5B-Instruct
 
 # 3. Generate
-./target/release/rai-generate \
-  --model tinyllama-1.1b-q4.raimodel \
-  --tokenizer tokenizer.json \
-  --chat-template zephyr \
+rai run qwen2.5-0.5b-instruct-q4.raimodel \
+  --chat-template chatml \
   --prompt "Explain photosynthesis in simple terms." \
   --max-tokens 64
+
+# 4. Or open the local chat interface
+rai serve qwen2.5-0.5b-instruct-q4.raimodel
+
+# What is on this machine?
+rai models .
 ```
 
-Conversion writes `tokenizer.json` next to the model file. Instruction-tuned
-models need the chat template they were trained on, or they emit
-end-of-sequence immediately; TinyLlama-Chat uses `zephyr`. Prebuilt binaries
-are in [INSTALL.md](./INSTALL.md); full conversion options, including the
-calibrated GPTQ path, are in
-[docs/INSTALL.md](./docs/INSTALL.md#converting-a-model).
+Conversion writes `tokenizer.json` beside the model, and `rai run` picks it up
+automatically. Instruction-tuned models need the chat template they were
+trained on, or they emit end-of-sequence immediately and print nothing:
+`chatml` for Qwen, `llama3` for Llama-3, `zephyr` for TinyLlama-Chat.
+
+Prebuilt binaries are in [INSTALL.md](./INSTALL.md); full conversion options,
+including the calibrated GPTQ path, are in
+[docs/INSTALL.md](./docs/INSTALL.md#converting-a-model). The double-click
+launchers in `launchers/` start the local interface without a terminal.
 
 ## Which models work
 
@@ -104,8 +109,8 @@ captured in `Cargo.lock`.
   format reader, kernels, model, sampling, speculative decoding — against
   `half`, `rayon`, `anyhow`, and `rand` alone. The CLI, tokenizer, and chat
   server sit behind the default-on `cli` feature.
-- **Speculative decoding.** Draft-model and self-speculative (first-N-layers)
-  modes with experimental target-model acceptance and verification logic.
+- **Speculative decoding.** Draft-model and prompt-lookup modes with exact
+  target-model verification, so the output distribution is unchanged.
 - **Local serving.** An HTTP chat server with a built-in web UI, plus a REST +
   MCP server so agentic tools (e.g. Claude Desktop, Claude Code) can use RAI
   as a tool backend.
