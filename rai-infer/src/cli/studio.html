@@ -303,8 +303,7 @@ function demo(path,opts){
     return bad
       ?{source:body.source,kind:"local-config-only",supported:false,weights_checked:false,model_type:"gemma2",
         shape:{num_layers:42,parameters_human:"9.2B"},container:null,
-        reason:"this checkpoint cannot be represented by the .raimodel format:
-  - config declares attn_logit_softcapping; logit softcapping is not supported."}
+        reason:"this checkpoint cannot be represented by the .raimodel format:\n  - config declares attn_logit_softcapping; logit softcapping is not supported."}
       :{source:body.source,kind:"local-checkpoint",supported:true,weights_checked:true,model_type:"qwen2",
         shape:{num_layers:24,parameters_human:"494.0M"},
         container:{output_bytes:335026528,output_human:"319.5 MB",format_version:2},
