@@ -11,7 +11,7 @@ use crate::format::{self, ModelConfig, RaiModelFile, NUM_PROJECTIONS};
 use crate::gemm::{embed_lookup, tied_lm_head, w4a8_matmul, w4a8_matvec};
 use crate::kv_cache::KVCache;
 use crate::layers::{
-    add_bias, attend_batch, glu_mul_inplace, gqa_attention_decode, rms_norm, rms_norm_heads,
+    add_bias, attend_batch, glu_mul_inplace, gqa_attention_decode, rms_norm,
     rms_norm_with_residual, soft_cap_slice, swiglu_mlp, vec_add, AttentionWork, MlpWork,
     ProjectionBiases, QkNorm, RoPETable, ScoreShaping,
 };
@@ -36,6 +36,18 @@ struct LayerNormExtras {
     /// Gemma2's sandwich norms on the attention and MLP outputs,
     /// `hidden_size` values each.
     sandwich: Option<(Vec<f32>, Vec<f32>)>,
+}
+
+/// Which norm weight applies at each of the four points in a layer.
+///
+/// `None` means no norm is applied there, which is a real configuration: a
+/// pre-norm model has nothing after its blocks, a post-norm model nothing
+/// before them.
+struct NormPlacement<'a> {
+    before_attn: Option<&'a [f32]>,
+    after_attn: Option<&'a [f32]>,
+    before_mlp: Option<&'a [f32]>,
+    after_mlp: Option<&'a [f32]>,
 }
 
 /// A loaded `.raimodel`, ready to run.
@@ -152,6 +164,28 @@ impl RaiModel {
         std::array::from_fn(|index| stored[index].as_deref())
     }
 
+    /// Open a block: normalize the residual stream into `normed`, or, for a
+    /// post-norm model that has no norm here, pass it through unchanged.
+    ///
+    /// The copy in the `None` arm is deliberate. Threading a "which buffer is
+    /// the block input" decision through the rest of the layer would put the
+    /// branch in three forward paths instead of one.
+    fn enter_block(
+        weight: Option<&[f32]>,
+        normed: &mut [f32],
+        residual: &mut [f32],
+        hidden: &[f32],
+        eps: f32,
+    ) {
+        match weight {
+            Some(weight) => rms_norm_with_residual(normed, residual, hidden, weight, eps),
+            None => {
+                normed.copy_from_slice(hidden);
+                residual.copy_from_slice(hidden);
+            }
+        }
+    }
+
     /// Layer `li`'s per-head query/key norms, or `None` for a model without
     /// them (every model but Qwen3-shaped ones).
     fn qk_norm_for(&self, li: usize) -> Option<QkNorm<'_>> {
@@ -159,7 +193,43 @@ impl RaiModel {
             q,
             k,
             eps: self.config.norm_eps,
+            full_width: self.config.has_full_qk_norm,
         })
+    }
+
+    /// Where layer `li`'s norms are applied, resolved once so that every
+    /// forward path branches identically.
+    ///
+    /// Three shapes collapse into four optional weights:
+    ///
+    /// | model | before attn | after attn | before MLP | after MLP |
+    /// |---|---|---|---|---|
+    /// | pre-norm (Llama, Qwen, Phi-3) | slot 0 | — | slot 1 | — |
+    /// | sandwich (Gemma2) | slot 0 | extra 0 | slot 1 | extra 1 |
+    /// | post-norm (OLMo2) | — | slot 0 | — | slot 1 |
+    ///
+    /// Resolving it here rather than at each call site is the point: three
+    /// separate forward paths each re-deriving the placement is three chances
+    /// to disagree, and a disagreement would produce output that looks like a
+    /// quality problem rather than a bug.
+    fn norm_placement(&self, li: usize) -> NormPlacement<'_> {
+        let slot0 = self.layer_input_norms[li].as_slice();
+        let slot1 = self.layer_post_attn_norms[li].as_slice();
+        if self.config.post_norm {
+            return NormPlacement {
+                before_attn: None,
+                after_attn: Some(slot0),
+                before_mlp: None,
+                after_mlp: Some(slot1),
+            };
+        }
+        let sandwich = self.sandwich_for(li);
+        NormPlacement {
+            before_attn: Some(slot0),
+            after_attn: sandwich.map(|(attn, _)| attn),
+            before_mlp: Some(slot1),
+            after_mlp: sandwich.map(|(_, mlp)| mlp),
+        }
     }
 
     /// Layer `li`'s Gemma2 sandwich norms as `(attention output, MLP output)`.
@@ -265,12 +335,15 @@ impl RaiModel {
             let layer = self.file.layer(li)?;
             let biases = self.biases_for(li);
 
-            // Attention block
-            rms_norm_with_residual(
+            // Attention block. Where the norms go is settled once, in
+            // `norm_placement`, so the pre-norm, sandwich and post-norm shapes
+            // differ only in which of these four weights is `Some`.
+            let norms = self.norm_placement(li);
+            Self::enter_block(
+                norms.before_attn,
                 &mut scratch.normed,
                 &mut scratch.residual,
                 hidden,
-                &self.layer_input_norms[li],
                 eps,
             );
             gqa_attention_decode(
@@ -293,23 +366,20 @@ impl RaiModel {
                 self.qk_norm_for(li),
                 self.shaping,
             );
-            // Gemma2's sandwich norm: the attention output is normalized before
-            // it rejoins the residual stream.
-            let sandwich = self.sandwich_for(li);
             norm_block_output(
                 &mut scratch.attn_out,
                 &mut scratch.norm_tmp,
-                sandwich.map(|(attn, _)| attn),
+                norms.after_attn,
                 eps,
             );
             vec_add(hidden, &scratch.residual, &scratch.attn_out);
 
             // MLP block
-            rms_norm_with_residual(
+            Self::enter_block(
+                norms.before_mlp,
                 &mut scratch.normed,
                 &mut scratch.residual,
                 hidden,
-                &self.layer_post_attn_norms[li],
                 eps,
             );
             swiglu_mlp(
@@ -325,7 +395,7 @@ impl RaiModel {
             norm_block_output(
                 &mut scratch.mlp_out,
                 &mut scratch.norm_tmp,
-                sandwich.map(|(_, mlp)| mlp),
+                norms.after_mlp,
                 eps,
             );
             vec_add(hidden, &scratch.residual, &scratch.mlp_out);
@@ -453,11 +523,12 @@ impl RaiModel {
             let layer = self.file.layer(li)?;
             let biases = self.biases_for(li);
 
-            rms_norm_with_residual(
+            let norms = self.norm_placement(li);
+            Self::enter_block(
+                norms.before_attn,
                 &mut scratch.normed,
                 &mut scratch.residual,
                 hidden,
-                &self.layer_input_norms[li],
                 eps,
             );
             gqa_attention_decode(
@@ -480,20 +551,19 @@ impl RaiModel {
                 self.qk_norm_for(li),
                 self.shaping,
             );
-            let sandwich = self.sandwich_for(li);
             norm_block_output(
                 &mut scratch.attn_out,
                 &mut scratch.norm_tmp,
-                sandwich.map(|(attn, _)| attn),
+                norms.after_attn,
                 eps,
             );
             vec_add(hidden, &scratch.residual, &scratch.attn_out);
 
-            rms_norm_with_residual(
+            Self::enter_block(
+                norms.before_mlp,
                 &mut scratch.normed,
                 &mut scratch.residual,
                 hidden,
-                &self.layer_post_attn_norms[li],
                 eps,
             );
             swiglu_mlp(
@@ -509,7 +579,7 @@ impl RaiModel {
             norm_block_output(
                 &mut scratch.mlp_out,
                 &mut scratch.norm_tmp,
-                sandwich.map(|(_, mlp)| mlp),
+                norms.after_mlp,
                 eps,
             );
             vec_add(hidden, &scratch.residual, &scratch.mlp_out);
@@ -564,12 +634,16 @@ impl RaiModel {
         for li in 0..nl {
             let layer = self.file.layer(li)?;
 
-            // 1. RMSNorm + save residual for each token
+            // 1. Enter the attention block: normalize into `normed` and save
+            //    the residual, or pass the stream through for a post-norm
+            //    model. Same `norm_placement` the sequential paths use, so the
+            //    two cannot disagree about where a norm goes.
+            let norms = self.norm_placement(li);
             for b in 0..batch {
                 let h = &hiddens[b * hs..(b + 1) * hs];
                 let n = &mut bs.normed[b * hs..(b + 1) * hs];
                 let r = &mut bs.residual[b * hs..(b + 1) * hs];
-                rms_norm_with_residual(n, r, h, &self.layer_input_norms[li], eps);
+                Self::enter_block(norms.before_attn, n, r, h, eps);
             }
 
             // 2. Batched QKV projection (read weights once for all tokens)
@@ -620,19 +694,12 @@ impl RaiModel {
             let qk_norm = self.qk_norm_for(li);
             if let Some(norm) = qk_norm {
                 for b in 0..batch {
-                    rms_norm_heads(
-                        &mut bs.q_batch[b * q_dim..(b + 1) * q_dim],
-                        nh,
-                        hd,
-                        norm.q,
-                        norm.eps,
-                    );
-                    rms_norm_heads(
+                    norm.apply(&mut bs.q_batch[b * q_dim..(b + 1) * q_dim], norm.q, nh, hd);
+                    norm.apply(
                         &mut bs.k_batch[b * kv_dim..(b + 1) * kv_dim],
+                        norm.k,
                         nkv,
                         hd,
-                        norm.k,
-                        norm.eps,
                     );
                 }
             }
@@ -681,12 +748,12 @@ impl RaiModel {
             );
             add_bias_batch(&mut bs.o_out, biases[3], hs, batch);
 
-            // 4b. Gemma2 sandwich norm on the attention output, per token.
-            let sandwich = self.sandwich_for(li);
+            // 4b. Norm on the attention output, per token: Gemma2's sandwich
+            //     norm, or a post-norm model's only norm for this block.
             norm_block_output_batch(
                 &mut bs.o_out,
                 &mut bs.norm_tmp,
-                sandwich.map(|(attn, _)| attn),
+                norms.after_attn,
                 hs,
                 batch,
                 eps,
@@ -705,7 +772,7 @@ impl RaiModel {
                 let h = &hiddens[b * hs..(b + 1) * hs];
                 let n = &mut bs.normed[b * hs..(b + 1) * hs];
                 let r = &mut bs.residual[b * hs..(b + 1) * hs];
-                rms_norm_with_residual(n, r, h, &self.layer_post_attn_norms[li], eps);
+                Self::enter_block(norms.before_mlp, n, r, h, eps);
             }
 
             // 7. Batched gate + up projections
@@ -757,7 +824,7 @@ impl RaiModel {
             norm_block_output_batch(
                 &mut bs.mlp_out,
                 &mut bs.norm_tmp,
-                sandwich.map(|(_, mlp)| mlp),
+                norms.after_mlp,
                 hs,
                 batch,
                 eps,
