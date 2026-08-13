@@ -1,0 +1,415 @@
+name: Release
+
+# Publishes the downloadable binaries. Until this existed the only way to get
+# RAI was `git clone` + `cargo build`, which is not a product.
+#
+# The one thing this workflow must never inherit is `.cargo/config.toml`'s
+# `target-cpu=native`. A release built that way runs only on CPUs at least as
+# new as whichever runner happened to pick up the job, and fails everywhere
+# else with SIGILL on the first instruction it does not know — after download,
+# after install, with no diagnostic. Every job below sets RUSTFLAGS explicitly;
+# the environment variable overrides the config file. See the RUSTFLAGS comment
+# in the build job for why the floor is x86-64-v2 and not v3.
+#
+# Nothing here publishes to crates.io. That is a separate, human-approved act.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and release (e.g. v0.2.0)"
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  # Portable release floor. NOT target-cpu=native — see the header comment.
+  RUSTFLAGS: "-C target-cpu=x86-64-v2"
+
+jobs:
+  prepare:
+    name: Resolve tag and open draft release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
+
+      - name: Resolve tag and verify it matches the workspace version
+        id: resolve
+        shell: bash
+        env:
+          # Via the environment, never interpolated into the script body:
+          # workflow_dispatch input is attacker-shaped text, and `${{ }}` inside
+          # a run block is textual substitution, not a shell argument.
+          RAW_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          tag="$RAW_TAG"
+
+          # Anything that is not a plain version tag is refused rather than
+          # passed on to gh and the archive names.
+          if ! printf '%s' "$tag" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
+            echo "::error::'$tag' is not a version tag of the form vMAJOR.MINOR.PATCH"
+            exit 1
+          fi
+
+          version="${tag#v}"
+
+          # A tag that disagrees with Cargo.toml ships archives whose names lie
+          # about what is inside them. Catch it before anything is built. Every
+          # crate inherits version.workspace, so disagreement among them is
+          # itself a defect worth failing on.
+          declared=$(cargo metadata --locked --format-version 1 --no-deps \
+            | jq -r '[.packages[].version] | unique | if length == 1 then .[0] else "MIXED" end')
+
+          if [ "$declared" = "MIXED" ]; then
+            echo "::error::workspace crates do not all declare the same version"
+            exit 1
+          fi
+
+          echo "tag=$tag"
+          echo "tag version=$version"
+          echo "workspace version=$declared"
+
+          if [ "$version" != "$declared" ]; then
+            echo "::error::tag $tag implies version $version but the workspace declares $declared"
+            exit 1
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Open the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Assets are uploaded by the per-platform jobs, so the release has to
+          # exist first. It stays a draft until SHA256SUMS is attached: a
+          # published release missing its checksums teaches people to skip
+          # verifying, which is worse than a late release.
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "Release $TAG already exists — reusing it."
+            exit 0
+          fi
+
+          cat > notes.md <<'NOTES'
+          Prebuilt binaries for x86-64 Linux, Windows, and macOS (Intel):
+          `rai-convert`, `rai-generate`, `rai-chat`, and `rai-server`.
+
+          **Verify your download before running it.** Fetch `SHA256SUMS` from
+          this release, put it next to the archive, and run:
+
+          ```
+          sha256sum --ignore-missing -c SHA256SUMS
+          ```
+
+          Built with `-C target-cpu=x86-64-v2`, so these start on any x86-64
+          CPU from roughly 2009 onward. The AVX2/FMA/F16C kernels are selected
+          at runtime on CPUs that report them, and fall back to scalar code
+          where they do not.
+
+          Setup and a sixty-second first run: see `INSTALL.md`.
+          NOTES
+
+          # The heredoc body carries this file's YAML indentation; strip it so
+          # the release page is not one big code block.
+          sed -i 's/^          //' notes.md
+
+          gh release create "$TAG" --repo "$REPO" \
+            --draft \
+            --title "RAI $TAG" \
+            --notes-file notes.md
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            archive: zip
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: tar.gz
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          persist-credentials: false
+
+      - name: Show pinned Rust toolchain and release flags
+        shell: bash
+        run: |
+          rustc --version --verbose
+          cargo --version --verbose
+          echo "RUSTFLAGS=$RUSTFLAGS"
+
+      - name: Cache Cargo registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Confirm the portable baseline actually took effect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # RUSTFLAGS (env) overrides build.rustflags in .cargo/config.toml.
+          # If that precedence ever changes, or someone adds a second flag
+          # source, this build would silently go back to shipping native-only
+          # binaries. Assert instead of trusting.
+          case "$RUSTFLAGS" in
+            *target-cpu=native*)
+              echo "::error::release build is using target-cpu=native — the artifacts would crash on older CPUs"
+              exit 1 ;;
+            *target-cpu=x86-64-v2*) echo "portable baseline confirmed: $RUSTFLAGS" ;;
+            *)
+              echo "::error::RUSTFLAGS does not pin a portable target-cpu: $RUSTFLAGS"
+              exit 1 ;;
+          esac
+
+      # Same command the CI release-build step runs, plus --locked. Only the
+      # two crates that own shipped binaries are built.
+      - name: Build release binaries
+        shell: bash
+        run: |
+          cargo build --locked --release \
+            --package classeve-rai-infer \
+            --package classeve-rai-server
+
+      - name: Stage archive contents
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+
+          stage="dist/rai-${VERSION}-${TARGET}"
+          mkdir -p "$stage"
+
+          ext=""
+          if [ "${RUNNER_OS}" = "Windows" ]; then ext=".exe"; fi
+
+          # Every one of these is a user-facing product binary. A missing one is
+          # a broken release, not a smaller archive — fail loudly.
+          for bin in rai-convert rai-generate rai-chat rai-server; do
+            src="target/release/${bin}${ext}"
+            if [ ! -f "$src" ]; then
+              echo "::error::expected release binary $src was not produced"
+              exit 1
+            fi
+            cp "$src" "$stage/"
+          done
+
+          cp LICENSE NOTICE README.md "$stage/"
+
+          cat > "$stage/RUNNING.txt" <<RUNNING
+          RAI ${VERSION} — ${TARGET}
+
+          WHAT IS IN HERE
+            rai-convert   turn a HuggingFace checkpoint into a .raimodel file
+            rai-generate  generate text from a .raimodel on the CPU
+            rai-chat      serve a local chat UI over HTTP (default 127.0.0.1:8090)
+            rai-server    local REST + MCP memory service
+
+          BEFORE YOU RUN ANYTHING
+            Verify the download against the release's SHA256SUMS:
+              sha256sum --ignore-missing -c SHA256SUMS      (Linux/macOS)
+              CertUtil -hashfile <archive> SHA256           (Windows)
+
+          INSTALL
+            Copy these binaries anywhere on your PATH. There is no installer,
+            no service, and nothing is written outside the paths you name.
+
+          SIXTY-SECOND FIRST RUN
+            1) Convert a checkpoint you already have on disk. No Python is
+               needed; rai-convert writes tokenizer.json beside the model.
+                 rai-convert --model /path/to/TinyLlama-1.1B-Chat-v1.0 \\
+                   --output tinyllama-q4.raimodel
+            2) Generate:
+                 rai-generate --model tinyllama-q4.raimodel \\
+                   --tokenizer tokenizer.json \\
+                   --chat-template zephyr \\
+                   --prompt "Explain photosynthesis in simple terms."
+
+            Instruction-tuned models need their own chat template. Without
+            --chat-template a chat model usually emits end-of-sequence at once
+            and prints nothing. That is not a crash.
+
+          CPU REQUIREMENTS
+            These binaries are built for the x86-64-v2 baseline, so they start
+            on any x86-64 CPU from roughly 2009 onward. The fast kernels need
+            AVX2 + FMA + F16C and are chosen at runtime; without them RAI still
+            runs, on scalar code, slower.
+
+          NO GPU IS REQUIRED, AND NOTHING PHONES HOME
+            rai-chat and rai-server listen on loopback only. rai-server sends
+            data off the machine only if you configure an external embedding
+            provider yourself.
+
+          MORE
+            INSTALL.md, README.md, and https://github.com/Classevelabs/rai
+          RUNNING
+
+          # As above: the heredoc body carries this file's YAML indentation.
+          sed -i.bak 's/^          //' "$stage/RUNNING.txt" && rm -f "$stage/RUNNING.txt.bak"
+
+          ls -l "$stage"
+          cat "$stage/RUNNING.txt"
+
+      - name: Create tar.gz
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          name="rai-${VERSION}-${TARGET}"
+          tar -C dist -czf "dist/${name}.tar.gz" "$name"
+          ls -l "dist/${name}.tar.gz"
+
+      - name: Create zip
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $name = "rai-$env:VERSION-$env:TARGET"
+          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip" -Force
+          Get-Item "dist/$name.zip"
+
+      - name: Upload the archive to the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          ARCHIVE: ${{ matrix.archive }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="dist/rai-${VERSION}-${TARGET}.${ARCHIVE}"
+          test -f "$asset"
+          gh release upload "$TAG" "$asset" --repo "$REPO" --clobber
+
+  checksums:
+    name: Publish SHA256SUMS and release
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download every archive back from the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          # Hashing what the release actually serves — not what a build job
+          # happened to have on disk — is the only version of this check that
+          # can catch a truncated or clobbered upload.
+          #
+          # The release is still a draft at this point. `gh release download`
+          # resolves drafts by listing them, but that is a fallback path inside
+          # gh rather than a documented guarantee, so a failure here drops to
+          # the REST API, which addresses assets by id and has no such
+          # ambiguity. Either way the count is asserted below.
+          if ! gh release download "$TAG" --repo "$REPO" --dir dist \
+                 --pattern 'rai-*.tar.gz' --pattern 'rai-*.zip'; then
+            echo "gh release download did not resolve the draft — falling back to the REST API"
+
+            release_id=$(gh api --paginate "repos/$REPO/releases" \
+              --jq "map(select(.tag_name == \"$TAG\")) | .[0].id")
+            test -n "$release_id"
+
+            gh api --paginate "repos/$REPO/releases/$release_id/assets" \
+              --jq '.[] | select(.name | test("^rai-.*\\.(tar\\.gz|zip)$")) | "\(.id) \(.name)"' \
+              | while read -r asset_id asset_name; do
+                  gh api -H "Accept: application/octet-stream" \
+                    "repos/$REPO/releases/assets/$asset_id" > "dist/$asset_name"
+                done
+          fi
+
+          ls -l dist
+
+          # Three platforms were built; three archives must be hashed. A short
+          # SHA256SUMS is worse than none — it silently blesses two downloads
+          # and leaves the third unverifiable.
+          found=$(find dist -maxdepth 1 -type f \
+            \( -name 'rai-*.tar.gz' -o -name 'rai-*.zip' \) | wc -l)
+          if [ "$found" -ne 3 ]; then
+            echo "::error::expected 3 release archives to hash, found $found"
+            exit 1
+          fi
+
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum rai-*.tar.gz rai-*.zip > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Attach SHA256SUMS and publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" dist/SHA256SUMS --repo "$REPO" --clobber
+          gh release edit "$TAG" --repo "$REPO" --draft=false
+          gh release view "$TAG" --repo "$REPO"
