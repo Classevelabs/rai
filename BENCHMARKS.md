@@ -6,71 +6,148 @@ a named machine on 2026-08-09 with the environment recorded in
 be quoted as evidence. Everything after it is the older, author-reported
 development record, kept for context and explicitly not reproduced.
 
-## Verified run — TinyLlama-1.1B-Chat, 2026-08-09
+## Verified runs, 2026-08-09
 
 **Machine:** Intel Core i5-10300H (4 cores / 8 threads, AVX2 + FMA + F16C),
-15.8 GB RAM, Windows 11. **Build:** `cargo build --release` (`target-cpu=native`,
-fat LTO), rustc 1.95.0, RAI 0.2.0.
-**Model:** `TinyLlama/TinyLlama-1.1B-Chat-v1.0` (22 layers, hidden 2048, 32 heads
-/ 4 KV heads, intermediate 5632, vocab 32,000, untied `lm_head`), exported with
-`export_rtn.py` (round-to-nearest 4-bit linears, group size 128, 8-bit embedding).
+15.8 GB RAM, Windows 11. **Build:** `cargo build --release`
+(`target-cpu=native`, fat LTO), rustc 1.95.0, RAI 0.2.0. Python environment
+pinned in `rai-infer/scripts/requirements-lock.txt`.
 
-### Conversion
+**On measurement noise.** This is a 4-core laptop that was shared with other
+work for much of the session. Absolute throughput swung by up to 40% between
+runs of identical code under load. Every ratio below is an interleaved A/B of
+the same binary in the same minute, which is unaffected; absolute figures state
+the conditions they were taken under. Where a number could not be taken on a
+quiet machine, it says so.
 
-| Metric | Value |
-| --- | --- |
-| Conversion time (whole model) | **47.0 s** |
-| — quantizing 22 layers | 38.2 s |
-| — embedding (8-bit) | 2.9 s |
-| — `lm_head` (4-bit) | 2.5 s |
-| Source checkpoint (fp16 safetensors) | 2,200 MB |
-| Output `.raimodel` | **619.5 MB** (3.55× smaller) |
-| Per-tensor quantization MSE | 6.4e-06 … 6.8e-06 (`q_proj`), 3.3e-06 (`down_proj`), 6.2e-09 (embedding) |
+### Models converted
 
-The calibrated path was exercised on the same checkpoint:
-`export_fast.py --cal-chunks 4 --seq-len 512` took **1,780 s** (328 s
-calibration + 1,436 s quantization) and produced a byte-identical-sized
-619.5 MB / 25-section file. Both exports generate correct text; GPTQ is far
-slower to produce and needs a calibration corpus, which is the trade it makes
-for quality. This run used a deliberately small calibration set to bound the
-time, so it is a working-path demonstration, not a quality claim against RTN.
+| Model | Architecture | Source | `.raimodel` | Sections |
+| --- | --- | --- | --- | --- |
+| TinyLlama-1.1B-Chat | Llama, untied lm_head | 2,200 MB fp16 | **619.5 MB** | 25 |
+| SmolLM2-1.7B-Instruct | Llama, tied | 3,422 MB fp16 | **963.0 MB** | 26 |
+| Zephyr-7B-beta | Mistral, untied lm_head | 14,000 MB fp16 | **3,917.7 MB** | 35 |
 
-### Inference, against HuggingFace on the same machine
+### Conversion: `rai-convert` versus the Python exporter
 
-Greedy decoding (`--temperature 0 --top-k 0 --top-p 1 --repetition-penalty 1`),
-identical prompt, identical generated length (91 tokens).
+`rai-convert` reads `.safetensors` directly and streams tensor by tensor, so
+peak memory does not grow with the model.
 
-| Metric | RAI 0.2.0 (4-bit) | transformers 5.15 fp32 (CPU) |
+| | `export_rtn.py` (torch) | **`rai-convert`** |
 | --- | --- | --- |
-| Decode speed, 91 tokens | **21.8 tok/s** (21.55 / 21.84 / 22.06, n=3) | 4.3 tok/s (3.95 / 4.66, n=2) |
-| Relative speed | **5.1×** | 1× |
-| Peak process RSS | **629 MB** | fp32 weights alone are ~4.4 GB |
-| Model load time | 0.33 s | ~2 s |
+| TinyLlama-1.1B wall time | 188.8 s | **7.6 s** (24.8×) |
+| TinyLlama-1.1B peak RSS | 4,980.9 MB | **22.9 MB** (217×) |
+| Zephyr-7B wall time | cannot run — needs ~29 GB | **82.6 s** |
+| Zephyr-7B peak RSS | — | **26.3 MB** |
 
-Shorter generations run faster because attention cost grows with context:
-40–45-token runs measured 29.4–33.0 tok/s on the same build. Prefill is
-compute-bound rather than bandwidth-bound — a 301-token prompt took 6.33 s
-(47.6 tok/s), which is the time-to-first-token to expect for long prompts on
-four cores.
+Output is **byte-identical** between the two implementations: SHA-256
+`B3B40DB6…2AF091FC` for TinyLlama-1.1B from both. Reaching that required
+matching numpy's tie-break for ±0.0 zero-points in all-zero embedding groups;
+1,714 bytes differed before the fix.
+
+Converting a 7B model on a 16 GB machine is possible only because of the
+streaming design — the Python path loads the whole checkpoint into RAM.
+
+### Inference
+
+Greedy decoding (`--temperature 0 --top-k 0 --top-p 1 --repetition-penalty 1`).
+
+| | TinyLlama-1.1B | Zephyr-7B |
+| --- | --- | --- |
+| Decode, quiet machine | **21.8 tok/s** (n=3: 21.55 / 21.84 / 22.06) | not taken quiet |
+| Decode, 49% background load | 15.5–16.4 tok/s (best of 5) | **2.96 tok/s** (n=3: 2.92 / 2.93 / 2.96) |
+| Peak process RSS | 629 MB | ~4.0 GB |
+| Model load, warm | 0.33 s | — |
+| Model load, cold (first read from disk) | — | 48.3 s |
+
+For comparison on the same machine, HuggingFace `transformers` 5.15 running the
+same TinyLlama checkpoint in fp32 on CPU decoded at **4.3 tok/s** (n=2: 3.95 /
+4.66) over an identical 91-token generation — RAI is **5.1× faster** and uses
+629 MB against roughly 4.4 GB for the fp32 weights alone.
+
+The 7B figure is bandwidth-dominated, which is why its variance is tight even
+under load: 3.9 GB of weights are streamed per token.
+
+### Roofline
+
+Decode streams **549.5 MB per token** for TinyLlama-1.1B — the sum of the
+attention projections (110.3 MB), MLP projections (404.4 MB), and the untied
+4-bit lm_head (34.8 MB). The 69.6 MB embedding table is not streamed: one row
+is read per token. `bw-bench` measured **26.4 GB/s** achievable read bandwidth
+on this machine.
+
+```
+ceiling = 26.4 GB/s / 549.5 MB = 48.0 tok/s
+21.8 tok/s = 45% of ceiling      33.0 tok/s (short runs) = 69%
+```
+
+Decode is bandwidth-bound by construction: 87–97% of a decode step is already
+inside the weight-streaming GEMMs.
+
+### Batched-GEMM rewrite (prefill)
+
+Profiling attributed 88.5% of prefill to `w4a8_matmul`, which drove a batch
+through the single-token kernel once per token and so repeated the per-row f16
+scale decode, the prefetch loop, and the 4-bit unpacking once for every token.
+The sequential per-token attention that looked like the obvious culprit was
+11.1%.
+
+| | Before | After |
+| --- | --- | --- |
+| Prefill, 308-token prompt, end to end | 1.0× | **~1.3×** (6 interleaved pairs: 1.13–1.48×) |
+| `forward_batch` alone, warm | 12,766 / 15,370 ms | **8,222 / 9,297 ms** (1.55–1.65×) |
+| Attention share of prefill | 11.1% | **4.3%** |
+| Decode attention at position 512 | 26.3 ms | **16.8 ms** (1.57×) |
+| Decode throughput | — | unchanged by design (decode never calls the batched path) |
+
+Greedy output is **byte-identical** before and after, and the
+sequential-versus-batched logit difference in `tests/model_invariants.rs` is
+exactly **0**.
+
+### Prompt-lookup speculative decoding
+
+Drafts tokens by copying what followed the most recent occurrence of the
+current suffix n-gram. No draft model, no draft forward pass, no training.
+Measured with `--lookup-k 2`, interleaved against baseline at equal load:
+
+| Workload | Baseline | Prompt-lookup | Ratio | Acceptance | Tokens/step |
+| --- | --- | --- | --- | --- | --- |
+| Repeat a 90-word passage (3 seeds) | 10.9–12.2 tok/s | **13.1–13.7 tok/s** | **1.12–1.20×** | 82–90% | 2.56–2.63 |
+| Original creative writing (2 seeds) | 11.5–12.1 tok/s | 9.0–10.1 tok/s | **0.74–0.88×** | 21–24% | — |
+
+It is a real gain when the output reuses context — summarisation, question
+answering over a document, RAG, code editing — and a real loss otherwise, so it
+ships **off by default**. Before the batched-GEMM rewrite the same benchmark
+measured 0.93×: the technique was blocked by verification cost, not by drafting
+quality.
+
+### Measured and rejected
+
+Recorded so nobody spends time re-deriving them:
+
+- **Self-speculative early exit: 0.4% acceptance, ~15× slower** than plain
+  decoding on TinyLlama-1.1B. No layer count or K wins, because an untrained
+  early exit predicts the full model poorly. Removed from the CLI; the library
+  implementation remains for use with a trained exit head.
+- **Per-call activation allocations in `w4a8_matvec`**: all 177 allocations per
+  token cost 19.2 µs, or **0.06% of a decode step**. Not worth removing.
+- **f16 KV cache**: KV attention is 1.0% of decode at position 128 and 7.7% at
+  512, so halving its bandwidth buys at most 4% for a numerics change.
+- **Unconditional parallel decode attention**: 6× *slower* at position 8, where
+  rayon's splitting costs more than the work. Enabled only above position 256.
 
 ### Output quality
 
-Against the fp32 reference on identical greedy prompts, the 4-bit model
+Against an fp32 reference on identical greedy prompts, the 4-bit model
 reproduced the substantive content: "The capital of France is" → *Paris*;
-"Water boils at a temperature of" → *100°C (212°F)*; `def fibonacci(n):` →
-the same recursive implementation the fp32 model emits (differing only in
-indent width). Continuations diverge after several tokens, which is expected:
-under greedy decoding any single differing logit changes the rest of the text.
+"Water boils at a temperature of" → *100°C (212°F)*; `def fibonacci(n):` → the
+same recursive implementation, differing only in indent width. Zephyr-7B
+explains Rayleigh scattering correctly. Continuations diverge after several
+tokens, which is expected under greedy decoding once any single logit differs.
 No perplexity sweep has been run, so no perplexity claim is made.
 
-### Self-speculative decoding: measured, and not currently useful
-
-Early-exit self-speculation (`--self-spec-layers 11 --self-spec-k 4`) on this
-model achieved a **2.2% draft acceptance rate**, which made generation
-**slower** (5.6 tok/s versus 21.8 tok/s baseline). The first-N-layers draft is
-too weak a predictor of the full model without a trained early-exit head. The
-feature remains available and correct, but it is not a speedup on this model
-and should not be presented as one.
+Per-tensor quantization error for TinyLlama-1.1B: 6.4e-06 … 6.8e-06 for
+`q_proj`, 3.3e-06 for `down_proj`, 6.2e-09 for the 8-bit embedding.
 
 ## Historical record (not reproduced)
 
