@@ -77,6 +77,31 @@ versioning for its pre-1.0 releases.
 
 ### Changed
 
+- **`.cargo/config.toml` now builds the portable `x86-64-v2` baseline instead
+  of `target-cpu=native`, and scopes it to x86-64.** A fresh clone's
+  `cargo build --release` used to produce a binary tuned to the machine that
+  built it, which dies with SIGILL on any older CPU it is copied to — the
+  wrong default for a public repository, where the first thing a stranger does
+  is clone and build. The AVX2/FMA/F16C kernels are selected at runtime, so the
+  portable floor costs nothing measurable. `RUSTFLAGS="-C target-cpu=native"`
+  is still there for a local benchmark. Scoping matters separately: the old
+  setting applied to every target, including aarch64, where an x86 processor
+  name is meaningless.
+- **CI now builds and tests on Apple Silicon (`macos-15`).** The matrix covered
+  `macos-15-intel` only, so the most common Mac was untested. It is also the
+  only runner without AVX2, and therefore the only place the scalar fallback
+  kernels — which every reference test claims equivalence against — actually
+  execute.
+- `rai convert`'s default output name keeps the checkpoint directory's case:
+  `Qwen2.5-0.5B-Instruct` now yields `Qwen2.5-0.5B-Instruct-q4.raimodel`, not
+  `qwen2.5-0.5b-instruct-q4.raimodel`. The lowercasing was invisible on Windows
+  and macOS and a trap on Linux, where the name derived from the source
+  directory then names a file that does not exist. The Python exporters derive
+  the same name through one shared helper, and split on both path separators
+  rather than `/` alone.
+- The container applies its `x86-64-v3` baseline only when the image being
+  built is x86-64. `docker build .` on an Apple Silicon Mac builds linux/arm64,
+  where the flag produced a wall of LLVM warnings and was ignored.
 - Narrowed runtime dependency features and removed the default native
   Oniguruma/C++ features from the tokenizer dependency.
 - Added locked cross-platform CI, RustSec, crate-package, Python syntax, and
@@ -159,6 +184,19 @@ versioning for its pre-1.0 releases.
   language.
 
 ### Fixed
+- **rai-infer compiles warning-clean on aarch64.** `cargo clippy --all-targets
+  -- -D warnings` — the gate CONTRIBUTING.md asks every contributor to run —
+  failed with 20 errors on Apple Silicon and ARM Linux, because the rayon
+  import, the send-safe pointer wrappers, the parallel chunk-sizing constants,
+  and several helpers exist only to serve the AVX2 dispatch path and are dead
+  code without it. They are now behind `cfg(target_arch = "x86_64")`.
+- The `launchers/` shell scripts are shipped executable. `cp` and `tar`
+  preserve the checkout's mode, so a launcher committed without the executable
+  bit reached Linux and macOS users as a file that cannot be double-clicked and
+  answers `./rai-studio.sh` with "Permission denied" — on the two platforms
+  where those scripts are the entire point. The release job now sets the bit
+  and asserts it, `.gitattributes` pins `*.sh`/`*.command` to LF, and
+  `INSTALL.md` says how to restore it.
 - GPTQ calibration no longer dies on `datasets` 5.x: the hardcoded bare
   `wikitext` repo id is rejected by the namespaced-id rule, so calibration is
   now `Salesforce/wikitext` and overridable with `--calibration-dataset` /

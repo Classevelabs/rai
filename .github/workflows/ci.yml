@@ -51,7 +51,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-2025, macos-15-intel]
+        # macos-15 is Apple Silicon (aarch64); macos-15-intel is x86-64. Both
+        # are here on purpose, and the ARM runner earns its minutes twice over:
+        #
+        #  * Apple Silicon is the common Mac now, so "does RAI build on a Mac?"
+        #    was previously being answered only for hardware Apple stopped
+        #    selling. `cargo install` on an M-series machine is a realistic
+        #    first contact with this project.
+        #  * It is the only runner without AVX2, so it is the only place the
+        #    scalar fallback kernels in gemm.rs and layers.rs actually execute.
+        #    On the other three, `has_avx2()` is true and every reference test
+        #    exercises the SIMD path; the scalar path they are supposed to be
+        #    equivalent to was never run by CI at all.
+        os: [ubuntu-24.04, windows-2025, macos-15, macos-15-intel]
 
     steps:
       - name: Checkout

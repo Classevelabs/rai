@@ -58,8 +58,7 @@ def main():
 
     # Auto-derive output name from model
     if args.output is None:
-        model_short = args.model.split('/')[-1].lower().replace(' ', '-')
-        args.output = f"{model_short}-q{args.bits}.raimodel"
+        args.output = raimodel.default_output_name(args.model, args.bits)
         print(f"Output: {args.output}")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"

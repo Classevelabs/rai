@@ -53,6 +53,7 @@ Section encodings:
 """
 
 import math
+import re
 import shutil
 import struct
 from pathlib import Path
@@ -111,6 +112,24 @@ def validate_export_options(parser, args):
     seq_len = getattr(args, "seq_len", None)
     if (cal_chunks is not None and cal_chunks < 1) or (seq_len is not None and seq_len < 1):
         parser.error("--cal-chunks and --seq-len must be greater than zero")
+
+
+def default_output_name(model, bits):
+    """`<last path component or repo name>-q<bits>.raimodel`.
+
+    Mirrors `default_output_name` in rai-infer/src/convert.rs, including its
+    two platform rules:
+
+    * Both separators are split on, because `--model` is equally likely to be a
+      HuggingFace repo id (`Qwen/Qwen2.5-0.5B-Instruct`), a POSIX path, or a
+      Windows path. `str.split('/')` alone left `C:\\models\\Foo` intact and
+      derived an output name containing a drive letter and backslashes.
+    * The case is preserved. Lowercasing is invisible on Windows and macOS and
+      a trap on Linux, where the file the exporter wrote and the name the user
+      types from the checkpoint directory are then two different files.
+    """
+    tail = re.split(r"[\\/]+", str(model).rstrip("\\/"))[-1]
+    return f"{tail.replace(' ', '-')}-q{bits}.raimodel"
 
 
 def validate_model_config(config):

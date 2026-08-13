@@ -144,13 +144,15 @@ embedding from the configured provider and stores/queries state through
 | GPU at runtime | **Not required** |
 | Python | Calibrated (GPTQ) export and draft-model preparation only. `rai convert` does round-to-nearest conversion without it. |
 
-> `.cargo/config.toml` builds with `target-cpu=native` so the kernels use
-> everything your CPU offers. That binary is for the machine that built it: run
-> it on anything older and it dies with SIGILL on startup. Override the flag
-> before you copy one anywhere —
-> `RUSTFLAGS="-C target-cpu=x86-64-v2" cargo build --release --locked` — which
-> is exactly what the release archives are built with, at no measurable cost,
-> because the AVX2 kernels are selected at runtime rather than at compile time.
+> `.cargo/config.toml` pins the x86-64 build to the **x86-64-v2** baseline —
+> the same floor the release archives use — so a binary you build here runs on
+> any x86-64 machine you copy it to. This costs nothing measurable: the AVX2,
+> FMA, and F16C kernels are chosen at runtime, not by the compile-time
+> baseline. aarch64 (Apple Silicon, ARM servers) is left at the toolchain
+> default. To tune a build to the machine in front of you — for a local
+> benchmark, never for a binary you hand to anyone else —
+> `RUSTFLAGS="-C target-cpu=native" cargo build --release --locked`; that
+> binary dies with SIGILL on any older CPU.
 
 ## Build
 

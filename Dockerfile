@@ -7,7 +7,7 @@
 # Docker only builds the stages the chosen target depends on, so asking for the
 # server never compiles the inference CLI and vice versa.
 
-# The optimized image is intentionally amd64/x86-64-v3. Unlike
+# The optimized amd64 image is intentionally x86-64-v3. Unlike
 # target-cpu=native, this does not bake the builder host's exact CPU into the
 # release binary. Override it if the image has to run on older hardware —
 # x86-64-v2 is the portable floor the published release archives use, and it
@@ -15,6 +15,13 @@
 # runtime rather than by the compile-time baseline:
 #
 #   docker build --build-arg RUST_TARGET_CPU=x86-64-v2 .
+#
+# This value is applied only when the image being built is actually x86-64.
+# `docker build .` on an Apple Silicon Mac builds linux/arm64 by default, and
+# handing an aarch64 compiler an x86 processor name got a wall of LLVM
+# "not a recognized processor for this target" warnings and a silently ignored
+# flag. On arm64 the build falls through to .cargo/config.toml, which scopes
+# its own baseline to x86-64 and so leaves aarch64 at the toolchain default.
 ARG RUST_TARGET_CPU=x86-64-v3
 
 FROM rust:1.97.1-slim-bookworm@sha256:96c0af8cf054fd006435089f0076729716784ec9be485bd655de59c55df105ce AS toolchain
@@ -22,15 +29,17 @@ FROM rust:1.97.1-slim-bookworm@sha256:96c0af8cf054fd006435089f0076729716784ec9be
 WORKDIR /src
 COPY . .
 
+# `uname -m` rather than the BuildKit TARGETARCH ARG: this stage runs on the
+# target platform either way, and uname needs no particular builder to be right.
 FROM toolchain AS build-server
 ARG RUST_TARGET_CPU
-ENV RUSTFLAGS="-C target-cpu=${RUST_TARGET_CPU}"
-RUN cargo build --locked --release --package classeve-rai-server
+RUN if [ "$(uname -m)" = "x86_64" ]; then export RUSTFLAGS="-C target-cpu=${RUST_TARGET_CPU}"; fi; \
+    cargo build --locked --release --package classeve-rai-server
 
 FROM toolchain AS build-cli
 ARG RUST_TARGET_CPU
-ENV RUSTFLAGS="-C target-cpu=${RUST_TARGET_CPU}"
-RUN cargo build --locked --release --package classeve-rai-infer
+RUN if [ "$(uname -m)" = "x86_64" ]; then export RUSTFLAGS="-C target-cpu=${RUST_TARGET_CPU}"; fi; \
+    cargo build --locked --release --package classeve-rai-infer
 
 FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241 AS base
 
