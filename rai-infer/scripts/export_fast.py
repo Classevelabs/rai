@@ -36,6 +36,9 @@ def main():
     parser.add_argument('--embed-bits', type=int, default=8)
     parser.add_argument('--embed-group-size', type=int, default=64)
     parser.add_argument('--cal-chunks', type=int, default=16)
+    # datasets >= 5 requires a namespaced repo id: a bare "wikitext" is rejected.
+    parser.add_argument('--calibration-dataset', type=str, default='Salesforce/wikitext')
+    parser.add_argument('--calibration-config', type=str, default='wikitext-2-raw-v1')
     parser.add_argument('--seq-len', type=int, default=2048)
     parser.add_argument('--max-context', type=int, default=2048)
     args = parser.parse_args()
@@ -101,7 +104,7 @@ def main():
     print(f"\n=== STEP 1: CALIBRATION ({args.cal_chunks} chunks) ===")
     sys.stdout.flush()
 
-    ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+    ds = load_dataset(args.calibration_dataset, args.calibration_config, split="train")
     text = "\n\n".join(ds["text"])
     tokens = tokenizer(text, return_tensors="pt")["input_ids"][0]
 
