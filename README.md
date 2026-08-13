@@ -72,19 +72,18 @@ calibrated GPTQ path, are in
 
 ## Which models work
 
-RAI runs one architecture: the plain Llama/Mistral decoder — RMSNorm, rotary
-embeddings from a single theta, grouped-query attention, SwiGLU, no bias
-vectors. Everything else is refused at conversion time, by name, before a file
-is written.
+RAI runs the Llama-family decoder and the capabilities layered on top of it.
+Anything it cannot represent is refused at conversion time, by name, before a
+file is written — never silently mis-converted.
 
 | | |
 | --- | --- |
-| **Works** | TinyLlama-1.1B, SmolLM / SmolLM2 (135M / 360M / 1.7B), Llama-2 7B and 13B, Mistral-7B v0.1–v0.3, and fine-tunes of those (Zephyr-7B, OpenHermes-Mistral, Vicuna) |
-| **Refused** | Qwen2 / 2.5 (attention bias), Qwen3 and OLMo2 (per-head QK norm), Llama-3.1 / 3.2 (RoPE scaling), every Gemma (GeGLU and a different RMSNorm), Mixtral and other MoE (router + expert weights) |
+| **Runs** | **Qwen2 / Qwen2.5**, **Llama-3.1 / 3.2**, **Gemma**, Llama-2, Mistral-7B v0.1–v0.3, TinyLlama, SmolLM / SmolLM2, and fine-tunes of those (Zephyr-7B, OpenHermes-Mistral, Vicuna) |
+| **Refused** | Qwen3 and OLMo2 (per-head QK norm), Gemma2 / Gemma3 (logit softcapping, QK norm), Mixtral and other MoE (router + expert weights), Phi / Falcon / GPT-NeoX (different module tree) |
 
-Check a checkpoint's `config.json` before downloading its weights, and read the
-one-line reason for every family, in **[docs/MODELS.md](./docs/MODELS.md)**.
-That page also costs out what supporting each refused family would take.
+Qwen2.5-0.5B, Llama-3.2-1B and gemma-2b-it were each converted and generated
+coherent text; the reasons behind every row are in
+**[docs/MODELS.md](./docs/MODELS.md)**.
 
 ## Why
 

@@ -50,13 +50,13 @@ nonsense. So the exporter rejects it instead.
 | SmolLM / SmolLM2 | **Supported** | `LlamaForCausalLM` with no bias and no RoPE scaling. |
 | Llama-2 / Mistral fine-tunes (Zephyr, OpenHermes, Vicuna, Nous-Hermes) | **Supported** | Fine-tuning changes weights, not architecture. |
 | Llama-3 / Llama-3 Instruct (8B) | **Accepted by preflight** | The 3.0 configs declare no `rope_scaling`, no bias, and no QK norm. Not measured here. Llama-3-70B needs a raised `--group-size` (see shape constraints). |
-| Qwen2, Qwen2.5 | Not supported | Q/K/V projections carry bias vectors; the format stores weights without biases. |
+| Qwen2, Qwen2.5 | **Supported** | Projection bias vectors are stored as f32 in the layer section (container v2). Qwen2.5-0.5B-Instruct verified generating. |
 | Qwen3 | Not supported | Per-head Q and K RMSNorms; the layer section has two norm vectors, both already used. |
 | Qwen3-MoE, Mixtral, other MoE | Not supported | A router plus per-expert MLPs; the layer section holds one gate/up/down triple. |
-| Llama-3.1, Llama-3.2 | Not supported | `rope_scaling` type `llama3`; the header carries one theta and the table builder has no frequency-scaling stage. |
-| Gemma | Not supported | Scales embeddings by `sqrt(hidden_size)`, and its RMSNorm is `x / rms * (1 + w)`. |
-| Gemma2 | Not supported | The `(1 + w)` RMSNorm plus attention and final logit softcapping. |
-| Gemma3, Gemma3-text | Not supported | The `(1 + w)` RMSNorm plus per-head QK norm. The whole Gemma family also uses GeGLU, not SwiGLU. |
+| Llama-3.1, Llama-3.2 | **Supported** | The `llama3` frequency rescaling is stored in the v2 header and applied when the RoPE table is built, pinned by unit test against the transformers reference to under 2e-7. Llama-3.2-1B-Instruct verified generating. |
+| Gemma | **Supported** | GeGLU is a second activation kernel selected by the v2 header; the `(1 + w)` RMSNorm folds into the stored norm weights at conversion; the `sqrt(hidden_size)` embedding scale is a header field applied at lookup (it cannot be folded — Gemma ties `lm_head` to the embedding, so a pre-scaled table would scale every logit). gemma-2b-it verified generating. |
+| Gemma2 | Not supported | Attention and final logit softcapping — extra operations, not extra parameters. |
+| Gemma3, Gemma3-text | Not supported | Per-head QK norm and interleaved sliding-window attention. |
 | OLMo2 | Not supported | Per-head QK norms. |
 | Phi, Falcon, GPT-NeoX, MPT, GPT-2 | Not supported | No Llama-style module tree. Either `model.model.layers` is absent, or the projections are fused or named differently (Phi-3 fuses QKV into one `qkv_proj` and gate/up into one `gate_up_proj`), so the exporter cannot find the seven tensors it stores. |
 
