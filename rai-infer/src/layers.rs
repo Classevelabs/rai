@@ -1785,6 +1785,94 @@ impl AttentionWork {
 /// Panics if the projections disagree on dimensions or any buffer fails the
 /// GEMM checks (see [`crate::gemm::w4a8_fused_gate_up`] and
 /// [`crate::gemm::w4a8_matvec`]).
+/// One token's routing decision: which experts, and with what weights.
+///
+/// Fixed capacity because `experts_per_token` is a small constant (1..=8 in
+/// every published model) and this is allocated per token per layer.
+#[derive(Debug, Default, Clone)]
+pub struct Routing {
+    pub experts: Vec<usize>,
+    pub weights: Vec<f32>,
+    /// Scratch for the full softmax over experts.
+    probs: Vec<f32>,
+}
+
+/// Choose the experts for one token.
+///
+/// Mirrors the reference routers exactly, and the order matters: softmax runs
+/// over **all** experts first, and the top-k is taken from those probabilities
+/// rather than from the raw logits. Taking the top-k first and normalizing
+/// after gives different weights whenever the unselected mass is not
+/// negligible — a difference that shows up as slightly-wrong output, never as
+/// an error.
+pub fn route_experts(
+    routing: &mut Routing,
+    hidden: &[f32],
+    router: &[f32],
+    num_experts: usize,
+    experts_per_token: usize,
+    norm_topk_prob: bool,
+) {
+    debug_assert_eq!(router.len(), num_experts * hidden.len());
+    let width = hidden.len();
+    routing.probs.clear();
+    routing.probs.reserve(num_experts);
+    for expert in 0..num_experts {
+        let row = &router[expert * width..(expert + 1) * width];
+        routing.probs.push(dot_f32(row, hidden));
+    }
+    // Softmax in f32, shifted by the max: the logits are unbounded and an
+    // un-shifted exp overflows to inf, which would make every weight NaN.
+    let max = routing
+        .probs
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0f32;
+    for value in routing.probs.iter_mut() {
+        *value = (*value - max).exp();
+        sum += *value;
+    }
+    for value in routing.probs.iter_mut() {
+        *value /= sum;
+    }
+
+    routing.experts.clear();
+    routing.weights.clear();
+    // Selection sort over k of n: k is at most 8 and n at most a few hundred,
+    // so this beats sorting the whole vector and keeps ties resolved by lowest
+    // index, matching torch.topk.
+    let mut taken = vec![false; num_experts];
+    for _ in 0..experts_per_token {
+        let mut best = usize::MAX;
+        let mut best_value = f32::NEG_INFINITY;
+        for expert in 0..num_experts {
+            if !taken[expert] && routing.probs[expert] > best_value {
+                best_value = routing.probs[expert];
+                best = expert;
+            }
+        }
+        if best == usize::MAX {
+            break;
+        }
+        taken[best] = true;
+        routing.experts.push(best);
+        routing.weights.push(best_value);
+    }
+    if norm_topk_prob {
+        let total: f32 = routing.weights.iter().sum();
+        if total > 0.0 {
+            for weight in routing.weights.iter_mut() {
+                *weight /= total;
+            }
+        }
+    }
+}
+
+fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
 pub fn swiglu_mlp(
     output: &mut [f32], // [hidden_size]
     input: &[f32],      // [hidden_size]

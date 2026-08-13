@@ -34,7 +34,10 @@
 //! | 96..100 | f32  | `attn_scale` — 0.0 = the default `1/sqrt(head_dim)` |
 //! | 100..104| f32  | `rope_local_theta` — 0.0 = one theta for every layer |
 //! | 104     | u8   | `global_layer_stride` — 0 = unused; else layer *i* uses `rope_theta` when `(i+1) % stride == 0` and `rope_local_theta` otherwise |
-//! | 105..128| —    | reserved, must be zero |
+//! | 105..107| u16  | `num_experts` — 0 = a dense MLP |
+//! | 107     | u8   | `experts_per_token` — how many of them each token uses |
+//! | 108     | u8   | `moe_flags` — bit 0: renormalize the top-k routing weights |
+//! | 109..128| —    | reserved, must be zero |
 //!
 //! Unknown `activation`, `rope_type`, `flags` bits, `bias_mask` bits and any
 //! non-zero reserved byte are hard errors. A reader that cannot implement a
@@ -225,6 +228,21 @@ pub struct ModelConfig {
     /// RoPE base for the layers that are *not* global, when a model uses two.
     /// `0.0` means one base for every layer, which is every model but Gemma3.
     pub rope_local_theta: f32,
+    /// Number of mixture-of-experts experts per layer, or `0` for a dense
+    /// MLP — which is every model but a sparse one.
+    ///
+    /// A dense model is stored as the one-expert case: its single MLP sits in
+    /// the same three slots it always has, and a sparse model appends its
+    /// router and its *remaining* experts after them. That is why adding
+    /// mixture-of-experts changed no byte of any file that does not use it.
+    pub num_experts: u16,
+    /// How many experts each token is routed to. Meaningless when
+    /// `num_experts` is 0.
+    pub experts_per_token: u8,
+    /// Whether the selected experts' routing weights are rescaled to sum to
+    /// one (`norm_topk_prob`). Models differ, and getting it wrong changes
+    /// every routed token's magnitude without failing.
+    pub norm_topk_prob: bool,
     /// Layer *i* uses `rope_theta` when `(i + 1) % global_layer_stride == 0`,
     /// and `rope_local_theta` otherwise. `0` means per-layer RoPE is unused.
     ///
@@ -319,7 +337,11 @@ pub struct SectionEntry {
 }
 
 /// Borrowed view of a quantized linear layer in the validated model buffer.
-#[derive(Debug, Clone)]
+///
+/// `Copy` because it is three shared slices and two integers: passing one by
+/// value is the same cost as a reference, and expert dispatch selects among
+/// them per token.
+#[derive(Debug, Clone, Copy)]
 pub struct QuantizedLinear<'a> {
     pub rows: usize,
     pub cols: usize,
@@ -373,6 +395,137 @@ pub struct LayerRefs<'a> {
     /// [`FLAG_HAS_SANDWICH_NORM`].
     pub attn_out_norm: Option<&'a [u8]>,
     pub mlp_out_norm: Option<&'a [u8]>,
+    /// Mixture-of-experts routing matrix, `num_experts * hidden_size` raw
+    /// little-endian f32 values. `None` for a dense model.
+    pub router: Option<&'a [u8]>,
+    /// Experts 1.. of a sparse layer, each three quantized linears in
+    /// gate/up/down order. Expert 0 is `gate_proj`/`up_proj`/`down_proj`.
+    /// `None` for a dense model.
+    pub extra_experts: Option<&'a [u8]>,
+}
+
+/// One expert's three projections.
+pub struct ExpertMlp<'a> {
+    pub gate: QuantizedLinear<'a>,
+    pub up: QuantizedLinear<'a>,
+    pub down: QuantizedLinear<'a>,
+}
+
+impl<'a> LayerRefs<'a> {
+    /// Borrow expert `index`'s three projections.
+    ///
+    /// Parsed on demand rather than up front: a token uses `experts_per_token`
+    /// of them, which is typically 8 of 64, so eagerly slicing every expert
+    /// would do eight times the work for nothing.
+    pub fn expert(&self, index: usize, config: &ModelConfig) -> Result<ExpertMlp<'a>> {
+        if index == 0 {
+            return Ok(ExpertMlp {
+                gate: self.gate_proj,
+                up: self.up_proj,
+                down: self.down_proj,
+            });
+        }
+        let data = self
+            .extra_experts
+            .context("layer has no experts beyond the first")?;
+        if index >= config.num_experts as usize {
+            bail!(
+                "expert {index} is beyond the layer's {} experts",
+                config.num_experts
+            );
+        }
+        let dims = config.projection_dims();
+        let mut offset = 0usize;
+        let mut linears = Vec::with_capacity(3);
+        for expert in 1..=index {
+            linears.clear();
+            for &(rows, cols) in &dims[4..] {
+                let (linear, next) = read_linear(
+                    data,
+                    offset,
+                    rows,
+                    cols,
+                    config.group_size as usize,
+                    &format!("expert {expert}"),
+                )?;
+                linears.push(linear);
+                offset = next;
+            }
+        }
+        Ok(ExpertMlp {
+            gate: linears[0],
+            up: linears[1],
+            down: linears[2],
+        })
+    }
+}
+
+/// Slice one quantized linear out of `data` at `offset`, returning it and the
+/// offset just past it.
+///
+/// The layout is `[u32 rows][u32 cols][group params][nibbles]`. Both the main
+/// layer loop and the expert parser go through here so the two cannot come to
+/// disagree about a linear's size.
+fn read_linear<'a>(
+    data: &'a [u8],
+    offset: usize,
+    expect_rows: usize,
+    expect_cols: usize,
+    group_size: usize,
+    label: &str,
+) -> Result<(QuantizedLinear<'a>, usize)> {
+    let header_end = checked_add(offset, 8, "linear header end")?;
+    if header_end > data.len() {
+        bail!("{label}: linear header truncated");
+    }
+    let rows = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+    let cols = u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap()) as usize;
+    if (rows, cols) != (expect_rows, expect_cols) {
+        bail!("{label}: linear is [{rows}, {cols}], expected [{expect_rows}, {expect_cols}]");
+    }
+    let num_groups = cols.div_ceil(group_size);
+    let params_size = checked_mul(
+        checked_mul(rows, num_groups, "linear parameter groups")?,
+        4,
+        "linear parameter bytes",
+    )?;
+    let nibble_size = checked_mul(rows, cols, "linear elements")?.div_ceil(2);
+    let params_end = checked_add(header_end, params_size, "linear parameter end")?;
+    let end = checked_add(params_end, nibble_size, "linear data end")?;
+    if end > data.len() {
+        bail!("{label}: linear data truncated");
+    }
+    Ok((
+        QuantizedLinear {
+            rows,
+            cols,
+            group_params: &data[header_end..params_end],
+            nibble_data: &data[params_end..end],
+            group_size,
+        },
+        end,
+    ))
+}
+
+/// The offset just past a linear, without borrowing it.
+fn skip_linear(
+    data: &[u8],
+    offset: usize,
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+    layer_idx: usize,
+    label: &str,
+) -> Result<usize> {
+    let (_, end) = read_linear(
+        data,
+        offset,
+        rows,
+        cols,
+        group_size,
+        &format!("layer {layer_idx}: {label}"),
+    )?;
+    Ok(end)
 }
 
 /// The full model file: header + validated heap-allocated data.
@@ -762,6 +915,40 @@ impl RaiModelFile {
             (None, None)
         };
 
+        // Router block, then the experts after the first: present only when the
+        // header declares experts. The first expert already sits in the three
+        // MLP slots above, which is what keeps a dense file byte-identical.
+        //
+        // The router is f32 rather than quantized. It is `num_experts * hidden`
+        // values against megabytes of expert weights, so the space is noise,
+        // and its output is a *ranking*: quantization error there does not
+        // blur an activation, it routes a token to a different expert.
+        let (router, extra_experts) = if self.config.num_experts > 0 {
+            let experts = self.config.num_experts as usize;
+            let router = take_vector(
+                &mut offset,
+                checked_mul(experts, hidden, "router elements")?,
+                "router",
+            )?;
+            let start = offset;
+            for expert in 1..experts {
+                for (index, &(rows, cols)) in linear_dims[4..].iter().enumerate() {
+                    offset = skip_linear(
+                        data,
+                        offset,
+                        rows,
+                        cols,
+                        self.config.group_size as usize,
+                        layer_idx,
+                        &format!("expert {expert} {}", PROJECTION_NAMES[4 + index]),
+                    )?;
+                }
+            }
+            (Some(router), Some(&data[start..offset]))
+        } else {
+            (None, None)
+        };
+
         // Two RMSNorm weight vectors: hidden_size * 4 bytes each
         let norm_bytes = checked_mul(hidden, 4, "norm bytes")?;
         let both_norms = checked_mul(2, norm_bytes, "layer norm bytes")?;
@@ -783,13 +970,13 @@ impl RaiModelFile {
         };
 
         Ok(LayerRefs {
-            q_proj: linears[0].clone(),
-            k_proj: linears[1].clone(),
-            v_proj: linears[2].clone(),
-            o_proj: linears[3].clone(),
-            gate_proj: linears[4].clone(),
-            up_proj: linears[5].clone(),
-            down_proj: linears[6].clone(),
+            q_proj: linears[0],
+            k_proj: linears[1],
+            v_proj: linears[2],
+            o_proj: linears[3],
+            gate_proj: linears[4],
+            up_proj: linears[5],
+            down_proj: linears[6],
             input_layernorm: input_ln,
             post_attn_layernorm: post_attn_ln,
             biases,
@@ -797,6 +984,8 @@ impl RaiModelFile {
             k_norm,
             attn_out_norm,
             mlp_out_norm,
+            router,
+            extra_experts,
         })
     }
 
@@ -948,6 +1137,9 @@ fn parse_header(data: &[u8]) -> Result<HeaderInfo> {
         post_norm: false,
         rope_local_theta: 0.0,
         global_layer_stride: 0,
+        num_experts: 0,
+        experts_per_token: 0,
+        norm_topk_prob: false,
         attn_logit_softcap: 0.0,
         final_logit_softcap: 0.0,
         attn_scale: 0.0,
@@ -988,8 +1180,8 @@ fn read_v2_capabilities(data: &[u8], config: &mut ModelConfig) -> Result<()> {
     if data[56..64].iter().any(|&byte| byte != 0) {
         bail!("header bytes 56..64 are reserved and must be zero");
     }
-    if data[105..HEADER_SIZE_V2].iter().any(|&byte| byte != 0) {
-        bail!("header bytes 105..128 are reserved and must be zero");
+    if data[109..HEADER_SIZE_V2].iter().any(|&byte| byte != 0) {
+        bail!("header bytes 109..128 are reserved and must be zero");
     }
 
     let activation_code = data[64];
@@ -1104,6 +1296,38 @@ fn read_v2_capabilities(data: &[u8], config: &mut ModelConfig) -> Result<()> {
     config.attn_logit_softcap = read_optional_positive(data, 88, "attn_logit_softcap")?;
     config.final_logit_softcap = read_optional_positive(data, 92, "final_logit_softcap")?;
     config.attn_scale = read_optional_positive(data, 96, "attn_scale")?;
+    config.num_experts = u16::from_le_bytes(data[105..107].try_into().unwrap());
+    config.experts_per_token = data[107];
+    let moe_flags = data[108];
+    if moe_flags & !0x01 != 0 {
+        bail!("moe_flags {moe_flags:#04x} sets bits this reader does not implement");
+    }
+    config.norm_topk_prob = moe_flags & 0x01 != 0;
+    // A router that selects no experts, or more than exist, produces no output
+    // at all rather than a wrong one - but it would do so per token, deep in
+    // the forward pass. Settle it once, here.
+    if config.num_experts == 0 {
+        if config.experts_per_token != 0 || moe_flags != 0 {
+            bail!(
+                "header declares no experts but sets experts_per_token={} and moe_flags={moe_flags:#04x}",
+                config.experts_per_token
+            );
+        }
+    } else {
+        if config.num_experts < 2 {
+            bail!(
+                "header declares {} expert; a dense MLP is stored with num_experts = 0",
+                config.num_experts
+            );
+        }
+        if config.experts_per_token == 0 || config.experts_per_token as u16 > config.num_experts {
+            bail!(
+                "experts_per_token is {} but the layer has {} experts",
+                config.experts_per_token,
+                config.num_experts
+            );
+        }
+    }
     config.rope_local_theta = read_optional_positive(data, 100, "rope_local_theta")?;
     config.global_layer_stride = data[104];
     // The two describe one mechanism. Either alone would leave the reader
@@ -1345,6 +1569,9 @@ mod tests {
             post_norm: false,
             rope_local_theta: 0.0,
             global_layer_stride: 0,
+            num_experts: 0,
+            experts_per_token: 0,
+            norm_topk_prob: false,
             attn_logit_softcap: 0.0,
             final_logit_softcap: 0.0,
             attn_scale: 0.0,
@@ -1876,7 +2103,7 @@ mod tests {
             (
                 "reserved-tail",
                 Box::new(|h: &mut [u8]| h[127] = 1),
-                "bytes 105..128 are reserved",
+                "bytes 109..128 are reserved",
             ),
         ] {
             let error = open_error(label, build_model_bytes(2, 0, patch));
