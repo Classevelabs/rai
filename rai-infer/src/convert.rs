@@ -1634,12 +1634,24 @@ fn projection_block(projection: &str) -> &'static str {
     }
 }
 
+/// `<checkpoint-dir-name>-q4.raimodel`, in the checkpoint's own case.
+///
+/// The case is preserved deliberately. This used to lowercase the directory
+/// name, which is harmless on Windows and macOS — where the filesystem matches
+/// case-insensitively — and a trap on Linux: converting `Qwen2.5-0.5B-Instruct`
+/// wrote `qwen2.5-0.5b-instruct-q4.raimodel`, so the obvious next command,
+/// naming the model after the directory it came from, failed with "no such
+/// file" on exactly the platform where the user could not see why.
+///
+/// `to_string_lossy` is still the fallback for a non-UTF-8 directory name,
+/// which Linux permits: replacement characters in a filename the user can see
+/// and retype beat refusing to convert at all, and `--output` overrides it.
 fn default_output_name(model_dir: &Path) -> Result<String> {
     let name = model_dir
         .canonicalize()
         .unwrap_or_else(|_| model_dir.to_path_buf())
         .file_name()
-        .map(|n| n.to_string_lossy().to_lowercase())
+        .map(|n| n.to_string_lossy().into_owned())
         .filter(|n| !n.is_empty())
         .with_context(|| {
             format!(

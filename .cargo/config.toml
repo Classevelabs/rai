@@ -1,2 +1,38 @@
-[build]
-rustflags = ["-C", "target-cpu=native"]
+# Build flags for anyone who clones this repository.
+#
+# This used to be `[build] rustflags = ["-C", "target-cpu=native"]`, which is
+# the right answer for a machine building for itself and the wrong default for
+# a public repository, for three reasons:
+#
+#   1. `cargo build --release` in a fresh clone produced a binary that runs
+#      only on the CPU that built it. Copy it to an older machine — or to a
+#      colleague, or into a container — and it dies with SIGILL on startup,
+#      with no diagnostic naming the cause.
+#   2. `native` on a host with AVX-512 (Zen 4/5, Sapphire Rapids) let the
+#      compiler auto-vectorize the surrounding code with instruction sets the
+#      kernels have never been tested against. The hand-written kernels are
+#      unaffected — they carry their own `#[target_feature]` — but the scalar
+#      reference paths they are validated against are not.
+#   3. `[build] rustflags` applies to *every* target, so an `x86-64-*` or
+#      host-detected value was also being handed to aarch64 builds, where it
+#      means nothing.
+#
+# The floor below is the same one the release archives are built with, and it
+# is scoped to x86-64 so aarch64 (Apple Silicon, ARM servers) gets the
+# toolchain default rather than an x86 CPU name.
+#
+# It costs essentially nothing. The AVX2/FMA/F16C kernels are selected at
+# *runtime* by `has_avx2()` in rai-infer/src/gemm.rs and compiled with their
+# own `#[target_feature(enable = "avx2,fma,f16c")]`, so the compile-time
+# baseline does not gate them.
+#
+# To build for this machine only — a local benchmark, never something you
+# copy elsewhere — override it for the one command:
+#
+#   RUSTFLAGS="-C target-cpu=native" cargo build --release
+#
+# (RUSTFLAGS in the environment replaces, rather than appends to, what is set
+# here.)
+
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-cpu=x86-64-v2"]

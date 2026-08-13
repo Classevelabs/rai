@@ -10,7 +10,11 @@
 use anyhow::{anyhow, ensure, Result};
 
 use crate::format::QuantizedLinear;
-use crate::gemm::{has_avx2, w4a8_fused_gate_up, w4a8_fused_qkv, w4a8_matvec};
+use crate::gemm::{w4a8_fused_gate_up, w4a8_fused_qkv, w4a8_matvec};
+// Every `has_avx2()` call guards an x86-64 intrinsic block, so on other targets
+// the import is unused and would fail the `-D warnings` gate contributors run.
+#[cfg(target_arch = "x86_64")]
+use crate::gemm::has_avx2;
 use crate::kv_cache::KVCache;
 use rayon::prelude::*;
 

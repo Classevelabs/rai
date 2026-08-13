@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RAI Studio</title>
+<style>
+:root{
+  --bg:#17120F; --panel:#1E1815; --panel-2:#251E1A; --panel-3:#2E2521; --sunk:#141010;
+  --line:#2E2621; --line-2:#3B302A;
+  --fg:#EDE6E1; --fg-2:#A8998F; --fg-3:#6E625A;
+  --accent:#E2542A; --accent-hi:#F26B3E; --accent-dim:#8A3A1C; --wash:#2A1A13;
+  --ok:#5AA37E; --warn:#C9922F; --bad:#C2503C;
+  --mono:ui-monospace,"SF Mono","Cascadia Mono","Segoe UI Mono",Menlo,Consolas,monospace;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  --r1:6px; --r2:9px; --r3:13px;
+  --s2:8px; --s3:12px; --s4:16px; --s5:24px; --s6:32px; --s7:44px;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);font-size:14px;
+  line-height:1.55;-webkit-font-smoothing:antialiased;display:flex;flex-direction:column;overflow:hidden}
+.lbl{font-family:var(--mono);font-size:10px;letter-spacing:.15em;text-transform:uppercase;color:var(--fg-3)}
+.val{font-family:var(--mono);font-variant-numeric:tabular-nums}
+h1{margin:0;font-family:var(--mono);font-size:21px;font-weight:700;letter-spacing:-.02em}
+/* chrome */
+.top{height:46px;flex:0 0 46px;display:flex;align-items:center;gap:var(--s4);padding:0 var(--s4);
+  border-bottom:1px solid var(--line);background:var(--panel)}
+.brand{display:flex;align-items:center;gap:10px;font-family:var(--mono);font-size:13px;font-weight:700;
+  letter-spacing:.22em;text-transform:uppercase}
+.brand .dot{width:9px;height:9px;background:var(--accent);border-radius:2px;transform:rotate(45deg)}
+.crumb{font-family:var(--mono);font-size:10px;letter-spacing:.15em;text-transform:uppercase;color:var(--fg-3)}
+.crumb b{color:var(--fg-2);font-weight:400}
+.top .right{margin-left:auto;display:flex;align-items:center;gap:var(--s4)}
+.pill{display:flex;align-items:center;gap:7px;padding:5px 11px;border:1px solid var(--line-2);
+  border-radius:100px;font-family:var(--mono);font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--fg-2)}
+.pill i{width:6px;height:6px;border-radius:50%;background:var(--fg-3);display:block;flex:0 0 6px}
+.pill.on i{background:var(--ok)}
+.pill.busy i{background:var(--accent)}
+.shell{flex:1;display:flex;min-height:0}
+.rail{width:58px;flex:0 0 58px;border-right:1px solid var(--line);background:var(--panel);
+  display:flex;flex-direction:column;align-items:center;padding:var(--s3) 0;gap:4px}
+.rail button{width:40px;height:40px;display:grid;place-items:center;background:none;border:0;
+  color:var(--fg-3);cursor:pointer;border-radius:var(--r2);position:relative}
+.rail button:hover{color:var(--fg-2);background:var(--panel-2)}
+.rail button[aria-current=true]{color:var(--accent);background:var(--wash)}
+.rail button[aria-current=true]::before{content:"";position:absolute;left:-13px;top:11px;bottom:11px;
+  width:2px;background:var(--accent);border-radius:2px}
+.rail svg{width:19px;height:19px;stroke:currentColor;fill:none;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
+main{flex:1;overflow-y:auto;min-width:0}
+.screen{display:none;padding:var(--s6) var(--s7) var(--s7);max-width:1240px}
+.screen.on{display:block}
+.head{display:flex;align-items:flex-end;gap:var(--s4);margin-bottom:var(--s5);flex-wrap:wrap}
+.head p{margin:6px 0 0;color:var(--fg-2);font-size:13.5px;max-width:64ch}
+.head .grow{flex:1}
+/* metric strip */
+.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(172px,1fr));gap:var(--s3);margin-bottom:var(--s6)}
+.metric{background:var(--panel);border:1px solid var(--line);border-radius:var(--r3);padding:var(--s4) var(--s5)}
+.metric .lbl{display:block;margin-bottom:9px}
+.metric .n{font-family:var(--mono);font-size:27px;font-weight:700;letter-spacing:-.03em;line-height:1;
+  font-variant-numeric:tabular-nums}
+.metric .n.acc{color:var(--accent)}
+.metric .n small{font-size:14px;color:var(--fg-3);font-weight:400}
+.metric .sub{color:var(--fg-3);font-size:12px;margin-top:7px}
+/* sections */
+.sec{margin-bottom:var(--s6)}
+.sec>header{display:flex;align-items:center;gap:var(--s3);padding-bottom:10px;
+  border-bottom:1px solid var(--line);margin-bottom:var(--s4)}
+.sec>header .lbl{color:var(--fg-2)}
+.sec>header .count{margin-left:auto;font-family:var(--mono);font-size:10px;letter-spacing:.14em;color:var(--fg-3)}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r3);padding:var(--s5)}
+/* buttons */
+.btn{font-family:var(--mono);font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;font-weight:600;
+  padding:11px 18px;border:1px solid transparent;border-radius:var(--r1);background:var(--accent);color:#fff;
+  cursor:pointer;display:inline-flex;align-items:center;gap:9px;transition:background .12s}
+.btn:hover:not(:disabled){background:var(--accent-hi)}
+.btn:disabled{background:var(--panel-3);color:var(--fg-3);cursor:not-allowed}
+.btn.ghost{background:none;border-color:var(--line-2);color:var(--fg-2)}
+.btn.ghost:hover:not(:disabled){background:var(--panel-2);color:var(--fg);border-color:var(--fg-3)}
+.btn.sm{padding:7px 13px;font-size:10px}
+.btn svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+/* inputs */
+.field{display:flex;flex-direction:column;gap:7px;min-width:0}
+input,select,textarea{background:var(--sunk);border:1px solid var(--line-2);border-radius:var(--r1);
+  color:var(--fg);font-family:var(--mono);font-size:13px;padding:11px 13px;width:100%}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--wash)}
+.row{display:flex;gap:var(--s3);align-items:flex-end;flex-wrap:wrap}
+.row>*{flex:1;min-width:130px}
+.row>.fixed{flex:0 0 auto;min-width:0}
+.seg{display:inline-flex;border:1px solid var(--line-2);border-radius:var(--r1);overflow:hidden}
+.seg button{font-family:var(--mono);font-size:10px;letter-spacing:.13em;text-transform:uppercase;
+  padding:9px 15px;background:none;border:0;color:var(--fg-3);cursor:pointer}
+.seg button[aria-pressed=true]{background:var(--wash);color:var(--accent)}
+.seg button+button{border-left:1px solid var(--line-2)}
+/* model rows */
+.mrow{display:grid;grid-template-columns:1fr auto auto;gap:var(--s4);align-items:center;
+  padding:var(--s4);border:1px solid var(--line);border-radius:var(--r2);background:var(--panel);margin-bottom:var(--s2)}
+.mrow:hover{background:var(--panel-2);border-color:var(--line-2)}
+.mrow.active{border-color:var(--accent-dim);background:var(--wash)}
+.nm{font-family:var(--mono);font-size:13.5px;font-weight:600;display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.spec{font-family:var(--mono);font-size:11px;color:var(--fg-3);margin-top:5px;font-variant-numeric:tabular-nums}
+.sz{font-family:var(--mono);font-size:13px;color:var(--fg-2);font-variant-numeric:tabular-nums;white-space:nowrap}
+.tag{font-family:var(--mono);font-size:9px;letter-spacing:.12em;text-transform:uppercase;padding:3px 8px;
+  border:1px solid var(--line-2);border-radius:100px;color:var(--fg-3)}
+.tag.v2{border-color:var(--accent-dim);color:var(--accent)}
+.tag.ok{border-color:#2F5442;color:var(--ok)}
+/* stages + progress */
+.stage{display:grid;grid-template-columns:24px 1fr auto;gap:var(--s4);align-items:center;
+  padding:11px var(--s3);border-bottom:1px solid var(--line)}
+.stage:last-child{border-bottom:0}
+.stage .n{font-family:var(--mono);font-size:10px;color:var(--fg-3)}
+.stage .t{font-family:var(--mono);font-size:11.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--fg-3)}
+.stage .s{font-family:var(--mono);font-size:10px;letter-spacing:.13em;text-transform:uppercase;color:var(--fg-3)}
+.stage[data-state=active] .t{color:var(--fg)} .stage[data-state=active] .s{color:var(--accent)}
+.stage[data-state=done] .t{color:var(--fg-2)} .stage[data-state=done] .s{color:var(--ok)}
+.bar{height:4px;background:var(--panel-3);border-radius:100px;overflow:hidden}
+.bar span{display:block;height:100%;background:var(--accent);width:0;border-radius:100px;transition:width .3s}
+.log{background:var(--sunk);border:1px solid var(--line);border-radius:var(--r2);padding:var(--s3) var(--s4);
+  font-family:var(--mono);font-size:11.5px;line-height:1.8;color:var(--fg-3);height:186px;overflow-y:auto;white-space:pre-wrap}
+.log .hl{color:var(--accent)} .log .dim{color:var(--fg-3)} .log .err{color:var(--bad)}
+/* chat */
+.chatwrap{display:flex;flex-direction:column;height:calc(100vh - 46px)}
+.chatbar{padding:var(--s4) var(--s7) 0;display:flex;gap:var(--s3);align-items:flex-end;flex-wrap:wrap}
+.thread{flex:1;overflow-y:auto;padding:var(--s5) var(--s7)}
+.msg{max-width:76ch;margin-bottom:var(--s5)}
+.msg .who{font-family:var(--mono);font-size:9.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--fg-3);margin-bottom:7px}
+.msg.me{margin-left:auto} .msg.me .who{text-align:right}
+.msg.me .bub{background:var(--panel-2);border:1px solid var(--line);border-radius:var(--r3);
+  padding:10px 15px;display:inline-block}
+.msg.ai .bub{white-space:pre-wrap}
+.composer{border-top:1px solid var(--line);background:var(--panel);padding:var(--s4) var(--s7)}
+.composer .box{display:flex;gap:var(--s3);align-items:flex-end}
+.composer textarea{resize:none;height:46px;font-family:var(--sans);font-size:14px;border-radius:var(--r2)}
+.strip{display:flex;gap:var(--s5);margin-top:11px;font-family:var(--mono);font-size:10px;
+  letter-spacing:.12em;text-transform:uppercase;color:var(--fg-3);flex-wrap:wrap}
+.strip b{color:var(--accent);font-weight:600;font-variant-numeric:tabular-nums}
+.empty{text-align:center;padding:var(--s7) var(--s4);color:var(--fg-3);
+  border:1px dashed var(--line-2);border-radius:var(--r3)}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--panel-2);
+  border:1px solid var(--line-2);border-radius:var(--r2);padding:11px 18px;font-family:var(--mono);
+  font-size:11px;letter-spacing:.08em;color:var(--fg);box-shadow:0 8px 26px #0009;z-index:9;max-width:80vw}
+.toast.bad{border-color:var(--bad);color:#F2C0B6}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-track{background:var(--bg)}
+::-webkit-scrollbar-thumb{background:var(--line-2);border-radius:100px}
+@media(max-width:900px){.screen{padding:var(--s5) var(--s4)}.thread,.composer,.chatbar{padding-left:var(--s4);padding-right:var(--s4)}}
+</style></head><body>
+
+<div class="top">
+  <div class="brand"><span class="dot"></span>RAI</div>
+  <div class="crumb">STUDIO · <b id="crumb">LIBRARY</b></div>
+  <div class="right">
+    <div class="pill" id="engine"><i></i><span id="engineTxt">No model loaded</span></div>
+  </div>
+</div>
+
+<div class="shell">
+  <nav class="rail">
+    <button data-go="library" aria-current="true" title="Library">
+      <svg viewBox="0 0 24 24"><path d="M3 7l9-4 9 4-9 4-9-4z"/><path d="M3 12l9 4 9-4"/><path d="M3 17l9 4 9-4"/></svg></button>
+    <button data-go="convert" title="Convert">
+      <svg viewBox="0 0 24 24"><path d="M12 3v11"/><path d="M8 10l4 4 4-4"/><path d="M4 17v3h16v-3"/></svg></button>
+    <button data-go="run" title="Run">
+      <svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M8 10l3 2-3 2"/><path d="M13 14h4"/></svg></button>
+  </nav>
+
+  <main>
+    <!-- LIBRARY -->
+    <section class="screen on" id="s-library">
+      <div class="head">
+        <div><h1>Model library</h1><p>Models on this machine. Everything here runs on the CPU — no GPU, no Python.</p></div>
+        <div class="grow"></div>
+        <button class="btn" data-go="convert"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>Convert a model</button>
+      </div>
+      <div class="metrics" id="libMetrics"></div>
+      <div class="sec">
+        <header><span class="lbl">Folder</span>
+          <span class="count" id="libCount">—</span></header>
+        <div class="row" style="margin-bottom:var(--s4)">
+          <div class="field"><input type="text" id="libDir" placeholder="Folder to scan (blank = current)" spellcheck="false"></div>
+          <div class="fixed"><button class="btn ghost" id="libScan">Scan</button></div>
+        </div>
+        <div id="modelList"><div class="empty">Loading…</div></div>
+      </div>
+    </section>
+
+    <!-- CONVERT -->
+    <section class="screen" id="s-convert">
+      <div class="head"><div><h1>Convert a model</h1>
+        <p>Point RAI at a checkpoint folder. Compatibility is checked before anything is written.</p></div></div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(370px,1fr));gap:var(--s5);align-items:start">
+        <div>
+          <div class="sec">
+            <header><span class="lbl">Source</span></header>
+            <div class="row">
+              <div class="field"><span class="lbl">Checkpoint folder</span>
+                <input type="text" id="src" placeholder="/path/to/Qwen2.5-0.5B-Instruct" spellcheck="false"></div>
+              <div class="fixed"><button class="btn ghost" id="inspectBtn">Check</button></div>
+            </div>
+          </div>
+          <div class="sec" id="inspectSec" style="display:none">
+            <header><span class="lbl">Compatibility</span><span class="count" id="inspectVerdict"></span></header>
+            <div class="card" id="inspectCard"></div>
+          </div>
+          <div class="sec">
+            <header><span class="lbl">Quantization</span></header>
+            <div class="row">
+              <div class="field"><span class="lbl">Group</span><select id="gs"><option>128</option><option>64</option><option>224</option></select></div>
+              <div class="field"><span class="lbl">Embed group</span><select id="egs"><option>64</option><option>128</option></select></div>
+              <div class="field"><span class="lbl">Context</span><select id="ctx"><option>2048</option><option>4096</option><option>8192</option></select></div>
+            </div>
+            <div class="field" style="margin-top:var(--s3)"><span class="lbl">Output file</span>
+              <input type="text" id="out" placeholder="model-q4.raimodel" spellcheck="false"></div>
+          </div>
+          <button class="btn" id="convertBtn" style="width:100%;justify-content:center" disabled>
+            <svg viewBox="0 0 24 24"><path d="M12 3v11"/><path d="M8 10l4 4 4-4"/><path d="M4 17v3h16v-3"/></svg>Convert</button>
+        </div>
+        <div>
+          <div class="sec">
+            <header><span class="lbl">Progress</span><span class="count" id="pctTxt">IDLE</span></header>
+            <div class="bar" style="margin-bottom:var(--s4)"><span id="bar"></span></div>
+            <div class="card" style="padding:0" id="stages"></div>
+          </div>
+          <div class="sec"><header><span class="lbl">Log</span></header>
+            <div class="log" id="log">Ready. Choose a checkpoint folder and press Check.</div></div>
+          <div class="sec" id="resultSec" style="display:none">
+            <header><span class="lbl">Result</span><span class="count">COMPLETE</span></header>
+            <div class="metrics" style="margin:0">
+              <div class="metric"><span class="lbl">Size</span><div class="n acc" id="rSize">—</div><div class="sub" id="rSections"></div></div>
+              <div class="metric"><span class="lbl">Time</span><div class="n" id="rTime">—</div><div class="sub">wall clock</div></div>
+              <div class="metric"><span class="lbl">Process peak</span><div class="n" id="rRam">—</div><div class="sub">whole server, not the conversion alone</div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- RUN -->
+    <section class="screen" id="s-run" style="padding:0;max-width:none">
+      <div class="chatwrap">
+        <div class="chatbar">
+          <div class="field" style="min-width:210px"><span class="lbl">Model</span><select id="runModel"></select></div>
+          <div class="field" style="max-width:150px"><span class="lbl">Template</span>
+            <select id="tpl"><option>auto</option><option>chatml</option><option>zephyr</option><option>llama3</option><option>mistral</option><option>few-shot</option><option>none</option></select></div>
+          <div class="field" style="max-width:104px"><span class="lbl">Temp</span><input type="number" id="temp" value="0.7" step="0.1" min="0.01" max="2"></div>
+          <div class="field" style="max-width:120px"><span class="lbl">Max tokens</span><input type="number" id="maxTok" value="256" min="1" max="512"></div>
+        </div>
+        <div class="thread" id="thread"></div>
+        <div class="composer">
+          <div class="box"><textarea id="prompt" placeholder="Send a message…"></textarea>
+            <button class="btn" id="sendBtn" style="height:46px">Send</button></div>
+          <div class="strip">
+            <span>Speed <b id="sTps">—</b></span><span>Tokens <b id="sTok">—</b></span>
+            <span>Prefill <b id="sPre">—</b></span><span>Context <b id="sCtx">—</b></span>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+<script>
+const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
+const esc=s=>String(s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+const human=b=>b>=1073741824?(b/1073741824).toFixed(2)+" GB":b>=1048576?(b/1048576).toFixed(1)+" MB":(b/1024).toFixed(0)+" KB";
+let INFO=null, MODELS=[], JOB=null, BUSY=false;
+
+function toast(msg,bad){const t=document.createElement("div");t.className="toast"+(bad?" bad":"");
+  t.textContent=msg;document.body.appendChild(t);setTimeout(()=>t.remove(),bad?6000:3000)}
+async function api(path,opts){
+  const r=await fetch(path,opts);
+  const text=await r.text();
+  let data=null; try{data=text?JSON.parse(text):null}catch(e){}
+  if(!r.ok)throw new Error((data&&data.error)||text||("HTTP "+r.status));
+  return data;
+}
+function go(id){$$(".screen").forEach(s=>s.classList.toggle("on",s.id==="s-"+id));
+  $$(".rail button[data-go]").forEach(b=>b.setAttribute("aria-current",String(b.dataset.go===id)));
+  $("#crumb").textContent=id.toUpperCase();
+  if(id==="library")loadModels();}
+$$("[data-go]").forEach(b=>b.addEventListener("click",()=>go(b.dataset.go)));
+
+/* ---------- engine state ---------- */
+function paintEngine(){
+  const p=$("#engine"),t=$("#engineTxt");
+  p.className="pill"+(BUSY?" busy":INFO&&INFO.loaded?" on":"");
+  t.textContent=BUSY?"Converting…":INFO&&INFO.loaded?(INFO.model_name||"Model loaded"):"No model loaded";
+}
+async function refreshInfo(){
+  try{INFO=await api("/api/info")}catch(e){INFO=null}
+  paintEngine();
+  if(INFO&&INFO.loaded){
+    $("#sCtx").textContent="0 / "+INFO.max_context;
+    if(INFO.chat_template)$("#tpl").value=String(INFO.chat_template).toLowerCase().replace(/\s+/g,"");
+  }
+}
+
+/* ---------- library ---------- */
+function caps(h){
+  if(!h)return[];
+  const out=[];
+  out.push({t:"FORMAT V"+h.format_version,c:h.format_version===2?"v2":""});
+  if(h.has_biases)out.push({t:"BIAS",c:""});
+  if(h.activation&&h.activation!=="silu")out.push({t:String(h.activation).toUpperCase(),c:""});
+  if(h.rope_type&&h.rope_type!=="none")out.push({t:String(h.rope_type).toUpperCase(),c:""});
+  if(h.tied_lm_head)out.push({t:"TIED",c:""});
+  return out;
+}
+async function loadModels(){
+  const dir=$("#libDir").value.trim();
+  const list=$("#modelList");
+  list.innerHTML='<div class="empty">Scanning…</div>';
+  let d;
+  try{d=await api("/api/models"+(dir?"?dir="+encodeURIComponent(dir):""))}
+  catch(e){list.innerHTML='<div class="empty">'+esc(e.message)+"</div>";return}
+  MODELS=(d.models||[]).filter(m=>m.readable);
+  const bad=(d.models||[]).filter(m=>!m.readable);
+  $("#libCount").textContent=String(d.count||0).padStart(2,"0")+" MODELS";
+  const total=MODELS.reduce((a,m)=>a+(m.size_bytes||0),0);
+  const v2=MODELS.filter(m=>m.header&&m.header.format_version===2).length;
+  $("#libMetrics").innerHTML=`
+    <div class="metric"><span class="lbl">Models</span><div class="n">${MODELS.length}</div><div class="sub">ready to run</div></div>
+    <div class="metric"><span class="lbl">On disk</span><div class="n">${human(total)}</div><div class="sub">4-bit weights</div></div>
+    <div class="metric"><span class="lbl">Format v2</span><div class="n acc">${v2}</div><div class="sub">Qwen · Gemma · Llama-3</div></div>
+    <div class="metric"><span class="lbl">Loaded</span><div class="n">${INFO&&INFO.loaded?"1":"0"}</div><div class="sub">${INFO&&INFO.loaded?esc(INFO.model_name||""):"none"}</div></div>`;
+  if(!MODELS.length&&!bad.length){
+    list.innerHTML='<div class="empty">No .raimodel files here.<br><br>'
+      +'<button class="btn" data-go="convert">Convert your first model</button></div>';
+    $$("[data-go]").forEach(b=>b.addEventListener("click",()=>go(b.dataset.go)));return;
+  }
+  list.innerHTML=MODELS.map(m=>{
+    const h=m.header||{};
+    return `<div class="mrow${m.loaded?" active":""}">
+      <div><div class="nm">${esc(m.name)}${caps(h).map(c=>`<span class="tag ${c.c}">${c.t}</span>`).join("")}
+        ${m.tokenizer_present?"":'<span class="tag" style="border-color:#5A3A2A;color:var(--warn)">NO TOKENIZER</span>'}</div>
+        <div class="spec">hidden ${h.hidden_size} · ${h.num_layers} layers · ${h.num_heads}/${h.num_kv_heads} heads · vocab ${(h.vocab_size||0).toLocaleString()}</div></div>
+      <span class="sz">${m.size_human||human(m.size_bytes)}</span>
+      <span><button class="btn sm${m.loaded?" ghost":""}" data-load="${esc(m.path)}">${m.loaded?"Loaded":"Load"}</button></span>
+    </div>`}).join("")
+    +bad.map(m=>`<div class="mrow"><div><div class="nm">${esc(m.name)}
+      <span class="tag" style="border-color:#5A2A2A;color:var(--bad)">UNREADABLE</span></div>
+      <div class="spec">${esc(m.error||"")}</div></div><span class="sz">${m.size_human||""}</span><span></span></div>`).join("");
+  $$("[data-load]").forEach(b=>b.addEventListener("click",()=>loadModel(b.dataset.load)));
+  $("#runModel").innerHTML=MODELS.map(m=>`<option value="${esc(m.path)}"${m.loaded?" selected":""}>${esc(m.name)}</option>`).join("");
+}
+async function loadModel(path){
+  toast("Loading model…");
+  try{INFO=await api("/api/load",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({path})});
+    paintEngine();toast("Loaded "+(INFO.model_name||""));loadModels();go("run");
+  }catch(e){toast(e.message,true)}
+}
+$("#libScan").addEventListener("click",loadModels);
+$("#libDir").addEventListener("keydown",e=>{if(e.key==="Enter")loadModels()});
+
+/* ---------- convert ---------- */
+const STAGES=[["planning","Read config"],["embedding","Embedding"],["layers","Quantize layers"],
+  ["final-norm","Final norm"],["lm_head","LM head"],["tokenizer","Tokenizer"]];
+function paintStages(cur,pct){
+  const i=STAGES.findIndex(s=>s[0]===cur);
+  $("#stages").innerHTML=STAGES.map((s,k)=>{
+    const st=cur==="done"||(i>=0&&k<i)?"done":k===i?"active":"idle";
+    return `<div class="stage" data-state="${st}"><span class="n">${String(k).padStart(2,"0")}</span>
+      <span class="t">${s[1]}</span><span class="s">${st==="done"?"OK":st==="active"?"RUNNING":"—"}</span></div>`}).join("");
+}
+paintStages(null,0);
+function logAppend(lines){
+  const l=$("#log");
+  for(const ln of lines){
+    const cls=/error|cannot|refus/i.test(ln)?"err":/DONE|===/i.test(ln)?"hl":"dim";
+    l.innerHTML+=`\n<span class="${cls}">${esc(ln)}</span>`;
+  }
+  l.scrollTop=l.scrollHeight;
+}
+$("#inspectBtn").addEventListener("click",async()=>{
+  const source=$("#src").value.trim();if(!source)return toast("Enter a checkpoint folder",true);
+  $("#inspectSec").style.display="";$("#inspectCard").innerHTML="Checking…";
+  $("#inspectVerdict").textContent="";
+  try{
+    const r=await api("/api/inspect",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({source,group_size:+$("#gs").value,embed_group_size:+$("#egs").value,max_context:+$("#ctx").value})});
+    const s=r.shape||{},c=r.container;
+    $("#inspectVerdict").innerHTML=r.supported
+      ?'<span style="color:var(--ok)">SUPPORTED</span>':'<span style="color:var(--bad)">NOT SUPPORTED</span>';
+    $("#inspectCard").innerHTML=`
+      <div style="display:flex;gap:var(--s6);flex-wrap:wrap;margin-bottom:var(--s4)">
+        <div><span class="lbl">Architecture</span><div class="val" style="font-size:15px;margin-top:5px">${esc(r.model_type||"unknown")}</div></div>
+        <div><span class="lbl">Parameters</span><div class="val" style="font-size:15px;margin-top:5px">${esc(s.parameters_human||"—")}</div></div>
+        <div><span class="lbl">Layers</span><div class="val" style="font-size:15px;margin-top:5px">${s.num_layers??"—"}</div></div>
+        ${c?`<div><span class="lbl">Output</span><div class="val" style="font-size:15px;margin-top:5px;color:var(--accent)">${esc(c.output_human||"")}</div></div>`:""}
+      </div>
+      <div style="color:${r.supported?"var(--fg-2)":"var(--bad)"};font-size:13px;white-space:pre-wrap">${esc(r.reason||"")}</div>
+      ${r.weights_checked===false?'<div class="lbl" style="margin-top:12px;text-transform:none;letter-spacing:.02em;font-size:11.5px">Config only — weight-level rules are checked when you convert.</div>':""}`;
+    $("#convertBtn").disabled=!r.supported;
+    if(r.supported&&!$("#out").value.trim()){
+      const base=source.replace(/[\\/]+$/,"").split(/[\\/]/).pop().toLowerCase();
+      $("#out").value=base+"-q4.raimodel";
+    }
+  }catch(e){
+    $("#inspectVerdict").innerHTML='<span style="color:var(--warn)">UNAVAILABLE</span>';
+    $("#inspectCard").innerHTML=`<div style="color:var(--fg-2);white-space:pre-wrap">${esc(e.message)}</div>`;
+    $("#convertBtn").disabled=true;
+  }
+});
+$("#convertBtn").addEventListener("click",async()=>{
+  const source=$("#src").value.trim(),output=$("#out").value.trim();
+  if(!output)return toast("Enter an output file name",true);
+  $("#convertBtn").disabled=true;$("#resultSec").style.display="none";
+  $("#log").textContent="Starting…";BUSY=true;paintEngine();
+  try{
+    const j=await api("/api/convert",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({source,output,group_size:+$("#gs").value,embed_group_size:+$("#egs").value,max_context:+$("#ctx").value})});
+    JOB={id:j.job_id,cursor:0};pollJob();
+  }catch(e){BUSY=false;paintEngine();$("#convertBtn").disabled=false;toast(e.message,true);
+    logAppend([e.message]);}
+});
+async function pollJob(){
+  if(!JOB)return;
+  let s;
+  try{s=await api(`/api/convert/${JOB.id}?since=${JOB.cursor}`)}
+  catch(e){JOB=null;BUSY=false;paintEngine();$("#convertBtn").disabled=false;return toast(e.message,true)}
+  if(s.log&&s.log.length){logAppend(s.log);JOB.cursor=s.log_next??JOB.cursor}
+  $("#bar").style.width=(s.percent||0)+"%";
+  $("#pctTxt").textContent=s.state==="running"
+    ?Math.round(s.percent||0)+"%"+(s.layer?` · LAYER ${s.layer.index}/${s.layer.total}`:"")
+    :s.state.toUpperCase();
+  paintStages(s.stage,s.percent);
+  if(s.state==="running"){setTimeout(pollJob,700);return}
+  BUSY=false;paintEngine();$("#convertBtn").disabled=false;JOB=null;
+  if(s.state==="error"){toast("Conversion failed",true);return}
+  const r=s.result||{};
+  $("#resultSec").style.display="";
+  $("#rSize").textContent=human(r.size_bytes||0);
+  $("#rSections").textContent=(r.num_sections||0)+" sections";
+  $("#rTime").textContent=((r.elapsed_ms||0)/1000).toFixed(1)+" s";
+  $("#rRam").textContent=r.peak_rss_bytes?human(r.peak_rss_bytes):"—";
+  toast("Converted "+human(r.size_bytes||0));
+  loadModels();
+}
+
+/* ---------- run ---------- */
+$("#runModel").addEventListener("change",e=>{if(e.target.value)loadModel(e.target.value)});
+function bubble(cls,who,text){
+  const d=document.createElement("div");d.className="msg "+cls;
+  d.innerHTML=`<div class="who">${who}</div><div class="bub"></div>`;
+  d.querySelector(".bub").textContent=text;
+  $("#thread").appendChild(d);$("#thread").scrollTop=$("#thread").scrollHeight;return d;
+}
+async function send(){
+  const p=$("#prompt").value.trim();if(!p)return;
+  if(!INFO||!INFO.loaded)return toast("Load a model first",true);
+  $("#prompt").value="";bubble("me","You",p);
+  const pending=bubble("ai","RAI","…");
+  $("#sendBtn").disabled=true;
+  try{
+    const r=await api("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({message:p,temperature:+$("#temp").value,max_tokens:+$("#maxTok").value})});
+    pending.querySelector(".bub").textContent=r.text||"(no output — try a chat template)";
+    $("#sTps").textContent=(r.tok_per_sec||0).toFixed(1)+" tok/s";
+    $("#sTok").textContent=r.tokens??"—";
+    $("#sPre").textContent=Math.round(r.prefill_ms||0)+" ms";
+    $("#sCtx").textContent=(r.tokens||0)+" / "+(INFO.max_context||0);
+  }catch(e){pending.querySelector(".bub").textContent=e.message;pending.querySelector(".bub").style.color="var(--bad)"}
+  $("#sendBtn").disabled=false;$("#thread").scrollTop=$("#thread").scrollHeight;
+}
+$("#sendBtn").addEventListener("click",send);
+$("#prompt").addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();send()}});
+
+/* ---------- boot ---------- */
+(async()=>{await refreshInfo();await loadModels();
+  if(!INFO||!INFO.loaded)bubble("ai","RAI","Load a model from the Library to start.");
+  else bubble("ai","RAI","Ready. Ask anything — generation runs entirely on this machine.");
+})();
+</script></body></html>
