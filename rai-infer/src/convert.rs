@@ -97,7 +97,7 @@ const GEMMA_MODEL_TYPES: [&str; 1] = ["gemma"];
 pub struct ConvertOptions {
     /// HuggingFace checkpoint directory.
     pub model_dir: PathBuf,
-    /// Output path; defaults to `<dirname lowercased>-q4.raimodel` in the
+    /// Output path; defaults to `<dirname>-q4.raimodel` in the
     /// working directory.
     pub output: Option<PathBuf>,
     pub group_size: u32,
@@ -1908,5 +1908,32 @@ mod tests {
             layer_linear_name(3, "down_proj"),
             "model.layers.3.mlp.down_proj.weight"
         );
+    }
+
+    /// The default output name keeps the checkpoint directory's own case.
+    ///
+    /// Lowercasing it is invisible on Windows and macOS and breaks on Linux,
+    /// where `Qwen2.5-0.5B-Instruct-q4.raimodel` and
+    /// `qwen2.5-0.5b-instruct-q4.raimodel` are two different files and only one
+    /// of them exists. The directory here is never created, so `canonicalize`
+    /// fails and the un-canonicalized path is used — which is also the branch a
+    /// relative `--model` argument takes.
+    #[test]
+    fn the_default_output_name_preserves_the_checkpoint_case() {
+        assert_eq!(
+            default_output_name(Path::new("models/Qwen2.5-0.5B-Instruct")).unwrap(),
+            "Qwen2.5-0.5B-Instruct-q4.raimodel"
+        );
+        assert_eq!(
+            default_output_name(Path::new("TinyLlama-1.1B-Chat-v1.0")).unwrap(),
+            "TinyLlama-1.1B-Chat-v1.0-q4.raimodel"
+        );
+    }
+
+    #[test]
+    fn a_nameless_model_dir_asks_for_an_explicit_output() {
+        // A bare root has no final component to name the output after.
+        let error = default_output_name(Path::new("/")).unwrap_err().to_string();
+        assert!(error.contains("--output"), "{error}");
     }
 }

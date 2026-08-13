@@ -9,9 +9,14 @@ development record, kept for context and explicitly not reproduced.
 ## Verified runs, 2026-08-09
 
 **Machine:** Intel Core i5-10300H (4 cores / 8 threads, AVX2 + FMA + F16C),
-15.8 GB RAM, Windows 11. **Build:** `cargo build --release`
-(`target-cpu=native`, fat LTO), rustc 1.95.0, RAI 0.2.0. Python environment
-pinned in `rai-infer/scripts/requirements-lock.txt`.
+15.8 GB RAM, Windows 11. **Build:** `cargo build --release` with
+`RUSTFLAGS="-C target-cpu=native"` (fat LTO), rustc 1.95.0, RAI 0.2.0. Python
+environment pinned in `rai-infer/scripts/requirements-lock.txt`.
+
+> These runs predate the change that made `x86-64-v2` the repository default,
+> so reproducing them needs that `RUSTFLAGS` set explicitly. The ratios below
+> are A/B comparisons of one binary against itself and do not depend on the
+> baseline; the absolute figures were taken at `native`.
 
 **On measurement noise.** This is a 4-core laptop that was shared with other
 work for much of the session. Absolute throughput swung by up to 40% between

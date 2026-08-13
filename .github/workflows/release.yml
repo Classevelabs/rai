@@ -3,13 +3,15 @@ name: Release
 # Publishes the downloadable binaries. Until this existed the only way to get
 # RAI was `git clone` + `cargo build`, which is not a product.
 #
-# The one thing this workflow must never inherit is `.cargo/config.toml`'s
-# `target-cpu=native`. A release built that way runs only on CPUs at least as
-# new as whichever runner happened to pick up the job, and fails everywhere
-# else with SIGILL on the first instruction it does not know — after download,
-# after install, with no diagnostic. Every job below sets RUSTFLAGS explicitly;
-# the environment variable overrides the config file. See the RUSTFLAGS comment
-# in the build job for why the floor is x86-64-v2 and not v3.
+# The one thing this workflow must never build with is `target-cpu=native`. A
+# release built that way runs only on CPUs at least as new as whichever runner
+# happened to pick up the job, and fails everywhere else with SIGILL on the
+# first instruction it does not know — after download, after install, with no
+# diagnostic. `.cargo/config.toml` now pins the same portable x86-64-v2 floor
+# this workflow sets, so the two agree; every job below still sets RUSTFLAGS
+# explicitly and asserts it, because that config file is one edit away from
+# being changed back and a release is the wrong place to find out. See the
+# RUSTFLAGS comment in the build job for why the floor is x86-64-v2 and not v3.
 #
 # Nothing here publishes to crates.io. That is a separate, human-approved act.
 
@@ -196,10 +198,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          # RUSTFLAGS (env) overrides build.rustflags in .cargo/config.toml.
-          # If that precedence ever changes, or someone adds a second flag
-          # source, this build would silently go back to shipping native-only
-          # binaries. Assert instead of trusting.
+          # RUSTFLAGS (env) replaces whatever .cargo/config.toml sets. That
+          # file pins the same portable floor today, but if someone puts
+          # `target-cpu=native` back — or adds a second flag source, or the
+          # precedence changes — this build would silently go back to shipping
+          # native-only binaries. Assert instead of trusting.
           case "$RUSTFLAGS" in
             *target-cpu=native*)
               echo "::error::release build is using target-cpu=native — the artifacts would crash on older CPUs"
@@ -250,6 +253,18 @@ jobs:
           # are useless if they are not next to the binary they start.
           cp LICENSE NOTICE README.md INSTALL.md "$stage/"
           cp -r launchers "$stage/"
+
+          # `cp` preserves the checkout's mode, and tar preserves it again, so a
+          # launcher committed without the executable bit reaches the user as a
+          # file that cannot be double-clicked and answers `./rai-studio.sh`
+          # with "Permission denied" — on the two platforms where those scripts
+          # are the entire point. The index should carry 100755 (see
+          # .gitattributes); this makes the shipped archive correct either way.
+          chmod +x "$stage"/launchers/*.sh "$stage"/launchers/*.command
+
+          for script in "$stage"/launchers/*.sh "$stage"/launchers/*.command; do
+            [ -x "$script" ] || { echo "::error::$script is not executable in the archive"; exit 1; }
+          done
 
           cat > "$stage/RUNNING.txt" <<RUNNING
           RAI ${VERSION} — ${TARGET}

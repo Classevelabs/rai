@@ -33,7 +33,9 @@ recovery, malformed model files, and the container. Also require:
 - a candidate version newer than every published crate and GitHub tag;
 - a changelog and release notes that identify security changes and
   compatibility breaks;
-- green CI on Linux, Windows, and Intel macOS for the exact commit;
+- green CI on Linux, Windows, Apple Silicon macOS, and Intel macOS for the
+  exact commit — the Apple Silicon job is also the only one that executes the
+  scalar fallback kernels, since it is the only runner without AVX2;
 - pinned model/dataset revisions, Python dependencies, hardware identity,
   commands, commit SHA, and retained raw output behind any new benchmark claim;
 - crate archive checksums, RustSec output, CI URL, and smoke evidence recorded
@@ -75,13 +77,15 @@ which needs no manual step:
 `workflow_dispatch` accepts an existing tag and re-runs the same path; asset
 uploads use `--clobber`, so a re-run replaces rather than duplicates.
 
-**Never let this workflow inherit `target-cpu=native`.** The repository's
-`.cargo/config.toml` sets it, which is correct for local builds and fatal for
-distributed ones: those binaries die with SIGILL on any CPU older than the
-runner that built them, after download, with no diagnostic. The build job
-asserts the override took effect. `x86-64-v2` is the right floor rather than
-`v3` because the AVX2/FMA/F16C kernels are selected at runtime by
-`has_avx2()` in `rai-infer/src/gemm.rs`, not by the compile-time baseline.
+**Never let this workflow build with `target-cpu=native`.** Such binaries die
+with SIGILL on any CPU older than the runner that built them, after download,
+with no diagnostic. `.cargo/config.toml` pins the same `x86-64-v2` floor this
+workflow sets, so nothing has to be overridden — but the build job still
+asserts `RUSTFLAGS` explicitly, because that config file is one edit away from
+being changed back and a published release is the wrong place to discover it.
+`x86-64-v2` is the right floor rather than `v3` because the AVX2/FMA/F16C
+kernels are selected at runtime by `has_avx2()` in `rai-infer/src/gemm.rs`, not
+by the compile-time baseline.
 
 Releasing an unsigned binary is deliberate: macOS users clear the quarantine
 attribute themselves and Windows shows a SmartScreen warning. `SHA256SUMS` is

@@ -13,7 +13,7 @@ use crate::convert::{convert, ConvertOptions};
 /// The tuning knobs, shared with the deprecated `rai-convert` binary.
 #[derive(clap::Args, Debug, Clone)]
 pub struct ConvertTuning {
-    /// Output file; defaults to <model-dir-name lowercased>-q4.raimodel
+    /// Output file; defaults to <model-dir-name>-q4.raimodel
     #[arg(short = 'o', long, value_name = "FILE")]
     pub output: Option<PathBuf>,
     /// Columns per quantization group for the 4-bit linears

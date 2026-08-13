@@ -141,7 +141,17 @@ rai serve tinyllama-q4.raimodel
 ```
 
 The double-click launchers in `launchers/` start that same interface without a
-terminal. To see what is already on the machine:
+terminal: `rai-studio.cmd` on Windows, `rai-studio.command` on macOS,
+`rai-studio.sh` (plus the `rai-studio.desktop` template) on Linux. Put one
+beside the `rai` binary and your `.raimodel` file. On macOS and Linux, if
+double-clicking does nothing or you get `Permission denied`, the executable bit
+did not survive the trip — restore it once:
+
+```bash
+chmod +x rai-studio.sh rai-studio.command
+```
+
+To see what is already on the machine:
 
 ```bash
 rai models .
@@ -186,20 +196,23 @@ cargo install --locked --path rai-server    # rai-server
 `cargo install` puts them in `~/.cargo/bin`, which `rustup` already added to
 your `PATH`.
 
-**Read this before you copy a source-built binary to another machine.** The
-repository's `.cargo/config.toml` sets `target-cpu=native`, which is right for
-a machine building for itself and wrong for anything else: the compiler is free
-to emit instructions your build machine has and the target machine does not, and
-the result dies with SIGILL — an illegal-instruction crash, on startup, with no
-useful message. Override it the way the release workflow does:
+**A source-built binary is safe to copy to another machine.** The repository's
+`.cargo/config.toml` pins x86-64 builds to `target-cpu=x86-64-v2`, the same
+portable floor the release workflow uses, so the compiler cannot emit an
+instruction your build machine has and the destination lacks. aarch64 builds
+are left at the toolchain default.
+
+If you want a binary tuned to the machine in front of you — worth it only for a
+local benchmark, never for anything you hand to someone else:
 
 ```bash
-RUSTFLAGS="-C target-cpu=x86-64-v2" cargo install --locked --path rai-infer
+RUSTFLAGS="-C target-cpu=native" cargo install --locked --path rai-infer
 ```
 
-That is the same portable floor the published archives use, and it costs
-nothing measurable: the hot kernels are runtime-dispatched, not compiled by
-baseline.
+That one dies with SIGILL — an illegal-instruction crash, on startup, with no
+useful message — on any CPU older than the one that built it. The portable
+default costs nothing measurable in exchange: the hot kernels are
+runtime-dispatched, not selected by the compile-time baseline.
 
 ## Container
 

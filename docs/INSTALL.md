@@ -29,18 +29,22 @@ That produces `rai` (the whole command-line surface) and `rai-server` (the
 memory service), plus the deprecated `rai-convert` / `rai-generate` /
 `rai-chat` wrappers.
 
-The repository's `.cargo/config.toml` uses `target-cpu=native`; binaries built
-that way are for the build machine and die with SIGILL on any CPU that lacks an
-instruction the compiler chose to use. Override the flag before moving a binary
-to a different CPU:
+The repository's `.cargo/config.toml` pins x86-64 builds to `target-cpu=x86-64-v2`,
+the same floor the published release archives use, so the binary you just built
+is safe to copy to another machine. It costs nothing: the AVX2/FMA/F16C kernels
+are dispatched at runtime, not selected by the compile-time baseline. aarch64
+builds are left at the toolchain default.
+
+To tune a build to the machine in front of you — worth doing only for a local
+benchmark, never for a binary anyone else will run:
 
 ```bash
-RUSTFLAGS="-C target-cpu=x86-64-v2" cargo build --workspace --release --locked
+RUSTFLAGS="-C target-cpu=native" cargo build --workspace --release --locked
 ```
 
-`x86-64-v2` is the floor the published release archives use. It costs nothing:
-the AVX2/FMA/F16C kernels are dispatched at runtime, not selected by the
-compile-time baseline.
+That binary is for the build machine alone. Run it on any CPU that lacks an
+instruction the compiler chose to use and it dies with SIGILL, on startup, with
+no diagnostic naming the cause.
 
 Install the two end-user binary crates from a checkout:
 
@@ -58,9 +62,11 @@ cargo install classeve-rai-server --locked
 
 ## Container
 
-The container is an amd64/x86-64-v3 MCP stdio image and runs as a non-root
-user. It does not expose a REST port because the built-in REST listener is
-loopback-only.
+The container is an MCP stdio image and runs as a non-root user. It does not
+expose a REST port because the built-in REST listener is loopback-only. Built
+on amd64 it targets `x86-64-v3`; built on arm64 — which is what `docker build`
+does by default on an Apple Silicon Mac — it takes the toolchain default and
+runs the scalar kernels, because there is no NEON implementation.
 
 ```bash
 docker build -t rai-server .
@@ -86,9 +92,10 @@ on purpose: it binds 127.0.0.1 and rejects non-localhost `Host`/`Origin`
 headers, so a published container port would only ever refuse the connection.
 Run `rai serve` on the host.
 
-Both images default to `x86-64-v3`. Pass
-`--build-arg RUST_TARGET_CPU=x86-64-v2` for the portable floor the release
-archives use.
+Both images default to `x86-64-v3` **when the image being built is x86-64**.
+Pass `--build-arg RUST_TARGET_CPU=x86-64-v2` for the portable floor the release
+archives use. The flag is not applied to arm64 builds, where an x86 processor
+name means nothing.
 
 ## Converting a model
 
@@ -120,7 +127,7 @@ cargo build --workspace --release --locked
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `<MODEL_DIR>` | required | Positional: directory holding `config.json`, the safetensors weights, and `tokenizer.json` |
-| `-o`, `--output <FILE>` | `<dirname lowercased>-q4.raimodel` | Destination `.raimodel` path |
+| `-o`, `--output <FILE>` | `<dirname>-q4.raimodel` | Destination `.raimodel` path |
 | `--group-size <N>` | 128 | Columns per quantization group for the 4-bit linears |
 | `--embed-group-size <N>` | 64 | Columns per quantization group for the 8-bit embedding table |
 | `--max-context <TOKENS>` | 2048 | Context length baked into the RoPE table |
