@@ -468,16 +468,22 @@ RAI is pre-1.0 and interfaces may change. What that means concretely:
 
 - One end-to-end conversion and decode run is measured (TinyLlama-1.1B,
   BENCHMARKS.md). The rest of the supported list is verified by architecture
-  and, for Qwen2.5-0.5B, Llama-3.2-1B, and gemma-2b-it, by a coherent
+  and, for Qwen2.5-0.5B, Qwen3-0.6B, Llama-3.2-1B, gemma-2b-it, gemma-2-2b-it,
+  gemma-3-1b-it, Phi-3-mini-4k, OLMo-2-1B and OLMoE-1B-7B, by a coherent
   generation — not by a retained qualification matrix.
-- Architecture coverage is deliberately narrow and enforced at conversion time.
-  [docs/MODELS.md](./docs/MODELS.md) states what is out and what each addition
-  would cost.
+- Architecture coverage is enforced at conversion time, and what remains
+  unsupported is unsupported for something a checkpoint *contains* rather than
+  for its name: a shared expert, a `rope_scaling` scheme the kernels do not
+  implement, an `lm_head` bias, or a module tree that is not Llama-shaped.
+  [docs/MODELS.md](./docs/MODELS.md) names each one and what to use instead.
 - Quantization quality is measured as Hessian-weighted output error
   (BENCHMARKS.md). No perplexity sweep has been run, so no perplexity claim is
   made.
-- The optimized paths are x86-64. A scalar fallback exists; ARM NEON kernels
-  are future work.
+- The optimized paths are x86-64 (AVX2 + FMA + F16C). On ARM — including
+  Apple Silicon — the GEMM falls back to a scalar, single-threaded path, so it
+  runs correctly but far slower than the measured x86-64 figures above. NEON
+  kernels are future work, and no ARM throughput is claimed here because none
+  has been measured.
 - The memory/reasoning service and the RC/HRC/SAC compression paths are
   research prototypes. Their confidence, crowding, and modeled-size outputs are
   not validated guarantees.
