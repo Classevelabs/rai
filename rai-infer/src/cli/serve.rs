@@ -2421,6 +2421,41 @@ mod tests {
         assert!(resolve_max_tokens(Some(1949), 100, 2048).is_err());
     }
 
+    /// The Studio client cannot know the per-reply ceiling before it sends,
+    /// because the ceiling is the context minus a prompt only this server can
+    /// measure. It therefore learns the number by reading it back out of this
+    /// refusal. That makes the wording of the refusal a contract, not prose:
+    /// when the server moved from a fixed ceiling to a per-request one, the
+    /// client's pattern was left matching the old wording, matched nothing,
+    /// never learned a ceiling, and every reply on a context of 4096 or less
+    /// dead-ended on the first message. This pins the two together so the next
+    /// rewording fails here instead of in front of a reader.
+    #[test]
+    fn the_studio_client_can_read_the_ceiling_out_of_this_refusal() {
+        let error = resolve_max_tokens(Some(2048), 24, 2048).unwrap_err();
+        assert_eq!(error.status, 400);
+        assert!(
+            error
+                .message
+                .contains("leaves 2024 of the 2048-token context window free"),
+            "the refusal no longer states the room it has left: {error}"
+        );
+
+        // The pattern studio.html uses to lift the number back out.
+        assert!(
+            CHAT_HTML.contains("leaves (\\d+) of the (\\d+)-token context window free"),
+            "studio.html no longer carries the pattern that reads the ceiling out \
+             of this refusal, so it cannot learn the limit and will dead-end"
+        );
+
+        // The pattern it used to carry matched a message this server has never
+        // sent. If it ever comes back, it is dead code pretending to recover.
+        assert!(
+            !CHAT_HTML.contains("max_tokens must be between 1 and"),
+            "studio.html is matching a refusal this server does not send"
+        );
+    }
+
     /// A prompt with no room left for an answer is said plainly, rather than
     /// answered with an empty reply.
     #[test]

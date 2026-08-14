@@ -675,9 +675,23 @@ const DEFAULT_GEN_TOKENS=4096;
 function defaultGenTokens(){return Math.max(1,Math.min(DEFAULT_GEN_TOKENS,genCeiling()))}
 function genCeiling(){
   const ctx=Number(INFO&&INFO.max_context)||modelMax();
-  const declared=Number(INFO&&INFO.max_generation_tokens)||0;
-  const cap=declared||GEN_CAP||0;
+  /* `INFO.max_generation_tokens` used to be consulted here, for a server that
+     declared one fixed ceiling. This server has no such number to declare —
+     its ceiling is the window minus whichever prompt was just sent — and it
+     never emitted the field, so reading it only ever yielded 0 and left the
+     whole window standing in as a ceiling no prompt can actually reach. The
+     learned number is the only real one. */
+  const cap=GEN_CAP||0;
   return Math.max(1,cap?Math.min(cap,ctx):ctx);
+}
+/* The server refuses a reply that will not fit and names the room it has left.
+   That number is the ceiling, exactly, for the prompt that was just sent — so
+   it is read back out rather than estimated. A prompt that fills the window
+   leaves no room at all and returns 0, which is not something a smaller
+   request can recover from. */
+function ceilingFromRefusal(message){
+  const fits=/leaves (\d+) of the (\d+)-token context window free/.exec(message||"");
+  return fits?Number(fits[1]):0;
 }
 async function refreshInfo(){
   try{INFO=await api("/api/info")}catch(e){INFO=null}
@@ -1236,36 +1250,53 @@ async function send(){
      event, so the two are merged; a reply that reports one and not the other
      would leave a dash in the strip for a number the server did send. */
   let opening=null;
+  const handlers={
+    onStart:info=>{opening=info;paintStrip({prefill_ms:info.prefill_ms,tokens:0,max_context:info.max_context},
+      "Prompt "+num(info.prompt_tokens||0)+" tokens")},
+    onToken:piece=>{reply.raw+=piece;paintLive();scrollThread(false)},
+    onDone:stats=>{
+      const merged=Object.assign({},stats);
+      if(opening){
+        if(!merged.prefill_ms)merged.prefill_ms=opening.prefill_ms;
+        if(!merged.max_context)merged.max_context=opening.max_context;
+        merged.prompt_tokens=opening.prompt_tokens;
+      }
+      reply.stats=merged;LAST=merged;
+      /* Both numbers are known now, so the ceiling stops being a guess: it is
+         this window minus what this prompt cost. Recording it keeps the Tuning
+         control showing a number the server would actually accept. */
+      const ctxWindow=Number(merged.max_context)||0, spent=Number(merged.prompt_tokens)||0;
+      if(ctxWindow&&spent)GEN_CAP=Math.max(1,ctxWindow-spent);
+      paintStrip(merged,merged.stop_reason==="max_tokens"
+        ?"Stopped at the token limit. Raise Max new tokens in Tuning for a longer reply."
+        :"");
+    },
+  };
   try{
-    await generate(body,{
-      onStart:info=>{opening=info;paintStrip({prefill_ms:info.prefill_ms,tokens:0,max_context:info.max_context},
-        "Prompt "+num(info.prompt_tokens||0)+" tokens")},
-      onToken:piece=>{reply.raw+=piece;paintLive();scrollThread(false)},
-      onDone:stats=>{
-        const merged=Object.assign({},stats);
-        if(opening){
-          if(!merged.prefill_ms)merged.prefill_ms=opening.prefill_ms;
-          if(!merged.max_context)merged.max_context=opening.max_context;
-          merged.prompt_tokens=opening.prompt_tokens;
+    /* The ceiling is the window minus this prompt, so nothing here can know it
+       before the server has seen the prompt. When the server refuses it states
+       the exact room it has left; that number is taken and the send repeated
+       once, so the reader gets their reply instead of an error they can do
+       nothing about. Retried only before any text has arrived, so a stream
+       that fails midway is never sent twice. */
+    for(let attempt=0;;attempt++){
+      try{await generate(body,handlers);break}
+      catch(e){
+        if(e.name==="AbortError"){
+          reply.stats=Object.assign({},reply.stats||{},{stop_reason:"stopped"});
+          paintStrip(reply.stats,"Stopped. The server may still be finishing this reply.");
+          break;
         }
-        reply.stats=merged;LAST=merged;
-        paintStrip(merged,merged.stop_reason==="max_tokens"
-          ?"Stopped at the token limit. Raise Max new tokens in Tuning for a longer reply."
-          :"");
-      },
-    });
-  }catch(e){
-    if(e.name==="AbortError"){
-      reply.stats=Object.assign({},reply.stats||{},{stop_reason:"stopped"});
-      paintStrip(reply.stats,"Stopped. The server may still be finishing this reply.");
-    }else{
-      /* A server that states its own per-reply ceiling is believed, and the
-         control is clamped to it rather than to a number chosen here. */
-      const cap=/max_tokens must be between 1 and (\d+)/.exec(e.message||"");
-      if(cap){GEN_CAP=Number(cap[1]);paintChatHeader();
-        toast("This server caps one reply at "+num(GEN_CAP)+" tokens",true)}
-      reply.error=e.message;reply.retry=true;
-      paintStrip(null,"");
+        const room=ceilingFromRefusal(e.message);
+        if(room&&!attempt&&!reply.raw){
+          GEN_CAP=room;paintChatHeader();
+          body.max_tokens=Math.max(1,Math.min(Number(body.max_tokens)||room,room));
+          continue;
+        }
+        reply.error=e.message;reply.retry=true;
+        paintStrip(null,"");
+        break;
+      }
     }
   }finally{
     ABORT=null;LIVE=null;

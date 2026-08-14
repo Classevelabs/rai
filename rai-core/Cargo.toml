@@ -32,7 +32,7 @@ path = "src/lib.rs"
 [dependencies]
 # Dependency key stays `rem-nra` so `use rem_nra::...` keeps resolving;
 # `package` points at the published crates.io name.
-rem-nra = { path = "../rem-nra", version = "0.2.0", package = "classeve-rai-rem-nra" }
+rem-nra = { path = "../rem-nra", version = "0.2.1", package = "classeve-rai-rem-nra" }
 nalgebra = { version = "0.33", features = ["serde-serialize"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
