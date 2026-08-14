@@ -472,7 +472,7 @@ input:disabled,select:disabled,textarea:disabled{color:var(--fg-3);cursor:not-al
               <div class="field"><span class="lbl">Temperature</span>
                 <input type="number" id="temp" value="0.7" step="0.1" min="0.01" max="2"></div>
               <div class="field"><span class="lbl">Max new tokens</span>
-                <input type="number" id="maxTok" value="512" min="1"></div>
+                <input type="number" id="maxTok" value="4096" min="1"></div>
               <div class="fixed" style="align-self:flex-end"><span class="lbl" id="tokCeil">&nbsp;</span></div>
             </div>
             <p class="note" id="tuneNote">Template and context are properties of the loaded model, so changing them reloads it. Temperature and max tokens apply to the next message.</p>
@@ -665,6 +665,14 @@ function modelMax(){
 /* The per-reply token ceiling. The model context is the real bound; a server
    that enforces a lower one says so in its 400, and that number is adopted
    below rather than guessed at here. */
+/* The reader has typed their own limit, so stop choosing one for them. */
+let TOK_TOUCHED=false;
+
+/* A generous starting limit that still returns in a sensible time. The model
+   normally stops itself at end-of-turn well before this; the number only
+   matters for a model that will not stop, and Stop covers that case. */
+const DEFAULT_GEN_TOKENS=4096;
+function defaultGenTokens(){return Math.max(1,Math.min(DEFAULT_GEN_TOKENS,genCeiling()))}
 function genCeiling(){
   const ctx=Number(INFO&&INFO.max_context)||modelMax();
   const declared=Number(INFO&&INFO.max_generation_tokens)||0;
@@ -847,6 +855,10 @@ function paintChatHeader(){
   $("#pillCtx").replaceChildren("CTX ",el("b",{text:loaded?num(INFO.max_context||0):"—"}));
   const tokBox=$("#maxTok");
   tokBox.max=String(genCeiling());
+  // Until the reader sets a number themselves, the default follows the model
+  // rather than a constant. A fixed 512 is the same instinct that capped the
+  // context: it silently decides for a 40k-context model that 512 is enough.
+  if(!TOK_TOUCHED)tokBox.value=String(defaultGenTokens());
   if(Number(tokBox.value)>genCeiling())tokBox.value=String(genCeiling());
   $("#pillTok").replaceChildren("MAX ",el("b",{text:tokBox.value}));
   $("#tokCeil").textContent="up to "+num(genCeiling());
@@ -877,8 +889,8 @@ function paintCtxOptions(){
 $("#tpl").addEventListener("change",e=>{TPL=e.target.value;paintChatHeader()});
 $("#runCtx").addEventListener("change",e=>{WANT_CTX=Number(e.target.value)||WANT_CTX;paintChatHeader()});
 $("#temp").addEventListener("change",paintChatHeader);
-$("#maxTok").addEventListener("change",paintChatHeader);
-$("#maxTok").addEventListener("input",paintChatHeader);
+$("#maxTok").addEventListener("change",()=>{TOK_TOUCHED=true;paintChatHeader()});
+$("#maxTok").addEventListener("input",()=>{TOK_TOUCHED=true;paintChatHeader()});
 $("#applyLoad").addEventListener("click",async()=>{
   if(!INFO||!INFO.loaded)return;
   const path=INFO.model_path;
@@ -1017,18 +1029,40 @@ window.addEventListener("resize",fitSidebar);
 const THINK_OPEN=/<think(?:ing)?\s*>/i;
 const THINK_CLOSE=/<\/think(?:ing)?\s*>/i;
 function splitThinking(raw){
-  const text=String(raw||"");
-  const open=THINK_OPEN.exec(text);
-  if(!open){
+  let text=String(raw||"");
+  // A stray close with no opener: everything before it was reasoning. Some
+  // models emit this when the opening tag is part of the prompt template.
+  if(!THINK_OPEN.exec(text)){
     const early=THINK_CLOSE.exec(text);
     if(early)return{think:text.slice(0,early.index),body:clean(text.slice(early.index+early[0].length)),closed:true};
     return{think:null,body:clean(text),closed:true};
   }
-  const before=text.slice(0,open.index);
-  const rest=text.slice(open.index+open[0].length);
-  const close=THINK_CLOSE.exec(rest);
-  if(!close)return{think:rest,body:clean(before),closed:false};
-  return{think:rest.slice(0,close.index),body:clean(before+rest.slice(close.index+close[0].length)),closed:true};
+  // Reasoning models emit more than one block: a scratchpad, an answer, a
+  // second thought, more answer. Every block belongs in the disclosure, so
+  // this consumes them all rather than only the first - the earlier version
+  // left the second block's contents in the visible reply with its tags
+  // stripped, which reads as the model answering with its own notes.
+  const thoughts=[];
+  let body="";
+  let closed=true;
+  for(;;){
+    const open=THINK_OPEN.exec(text);
+    if(!open){body+=text;break}
+    body+=text.slice(0,open.index);
+    const rest=text.slice(open.index+open[0].length);
+    const close=THINK_CLOSE.exec(rest);
+    if(!close){
+      // Still streaming, or the model never closed it. Either way the tail is
+      // reasoning, not answer.
+      thoughts.push(rest);
+      closed=false;
+      text="";
+      break;
+    }
+    thoughts.push(rest.slice(0,close.index));
+    text=rest.slice(close.index+close[0].length);
+  }
+  return{think:thoughts.length?thoughts.join("\n\n"):null,body:clean(body),closed};
 }
 function clean(text){return String(text).replace(/<\/?think(?:ing)?\s*>/gi,"").replace(/^\n+/,"")}
 
@@ -1252,8 +1286,23 @@ async function generate(body,handlers){
     NO_STREAM=true;
     paintStrip(null,"This build has no /api/chat/stream; using /api/chat.");
   }
+  // The fallback needs its own controller: without one, Stop is a button that
+  // does nothing, which is worse than no button at all.
+  ABORT=new AbortController();
   const t0=performance.now();
-  const r=await api("/api/chat",jsonPost(body));
+  const post=jsonPost(body);
+  post.signal=ABORT.signal;
+  let r;
+  try{r=await api("/api/chat",post)}
+  catch(e){
+    if(e&&e.name==="AbortError"){
+      handlers.onDone({tokens:0,tok_per_sec:0,decode_ms:performance.now()-t0,
+        context_used:0,max_context:(INFO&&INFO.max_context)||0,prefill_ms:0,
+        stop_reason:"stopped"});
+      return;
+    }
+    throw e;
+  }
   handlers.onStart({prompt_tokens:0,prefill_ms:r.prefill_ms||0,max_context:(INFO&&INFO.max_context)||0});
   handlers.onToken(r.text||"");
   handlers.onDone({tokens:r.tokens||0,tok_per_sec:r.tok_per_sec||0,
@@ -1661,14 +1710,14 @@ function paintResult(r){
     ?(r.source_files?num(r.source_files)+(r.source_files===1?" safetensors file":" safetensors files"):"checkpoint on disk")
     :"not reported by this server build";
   $("#rSize").textContent=outBytes?human(outBytes):"—";
-  $("#rSections").textContent=(r.num_sections||0)+" sections";
+  $("#rSections").textContent=r.num_sections?num(r.num_sections)+" sections":"section count not reported";
   $("#rRatio").textContent=ratio?ratio.toFixed(2)+"x":"—";
   $("#rSaved").textContent=ratio&&sourceBytes&&outBytes
     ?human(sourceBytes-outBytes)+" smaller"
     :"needs the source size to compute";
   $("#rBpp").textContent=r.bits_per_parameter?Number(r.bits_per_parameter).toFixed(2):"—";
   $("#rParams").textContent=r.parameters?params(r.parameters)+" parameters":"parameter count not reported";
-  $("#rTime").textContent=((r.elapsed_ms||0)/1000).toFixed(1)+" s";
+  $("#rTime").textContent=r.elapsed_ms?(r.elapsed_ms/1000).toFixed(1)+" s":"not reported";
   $("#rRam").textContent=r.peak_rss_bytes?human(r.peak_rss_bytes):"—";
   /* The context baked into the file, where that number came from, and what it
      will cost in KV cache when the file is loaded. */

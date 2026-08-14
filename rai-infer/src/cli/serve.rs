@@ -1572,7 +1572,7 @@ pub(crate) fn context_choice_note(
         return None;
     }
     Some(format!(
-        "Context: {} of the model's {} — its full window would need a {} KV cache, and this          machine has {} free. Pass --max-context to choose your own.",
+        "Context: {} of the model's {} — its full window would need a {} KV cache,          and this machine has {} free. Pass --max-context to choose your own.",
         choice.context,
         choice.model_max,
         crate::cli::format_bytes(kv_bytes_for(choice.model_max) as u64),
