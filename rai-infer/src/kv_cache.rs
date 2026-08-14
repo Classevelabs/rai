@@ -15,13 +15,31 @@
 
 use anyhow::{anyhow, ensure, Result};
 
+/// Positions allocated up front, before any conversation has happened.
+///
+/// The window a model *declares* and the window a conversation *uses* are
+/// different numbers, and eagerly allocating the first is what used to force
+/// the second to be small: a 40,960-token window on a 28-layer model reserves
+/// 2.6 GB before a single token is generated, which pushes a laptop into
+/// paging and makes decode several times slower than the same model at a
+/// short window. Reserving the ceiling and allocating in steps means the long
+/// window costs nothing until it is actually reached.
+const INITIAL_POSITIONS: usize = 1024;
+
 /// KV cache for a single transformer layer.
+///
+/// Allocated for `capacity` positions and grown towards `max_ctx` on demand.
+/// `capacity` is the stride of both buffers, so it changes on every growth and
+/// every index is computed from it rather than from `max_ctx`.
 pub struct LayerKVCache {
-    /// Key cache: `[num_kv_heads * max_ctx * head_dim]`
+    /// Key cache: `[num_kv_heads * capacity * head_dim]`
     k: Vec<f32>,
-    /// Value cache: `[num_kv_heads * max_ctx * head_dim]`
+    /// Value cache: `[num_kv_heads * capacity * head_dim]`
     v: Vec<f32>,
     num_kv_heads: usize,
+    /// Positions currently allocated. Also the row stride.
+    capacity: usize,
+    /// Ceiling this cache may grow to.
     max_ctx: usize,
     head_dim: usize,
     /// Number of leading positions that contain stored data.
@@ -38,8 +56,34 @@ impl LayerKVCache {
             num_kv_heads > 0 && max_ctx > 0 && head_dim > 0,
             "KV cache dimensions must be non-zero"
         );
-        let total = num_kv_heads
+        // The ceiling is validated even though it is not allocated: a model
+        // declaring a window whose indices overflow is malformed regardless of
+        // how much of it a conversation reaches.
+        num_kv_heads
             .checked_mul(max_ctx)
+            .and_then(|value| value.checked_mul(head_dim))
+            .ok_or_else(|| anyhow!("KV cache dimensions overflow"))?;
+        let capacity = max_ctx.min(INITIAL_POSITIONS);
+        let (k, v) = Self::allocate(num_kv_heads, capacity, head_dim)?;
+        Ok(Self {
+            k,
+            v,
+            num_kv_heads,
+            capacity,
+            max_ctx,
+            head_dim,
+            filled: 0,
+        })
+    }
+
+    /// Two zeroed buffers for `positions` positions, or an error naming the size.
+    fn allocate(
+        num_kv_heads: usize,
+        positions: usize,
+        head_dim: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let total = num_kv_heads
+            .checked_mul(positions)
             .and_then(|value| value.checked_mul(head_dim))
             .ok_or_else(|| anyhow!("KV cache dimensions overflow"))?;
         let mib = (total * 2 * std::mem::size_of::<f32>()) >> 20;
@@ -50,14 +94,41 @@ impl LayerKVCache {
             .map_err(|_| anyhow!("cannot allocate {mib} MiB for the KV cache"))?;
         k.resize(total, 0.0);
         v.resize(total, 0.0);
-        Ok(Self {
-            k,
-            v,
-            num_kv_heads,
-            max_ctx,
-            head_dim,
-            filled: 0,
-        })
+        Ok((k, v))
+    }
+
+    /// Grow so that `pos` is addressable, doubling but never past `max_ctx`.
+    ///
+    /// Growth re-strides both buffers, so the filled positions of every head
+    /// are copied to their new offsets. It is O(filled) and happens at most
+    /// log2(max_ctx / INITIAL_POSITIONS) times per conversation.
+    fn grow_to_hold(&mut self, pos: usize) -> Result<()> {
+        if pos < self.capacity {
+            return Ok(());
+        }
+        let target = self
+            .capacity
+            .saturating_mul(2)
+            .max(pos + 1)
+            .min(self.max_ctx);
+        let (mut k, mut v) = Self::allocate(self.num_kv_heads, target, self.head_dim)?;
+        for head in 0..self.num_kv_heads {
+            let old = (head * self.capacity) * self.head_dim;
+            let new = (head * target) * self.head_dim;
+            let len = self.filled * self.head_dim;
+            k[new..new + len].copy_from_slice(&self.k[old..old + len]);
+            v[new..new + len].copy_from_slice(&self.v[old..old + len]);
+        }
+        self.k = k;
+        self.v = v;
+        self.capacity = target;
+        Ok(())
+    }
+
+    /// Positions currently allocated, which is not the declared window.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.capacity
     }
 
     /// Store K and V vectors at the given position.
@@ -71,6 +142,12 @@ impl LayerKVCache {
     /// of unwritten positions below it, or on a vector length mismatch.
     pub fn store(&mut self, pos: usize, k_vec: &[f32], v_vec: &[f32]) {
         assert!(pos < self.max_ctx, "KV cache position is out of range");
+        // Growth is fallible, but `store` is on the hot path and every caller
+        // has already had the window checked against memory at load time. A
+        // failure here means the machine lost memory mid-conversation, which
+        // is not a recoverable state for a half-written layer.
+        self.grow_to_hold(pos)
+            .expect("KV cache growth failed mid-generation");
         assert!(
             pos <= self.filled,
             "KV store at position {pos} would leave a gap (filled {})",
@@ -85,7 +162,7 @@ impl LayerKVCache {
 
         for h in 0..self.num_kv_heads {
             let src_start = h * self.head_dim;
-            let dst_start = (h * self.max_ctx + pos) * self.head_dim;
+            let dst_start = (h * self.capacity + pos) * self.head_dim;
             self.k[dst_start..dst_start + self.head_dim]
                 .copy_from_slice(&k_vec[src_start..src_start + self.head_dim]);
             self.v[dst_start..dst_start + self.head_dim]
@@ -106,7 +183,7 @@ impl LayerKVCache {
             "KV read at unwritten position {pos} (filled {})",
             self.filled
         );
-        let start = (head * self.max_ctx + pos) * self.head_dim;
+        let start = (head * self.capacity + pos) * self.head_dim;
         &self.k[start..start + self.head_dim]
     }
 
@@ -122,7 +199,7 @@ impl LayerKVCache {
             "KV read at unwritten position {pos} (filled {})",
             self.filled
         );
-        let start = (head * self.max_ctx + pos) * self.head_dim;
+        let start = (head * self.capacity + pos) * self.head_dim;
         &self.v[start..start + self.head_dim]
     }
 
@@ -255,6 +332,57 @@ impl KVCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole point of growing: a long declared window must not cost
+    /// anything until a conversation actually reaches it.
+    #[test]
+    fn a_long_window_allocates_little_until_it_is_used() {
+        let heads = 8;
+        let head_dim = 128;
+        let mut cache = LayerKVCache::new(heads, 40_960, head_dim).expect("allocate");
+        let ceiling = heads * 40_960 * head_dim * 2 * std::mem::size_of::<f32>();
+        assert!(
+            cache.memory_bytes() * 8 < ceiling,
+            "a 40,960 window should not allocate its ceiling up front: {} vs {ceiling}",
+            cache.memory_bytes()
+        );
+        assert_eq!(cache.capacity(), INITIAL_POSITIONS);
+
+        // Writing past the allocation grows it, and everything already stored
+        // survives the re-stride. That is the part a wrong stride would break.
+        let k: Vec<f32> = (0..heads * head_dim).map(|i| i as f32).collect();
+        let v: Vec<f32> = (0..heads * head_dim).map(|i| -(i as f32)).collect();
+        for pos in 0..INITIAL_POSITIONS + 5 {
+            cache.store(pos, &k, &v);
+        }
+        assert!(cache.capacity() > INITIAL_POSITIONS, "it must have grown");
+        assert_eq!(cache.filled(), INITIAL_POSITIONS + 5);
+        for head in 0..heads {
+            let expected = &k[head * head_dim..(head + 1) * head_dim];
+            assert_eq!(cache.get_k(head, 0), expected, "head {head} position 0");
+            assert_eq!(
+                cache.get_k(head, INITIAL_POSITIONS + 4),
+                expected,
+                "head {head} at the grown end"
+            );
+        }
+    }
+
+    /// Growth stops at the declared ceiling; it never quietly exceeds it.
+    #[test]
+    fn growth_never_passes_the_declared_window() {
+        let mut cache = LayerKVCache::new(2, 4, 2).expect("allocate");
+        assert_eq!(
+            cache.capacity(),
+            4,
+            "a window below the step allocates once"
+        );
+        let k = vec![1.0f32; 4];
+        for pos in 0..4 {
+            cache.store(pos, &k, &k);
+        }
+        assert_eq!(cache.capacity(), 4);
+    }
 
     #[test]
     fn test_store_and_retrieve() {

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 
 use crate::cli::format_bytes;
-use crate::convert::{convert, ConvertOptions};
+use crate::convert::{convert, ConvertOptions, FOLLOW_MODEL_CONTEXT};
 
 /// The tuning knobs, shared with the deprecated `rai-convert` binary.
 #[derive(clap::Args, Debug, Clone)]
@@ -22,9 +22,10 @@ pub struct ConvertTuning {
     /// Columns per quantization group for the 8-bit embedding
     #[arg(long, default_value_t = 64, value_name = "N")]
     pub embed_group_size: u32,
-    /// Context length the model is built for (sizes the RoPE table)
-    #[arg(long, default_value_t = 2048, value_name = "TOKENS")]
-    pub max_context: u32,
+    /// Context length the model is built for (sizes the RoPE table);
+    /// defaults to the model's own max_position_embeddings
+    #[arg(long, value_name = "TOKENS")]
+    pub max_context: Option<u32>,
     /// Where to copy tokenizer.json; defaults to next to the output file
     #[arg(long, value_name = "FILE")]
     pub tokenizer_out: Option<PathBuf>,
@@ -49,7 +50,9 @@ impl ConvertArgs {
             output: self.tuning.output.clone(),
             group_size: self.tuning.group_size,
             embed_group_size: self.tuning.embed_group_size,
-            max_context: self.tuning.max_context,
+            // No flag means the model's own context, not a constant: see
+            // `convert::FOLLOW_MODEL_CONTEXT`.
+            max_context: self.tuning.max_context.unwrap_or(FOLLOW_MODEL_CONTEXT),
             tokenizer_out: self.tuning.tokenizer_out.clone(),
             quiet: self.tuning.quiet,
         }

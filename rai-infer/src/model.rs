@@ -359,16 +359,7 @@ impl RaiModel {
 
     /// Estimate KV cache memory for a given max context length (in bytes).
     pub fn kv_cache_bytes(&self, max_ctx: usize) -> usize {
-        let nl = self.config.num_layers as usize;
-        let nkv = self.config.num_kv_heads as usize;
-        let hd = self.config.head_dim as usize;
-        // 2 (K+V) * layers * kv_heads * max_ctx * head_dim * 4 bytes
-        2usize
-            .saturating_mul(nl)
-            .saturating_mul(nkv)
-            .saturating_mul(max_ctx)
-            .saturating_mul(hd)
-            .saturating_mul(std::mem::size_of::<f32>())
+        self.config.kv_cache_bytes(max_ctx)
     }
 
     /// Model file size in bytes.
