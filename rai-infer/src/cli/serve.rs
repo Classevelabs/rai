@@ -1665,17 +1665,24 @@ fn system_json(state: &ServerState) -> Value {
 /// the ones every vendor fills in. Architectures without CPUID say nothing.
 #[cfg(target_arch = "x86_64")]
 fn cpu_brand() -> Option<String> {
-    // `__cpuid` is a safe intrinsic on x86_64: the instruction is baseline
-    // there. The extended leaves are still only read once leaf 0x80000000 has
-    // reported that they exist, because a CPU that lacks them returns whatever
-    // its highest supported leaf returns rather than failing.
-    let highest_extended = std::arch::x86_64::__cpuid(0x8000_0000).eax;
+    // CPUID is baseline on x86_64, so this cannot fault. The `unsafe` block is
+    // written explicitly because `__cpuid` is an unsafe fn on the minimum Rust
+    // this crate supports and a safe one on current toolchains; `unused_unsafe`
+    // is allowed so the same source compiles warning-free on both. Removing it
+    // builds here and fails the MSRV job, which is how it was caught.
+    //
+    // The extended leaves are read only once leaf 0x80000000 reports they
+    // exist: a CPU without them returns its highest supported leaf's contents
+    // instead of failing, which would otherwise be read as a brand string.
+    #[allow(unused_unsafe)]
+    let highest_extended = unsafe { std::arch::x86_64::__cpuid(0x8000_0000) }.eax;
     if highest_extended < 0x8000_0004 {
         return None;
     }
     let mut bytes = Vec::with_capacity(48);
     for leaf in [0x8000_0002u32, 0x8000_0003, 0x8000_0004] {
-        let result = std::arch::x86_64::__cpuid(leaf);
+        #[allow(unused_unsafe)]
+        let result = unsafe { std::arch::x86_64::__cpuid(leaf) };
         for word in [result.eax, result.ebx, result.ecx, result.edx] {
             bytes.extend_from_slice(&word.to_le_bytes());
         }
