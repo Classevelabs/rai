@@ -742,6 +742,10 @@ pub fn convert_with_progress(
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
     }
+    // The exact output size is known before a byte is written, so running out
+    // of disk should be a sentence up front rather than an OS error minutes
+    // in, after the work is done and a truncated file is on disk.
+    check_output_space(&output_path, total_size)?;
     let mut file = File::create(&output_path)
         .with_context(|| format!("creating {}", output_path.display()))?;
     write_header(&mut file, &config, num_sections as u32)?;
@@ -2255,6 +2259,121 @@ pub fn preflight(
         }
     }
     Ok(report)
+}
+
+/// Refuse a conversion the destination cannot hold, before anything is written.
+///
+/// The check is advisory in one direction only: when free space cannot be
+/// measured it says nothing and lets the write proceed, because refusing a
+/// conversion that would have succeeded is worse than the error this prevents.
+fn check_output_space(output: &Path, needed: u64) -> Result<()> {
+    let directory = output.parent().filter(|p| !p.as_os_str().is_empty());
+    let Some(free) = free_disk_bytes(directory.unwrap_or_else(|| Path::new("."))) else {
+        return Ok(());
+    };
+    // A margin: the tokenizer is copied beside the model, and a filesystem at
+    // exactly zero free bytes is its own kind of broken.
+    let margin = 64 * 1024 * 1024;
+    if free < needed.saturating_add(margin) {
+        bail!(
+            "this conversion writes {} but {} has only {} free. Free up space or pass              --output to a different drive.",
+            crate::cli::format_bytes(needed),
+            directory.unwrap_or_else(|| Path::new(".")).display(),
+            crate::cli::format_bytes(free),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod space_tests {
+    use super::*;
+
+    /// The point of the preflight: a conversion that cannot fit is refused
+    /// with the two numbers, before any bytes are written, instead of dying
+    /// partway through with an OS error and leaving a truncated file.
+    #[test]
+    fn a_conversion_larger_than_the_disk_is_refused_with_both_numbers() {
+        let directory = std::env::temp_dir();
+        let Some(free) = free_disk_bytes(&directory) else {
+            // Unmeasurable here; the advisory path is covered below.
+            return;
+        };
+        let output = directory.join("rai-space-check.raimodel");
+        let error = check_output_space(&output, free.saturating_add(1 << 40))
+            .expect_err("a conversion larger than the disk must be refused");
+        let message = format!("{error:#}");
+        assert!(message.contains("free"), "{message}");
+        assert!(
+            message.contains("--output"),
+            "the refusal must say what to do: {message}"
+        );
+        assert!(
+            !output.exists(),
+            "the preflight must not create the output file"
+        );
+    }
+
+    /// A conversion that plainly fits is not refused.
+    #[test]
+    fn a_small_conversion_is_allowed() {
+        let output = std::env::temp_dir().join("rai-space-ok.raimodel");
+        check_output_space(&output, 1024).expect("a 1 KB write must not be refused");
+    }
+}
+
+/// Free bytes on the filesystem holding `directory`, or `None` when this
+/// platform will not say.
+#[cfg(windows)]
+fn free_disk_bytes(directory: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetDiskFreeSpaceExW(
+            directory: *const u16,
+            free_to_caller: *mut u64,
+            total: *mut u64,
+            total_free: *mut u64,
+        ) -> i32;
+    }
+    let mut wide: Vec<u16> = directory.as_os_str().encode_wide().collect();
+    wide.push(0);
+    let mut free_to_caller = 0u64;
+    let mut total = 0u64;
+    let mut total_free = 0u64;
+    // SAFETY: `wide` is a NUL-terminated UTF-16 path and the three outputs are
+    // valid initialized u64s for the duration of the call.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free_to_caller,
+            &mut total,
+            &mut total_free,
+        )
+    };
+    (ok != 0).then_some(free_to_caller)
+}
+
+#[cfg(unix)]
+fn free_disk_bytes(directory: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut path: Vec<u8> = directory.as_os_str().as_bytes().to_vec();
+    path.push(0);
+    // SAFETY: `path` is NUL-terminated and `stat` is a valid output buffer for
+    // the duration of the call.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let ok = unsafe { libc::statvfs(path.as_ptr() as *const libc::c_char, &mut stat) };
+    if ok != 0 {
+        return None;
+    }
+    // f_bavail is what a non-root process may actually use, which is the
+    // number that matters here; f_bfree includes the reserved blocks.
+    Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+}
+
+#[cfg(not(any(windows, unix)))]
+fn free_disk_bytes(_directory: &Path) -> Option<u64> {
+    None
 }
 
 fn check_tensor(store: &SafeTensorsSet, name: &str, rows: usize, cols: usize) -> Result<()> {

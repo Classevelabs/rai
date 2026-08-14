@@ -15,8 +15,16 @@ setlocal enabledelayedexpansion
 set "HERE=%~dp0"
 if not defined RAI_PORT set "RAI_PORT=8090"
 
-rem --- locate the rai binary: beside this script first, then PATH ------------
+rem --- where this launcher looks for things ----------------------------------
+rem The release archive ships rai.exe at its root and the launchers one level
+rem down, so the parent directory is searched too. Looking only beside this
+rem script is what made a downloaded archive fail on the first double-click.
+set "ROOT=%HERE%"
+if exist "%HERE%..\rai.exe" for %%D in ("%HERE%..") do set "ROOT=%%~fD\"
+
+rem --- locate rai: beside this script, then the archive root, then PATH -----
 set "RAI=%HERE%rai.exe"
+if not exist "%RAI%" set "RAI=%ROOT%rai.exe"
 if not exist "%RAI%" (
     set "RAI="
     for %%I in (rai.exe) do set "RAI=%%~$PATH:I"
@@ -25,7 +33,7 @@ if not defined RAI (
     echo.
     echo   Could not find rai.exe.
     echo.
-    echo   Put rai.exe in this folder ^(%HERE%^) or on your PATH,
+    echo   Put rai.exe in this folder ^(%ROOT%^) or on your PATH,
     echo   then run this launcher again.
     echo.
     pause
@@ -45,7 +53,7 @@ if defined RAI_MODEL (
 ) else (
     set "MODEL="
     set /a COUNT=0
-    for %%F in ("%HERE%*.raimodel") do (
+    for %%F in ("%ROOT%*.raimodel") do (
         set /a COUNT+=1
         set "MODEL=%%~fF"
     )
@@ -53,10 +61,10 @@ if defined RAI_MODEL (
     if !COUNT! EQU 0 (
         echo.
         echo   No .raimodel file found in this folder:
-        echo     %HERE%
+        echo     %ROOT%
         echo.
         echo   Convert a HuggingFace checkpoint first, for example:
-        echo     "%RAI%" convert C:\path\to\TinyLlama-1.1B-Chat -o "%HERE%tinyllama.raimodel"
+        echo     "%RAI%" convert C:\path\to\TinyLlama-1.1B-Chat -o "%ROOT%tinyllama.raimodel"
         echo.
         echo   Then run this launcher again.
         echo.
@@ -69,10 +77,10 @@ if defined RAI_MODEL (
         echo   More than one .raimodel file is in this folder, so it is not
         echo   obvious which one to start:
         echo.
-        for %%F in ("%HERE%*.raimodel") do echo     %%~nxF
+        for %%F in ("%ROOT%*.raimodel") do echo     %%~nxF
         echo.
         echo   Pick one by setting RAI_MODEL and running this launcher again:
-        echo     set RAI_MODEL=%HERE%^<name^>.raimodel
+        echo     set RAI_MODEL=%ROOT%^<name^>.raimodel
         echo.
         pause
         exit /b 1

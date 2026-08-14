@@ -1842,7 +1842,12 @@ fn handle_inspect(body: &str) -> Result<Value, ChatHttpError> {
 
     let group_size = request.group_size.unwrap_or(128);
     let embed_group_size = request.embed_group_size.unwrap_or(64);
-    let max_context = request.max_context.unwrap_or(2048);
+    // No context in the request means the same thing it means on the command
+    // line: follow the model's own window rather than a number this API
+    // invented. A constant here would reintroduce the cap the CLI just lost.
+    let max_context = request
+        .max_context
+        .unwrap_or(crate::convert::FOLLOW_MODEL_CONTEXT);
 
     let kind = catalog::classify(source);
     if kind == catalog::SourceKind::HuggingFaceId {
@@ -1896,7 +1901,9 @@ fn handle_convert(state: &ServerState, body: &str) -> Result<Value, ChatHttpErro
         output: Some(request.output),
         group_size: request.group_size.unwrap_or(128),
         embed_group_size: request.embed_group_size.unwrap_or(64),
-        max_context: request.max_context.unwrap_or(2048),
+        max_context: request
+            .max_context
+            .unwrap_or(crate::convert::FOLLOW_MODEL_CONTEXT),
         tokenizer_out: request.tokenizer_out,
         // The job captures the narration; printing it into the server's
         // terminal too would interleave with request logging.

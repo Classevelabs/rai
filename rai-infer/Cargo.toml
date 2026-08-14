@@ -34,6 +34,13 @@ cli = [
     "dep:memmap2",
 ]
 
+# Unix-only, and only for the free-space preflight before a conversion writes.
+# libc is already in the lock file transitively, so this adds no new code to the
+# dependency tree; the alternative was hand-declaring statvfs, whose struct
+# layout differs between glibc, musl and macOS and would be a guess per target.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dependencies]
 half = "2.4"
 anyhow = "1"

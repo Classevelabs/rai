@@ -14,6 +14,14 @@
 set -u
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+# The release archive ships the binary at its root and the launchers one level
+# down, so the parent directory counts as home too. Looking only beside this
+# script is what made a downloaded archive fail on the first double-click.
+ROOT="${HERE}"
+if [ ! -x "${HERE}/rai" ] && [ -x "${HERE}/../rai" ]; then
+    ROOT="$(cd -- "${HERE}/.." && pwd)"
+fi
 PORT="${RAI_PORT:-8090}"
 URL="http://localhost:${PORT}/"
 
@@ -30,12 +38,14 @@ die() {
 # --- locate the rai binary: beside this script first, then PATH -------------
 if [ -x "${HERE}/rai" ]; then
     RAI="${HERE}/rai"
+elif [ -x "${ROOT}/rai" ]; then
+    RAI="${ROOT}/rai"
 elif RAI="$(command -v rai 2>/dev/null)"; then
     :
 else
     die "  Could not find the rai binary.
 
-  Put it in ${HERE} or on your PATH, then run this launcher again."
+  Put it in ${ROOT} or on your PATH, then run this launcher again."
 fi
 
 # --- pick a model -----------------------------------------------------------
@@ -46,15 +56,15 @@ else
     models=()
     while IFS= read -r -d '' path; do
         models+=("${path}")
-    done < <(find "${HERE}" -maxdepth 1 -type f -name '*.raimodel' -print0 2>/dev/null | sort -z)
+    done < <(find "${ROOT}" -maxdepth 1 -type f -name '*.raimodel' -print0 2>/dev/null | sort -z)
 
     case "${#models[@]}" in
         0)
             die "  No .raimodel file found in this directory:
-    ${HERE}
+    ${ROOT}
 
   Convert a HuggingFace checkpoint first, for example:
-    \"${RAI}\" convert /path/to/TinyLlama-1.1B-Chat -o \"${HERE}/tinyllama.raimodel\"
+    \"${RAI}\" convert /path/to/TinyLlama-1.1B-Chat -o \"${ROOT}/tinyllama.raimodel\"
 
   Then run this launcher again."
             ;;
@@ -71,7 +81,7 @@ else
 
 ${listing}
   Pick one by setting RAI_MODEL and running this launcher again:
-    RAI_MODEL=${HERE}/<name>.raimodel $0"
+    RAI_MODEL=${ROOT}/<name>.raimodel $0"
             ;;
     esac
 fi
