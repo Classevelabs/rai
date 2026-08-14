@@ -17,6 +17,7 @@
   --r1:12px; --r2:16px; --r3:22px; --r4:28px;
   --squircle:superellipse(1.8);
   --s2:8px; --s3:12px; --s4:16px; --s5:24px; --s6:32px; --s7:44px;
+  --col:836px;
 }
 *{box-sizing:border-box}
 html,body{height:100%}
@@ -25,6 +26,7 @@ body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);font-
 .lbl{font-family:var(--mono);font-size:10px;letter-spacing:.15em;text-transform:uppercase;color:var(--fg-3)}
 .val{font-family:var(--mono);font-variant-numeric:tabular-nums}
 h1{margin:0;font-family:var(--mono);font-size:21px;font-weight:700;letter-spacing:-.02em}
+[hidden]{display:none !important}
 /* chrome */
 .top{height:46px;flex:0 0 46px;display:flex;align-items:center;gap:var(--s4);padding:0 var(--s4);
   border-bottom:1px solid var(--line);background:var(--panel)}
@@ -33,24 +35,28 @@ h1{margin:0;font-family:var(--mono);font-size:21px;font-weight:700;letter-spacin
 .brand .dot{width:9px;height:9px;background:var(--accent);border-radius:2px;transform:rotate(45deg)}
 .crumb{font-family:var(--mono);font-size:10px;letter-spacing:.15em;text-transform:uppercase;color:var(--fg-3)}
 .crumb b{color:var(--fg-2);font-weight:400}
-.top .right{margin-left:auto;display:flex;align-items:center;gap:var(--s4)}
+.top .right{margin-left:auto;display:flex;align-items:center;gap:var(--s3)}
 .pill{display:flex;align-items:center;gap:7px;padding:5px 11px;border:1px solid var(--line-2);
   border-radius:100px;font-family:var(--mono);font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--fg-2)}
 .pill i{width:6px;height:6px;border-radius:50%;background:var(--fg-3);display:block;flex:0 0 6px}
 .pill.on i{background:var(--ok)}
-.pill.busy i{background:var(--accent)}
+.pill.busy i{background:var(--accent);animation:pulse 1.1s ease-in-out infinite}
+@keyframes pulse{50%{opacity:.25}}
+@keyframes blink{50%{opacity:0}}
 .shell{flex:1;display:flex;min-height:0}
 .rail{width:58px;flex:0 0 58px;border-right:1px solid var(--line);background:var(--panel);
   display:flex;flex-direction:column;align-items:center;padding:var(--s3) 0;gap:4px}
 .rail button{width:40px;height:40px;display:grid;place-items:center;background:none;border:0;
   color:var(--fg-3);cursor:pointer;border-radius:var(--r2);corner-shape:var(--squircle);position:relative}
 .rail button:hover{color:var(--fg-2);background:var(--panel-2)}
+.rail button:active{background:var(--panel-3)}
+.rail button:focus-visible{outline:none;color:var(--fg);box-shadow:0 0 0 3px var(--wash)}
 .rail button[aria-current=true]{color:var(--accent);background:var(--wash)}
 .rail button[aria-current=true]::before{content:"";position:absolute;left:-13px;top:11px;bottom:11px;
   width:2px;background:var(--accent);border-radius:2px}
 .rail svg{width:19px;height:19px;stroke:currentColor;fill:none;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
-main{flex:1;overflow-y:auto;min-width:0}
-.screen{display:none;padding:var(--s6) var(--s7) var(--s7);max-width:1240px}
+main{flex:1;overflow-y:auto;min-width:0;position:relative}
+.screen{display:none;padding:var(--s6) var(--s7) var(--s7);max-width:1240px;margin:0 auto}
 .screen.on{display:block}
 .head{display:flex;align-items:flex-end;gap:var(--s4);margin-bottom:var(--s5);flex-wrap:wrap}
 .head p{margin:6px 0 0;color:var(--fg-2);font-size:13.5px;max-width:64ch}
@@ -60,7 +66,7 @@ main{flex:1;overflow-y:auto;min-width:0}
 .metric{background:var(--panel);border:1px solid var(--line);border-radius:var(--r3);corner-shape:var(--squircle);padding:var(--s4) var(--s5)}
 .metric .lbl{display:block;margin-bottom:9px}
 .metric .n{font-family:var(--mono);font-size:27px;font-weight:700;letter-spacing:-.03em;line-height:1;
-  font-variant-numeric:tabular-nums}
+  font-variant-numeric:tabular-nums;word-break:break-word}
 .metric .n.acc{color:var(--accent)}
 .metric .n small{font-size:14px;color:var(--fg-3);font-weight:400}
 .metric .sub{color:var(--fg-3);font-size:12px;margin-top:7px}
@@ -74,11 +80,15 @@ main{flex:1;overflow-y:auto;min-width:0}
 /* buttons */
 .btn{font-family:var(--mono);font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;font-weight:600;
   padding:11px 18px;border:1px solid transparent;border-radius:var(--r1);corner-shape:var(--squircle);background:var(--accent);color:#fff;
-  cursor:pointer;display:inline-flex;align-items:center;gap:9px;transition:background .12s}
+  cursor:pointer;display:inline-flex;align-items:center;justify-content:center;gap:9px;transition:background .12s,border-color .12s}
 .btn:hover:not(:disabled){background:var(--accent-hi)}
+.btn:active:not(:disabled){background:var(--accent-dim)}
+.btn:focus-visible{outline:none;box-shadow:0 0 0 3px var(--wash)}
 .btn:disabled{background:var(--panel-3);color:var(--fg-3);cursor:not-allowed}
 .btn.ghost{background:none;border-color:var(--line-2);color:var(--fg-2)}
 .btn.ghost:hover:not(:disabled){background:var(--panel-2);color:var(--fg);border-color:var(--fg-3)}
+.btn.ghost:active:not(:disabled){background:var(--panel-3)}
+.btn.ghost:disabled{background:none;border-color:var(--line);color:var(--fg-3)}
 .btn.sm{padding:7px 13px;font-size:10px}
 .btn svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
 /* inputs */
@@ -86,8 +96,9 @@ main{flex:1;overflow-y:auto;min-width:0}
 input,select,textarea{background:var(--sunk);border:1px solid var(--line-2);border-radius:var(--r1);corner-shape:var(--squircle);
   color:var(--fg);font-family:var(--mono);font-size:13px;padding:11px 13px;width:100%}
 input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--wash)}
+input:disabled,select:disabled,textarea:disabled{color:var(--fg-3);cursor:not-allowed;background:var(--panel-2)}
 .row{display:flex;gap:var(--s3);align-items:flex-end;flex-wrap:wrap}
-.row>*{flex:1;min-width:130px}
+.row>*{flex:1 1 190px;min-width:130px}
 .row>.fixed{flex:0 0 auto;min-width:0}
 .seg{display:inline-flex;border:1px solid var(--line-2);border-radius:var(--r1);corner-shape:var(--squircle);overflow:hidden}
 .seg button{font-family:var(--mono);font-size:10px;letter-spacing:.13em;text-transform:uppercase;
@@ -103,9 +114,11 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);
 .spec{font-family:var(--mono);font-size:11px;color:var(--fg-3);margin-top:5px;font-variant-numeric:tabular-nums}
 .sz{font-family:var(--mono);font-size:13px;color:var(--fg-2);font-variant-numeric:tabular-nums;white-space:nowrap}
 .tag{font-family:var(--mono);font-size:9px;letter-spacing:.12em;text-transform:uppercase;padding:3px 8px;
-  border:1px solid var(--line-2);border-radius:100px;color:var(--fg-3)}
+  border:1px solid var(--line-2);border-radius:100px;color:var(--fg-3);white-space:nowrap}
 .tag.v2{border-color:var(--accent-dim);color:var(--accent)}
 .tag.ok{border-color:#2F5442;color:var(--ok)}
+.tag.warn{border-color:#5A3A2A;color:var(--warn)}
+.tag.bad{border-color:#5A2A2A;color:var(--bad)}
 /* stages + progress */
 .stage{display:grid;grid-template-columns:24px 1fr auto;gap:var(--s4);align-items:center;
   padding:11px var(--s3);border-bottom:1px solid var(--line)}
@@ -120,27 +133,160 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);
 .log{background:var(--sunk);border:1px solid var(--line);border-radius:var(--r2);corner-shape:var(--squircle);padding:var(--s3) var(--s4);
   font-family:var(--mono);font-size:11.5px;line-height:1.8;color:var(--fg-3);height:186px;overflow-y:auto;white-space:pre-wrap}
 .log .hl{color:var(--accent)} .log .dim{color:var(--fg-3)} .log .err{color:var(--bad)}
-/* chat */
-.chatwrap{display:flex;flex-direction:column;height:calc(100vh - 46px)}
-.chatbar{padding:var(--s4) var(--s7) 0;display:flex;gap:var(--s3);align-items:flex-end;flex-wrap:wrap}
-.thread{flex:1;overflow-y:auto;padding:var(--s5) var(--s7)}
-.msg{max-width:76ch;margin-bottom:var(--s5)}
+.pathrow{display:flex;gap:var(--s3);align-items:center;flex-wrap:wrap;background:var(--sunk);
+  border:1px solid var(--line);border-radius:var(--r2);corner-shape:var(--squircle);padding:var(--s3) var(--s4)}
+.pathrow .grow{flex:1;min-width:220px}
+.pathrow code{font-family:var(--mono);font-size:12px;color:var(--fg);word-break:break-all;display:block;margin-top:5px}
+/* ---------- chat ---------- */
+.chatwrap{display:flex;height:calc(100vh - 46px);min-height:0;position:relative}
+.sessions{width:238px;flex:0 0 238px;border-right:1px solid var(--line);background:var(--panel);
+  display:flex;flex-direction:column;min-height:0}
+.sessions[data-collapsed=true]{display:none}
+.sessions-head{display:flex;align-items:center;gap:var(--s3);padding:var(--s3) var(--s3) var(--s3) var(--s4);
+  border-bottom:1px solid var(--line)}
+.sessions-head .lbl{flex:1}
+.sessions-list{flex:1;overflow-y:auto;padding:var(--s3);display:flex;flex-direction:column;gap:3px;min-height:0}
+.sessions-foot{border-top:1px solid var(--line);padding:var(--s3) var(--s4);color:var(--fg-3);font-size:11px;line-height:1.5}
+.sitem{display:grid;grid-template-columns:1fr auto auto;align-items:center;border:1px solid transparent;
+  border-radius:var(--r2);corner-shape:var(--squircle)}
+.sitem:hover{background:var(--panel-2)}
+.sitem[aria-current=true]{background:var(--wash);border-color:var(--accent-dim)}
+.sitem .sopen{display:block;width:100%;text-align:left;background:none;border:0;color:inherit;font:inherit;
+  padding:9px 4px 9px 11px;cursor:pointer;min-width:0;border-radius:var(--r2);corner-shape:var(--squircle)}
+.sitem .sopen:focus-visible{outline:none;box-shadow:0 0 0 3px var(--wash)}
+.sitem .t{display:block;font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--fg-2)}
+.sitem[aria-current=true] .t{color:var(--fg)}
+.sitem .m{display:block;font-family:var(--mono);font-size:9px;letter-spacing:.11em;text-transform:uppercase;
+  color:var(--fg-3);margin-top:3px}
+.sitem .sact{background:none;border:0;color:var(--fg-3);cursor:pointer;padding:6px;opacity:0;
+  border-radius:var(--r1);corner-shape:var(--squircle);display:grid;place-items:center}
+.sitem:hover .sact,.sitem:focus-within .sact{opacity:1}
+.sitem .sact:hover{color:var(--fg);background:var(--panel-3)}
+.sitem .sact:focus-visible{outline:none;opacity:1;box-shadow:0 0 0 3px var(--wash)}
+.sitem .sact.danger:hover{color:var(--bad)}
+.sitem .sact svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+.sitem input.rename{font-family:var(--sans);font-size:12.5px;padding:6px 8px;margin:3px}
+.sconfirm{grid-column:1/-1;padding:9px 11px}
+.sconfirm .q{display:block;font-size:11.5px;color:var(--fg-2)}
+.sconfirm .b{display:flex;gap:6px;margin-top:8px}
+.sconfirm .b .btn{flex:1}
+.chatmain{flex:1;display:flex;flex-direction:column;min-width:0;min-height:0}
+.chathead{display:flex;align-items:center;gap:var(--s3);padding:10px var(--s4);border-bottom:1px solid var(--line);
+  background:var(--panel);flex-wrap:wrap}
+.chathead .grow{flex:1;min-width:8px}
+.iconbtn{background:none;border:1px solid var(--line-2);color:var(--fg-3);cursor:pointer;width:34px;height:34px;
+  display:grid;place-items:center;border-radius:var(--r1);corner-shape:var(--squircle);flex:0 0 auto}
+.iconbtn:hover{color:var(--fg);background:var(--panel-2)}
+.iconbtn:active{background:var(--panel-3)}
+.iconbtn:focus-visible{outline:none;box-shadow:0 0 0 3px var(--wash)}
+.iconbtn[aria-pressed=true],.iconbtn[aria-expanded=true]{color:var(--accent);border-color:var(--accent-dim);background:var(--wash)}
+.iconbtn svg{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+.modelpick{position:relative;min-width:0}
+.picker{display:flex;align-items:center;gap:10px;padding:7px 12px;max-width:360px;
+  border:1px solid var(--line-2);border-radius:var(--r2);corner-shape:var(--squircle);background:var(--sunk);color:var(--fg);
+  font-family:var(--mono);font-size:12.5px;cursor:pointer;text-align:left}
+.picker:hover:not(:disabled){border-color:var(--fg-3);background:var(--panel-2)}
+.picker:focus-visible{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--wash)}
+.picker[aria-expanded=true]{border-color:var(--accent)}
+.picker:disabled{cursor:progress;color:var(--fg-3)}
+.picker .who{font-family:var(--mono);font-size:9px;letter-spacing:.16em;text-transform:uppercase;color:var(--fg-3)}
+.picker .nm2{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block;max-width:250px}
+.picker svg{width:13px;height:13px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;
+  flex:0 0 13px;margin-left:auto}
+.pop{position:absolute;top:calc(100% + 7px);left:0;width:420px;max-width:82vw;z-index:20;padding:6px;
+  background:var(--panel-2);border:1px solid var(--line-2);border-radius:var(--r3);corner-shape:var(--squircle);
+  box-shadow:0 18px 44px #000b;max-height:min(64vh,460px);overflow-y:auto}
+.mitem{display:grid;grid-template-columns:1fr auto;gap:3px var(--s3);width:100%;text-align:left;background:none;
+  border:1px solid transparent;border-radius:var(--r2);corner-shape:var(--squircle);padding:9px 11px;color:inherit;font:inherit;cursor:pointer}
+.mitem:hover{background:var(--panel-3)}
+.mitem:focus-visible{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--wash)}
+.mitem[aria-current=true]{border-color:var(--accent-dim);background:var(--wash)}
+.mitem:disabled{cursor:not-allowed;color:var(--fg-3)}
+.mitem .n{font-family:var(--mono);font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mitem .s{font-family:var(--mono);font-size:11px;color:var(--fg-2);font-variant-numeric:tabular-nums}
+.mitem .d{grid-column:1/-1;font-family:var(--mono);font-size:10px;color:var(--fg-3);font-variant-numeric:tabular-nums}
+.popfoot{display:flex;gap:var(--s2);padding:8px 5px 3px;border-top:1px solid var(--line);margin-top:5px;flex-wrap:wrap}
+.popmsg{padding:var(--s4);color:var(--fg-3);font-size:12.5px;text-align:center}
+.tune{border-bottom:1px solid var(--line);background:var(--panel-2);padding:var(--s4)}
+.tune .note{color:var(--fg-3);font-size:11.5px;margin:var(--s3) 0 0}
+.metapill{font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--fg-3);
+  border:1px solid var(--line);border-radius:100px;padding:5px 10px;background:none;cursor:pointer;white-space:nowrap}
+.metapill:hover{color:var(--fg-2);border-color:var(--line-2)}
+.metapill:focus-visible{outline:none;box-shadow:0 0 0 3px var(--wash)}
+.metapill b{color:var(--fg-2);font-weight:600}
+.thread{flex:1;overflow-y:auto;padding:var(--s5) var(--s5) var(--s3);min-height:0;position:relative}
+.tinner{max-width:var(--col);margin:0 auto;width:100%}
+.msg{margin-bottom:var(--s5);display:flex;flex-direction:column;align-items:flex-start}
+.msg.me{align-items:flex-end}
 .msg .who{font-family:var(--mono);font-size:9.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--fg-3);margin-bottom:7px}
-.msg.me{margin-left:auto} .msg.me .who{text-align:right}
 .msg.me .bub{background:var(--panel-2);border:1px solid var(--line);border-radius:var(--r3);corner-shape:var(--squircle);
-  padding:10px 15px;display:inline-block}
-.msg.ai .bub{white-space:pre-wrap}
-.composer{border-top:1px solid var(--line);background:var(--panel);padding:var(--s4) var(--s7)}
-.composer .box{display:flex;gap:var(--s3);align-items:flex-end}
-.composer textarea{resize:none;height:46px;font-family:var(--sans);font-size:14px;border-radius:var(--r2)}
+  padding:10px 15px;max-width:min(100%,62ch);white-space:pre-wrap;word-break:break-word}
+.msg.ai{width:100%}
+.msg.ai .bub{white-space:pre-wrap;word-break:break-word;width:100%}
+.msg.ai .bub.err{color:#F2C0B6;border:1px solid var(--bad);border-radius:var(--r2);corner-shape:var(--squircle);padding:11px 15px;background:#2A1512}
+.msg .bub.live::after{content:"";display:inline-block;width:7px;height:14px;background:var(--accent);
+  margin-left:3px;vertical-align:-2px;animation:blink 1s steps(2) infinite}
+.msg .mstats{font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--fg-3);
+  margin-top:9px;display:flex;gap:var(--s4);flex-wrap:wrap}
+.msg .mstats b{color:var(--fg-2);font-weight:600;font-variant-numeric:tabular-nums}
+.think{border:1px solid var(--line);border-radius:var(--r2);corner-shape:var(--squircle);background:var(--sunk);margin-bottom:11px}
+.think>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:9px;padding:8px 13px;
+  font-family:var(--mono);font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--fg-3)}
+.think>summary::-webkit-details-marker{display:none}
+.think>summary::marker{content:""}
+.think>summary:hover{color:var(--fg-2)}
+.think>summary:focus-visible{outline:none;box-shadow:0 0 0 3px var(--wash);border-radius:var(--r2)}
+.think .cv{width:12px;height:12px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;
+  stroke-linejoin:round;transition:transform .15s;flex:0 0 12px}
+.think[open] .cv{transform:rotate(90deg)}
+.think .n2{margin-left:auto;color:var(--fg-3);letter-spacing:.1em}
+.think.live>summary{color:var(--accent)}
+.think .tbody{padding:11px 15px 13px;border-top:1px solid var(--line);color:var(--fg-2);font-size:13px;
+  white-space:pre-wrap;word-break:break-word}
+.think .tnote{padding:0 15px 13px;color:var(--warn);font-size:12px}
+.jump{position:absolute;bottom:14px;left:50%;transform:translateX(-50%);z-index:6}
+.composer{border-top:1px solid var(--line);background:var(--panel);padding:var(--s3) var(--s5) var(--s4)}
+.composer .cinner{max-width:var(--col);margin:0 auto}
+.composer .box{display:flex;gap:var(--s3);align-items:flex-end;background:var(--sunk);border:1px solid var(--line-2);
+  border-radius:var(--r3);corner-shape:var(--squircle);padding:7px 7px 7px 15px}
+.composer .box:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px var(--wash)}
+.composer textarea{border:0;background:none;padding:11px 0;resize:none;min-height:46px;max-height:230px;
+  font-family:var(--sans);font-size:14.5px;line-height:1.55;border-radius:0}
+.composer textarea:focus{outline:none;box-shadow:none}
+.composer textarea::placeholder{color:var(--fg-3)}
+.composer .send{height:46px;min-width:96px;flex:0 0 auto}
 .strip{display:flex;gap:var(--s5);margin-top:11px;font-family:var(--mono);font-size:10px;
-  letter-spacing:.12em;text-transform:uppercase;color:var(--fg-3);flex-wrap:wrap}
+  letter-spacing:.12em;text-transform:uppercase;color:var(--fg-3);flex-wrap:wrap;align-items:center}
 .strip b{color:var(--accent);font-weight:600;font-variant-numeric:tabular-nums}
-.empty{text-align:center;padding:var(--s7) var(--s4);color:var(--fg-3);
-  border:1px dashed var(--line-2);border-radius:var(--r3)}
+.strip .hintline{color:var(--fg-3);letter-spacing:.04em;text-transform:none;font-family:var(--sans);font-size:11.5px}
+/* system panel */
+.syspanel{width:312px;flex:0 0 312px;border-left:1px solid var(--line);background:var(--panel);
+  overflow-y:auto;padding:var(--s4) var(--s4) var(--s6)}
+.sysgrp{margin-bottom:var(--s5)}
+.sysgrp>h5{margin:0 0 9px;font-family:var(--mono);font-size:10px;letter-spacing:.15em;text-transform:uppercase;
+  color:var(--fg-2);font-weight:400;display:flex;align-items:center;gap:8px}
+.kv{display:flex;justify-content:space-between;gap:var(--s3);padding:6px 0;border-bottom:1px solid var(--line)}
+.kv:last-child{border-bottom:0}
+.kv .k{color:var(--fg-3);font-size:12px;flex:0 0 auto}
+.kv .v{font-family:var(--mono);font-size:12px;font-variant-numeric:tabular-nums;text-align:right;
+  word-break:break-word;min-width:0}
+.kv .v.na{font-family:var(--sans);font-size:11.5px;color:var(--fg-3)}
+.chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:9px}
+.chip{font-family:var(--mono);font-size:9px;letter-spacing:.12em;text-transform:uppercase;padding:3px 8px;
+  border-radius:100px;border:1px solid var(--line-2);color:var(--fg-3)}
+.chip.on{border-color:#2F5442;color:var(--ok)}
+.sysnote{color:var(--fg-3);font-size:11.5px;line-height:1.5;margin:10px 0 0}
+.meter{height:4px;background:var(--panel-3);border-radius:100px;overflow:hidden;margin-top:9px}
+.meter span{display:block;height:100%;background:var(--accent);border-radius:100px;transition:width .3s}
+/* shared states */
+.empty{text-align:center;padding:var(--s6) var(--s4);color:var(--fg-3);
+  border:1px dashed var(--line-2);border-radius:var(--r3);corner-shape:var(--squircle)}
+.empty h3{margin:0 0 8px;font-family:var(--mono);font-size:13px;color:var(--fg-2);font-weight:600}
+.empty p{margin:0 auto;max-width:52ch;font-size:12.5px;line-height:1.6}
+.empty .acts{display:flex;gap:var(--s3);justify-content:center;flex-wrap:wrap;margin-top:var(--s4)}
 .toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--panel-2);
   border:1px solid var(--line-2);border-radius:var(--r2);corner-shape:var(--squircle);padding:11px 18px;font-family:var(--mono);
-  font-size:11px;letter-spacing:.08em;color:var(--fg);box-shadow:0 8px 26px #0009;z-index:9;max-width:80vw}
+  font-size:11px;letter-spacing:.08em;color:var(--fg);box-shadow:0 8px 26px #0009;z-index:30;max-width:80vw}
 .toast.bad{border-color:var(--bad);color:#F2C0B6}
 /* refusal -> next step */
 .nx{margin-top:var(--s4);padding-top:var(--s4);border-top:1px solid var(--line)}
@@ -159,7 +305,22 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);
 ::-webkit-scrollbar{width:10px;height:10px}
 ::-webkit-scrollbar-track{background:var(--bg)}
 ::-webkit-scrollbar-thumb{background:var(--line-2);border-radius:100px}
-@media(max-width:900px){.screen{padding:var(--s5) var(--s4)}.thread,.composer,.chatbar{padding-left:var(--s4);padding-right:var(--s4)}}
+/* Below these widths the two side panels become drawers over the chat. The
+   column is inset by the same amount so nothing ends up hidden underneath
+   one - a message half under a drawer reads as a broken row. */
+@media(max-width:1240px){
+  .syspanel{position:absolute;right:0;top:0;bottom:0;z-index:18;box-shadow:-18px 0 44px #0009}
+  .chatwrap[data-sys=open] .chatmain{padding-right:312px}
+}
+@media(max-width:980px){
+  .sessions{position:absolute;left:0;top:0;bottom:0;z-index:19;box-shadow:18px 0 44px #0009}
+  .chatwrap[data-chats=open] .chatmain{padding-left:238px}
+}
+@media(max-width:900px){
+  .screen{padding:var(--s5) var(--s4)}
+  .thread,.composer{padding-left:var(--s4);padding-right:var(--s4)}
+  .picker{max-width:210px}.picker .nm2{max-width:120px}
+}
 </style></head><body>
 
 <div class="top">
@@ -176,7 +337,7 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);
       <svg viewBox="0 0 24 24"><path d="M3 7l9-4 9 4-9 4-9-4z"/><path d="M3 12l9 4 9-4"/><path d="M3 17l9 4 9-4"/></svg></button>
     <button data-go="convert" title="Convert">
       <svg viewBox="0 0 24 24"><path d="M12 3v11"/><path d="M8 10l4 4 4-4"/><path d="M4 17v3h16v-3"/></svg></button>
-    <button data-go="run" title="Run">
+    <button data-go="run" title="Chat">
       <svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M8 10l3 2-3 2"/><path d="M13 14h4"/></svg></button>
   </nav>
 
@@ -223,8 +384,11 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);
             <div class="row">
               <div class="field"><span class="lbl">Group</span><select id="gs"><option>128</option><option>64</option><option>224</option></select></div>
               <div class="field"><span class="lbl">Embed group</span><select id="egs"><option>64</option><option>128</option></select></div>
-              <div class="field"><span class="lbl">Context</span><select id="ctx"><option>2048</option><option>4096</option><option>8192</option></select></div>
+              <div class="field"><span class="lbl">Context</span><select id="ctx">
+                <option>1024</option><option selected>2048</option><option>4096</option><option>8192</option>
+                <option>16384</option><option>32768</option><option>65536</option><option>131072</option></select></div>
             </div>
+            <p class="hint" id="ctxCost">Context is the KV-cache window baked into the file. Larger costs memory at run time.</p>
             <div class="field" style="margin-top:var(--s3)"><span class="lbl">Output file</span>
               <input type="text" id="out" placeholder="model-q4.raimodel" spellcheck="false"></div>
           </div>
@@ -240,36 +404,101 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);
           <div class="sec"><header><span class="lbl">Log</span></header>
             <div class="log" id="log">Ready. Choose a checkpoint folder and press Check.</div></div>
           <div class="sec" id="resultSec" style="display:none">
-            <header><span class="lbl">Result</span><span class="count">COMPLETE</span></header>
-            <div class="metrics" style="margin:0">
-              <div class="metric"><span class="lbl">Size</span><div class="n acc" id="rSize">—</div><div class="sub" id="rSections"></div></div>
+            <header><span class="lbl">Result</span><span class="count" id="rVerdict">COMPLETE</span></header>
+            <div class="metrics" style="margin:0 0 var(--s4)">
+              <div class="metric"><span class="lbl">Source</span><div class="n" id="rSrc">—</div><div class="sub" id="rSrcSub">checkpoint on disk</div></div>
+              <div class="metric"><span class="lbl">Output</span><div class="n acc" id="rSize">—</div><div class="sub" id="rSections"></div></div>
+              <div class="metric"><span class="lbl">Smaller by</span><div class="n" id="rRatio">—</div><div class="sub" id="rSaved">source ÷ output</div></div>
+              <div class="metric"><span class="lbl">Bits / parameter</span><div class="n" id="rBpp">—</div><div class="sub" id="rParams">parameters</div></div>
               <div class="metric"><span class="lbl">Time</span><div class="n" id="rTime">—</div><div class="sub">wall clock</div></div>
               <div class="metric"><span class="lbl">Process peak</span><div class="n" id="rRam">—</div><div class="sub">whole server, not the conversion alone</div></div>
             </div>
+            <div class="pathrow">
+              <div class="grow"><span class="lbl">Saved to</span><code id="rPath">—</code></div>
+              <button class="btn sm ghost" id="rCopy">Copy path</button>
+              <button class="btn sm" id="rLoad">Load it</button>
+            </div>
+            <p class="hint" id="rCtxLine"></p>
+            <p class="hint" id="rTok"></p>
           </div>
         </div>
       </div>
     </section>
 
     <!-- RUN -->
-    <section class="screen" id="s-run" style="padding:0;max-width:none">
+    <section class="screen" id="s-run" style="padding:0;max-width:none;margin:0">
       <div class="chatwrap">
-        <div class="chatbar">
-          <div class="field" style="min-width:210px"><span class="lbl">Model</span><select id="runModel"></select></div>
-          <div class="field" style="max-width:150px"><span class="lbl">Template</span>
-            <select id="tpl"><option>auto</option><option>chatml</option><option>zephyr</option><option>llama3</option><option>mistral</option><option>few-shot</option><option>none</option></select></div>
-          <div class="field" style="max-width:104px"><span class="lbl">Temp</span><input type="number" id="temp" value="0.7" step="0.1" min="0.01" max="2"></div>
-          <div class="field" style="max-width:120px"><span class="lbl">Max tokens</span><input type="number" id="maxTok" value="256" min="1" max="512"></div>
-        </div>
-        <div class="thread" id="thread"></div>
-        <div class="composer">
-          <div class="box"><textarea id="prompt" placeholder="Send a message…"></textarea>
-            <button class="btn" id="sendBtn" style="height:46px">Send</button></div>
-          <div class="strip">
-            <span>Speed <b id="sTps">—</b></span><span>Tokens <b id="sTok">—</b></span>
-            <span>Prefill <b id="sPre">—</b></span><span>Context <b id="sCtx">—</b></span>
+        <aside class="sessions" id="sessions">
+          <div class="sessions-head">
+            <span class="lbl">Chats</span>
+            <button class="btn sm ghost" id="newChat">New chat</button>
+          </div>
+          <div class="sessions-list" id="sessionList"></div>
+          <div class="sessions-foot" id="sessionsFoot">Chats are kept in this browser only.</div>
+        </aside>
+
+        <div class="chatmain">
+          <header class="chathead">
+            <button class="iconbtn" id="railChats" title="Show or hide the chat list" aria-pressed="true">
+              <svg viewBox="0 0 24 24"><path d="M4 6h16"/><path d="M4 12h16"/><path d="M4 18h10"/></svg></button>
+            <div class="modelpick">
+              <button class="picker" id="modelBtn" aria-expanded="false" aria-haspopup="listbox">
+                <span class="who">Model</span><span class="nm2" id="modelBtnName">No model loaded</span>
+                <svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg></button>
+              <div class="pop" id="modelPop" role="listbox" hidden></div>
+            </div>
+            <button class="metapill" id="pillTpl" title="Open tuning">TPL <b>auto</b></button>
+            <button class="metapill" id="pillCtx" title="Open tuning">CTX <b>—</b></button>
+            <button class="metapill" id="pillTok" title="Open tuning">MAX <b>512</b></button>
+            <div class="grow"></div>
+            <button class="iconbtn" id="tuneBtn" title="Generation and model settings" aria-expanded="false">
+              <svg viewBox="0 0 24 24"><path d="M4 6h10"/><path d="M18 6h2"/><circle cx="16" cy="6" r="2"/><path d="M4 12h4"/><path d="M12 12h8"/><circle cx="10" cy="12" r="2"/><path d="M4 18h10"/><path d="M18 18h2"/><circle cx="16" cy="18" r="2"/></svg></button>
+            <button class="iconbtn" id="sysBtn" title="System monitor" aria-expanded="false">
+              <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/><path d="M7 12l2.5-3 2 4 2-2.5L17 12"/></svg></button>
+          </header>
+
+          <div class="tune" id="tunePanel" hidden>
+            <div class="row">
+              <div class="field"><span class="lbl">Chat template</span>
+                <select id="tpl"><option value="auto">auto</option><option value="chatml">chatml</option>
+                  <option value="gemma">gemma</option><option value="llama3">llama3</option>
+                  <option value="mistral">mistral</option><option value="phi3">phi3</option>
+                  <option value="zephyr">zephyr</option><option value="few-shot">few-shot</option>
+                  <option value="none">none</option></select></div>
+              <div class="field"><span class="lbl">Context window</span><select id="runCtx"></select></div>
+              <div class="fixed"><button class="btn ghost" id="applyLoad" disabled>Reload model</button></div>
+            </div>
+            <div class="row" style="margin-top:var(--s3)">
+              <div class="field"><span class="lbl">Temperature</span>
+                <input type="number" id="temp" value="0.7" step="0.1" min="0.01" max="2"></div>
+              <div class="field"><span class="lbl">Max new tokens</span>
+                <input type="number" id="maxTok" value="512" min="1"></div>
+              <div class="fixed" style="align-self:flex-end"><span class="lbl" id="tokCeil">&nbsp;</span></div>
+            </div>
+            <p class="note" id="tuneNote">Template and context are properties of the loaded model, so changing them reloads it. Temperature and max tokens apply to the next message.</p>
+          </div>
+
+          <div class="thread" id="thread"><div class="tinner" id="threadInner"></div>
+            <button class="btn sm ghost jump" id="jumpBtn" hidden>Jump to latest</button></div>
+
+          <div class="composer">
+            <div class="cinner">
+              <div class="box">
+                <textarea id="prompt" rows="1" placeholder="Send a message…  (Enter to send, Shift+Enter for a new line)"></textarea>
+                <button class="btn send" id="sendBtn">Send</button>
+                <button class="btn ghost send" id="stopBtn" hidden>Stop</button>
+              </div>
+              <div class="strip">
+                <span>Speed <b id="sTps">—</b></span><span>Tokens <b id="sTok">—</b></span>
+                <span>Prefill <b id="sPre">—</b></span><span>Context <b id="sCtx">—</b></span>
+                <span>Stop <b id="sStop">—</b></span>
+                <span class="hintline" id="sHint"></span>
+              </div>
+            </div>
           </div>
         </div>
+
+        <aside class="syspanel" id="sysPanel" hidden></aside>
       </div>
     </section>
   </main>
@@ -278,10 +507,55 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 const esc=s=>String(s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 const human=b=>b>=1073741824?(b/1073741824).toFixed(2)+" GB":b>=1048576?(b/1048576).toFixed(1)+" MB":(b/1024).toFixed(0)+" KB";
-let INFO=null, MODELS=[], JOB=null, BUSY=false;
+const num=n=>Number(n||0).toLocaleString();
+const params=n=>{n=Number(n)||0;return n>=1e9?(n/1e9).toFixed(2)+"B":n>=1e6?(n/1e6).toFixed(1)+"M":num(n)};
+const SVGNS="http://www.w3.org/2000/svg";
+
+/* Small DOM builder. Everything user-supplied or model-supplied goes in as
+   text, never as markup, so no reply can inject anything and no escaping bug
+   can survive a refactor. */
+function el(tag,attrs,kids){
+  const node=document.createElement(tag);
+  if(attrs)for(const key in attrs){
+    const value=attrs[key];
+    if(value===null||value===undefined||value===false)continue;
+    if(key==="class")node.className=value;
+    else if(key==="text")node.textContent=value;
+    else if(key.slice(0,2)==="on")node.addEventListener(key.slice(2),value);
+    else node.setAttribute(key,value===true?"":String(value));
+  }
+  if(kids!==undefined&&kids!==null)for(const kid of [].concat(kids)){
+    if(kid===null||kid===undefined||kid===false)continue;
+    node.appendChild(typeof kid==="object"?kid:document.createTextNode(String(kid)));
+  }
+  return node;
+}
+function icon(d,cls){
+  const svg=document.createElementNS(SVGNS,"svg");
+  svg.setAttribute("viewBox","0 0 24 24");
+  if(cls)svg.setAttribute("class",cls);
+  for(const one of [].concat(d)){
+    const path=document.createElementNS(SVGNS,"path");
+    path.setAttribute("d",one);svg.appendChild(path);
+  }
+  return svg;
+}
+const ICON_PENCIL="M4 20h4l10-10-4-4L4 16v4z";
+const ICON_TRASH=["M4 7h16","M9 7V5h6v2","M6 7l1 13h10l1-13"];
+const ICON_CHEVRON="M9 6l6 6-6 6";
+
+let INFO=null, MODELS=[], UNREADABLE=[], MODELS_STATE="loading", MODELS_ERROR="", JOB=null, BUSY=false;
+let TPL="auto";          /* template value the user picked; auto until changed */
+let WANT_CTX=0;          /* context the tuning panel is asking for */
+let GEN_CAP=0;           /* per-reply token ceiling, once the server states one */
+let NO_STREAM=false;     /* set when this build has no /api/chat/stream */
+let GENERATING=false, ABORT=null;
+let SYS=null, SYS_ERR="", SYS_TIMER=0, SYS_OPEN=false;
+let LAST=null;           /* stats of the most recent reply */
 
 function toast(msg,bad){const t=document.createElement("div");t.className="toast"+(bad?" bad":"");
   t.textContent=msg;document.body.appendChild(t);setTimeout(()=>t.remove(),bad?6000:3000)}
+
 /* When this page is opened directly from disk rather than served by
    `rai serve`, there is no API to talk to. Rather than showing a wall of
    network errors, fall back to a small fixed dataset so the interface can be
@@ -289,29 +563,45 @@ function toast(msg,bad){const t=document.createElement("div");t.className="toast
    surfaces real errors. */
 const DEMO = location.protocol !== "http:" && location.protocol !== "https:";
 const DEMO_MODELS=[
- {name:"qwen2.5-0.5b-q4.raimodel",path:"qwen2.5-0.5b-q4.raimodel",size_bytes:335026528,size_human:"319.5 MB",
+ {name:"qwen3-0.6b-q4.raimodel",path:"qwen3-0.6b-q4.raimodel",size_bytes:399534208,size_human:"381.0 MB",
   readable:true,loaded:true,tokenizer_present:true,
-  header:{hidden_size:896,num_layers:24,num_heads:14,num_kv_heads:2,vocab_size:151936,format_version:2,
-    activation:"silu",rope_type:"none",has_biases:true,tied_lm_head:true}},
+  header:{hidden_size:1024,num_layers:28,num_heads:16,num_kv_heads:8,head_dim:128,vocab_size:151936,
+    max_context:32768,format_version:2,activation:"silu",rope_type:"none",has_biases:false,tied_lm_head:true}},
  {name:"gemma-2b-it-q4.raimodel",path:"gemma-2b-it-q4.raimodel",size_bytes:1610196400,size_human:"1.5 GB",
   readable:true,loaded:false,tokenizer_present:true,
-  header:{hidden_size:2048,num_layers:18,num_heads:8,num_kv_heads:1,vocab_size:256000,format_version:2,
-    activation:"gelu_tanh",rope_type:"none",has_biases:false,tied_lm_head:true}},
+  header:{hidden_size:2048,num_layers:18,num_heads:8,num_kv_heads:1,head_dim:256,vocab_size:256000,
+    max_context:8192,format_version:2,activation:"gelu_tanh",rope_type:"none",has_biases:false,tied_lm_head:true}},
  {name:"llama-3.2-1b-q4.raimodel",path:"llama-3.2-1b-q4.raimodel",size_bytes:796262400,size_human:"759.4 MB",
   readable:true,loaded:false,tokenizer_present:true,
-  header:{hidden_size:2048,num_layers:16,num_heads:32,num_kv_heads:8,vocab_size:128256,format_version:2,
-    activation:"silu",rope_type:"llama3",has_biases:false,tied_lm_head:true}},
+  header:{hidden_size:2048,num_layers:16,num_heads:32,num_kv_heads:8,head_dim:64,vocab_size:128256,
+    max_context:131072,format_version:2,activation:"silu",rope_type:"llama3",has_biases:false,tied_lm_head:true}},
  {name:"zephyr-7b-q4.raimodel",path:"zephyr-7b-q4.raimodel",size_bytes:4107104256,size_human:"3.6 GB",
   readable:true,loaded:false,tokenizer_present:true,
-  header:{hidden_size:4096,num_layers:32,num_heads:32,num_kv_heads:8,vocab_size:32000,format_version:1,
-    activation:"silu",rope_type:"none",has_biases:false,tied_lm_head:false}},
+  header:{hidden_size:4096,num_layers:32,num_heads:32,num_kv_heads:8,head_dim:128,vocab_size:32000,
+    max_context:32768,format_version:1,activation:"silu",rope_type:"none",has_biases:false,tied_lm_head:false}},
 ];
+const DEMO_INFO={loaded:true,model_name:"qwen3-0.6b-q4.raimodel",model_path:"qwen3-0.6b-q4.raimodel",
+  max_context:4096,model_max_context:32768,chat_template:"ChatML",format_version:2,
+  num_layers:28,num_kv_heads:8,head_dim:128,size_bytes:399534208,kv_cache_bytes:939524096};
 function demo(path,opts){
   const body=opts&&opts.body?JSON.parse(opts.body):{};
-  if(path.startsWith("/api/info"))return{loaded:true,model_name:"qwen2.5-0.5b-q4.raimodel",max_context:2048,
-    chat_template:"ChatML",format_version:2};
+  if(path.startsWith("/api/info"))return JSON.parse(JSON.stringify(DEMO_INFO));
   if(path.startsWith("/api/models"))return{count:DEMO_MODELS.length,dirs:[],models:DEMO_MODELS};
-  if(path.startsWith("/api/load"))return{loaded:true,model_name:(body.path||"model").split(/[\/]/).pop(),max_context:2048};
+  if(path.startsWith("/api/system"))return{
+    cpu:{brand:"Offline preview CPU",logical_cores:16,threads_used:8,avx2:true,fma:true,f16c:true,kernel:"AVX2 W4A8"},
+    memory:{rss_bytes:1284620288,peak_rss_bytes:null},
+    model:{loaded:true,weights_bytes:399534208,kv_cache_bytes:939524096,max_context:4096,model_max_context:32768}};
+  if(path.startsWith("/api/load")){
+    const name=String(body.path||"model").split(/[\\/]/).pop();
+    const found=DEMO_MODELS.find(m=>m.path===body.path)||DEMO_MODELS[0];
+    DEMO_MODELS.forEach(m=>{m.loaded=m.path===body.path});
+    Object.assign(DEMO_INFO,{loaded:true,model_name:name,model_path:body.path||name,
+      max_context:body.max_context||DEMO_INFO.max_context,model_max_context:found.header.max_context,
+      num_layers:found.header.num_layers,num_kv_heads:found.header.num_kv_heads,head_dim:found.header.head_dim,
+      size_bytes:found.size_bytes});
+    DEMO_INFO.kv_cache_bytes=kvBytes(found.header,DEMO_INFO.max_context);
+    return JSON.parse(JSON.stringify(DEMO_INFO));
+  }
   if(path.startsWith("/api/inspect")){
     const src=String(body.source||"");
     /* The server answers a repository id with 501: it has no HTTP client.
@@ -320,20 +610,21 @@ function demo(path,opts){
       const e=new Error("'"+src+"' is not a path on this machine. /api/inspect reads local checkpoints only.");
       e.status=501;throw e;
     }
-    const bad=/mixtral|moe|falcon|phi|neox|mpt/i.test(src);
+    const bad=/mixtral|moe|falcon|neox|mpt/i.test(src);
     return bad
       ?{source:body.source,kind:"local-config-only",supported:false,weights_checked:false,model_type:"mixtral",
         shape:{num_layers:32,parameters:46700000000,parameters_human:"46.7B"},container:null,
         reason:"this checkpoint cannot be represented by the .raimodel format:\n  - config declares num_local_experts=8; mixture-of-experts routing is not supported."}
       :{source:body.source,kind:"local-checkpoint",supported:true,weights_checked:true,model_type:"qwen2",
-        shape:{num_layers:24,parameters_human:"494.0M"},
+        shape:{num_layers:24,parameters:494000000,parameters_human:"494.0M"},
         container:{output_bytes:335026528,output_human:"319.5 MB",format_version:2},
         reason:"`rai convert` accepts this checkpoint: model_type 'qwen2' converts to a container v2 file of 335026528 bytes (26 sections)."};
   }
-  if(path.startsWith("/api/chat"))return{text:"This interface is running without a server, so this reply is canned. Start it with `rai serve` to generate for real.",
-    tokens:24,tok_per_sec:13.8,prefill_ms:212};
+  if(path.startsWith("/api/chat"))return{text:DEMO_REPLY,tokens:96,tok_per_sec:13.8,prefill_ms:212,
+    decode_ms:6956,context_used:132,max_context:4096,stop_reason:"eos"};
   throw new Error("not available offline");
 }
+const DEMO_REPLY="<think>The page is offline, so there is no engine behind this reply. I should say that plainly and keep it short.</think>This interface is running without a server, so this reply is canned. Start it with `rai serve` to generate for real.";
 async function api(path,opts){
   if(DEMO){await new Promise(r=>setTimeout(r,140));return demo(path,opts)}
   const r=await fetch(path,opts);
@@ -345,25 +636,52 @@ async function api(path,opts){
   if(!r.ok){const err=new Error((data&&data.error)||text||("HTTP "+r.status));err.status=r.status;throw err}
   return data;
 }
+function jsonPost(body){return{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}}
 function go(id){$$(".screen").forEach(s=>s.classList.toggle("on",s.id==="s-"+id));
   $$(".rail button[data-go]").forEach(b=>b.setAttribute("aria-current",String(b.dataset.go===id)));
-  $("#crumb").textContent=id.toUpperCase();
-  if(id==="library")loadModels();}
-$$("[data-go]").forEach(b=>b.addEventListener("click",()=>go(b.dataset.go)));
+  $("#crumb").textContent=id==="run"?"CHAT":id.toUpperCase();
+  if(id==="run"){sizePrompt();$("#prompt").focus()}
+  syncSysPolling();
+}
+$$(".rail [data-go],.head [data-go]").forEach(b=>b.addEventListener("click",()=>go(b.dataset.go)));
 
 /* ---------- engine state ---------- */
 function paintEngine(){
   const p=$("#engine"),t=$("#engineTxt");
-  p.className="pill"+(BUSY?" busy":INFO&&INFO.loaded?" on":"");
-  t.textContent=BUSY?"Converting…":INFO&&INFO.loaded?(INFO.model_name||"Model loaded"):"No model loaded";
+  const busy=BUSY||GENERATING;
+  p.className="pill"+(busy?" busy":INFO&&INFO.loaded?" on":"");
+  t.textContent=BUSY?"Converting…":GENERATING?"Generating…":INFO&&INFO.loaded?(INFO.model_name||"Model loaded"):"No model loaded";
+}
+function kvBytes(h,ctx){
+  const layers=Number(h&&h.num_layers)||0, kv=Number(h&&h.num_kv_heads)||0, dim=Number(h&&h.head_dim)||0;
+  return 2*layers*kv*dim*(Number(ctx)||0)*4;
+}
+function modelMax(){
+  const fromInfo=Number(INFO&&INFO.model_max_context)||0;
+  if(fromInfo)return fromInfo;
+  const current=MODELS.find(m=>m.loaded);
+  return Number(current&&current.header&&current.header.max_context)||Number(INFO&&INFO.max_context)||2048;
+}
+/* The per-reply token ceiling. The model context is the real bound; a server
+   that enforces a lower one says so in its 400, and that number is adopted
+   below rather than guessed at here. */
+function genCeiling(){
+  const ctx=Number(INFO&&INFO.max_context)||modelMax();
+  const declared=Number(INFO&&INFO.max_generation_tokens)||0;
+  const cap=declared||GEN_CAP||0;
+  return Math.max(1,cap?Math.min(cap,ctx):ctx);
 }
 async function refreshInfo(){
   try{INFO=await api("/api/info")}catch(e){INFO=null}
-  paintEngine();
-  if(INFO&&INFO.loaded){
-    $("#sCtx").textContent="0 / "+INFO.max_context;
-    if(INFO.chat_template)$("#tpl").value=String(INFO.chat_template).toLowerCase().replace(/\s+/g,"");
-  }
+  if(INFO&&INFO.loaded&&INFO.chat_template)TPL=templateValue(INFO.chat_template);
+  paintEngine();paintChatHeader();
+  return INFO;
+}
+const TPL_VALUES={"none":"none","few-shot":"few-shot","mistral instruct":"mistral","llama-3 instruct":"llama3",
+  "chatml":"chatml","zephyr":"zephyr","phi-3":"phi3","gemma":"gemma"};
+function templateValue(displayName){
+  const key=String(displayName||"").toLowerCase().trim();
+  return TPL_VALUES[key]||"auto";
 }
 
 /* ---------- library ---------- */
@@ -377,52 +695,718 @@ function caps(h){
   if(h.tied_lm_head)out.push({t:"TIED",c:""});
   return out;
 }
-async function loadModels(){
+function modelSpec(h){
+  return "hidden "+(h.hidden_size??"?")+" · "+(h.num_layers??"?")+" layers · "
+    +(h.num_heads??"?")+"/"+(h.num_kv_heads??"?")+" heads · vocab "+num(h.vocab_size||0)
+    +" · ctx "+num(h.max_context||0);
+}
+async function refreshModels(){
   const dir=$("#libDir").value.trim();
-  const list=$("#modelList");
-  list.innerHTML='<div class="empty">Scanning…</div>';
+  MODELS_STATE="loading";MODELS_ERROR="";paintLibrary();paintPicker();
   let d;
   try{d=await api("/api/models"+(dir?"?dir="+encodeURIComponent(dir):""))}
-  catch(e){list.innerHTML='<div class="empty">'+esc(e.message)+"</div>";return}
+  catch(e){MODELS_STATE="error";MODELS_ERROR=e.message;MODELS=[];UNREADABLE=[];paintLibrary();paintPicker();return}
   MODELS=(d.models||[]).filter(m=>m.readable);
-  const bad=(d.models||[]).filter(m=>!m.readable);
-  $("#libCount").textContent=String(d.count||0).padStart(2,"0")+" MODELS";
+  UNREADABLE=(d.models||[]).filter(m=>!m.readable);
+  MODELS_STATE="ready";
+  paintLibrary();paintPicker();paintChatHeader();
+}
+function paintLibrary(){
+  const list=$("#modelList"), bad=UNREADABLE;
+  if(MODELS_STATE==="loading"){list.replaceChildren(el("div",{class:"empty"},[el("h3",{text:"Scanning…"}),
+    el("p",{text:"Reading .raimodel headers in the folder."})]));return}
+  if(MODELS_STATE==="error"){
+    list.replaceChildren(el("div",{class:"empty"},[el("h3",{text:"Could not read that folder"}),
+      el("p",{text:MODELS_ERROR}),el("div",{class:"acts"},[
+        el("button",{class:"btn ghost",onclick:refreshModels},["Try again"])])]));
+    $("#libCount").textContent="—";return;
+  }
+  $("#libCount").textContent=String(MODELS.length+bad.length).padStart(2,"0")+" MODELS";
   const total=MODELS.reduce((a,m)=>a+(m.size_bytes||0),0);
   const v2=MODELS.filter(m=>m.header&&m.header.format_version===2).length;
-  $("#libMetrics").innerHTML=`
-    <div class="metric"><span class="lbl">Models</span><div class="n">${MODELS.length}</div><div class="sub">ready to run</div></div>
-    <div class="metric"><span class="lbl">On disk</span><div class="n">${human(total)}</div><div class="sub">4-bit weights</div></div>
-    <div class="metric"><span class="lbl">Format v2</span><div class="n acc">${v2}</div><div class="sub">Qwen · Gemma · Llama-3</div></div>
-    <div class="metric"><span class="lbl">Loaded</span><div class="n">${INFO&&INFO.loaded?"1":"0"}</div><div class="sub">${INFO&&INFO.loaded?esc(INFO.model_name||""):"none"}</div></div>`;
+  const metrics=[
+    ["Models",String(MODELS.length),"ready to run",false],
+    ["On disk",human(total),"4-bit weights",false],
+    ["Format v2",String(v2),"Qwen · Gemma · Llama · Phi-3 · OLMo2 · MoE",true],
+    ["Loaded",INFO&&INFO.loaded?"1":"0",INFO&&INFO.loaded?(INFO.model_name||""):"none",false],
+  ];
+  $("#libMetrics").replaceChildren(...metrics.map(([label,value,sub,acc])=>
+    el("div",{class:"metric"},[el("span",{class:"lbl",text:label}),
+      el("div",{class:"n"+(acc?" acc":""),text:value}),el("div",{class:"sub",text:sub})])));
   if(!MODELS.length&&!bad.length){
-    list.innerHTML='<div class="empty">No .raimodel files here.<br><br>'
-      +'<button class="btn" data-go="convert">Convert your first model</button></div>';
-    $$("[data-go]").forEach(b=>b.addEventListener("click",()=>go(b.dataset.go)));return;
+    list.replaceChildren(el("div",{class:"empty"},[
+      el("h3",{text:"No .raimodel files here"}),
+      el("p",{text:"Nothing in the scanned folders. Convert a checkpoint, or scan the folder your models are in."}),
+      el("div",{class:"acts"},[
+        el("button",{class:"btn",onclick:()=>go("convert")},["Convert your first model"]),
+        el("button",{class:"btn ghost",onclick:()=>$("#libDir").focus()},["Scan another folder"])])]));
+    return;
   }
-  list.innerHTML=MODELS.map(m=>{
+  const rows=MODELS.map(m=>{
     const h=m.header||{};
-    return `<div class="mrow${m.loaded?" active":""}">
-      <div><div class="nm">${esc(m.name)}${caps(h).map(c=>`<span class="tag ${c.c}">${c.t}</span>`).join("")}
-        ${m.tokenizer_present?"":'<span class="tag" style="border-color:#5A3A2A;color:var(--warn)">NO TOKENIZER</span>'}</div>
-        <div class="spec">hidden ${h.hidden_size} · ${h.num_layers} layers · ${h.num_heads}/${h.num_kv_heads} heads · vocab ${(h.vocab_size||0).toLocaleString()}</div></div>
-      <span class="sz">${m.size_human||human(m.size_bytes)}</span>
-      <span><button class="btn sm${m.loaded?" ghost":""}" data-load="${esc(m.path)}">${m.loaded?"Loaded":"Load"}</button></span>
-    </div>`}).join("")
-    +bad.map(m=>`<div class="mrow"><div><div class="nm">${esc(m.name)}
-      <span class="tag" style="border-color:#5A2A2A;color:var(--bad)">UNREADABLE</span></div>
-      <div class="spec">${esc(m.error||"")}</div></div><span class="sz">${m.size_human||""}</span><span></span></div>`).join("");
-  $$("[data-load]").forEach(b=>b.addEventListener("click",()=>loadModel(b.dataset.load)));
-  $("#runModel").innerHTML=MODELS.map(m=>`<option value="${esc(m.path)}"${m.loaded?" selected":""}>${esc(m.name)}</option>`).join("");
+    const tags=caps(h).map(c=>el("span",{class:"tag "+c.c,text:c.t}));
+    if(!m.tokenizer_present)tags.push(el("span",{class:"tag warn",text:"NO TOKENIZER"}));
+    const action=m.loaded
+      ?el("button",{class:"btn sm ghost",onclick:()=>go("run")},["Open in chat"])
+      :el("button",{class:"btn sm",onclick:()=>chooseModel(m.path)},["Load"]);
+    return el("div",{class:"mrow"+(m.loaded?" active":"")},[
+      el("div",{},[el("div",{class:"nm"},[m.name].concat(tags)),el("div",{class:"spec",text:modelSpec(h)})]),
+      el("span",{class:"sz",text:m.size_human||human(m.size_bytes||0)}),
+      el("span",{},[action])]);
+  });
+  const badRows=bad.map(m=>el("div",{class:"mrow"},[
+    el("div",{},[el("div",{class:"nm"},[m.name,el("span",{class:"tag bad",text:"UNREADABLE"})]),
+      el("div",{class:"spec",text:m.error||""})]),
+    el("span",{class:"sz",text:m.size_human||""}),el("span",{})]));
+  list.replaceChildren(...rows,...badRows);
 }
-async function loadModel(path){
-  toast("Loading model…");
-  try{INFO=await api("/api/load",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({path})});
-    paintEngine();toast("Loaded "+(INFO.model_name||""));loadModels();go("run");
-  }catch(e){toast(e.message,true)}
+/* Loading a model is one call, from wherever it was asked for. It never
+   rebuilds the control that asked. */
+async function chooseModel(path,opts){
+  const wanted=Object.assign({path},opts||{});
+  closePicker();
+  setPickerBusy(true,"Loading "+String(path).split(/[\\/]/).pop());
+  try{
+    INFO=await api("/api/load",jsonPost(wanted));
+    TPL=templateValue(INFO.chat_template);
+    WANT_CTX=Number(INFO.max_context)||0;
+    GEN_CAP=0;
+    toast("Loaded "+(INFO.model_name||""));
+    /* Which file is loaded is answered by the server, not by a flag guessed
+       here: the paths it lists and the path asked for can be spelled
+       differently. */
+    await refreshModels();
+    paintEngine();paintChatHeader();paintThread();readSystem();
+    return true;
+  }catch(e){
+    toast(e.message,true);
+    paintPicker();paintChatHeader();
+    return false;
+  }finally{setPickerBusy(false)}
 }
-$("#libScan").addEventListener("click",loadModels);
-$("#libDir").addEventListener("keydown",e=>{if(e.key==="Enter")loadModels()});
+$("#libScan").addEventListener("click",refreshModels);
+$("#libDir").addEventListener("keydown",e=>{if(e.key==="Enter")refreshModels()});
+
+/* ---------- chat: model picker ---------- */
+let PICKER_BUSY=false;
+function setPickerBusy(busy,label){
+  PICKER_BUSY=busy;
+  const btn=$("#modelBtn");
+  btn.disabled=busy;
+  if(busy)$("#modelBtnName").textContent=label||"Loading…";
+  else paintChatHeader();
+}
+function openPicker(){
+  if(PICKER_BUSY)return;
+  $("#modelPop").hidden=false;$("#modelBtn").setAttribute("aria-expanded","true");
+  if(MODELS_STATE!=="loading"&&!MODELS.length)refreshModels();
+}
+function closePicker(){$("#modelPop").hidden=true;$("#modelBtn").setAttribute("aria-expanded","false")}
+function togglePicker(){$("#modelPop").hidden?openPicker():closePicker()}
+$("#modelBtn").addEventListener("click",togglePicker);
+/* Dismiss on pointerdown, not on click: a click that opens the picker from
+   somewhere else on the page - the empty state, a toast action - bubbles to
+   this listener afterwards and would close what it just opened. Pointerdown
+   lands before that click, while the picker is still shut. */
+document.addEventListener("pointerdown",e=>{
+  if(!$("#modelPop").hidden&&!e.target.closest(".modelpick"))closePicker();
+});
+document.addEventListener("keydown",e=>{if(e.key==="Escape")closePicker()});
+function paintPicker(){
+  const pop=$("#modelPop"), kids=[];
+  if(MODELS_STATE==="loading")kids.push(el("div",{class:"popmsg",text:"Scanning for models…"}));
+  else if(MODELS_STATE==="error")kids.push(el("div",{class:"popmsg"},[
+    el("div",{text:MODELS_ERROR}),el("div",{style:"margin-top:10px"},[
+      el("button",{class:"btn sm ghost",onclick:refreshModels},["Try again"])])]));
+  else if(!MODELS.length)kids.push(el("div",{class:"popmsg"},[
+    el("div",{text:"No .raimodel files in the scanned folders."}),
+    el("div",{style:"margin-top:10px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap"},[
+      el("button",{class:"btn sm",onclick:()=>{closePicker();go("convert")}},["Convert a model"]),
+      el("button",{class:"btn sm ghost",onclick:()=>{closePicker();go("library");$("#libDir").focus()}},["Scan a folder"])])]));
+  else for(const m of MODELS){
+    const h=m.header||{};
+    const detail=(m.size_human||human(m.size_bytes||0))+" · ctx "+num(h.max_context||0)
+      +" · v"+(h.format_version??"?")+(m.tokenizer_present?"":" · no tokenizer");
+    kids.push(el("button",{class:"mitem","aria-current":String(!!m.loaded),role:"option",
+      onclick:()=>{if(!m.loaded)chooseModel(m.path);else closePicker()}},[
+      el("span",{class:"n",text:m.name}),
+      el("span",{class:"s",text:m.loaded?"LOADED":""}),
+      el("span",{class:"d",text:detail})]));
+  }
+  if(MODELS_STATE==="ready")kids.push(el("div",{class:"popfoot"},[
+    el("button",{class:"btn sm ghost",onclick:()=>refreshModels()},["Rescan"]),
+    el("button",{class:"btn sm ghost",onclick:()=>{closePicker();go("library")}},["Open library"]),
+    /* The empty state above already offers this one. */
+    MODELS.length?el("button",{class:"btn sm ghost",onclick:()=>{closePicker();go("convert")}},["Convert"]):null]));
+  pop.replaceChildren(...kids);
+}
+function paintChatHeader(){
+  const loaded=INFO&&INFO.loaded;
+  $("#modelBtnName").textContent=loaded?(INFO.model_name||INFO.model_path||"Model loaded"):"No model loaded";
+  $("#pillTpl").replaceChildren("TPL ",el("b",{text:loaded?TPL:"—"}));
+  $("#pillCtx").replaceChildren("CTX ",el("b",{text:loaded?num(INFO.max_context||0):"—"}));
+  const tokBox=$("#maxTok");
+  tokBox.max=String(genCeiling());
+  if(Number(tokBox.value)>genCeiling())tokBox.value=String(genCeiling());
+  $("#pillTok").replaceChildren("MAX ",el("b",{text:tokBox.value}));
+  $("#tokCeil").textContent="up to "+num(genCeiling());
+  $("#tpl").value=loaded?TPL:"auto";
+  paintCtxOptions();
+  $("#applyLoad").disabled=!loaded||(TPL===templateValue(INFO.chat_template)&&WANT_CTX===Number(INFO.max_context));
+}
+/* Context choices come from the model that is actually loaded, with the cost
+   of each spelled out, because the KV cache is what the choice buys. */
+function paintCtxOptions(){
+  const sel=$("#runCtx"), max=modelMax();
+  const loaded=INFO&&INFO.loaded;
+  const header=loaded?{num_layers:INFO.num_layers,num_kv_heads:INFO.num_kv_heads,head_dim:INFO.head_dim}:null;
+  const values=[];
+  for(let v=512;v<max;v*=2)values.push(v);
+  values.push(max);
+  if(!WANT_CTX)WANT_CTX=Number(loaded&&INFO.max_context)||max;
+  if(!values.includes(WANT_CTX))values.push(WANT_CTX);
+  values.sort((a,b)=>a-b);
+  sel.replaceChildren(...values.map(v=>{
+    const bytes=header?kvBytes(header,v):0;
+    const label=num(v)+(bytes?" · KV "+human(bytes):"")+(bytes>4*1073741824?" · heavy":"");
+    return el("option",{value:v,text:label,selected:v===WANT_CTX});
+  }));
+  sel.disabled=!loaded;
+  sel.value=String(WANT_CTX);
+}
+$("#tpl").addEventListener("change",e=>{TPL=e.target.value;paintChatHeader()});
+$("#runCtx").addEventListener("change",e=>{WANT_CTX=Number(e.target.value)||WANT_CTX;paintChatHeader()});
+$("#temp").addEventListener("change",paintChatHeader);
+$("#maxTok").addEventListener("change",paintChatHeader);
+$("#maxTok").addEventListener("input",paintChatHeader);
+$("#applyLoad").addEventListener("click",async()=>{
+  if(!INFO||!INFO.loaded)return;
+  const path=INFO.model_path;
+  const ok=await chooseModel(path,{max_context:WANT_CTX,chat_template:TPL});
+  if(ok)toast("Reloaded at context "+num(WANT_CTX)+" with template "+TPL);
+});
+function toggleTune(){
+  const panel=$("#tunePanel"), open=panel.hidden;
+  panel.hidden=!open;$("#tuneBtn").setAttribute("aria-expanded",String(open));
+}
+$("#tuneBtn").addEventListener("click",toggleTune);
+$$(".metapill").forEach(p=>p.addEventListener("click",()=>{if($("#tunePanel").hidden)toggleTune()}));
+
+/* ---------- chat: sessions ---------- */
+const CHAT_KEY="rai.studio.chats.v1";
+let STORE_OK=true, CHATS={active:null,sessions:[]};
+function storeRead(){
+  if(!STORE_OK)return null;
+  try{return localStorage.getItem(CHAT_KEY)}
+  catch(e){STORE_OK=false;toast("This browser blocked local storage, so chats will not survive a reload",true);return null}
+}
+function storeWrite(value){
+  if(!STORE_OK)return;
+  try{localStorage.setItem(CHAT_KEY,value)}
+  catch(e){STORE_OK=false;toast("Chats could not be saved: "+e.message,true);paintSessionsFoot()}
+}
+function saveChats(){storeWrite(JSON.stringify(CHATS))}
+function loadChats(){
+  const raw=storeRead();
+  if(!raw)return;
+  let parsed=null;
+  try{parsed=JSON.parse(raw)}
+  catch(e){toast("Saved chats could not be read and were left untouched",true);return}
+  if(!parsed||!Array.isArray(parsed.sessions))return;
+  CHATS={active:parsed.active||null,sessions:parsed.sessions.filter(s=>s&&s.id&&Array.isArray(s.messages))};
+}
+function newId(){return Date.now().toString(36)+Math.random().toString(36).slice(2,7)}
+function activeSession(){return CHATS.sessions.find(s=>s.id===CHATS.active)||null}
+function newSession(){
+  const s={id:newId(),title:"New chat",titled:false,created:Date.now(),updated:Date.now(),messages:[]};
+  CHATS.sessions.unshift(s);CHATS.active=s.id;saveChats();
+  paintSessions();paintThread();$("#prompt").focus();
+  return s;
+}
+function ensureSession(){return activeSession()||newSession()}
+function touchSession(s){s.updated=Date.now();CHATS.sessions.sort((a,b)=>b.updated-a.updated);saveChats();paintSessions()}
+function deleteSession(id){
+  const at=CHATS.sessions.findIndex(s=>s.id===id);
+  if(at<0)return;
+  CHATS.sessions.splice(at,1);
+  if(CHATS.active===id)CHATS.active=CHATS.sessions.length?CHATS.sessions[0].id:null;
+  saveChats();paintSessions();paintThread();
+}
+function whenStamp(ms){
+  const d=new Date(ms||Date.now()), now=new Date();
+  const sameDay=d.toDateString()===now.toDateString();
+  return sameDay?d.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}):d.toLocaleDateString();
+}
+function paintSessionsFoot(){
+  $("#sessionsFoot").textContent=STORE_OK
+    ?"Chats are kept in this browser. The server holds no conversation, so each message is sent on its own."
+    :"Local storage is unavailable, so this list is lost on reload. The server holds no conversation either.";
+}
+function paintSessions(){
+  const list=$("#sessionList");
+  if(!CHATS.sessions.length){
+    list.replaceChildren(el("div",{class:"empty",style:"padding:var(--s5) var(--s3)"},[
+      el("p",{text:"No chats yet."}),
+      el("div",{class:"acts"},[el("button",{class:"btn sm",onclick:newSession},["New chat"])])]));
+    return;
+  }
+  list.replaceChildren(...CHATS.sessions.map(s=>{
+    const count=s.messages.length;
+    const row=el("div",{class:"sitem","aria-current":String(s.id===CHATS.active)});
+    const open=el("button",{class:"sopen",onclick:()=>{CHATS.active=s.id;saveChats();paintSessions();paintThread()}},[
+      el("span",{class:"t",text:s.title||"Untitled"}),
+      el("span",{class:"m",text:count+(count===1?" message · ":" messages · ")+whenStamp(s.updated)})]);
+    const rename=el("button",{class:"sact",title:"Rename",onclick:e=>{e.stopPropagation();startRename(row,open,s)}},
+      [icon(ICON_PENCIL)]);
+    const del=el("button",{class:"sact danger",title:"Delete",onclick:e=>{e.stopPropagation();confirmDelete(row,s)}},
+      [icon(ICON_TRASH)]);
+    row.append(open,rename,del);
+    return row;
+  }));
+}
+function startRename(row,openButton,s){
+  const input=el("input",{class:"rename",type:"text",value:s.title||""});
+  row.replaceChild(input,openButton);
+  input.focus();input.select();
+  let settled=false;
+  const commit=keep=>{
+    if(settled)return;settled=true;
+    if(keep){const v=input.value.trim();s.title=v||s.title;s.titled=!!v;saveChats()}
+    paintSessions();
+  };
+  input.addEventListener("keydown",e=>{
+    if(e.key==="Enter"){e.preventDefault();commit(true)}
+    if(e.key==="Escape"){e.preventDefault();commit(false)}
+  });
+  input.addEventListener("blur",()=>commit(true));
+}
+function confirmDelete(row,s){
+  const bar=el("div",{class:"sconfirm"},[
+    el("span",{class:"q",text:"Delete this chat?"}),
+    el("div",{class:"b"},[
+      el("button",{class:"btn sm ghost",onclick:paintSessions},["Keep"]),
+      el("button",{class:"btn sm",onclick:()=>deleteSession(s.id)},["Delete"])])]);
+  row.replaceChildren(bar);
+}
+$("#newChat").addEventListener("click",newSession);
+/* The chat list starts closed on a narrow window and follows the window until
+   the user decides for themselves, after which their choice is kept. */
+let SIDEBAR_MANUAL=false;
+function setSidebar(open){
+  $("#sessions").dataset.collapsed=String(!open);
+  $("#railChats").setAttribute("aria-pressed",String(open));
+  $(".chatwrap").dataset.chats=open?"open":"closed";
+}
+function fitSidebar(){
+  if(SIDEBAR_MANUAL)return;
+  setSidebar(!(window.matchMedia&&window.matchMedia("(max-width: 980px)").matches));
+}
+$("#railChats").addEventListener("click",()=>{
+  SIDEBAR_MANUAL=true;
+  setSidebar($("#sessions").dataset.collapsed==="true");
+});
+window.addEventListener("resize",fitSidebar);
+
+/* ---------- chat: reasoning split ----------
+   A reasoning model wraps its scratchpad in <think>...</think>. The tags are
+   never shown: the scratchpad goes into a collapsed disclosure and the answer
+   is the message. Four shapes have to survive this - closed block, block still
+   open mid-stream, a reply with no block at all, and a closing tag with no
+   opening one, which some fine-tunes emit because the opening tag was in the
+   prompt. */
+const THINK_OPEN=/<think(?:ing)?\s*>/i;
+const THINK_CLOSE=/<\/think(?:ing)?\s*>/i;
+function splitThinking(raw){
+  const text=String(raw||"");
+  const open=THINK_OPEN.exec(text);
+  if(!open){
+    const early=THINK_CLOSE.exec(text);
+    if(early)return{think:text.slice(0,early.index),body:clean(text.slice(early.index+early[0].length)),closed:true};
+    return{think:null,body:clean(text),closed:true};
+  }
+  const before=text.slice(0,open.index);
+  const rest=text.slice(open.index+open[0].length);
+  const close=THINK_CLOSE.exec(rest);
+  if(!close)return{think:rest,body:clean(before),closed:false};
+  return{think:rest.slice(0,close.index),body:clean(before+rest.slice(close.index+close[0].length)),closed:true};
+}
+function clean(text){return String(text).replace(/<\/?think(?:ing)?\s*>/gi,"").replace(/^\n+/,"")}
+
+/* ---------- chat: rendering ---------- */
+function statsLine(stats){
+  if(!stats)return null;
+  const parts=[];
+  if(stats.tok_per_sec)parts.push(["speed",stats.tok_per_sec.toFixed(1)+" tok/s"]);
+  if(stats.tokens!==undefined&&stats.tokens!==null)parts.push(["tokens",num(stats.tokens)]);
+  if(stats.prefill_ms)parts.push(["prefill",Math.round(stats.prefill_ms)+" ms"]);
+  if(stats.context_used)parts.push(["context",num(stats.context_used)+" / "+num(stats.max_context||0)]);
+  if(stats.stop_reason)parts.push(["stop",stats.stop_reason]);
+  if(!parts.length)return null;
+  return el("div",{class:"mstats"},parts.map(([k,v])=>el("span",{},[k+" ",el("b",{text:v})])));
+}
+function thinkBlock(think,closed,streaming){
+  const details=el("details",{class:"think"+(streaming&&!closed?" live":"")});
+  const chars=String(think||"").trim().length;
+  const label=streaming&&!closed?"Thinking…":"Thinking";
+  const summary=el("summary",{},[icon(ICON_CHEVRON,"cv"),el("span",{text:label}),
+    el("span",{class:"n2",text:chars?num(chars)+" chars":""})]);
+  details.append(summary,el("div",{class:"tbody",text:String(think||"").trim()}));
+  if(!closed&&!streaming)details.append(el("div",{class:"tnote",
+    text:"The model never closed this block, so it produced reasoning and no separate answer."}));
+  if(!closed&&!streaming)details.open=true;
+  return details;
+}
+/* One assistant message. Called once per completed message and again on every
+   streamed token for the live one; the parts are rebuilt from the raw text so
+   a block that closes mid-stream moves its content across correctly. */
+function paintAssistant(node,message,streaming){
+  const {think,body,closed}=splitThinking(message.raw||"");
+  const kids=[el("div",{class:"who",text:"RAI"})];
+  if(message.error){
+    kids.push(el("div",{class:"bub err",text:message.error}));
+    if(message.retry)kids.push(el("div",{style:"margin-top:10px"},[
+      el("button",{class:"btn sm ghost",onclick:()=>retrySend(message)},["Try again"])]));
+  }else{
+    if(think!==null&&think!==undefined)kids.push(thinkBlock(think,closed,streaming));
+    const text=body||(streaming?"":think!==null&&!closed?"":"(no output — try another chat template)");
+    kids.push(el("div",{class:"bub"+(streaming?" live":""),text:text}));
+    const line=statsLine(message.stats);
+    if(line&&!streaming)kids.push(line);
+  }
+  node.className="msg ai";
+  node.replaceChildren(...kids);
+  return node;
+}
+function paintUser(node,message){
+  node.className="msg me";
+  node.replaceChildren(el("div",{class:"who",text:"You"}),el("div",{class:"bub",text:message.text||""}));
+  return node;
+}
+function threadEmptyState(){
+  if(!INFO||!INFO.loaded){
+    const acts=[el("button",{class:"btn",onclick:openPicker},["Choose a model"]),
+      el("button",{class:"btn ghost",onclick:()=>go("convert")},["Convert a model"])];
+    return el("div",{class:"empty"},[el("h3",{text:"No model loaded"}),
+      el("p",{text:MODELS.length?"Pick one of the models on this machine and it loads right here — the library screen is not a detour you have to take.":"No .raimodel files were found in the scanned folders. Convert a checkpoint or scan the folder your models are in."}),
+      el("div",{class:"acts"},acts)]);
+  }
+  const chip=text=>el("button",{class:"btn sm ghost",onclick:()=>{$("#prompt").value=text;sizePrompt();$("#prompt").focus()}},[text]);
+  return el("div",{class:"empty"},[el("h3",{text:"Ready — "+(INFO.model_name||"model loaded")}),
+    el("p",{text:"Every token is generated on this machine, on the CPU. Nothing leaves it."}),
+    el("div",{class:"acts"},[chip("Explain what quantization costs"),chip("Write a haiku about slow hardware")])]);
+}
+/* The message currently being generated. The thread is rebuilt from the
+   session list on every repaint, so the live reply is identified by its place
+   in that list rather than by a DOM node held across repaints: a repaint
+   during generation - a session switch, a model load, the last step of boot -
+   would otherwise leave the visible reply frozen while tokens kept arriving
+   into a node no longer on the page. */
+let LIVE=null;
+function paintThread(jump){
+  const s=activeSession(), inner=$("#threadInner");
+  if(!s||!s.messages.length){inner.replaceChildren(threadEmptyState());return}
+  inner.replaceChildren(...s.messages.map(m=>{
+    const node=el("div",{});
+    return m.role==="user"?paintUser(node,m):paintAssistant(node,m,m===LIVE);
+  }));
+  /* Opening a thread lands at the newest message; a repaint of the thread
+     already on screen leaves the reader where they were. */
+  scrollThread(jump!==false);
+}
+/* Repaint just the streaming reply, if it is on screen at all. */
+function paintLive(){
+  if(!LIVE)return;
+  const s=activeSession();
+  if(!s)return;
+  const at=s.messages.indexOf(LIVE);
+  if(at<0)return;
+  const node=$("#threadInner").children[at];
+  if(node)paintAssistant(node,LIVE,true);
+}
+let STICK=true;
+function nearBottom(){const t=$("#thread");return t.scrollHeight-t.scrollTop-t.clientHeight<90}
+function scrollThread(force){
+  const t=$("#thread");
+  if(force||STICK)t.scrollTop=t.scrollHeight;
+  $("#jumpBtn").hidden=nearBottom();
+}
+$("#thread").addEventListener("scroll",()=>{STICK=nearBottom();$("#jumpBtn").hidden=nearBottom()});
+$("#jumpBtn").addEventListener("click",()=>{STICK=true;scrollThread(true)});
+
+/* ---------- chat: composer ---------- */
+/* Measure from a definite zero height, never from `auto`: the textarea is a
+   flex item, and an `auto` height lets the box it sits in stretch it to
+   whatever height the box already has, so each measurement would return the
+   previous one and the composer would only ever grow. */
+function sizePrompt(){
+  const box=$("#prompt");
+  box.style.height="0px";
+  box.style.height=Math.max(46,Math.min(box.scrollHeight,230))+"px";
+}
+$("#prompt").addEventListener("input",sizePrompt);
+$("#prompt").addEventListener("keydown",e=>{
+  if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();send()}
+});
+$("#sendBtn").addEventListener("click",()=>send());
+$("#stopBtn").addEventListener("click",()=>{if(ABORT)ABORT.abort()});
+
+/* The composer stays writable while a reply is generating: on a CPU that
+   reply can take half a minute, and composing the next message during it is
+   the natural thing to do. Only sending is held back. */
+function setGenerating(on){
+  GENERATING=on;
+  $("#sendBtn").hidden=on;$("#stopBtn").hidden=!on;
+  paintEngine();syncSysPolling();
+}
+function paintStrip(stats,hint){
+  $("#sTps").textContent=stats&&stats.tok_per_sec?stats.tok_per_sec.toFixed(1)+" tok/s":"—";
+  $("#sTok").textContent=stats&&stats.tokens!==undefined?num(stats.tokens):"—";
+  $("#sPre").textContent=stats&&stats.prefill_ms?Math.round(stats.prefill_ms)+" ms":"—";
+  $("#sCtx").textContent=stats&&stats.context_used
+    ?num(stats.context_used)+" / "+num(stats.max_context||0)
+    :(INFO&&INFO.loaded?"0 / "+num(INFO.max_context||0):"—");
+  $("#sStop").textContent=stats&&stats.stop_reason?stats.stop_reason:"—";
+  $("#sHint").textContent=hint||"";
+}
+function requestBody(text){
+  return{message:text,temperature:Number($("#temp").value)||0.7,
+    max_tokens:Math.max(1,Math.min(Number($("#maxTok").value)||512,genCeiling()))};
+}
+async function retrySend(message){
+  const s=activeSession();if(!s)return;
+  const at=s.messages.indexOf(message);
+  if(at>0&&s.messages[at-1].role==="user"){
+    const text=s.messages[at-1].text;
+    s.messages.splice(at-1,2);saveChats();paintThread();
+    $("#prompt").value=text;sizePrompt();send();
+  }
+}
+async function send(){
+  const text=$("#prompt").value.trim();
+  if(!text)return;
+  if(GENERATING)return void toast("Still generating — press Stop to interrupt it",true);
+  if(!INFO||!INFO.loaded){toast("Load a model first",true);openPicker();return}
+  const s=ensureSession();
+  $("#prompt").value="";sizePrompt();
+  s.messages.push({role:"user",text});
+  if(!s.titled){s.title=text.length>44?text.slice(0,44).trim()+"…":text;}
+  const reply={role:"assistant",raw:"",stats:null};
+  s.messages.push(reply);
+  LIVE=reply;
+  touchSession(s);
+  paintThread();
+  STICK=true;scrollThread(true);
+  setGenerating(true);paintStrip(null,"Generating…");
+  const body=requestBody(text);
+  /* The prompt cost is only in the start event and the speed only in the done
+     event, so the two are merged; a reply that reports one and not the other
+     would leave a dash in the strip for a number the server did send. */
+  let opening=null;
+  try{
+    await generate(body,{
+      onStart:info=>{opening=info;paintStrip({prefill_ms:info.prefill_ms,tokens:0,max_context:info.max_context},
+        "Prompt "+num(info.prompt_tokens||0)+" tokens")},
+      onToken:piece=>{reply.raw+=piece;paintLive();scrollThread(false)},
+      onDone:stats=>{
+        const merged=Object.assign({},stats);
+        if(opening){
+          if(!merged.prefill_ms)merged.prefill_ms=opening.prefill_ms;
+          if(!merged.max_context)merged.max_context=opening.max_context;
+          merged.prompt_tokens=opening.prompt_tokens;
+        }
+        reply.stats=merged;LAST=merged;
+        paintStrip(merged,merged.stop_reason==="max_tokens"
+          ?"Stopped at the token limit. Raise Max new tokens in Tuning for a longer reply."
+          :"");
+      },
+    });
+  }catch(e){
+    if(e.name==="AbortError"){
+      reply.stats=Object.assign({},reply.stats||{},{stop_reason:"stopped"});
+      paintStrip(reply.stats,"Stopped. The server may still be finishing this reply.");
+    }else{
+      /* A server that states its own per-reply ceiling is believed, and the
+         control is clamped to it rather than to a number chosen here. */
+      const cap=/max_tokens must be between 1 and (\d+)/.exec(e.message||"");
+      if(cap){GEN_CAP=Number(cap[1]);paintChatHeader();
+        toast("This server caps one reply at "+num(GEN_CAP)+" tokens",true)}
+      reply.error=e.message;reply.retry=true;
+      paintStrip(null,"");
+    }
+  }finally{
+    ABORT=null;LIVE=null;
+    setGenerating(false);touchSession(s);
+    /* One repaint from state closes the message off: the live caret goes, the
+       thinking block settles, and the stats line appears. */
+    paintThread(false);scrollThread(false);$("#prompt").focus();
+    if(SYS_OPEN)readSystem();
+  }
+}
+/* Streaming first; the non-streaming endpoint is the fallback and stays the
+   contract for builds without /api/chat/stream. */
+async function generate(body,handlers){
+  if(DEMO)return demoStream(body,handlers);
+  if(!NO_STREAM){
+    const started=await openStream(body,handlers);
+    if(started)return;
+    NO_STREAM=true;
+    paintStrip(null,"This build has no /api/chat/stream; using /api/chat.");
+  }
+  const t0=performance.now();
+  const r=await api("/api/chat",jsonPost(body));
+  handlers.onStart({prompt_tokens:0,prefill_ms:r.prefill_ms||0,max_context:(INFO&&INFO.max_context)||0});
+  handlers.onToken(r.text||"");
+  handlers.onDone({tokens:r.tokens||0,tok_per_sec:r.tok_per_sec||0,
+    decode_ms:r.decode_ms||(performance.now()-t0),
+    context_used:r.context_used||0,max_context:r.max_context||(INFO&&INFO.max_context)||0,
+    prefill_ms:r.prefill_ms||0,stop_reason:r.stop_reason||"end of reply"});
+}
+/* Returns false when this build does not serve the streaming route, so the
+   caller can fall back. Every other failure is raised to the caller. */
+async function openStream(body,handlers){
+  ABORT=new AbortController();
+  let response;
+  try{
+    response=await fetch("/api/chat/stream",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(body),signal:ABORT.signal});
+  }catch(e){
+    if(e.name==="AbortError")throw e;
+    /* The connection itself failed. That is not a missing route, so it is
+       reported rather than retried against the other endpoint. */
+    throw e;
+  }
+  if(response.status===404||response.status===405||response.status===501)return false;
+  if(!response.ok){
+    const text=await response.text();
+    let data=null;try{data=text?JSON.parse(text):null}catch(e){}
+    const err=new Error((data&&data.error)||text||("HTTP "+response.status));
+    err.status=response.status;throw err;
+  }
+  if(!response.body)return false;
+  const reader=response.body.getReader(), decoder=new TextDecoder();
+  let buffer="", sawTerminal=false;
+  const handleLine=line=>{
+    const trimmed=line.trim();
+    if(!trimmed)return;
+    let event=null;
+    try{event=JSON.parse(trimmed)}
+    catch(e){handlers.onToken("");toast("The server sent a line this page could not parse",true);return}
+    if(event.type==="start")handlers.onStart(event);
+    else if(event.type==="token")handlers.onToken(event.text||"");
+    else if(event.type==="done"){sawTerminal=true;handlers.onDone(event)}
+    else if(event.type==="error"){sawTerminal=true;throw new Error(event.message||"the server reported an error")}
+  };
+  for(;;){
+    const {value,done}=await reader.read();
+    if(done)break;
+    buffer+=decoder.decode(value,{stream:true});
+    let cut=buffer.indexOf("\n");
+    while(cut>=0){handleLine(buffer.slice(0,cut));buffer=buffer.slice(cut+1);cut=buffer.indexOf("\n")}
+  }
+  buffer+=decoder.decode();
+  if(buffer.trim())handleLine(buffer);
+  if(!sawTerminal)throw new Error("the stream ended without a done event");
+  return true;
+}
+function demoStream(body,handlers){
+  ABORT=new AbortController();
+  return new Promise((resolve,reject)=>{
+    const pieces=DEMO_REPLY.match(/\s*\S+/g)||[DEMO_REPLY];
+    handlers.onStart({prompt_tokens:14,prefill_ms:212,max_context:(INFO&&INFO.max_context)||4096});
+    let i=0;
+    const step=()=>{
+      if(ABORT&&ABORT.signal.aborted){
+        const stop=new Error("stopped");stop.name="AbortError";reject(stop);return;
+      }
+      if(i>=pieces.length){
+        handlers.onDone({tokens:pieces.length,tok_per_sec:13.8,decode_ms:pieces.length*72,
+          context_used:14+pieces.length,max_context:(INFO&&INFO.max_context)||4096,stop_reason:"eos"});
+        resolve();return;
+      }
+      handlers.onToken(pieces[i++]);
+      setTimeout(step,55);
+    };
+    setTimeout(step,220);
+  });
+}
+
+/* ---------- chat: system panel ----------
+   Only what the machine can actually report. RAI has no GPU path, so there is
+   no GPU meter to draw and no invented utilisation percentage. */
+function kv(label,value,missing){
+  return el("div",{class:"kv"},[el("span",{class:"k",text:label}),
+    el("span",{class:"v"+(missing?" na":""),text:value})]);
+}
+function paintSystem(){
+  const panel=$("#sysPanel");
+  if(SYS_ERR){
+    panel.replaceChildren(el("div",{class:"empty"},[el("h3",{text:"No system reading"}),
+      el("p",{text:SYS_ERR}),el("div",{class:"acts"},[
+        el("button",{class:"btn sm ghost",onclick:()=>{SYS_ERR="";paintSystem();readSystem()}},["Try again"])])]));
+    return;
+  }
+  if(!SYS){panel.replaceChildren(el("div",{class:"popmsg",text:"Reading /api/system…"}));return}
+  const cpu=SYS.cpu||{}, mem=SYS.memory||{}, model=SYS.model||{};
+  const chips=el("div",{class:"chips"},[
+    el("span",{class:"chip"+(cpu.avx2?" on":""),text:"AVX2"}),
+    el("span",{class:"chip"+(cpu.fma?" on":""),text:"FMA"}),
+    el("span",{class:"chip"+(cpu.f16c?" on":""),text:"F16C"})]);
+  const used=LAST&&LAST.context_used?Number(LAST.context_used):0;
+  const win=Number(model.max_context)||Number(INFO&&INFO.max_context)||0;
+  const meter=el("div",{class:"meter"},[el("span",{style:"width:"+(win?Math.min(100,used/win*100):0)+"%"})]);
+  panel.replaceChildren(
+    el("div",{class:"sysgrp"},[el("h5",{},["Processor"]),
+      kv("Model",cpu.brand||"not reported",!cpu.brand),
+      kv("Logical cores",cpu.logical_cores!==undefined&&cpu.logical_cores!==null?num(cpu.logical_cores):"not available on this platform",cpu.logical_cores===undefined||cpu.logical_cores===null),
+      kv("Threads used",cpu.threads_used!==undefined&&cpu.threads_used!==null?num(cpu.threads_used):"not available on this platform",cpu.threads_used===undefined||cpu.threads_used===null),
+      kv("Kernel",cpu.kernel||"not reported",!cpu.kernel),
+      chips,
+      el("p",{class:"sysnote",text:"RAI runs on the CPU. There is no GPU path in this engine, so there is no GPU reading to show."})]),
+    el("div",{class:"sysgrp"},[el("h5",{},["Memory"]),
+      kv("Resident now",mem.rss_bytes?human(mem.rss_bytes):"not available on this platform",!mem.rss_bytes),
+      kv("Peak resident",mem.peak_rss_bytes?human(mem.peak_rss_bytes):"not available on this platform",!mem.peak_rss_bytes),
+      el("p",{class:"sysnote",text:"Whole-process figures: weights, KV cache and everything else this server holds."})]),
+    el("div",{class:"sysgrp"},[el("h5",{},["Model"]),
+      kv("Loaded",model.loaded?"yes":"no"),
+      kv("Weights",model.weights_bytes?human(model.weights_bytes):"—",!model.weights_bytes),
+      kv("KV cache",model.kv_cache_bytes?human(model.kv_cache_bytes):"—",!model.kv_cache_bytes),
+      kv("Context window",win?num(win):"—",!win),
+      kv("Model maximum",model.model_max_context?num(model.model_max_context):"—",!model.model_max_context)]),
+    el("div",{class:"sysgrp"},[el("h5",{},["Last reply"]),
+      kv("Context used",used?num(used)+" / "+num(win):"no reply yet",!used),
+      kv("Speed",LAST&&LAST.tok_per_sec?LAST.tok_per_sec.toFixed(1)+" tok/s":"—",!(LAST&&LAST.tok_per_sec)),
+      kv("Decode",LAST&&LAST.decode_ms?Math.round(LAST.decode_ms)+" ms":"—",!(LAST&&LAST.decode_ms)),
+      meter]));
+}
+async function readSystem(){
+  if(!SYS_OPEN)return;
+  try{SYS=await api("/api/system");SYS_ERR=""}
+  catch(e){
+    SYS=null;
+    SYS_ERR=e.status===404
+      ?"This server build does not serve /api/system, so there is nothing to read yet."
+      :e.message;
+  }
+  paintSystem();
+}
+function syncSysPolling(){
+  clearTimeout(SYS_TIMER);SYS_TIMER=0;
+  const onChat=$("#s-run").classList.contains("on");
+  if(!SYS_OPEN||!onChat)return;
+  const tick=async()=>{
+    await readSystem();
+    if(!SYS_OPEN)return;
+    SYS_TIMER=setTimeout(tick,GENERATING?800:2500);
+  };
+  tick();
+}
+$("#sysBtn").addEventListener("click",()=>{
+  SYS_OPEN=!SYS_OPEN;
+  $("#sysPanel").hidden=!SYS_OPEN;
+  $(".chatwrap").dataset.sys=SYS_OPEN?"open":"closed";
+  $("#sysBtn").setAttribute("aria-expanded",String(SYS_OPEN));
+  if(SYS_OPEN){paintSystem();syncSysPolling()}else{clearTimeout(SYS_TIMER);SYS_TIMER=0}
+});
 
 /* ---------- convert ---------- */
 const STAGES=[["planning","Read config"],["embedding","Embedding"],["layers","Quantize layers"],
@@ -615,8 +1599,8 @@ $("#inspectBtn").addEventListener("click",async()=>{
   $("#inspectSec").style.display="";$("#inspectCard").innerHTML="Checking…";
   $("#inspectVerdict").textContent="";
   try{
-    const r=await api("/api/inspect",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({source,group_size:+$("#gs").value,embed_group_size:+$("#egs").value,max_context:+$("#ctx").value})});
+    const r=await api("/api/inspect",jsonPost({source,group_size:+$("#gs").value,
+      embed_group_size:+$("#egs").value,max_context:+$("#ctx").value}));
     const s=r.shape||{},c=r.container;
     $("#inspectVerdict").innerHTML=r.supported
       ?'<span style="color:var(--ok)">SUPPORTED</span>':'<span style="color:var(--bad)">NOT SUPPORTED</span>';
@@ -656,11 +1640,58 @@ $("#convertBtn").addEventListener("click",async()=>{
   $("#log").textContent="Starting…";BUSY=true;paintEngine();
   try{
     if(DEMO){demoConvert();return}
-    const j=await api("/api/convert",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({source,output,group_size:+$("#gs").value,embed_group_size:+$("#egs").value,max_context:+$("#ctx").value})});
+    const j=await api("/api/convert",jsonPost({source,output,group_size:+$("#gs").value,
+      embed_group_size:+$("#egs").value,max_context:+$("#ctx").value}));
     JOB={id:j.job_id,cursor:0};pollJob();
   }catch(e){BUSY=false;paintEngine();$("#convertBtn").disabled=false;toast(e.message,true);
     logAppend([e.message]);}
+});
+
+/* What the conversion bought, in the terms the claim is made in: what went in,
+   what came out, the ratio between them, and where the file is. Fields an
+   older server does not send are marked as not reported rather than filled in
+   with a guess. */
+let RESULT_PATH="";
+function paintResult(r){
+  const sourceBytes=Number(r.source_bytes)||0, outBytes=Number(r.size_bytes)||0;
+  const ratio=Number(r.compression_ratio)||(sourceBytes&&outBytes?sourceBytes/outBytes:0);
+  $("#resultSec").style.display="";
+  $("#rSrc").textContent=sourceBytes?human(sourceBytes):"—";
+  $("#rSrcSub").textContent=sourceBytes
+    ?(r.source_files?num(r.source_files)+(r.source_files===1?" safetensors file":" safetensors files"):"checkpoint on disk")
+    :"not reported by this server build";
+  $("#rSize").textContent=outBytes?human(outBytes):"—";
+  $("#rSections").textContent=(r.num_sections||0)+" sections";
+  $("#rRatio").textContent=ratio?ratio.toFixed(2)+"x":"—";
+  $("#rSaved").textContent=ratio&&sourceBytes&&outBytes
+    ?human(sourceBytes-outBytes)+" smaller"
+    :"needs the source size to compute";
+  $("#rBpp").textContent=r.bits_per_parameter?Number(r.bits_per_parameter).toFixed(2):"—";
+  $("#rParams").textContent=r.parameters?params(r.parameters)+" parameters":"parameter count not reported";
+  $("#rTime").textContent=((r.elapsed_ms||0)/1000).toFixed(1)+" s";
+  $("#rRam").textContent=r.peak_rss_bytes?human(r.peak_rss_bytes):"—";
+  /* The context baked into the file, where that number came from, and what it
+     will cost in KV cache when the file is loaded. */
+  const ctxLine=[];
+  if(r.max_context){
+    ctxLine.push("Context window "+num(r.max_context)
+      +(r.context_source?" ("+String(r.context_source).replace(/[-_]/g," ")+")":""));
+    if(r.kv_cache_bytes)ctxLine.push("KV cache "+human(r.kv_cache_bytes)+" at that window");
+  }
+  $("#rCtxLine").textContent=ctxLine.join(" · ");
+  RESULT_PATH=r.output_path||"";
+  $("#rPath").textContent=RESULT_PATH||"not reported";
+  $("#rCopy").disabled=!RESULT_PATH;
+  $("#rLoad").disabled=!RESULT_PATH;
+  $("#rTok").textContent=r.tokenizer_path
+    ?(r.tokenizer_copied?"Tokenizer copied to ":"Tokenizer left at ")+r.tokenizer_path
+    :"";
+}
+$("#rCopy").addEventListener("click",()=>{if(RESULT_PATH)copy(RESULT_PATH,"Output path copied")});
+$("#rLoad").addEventListener("click",async()=>{
+  if(!RESULT_PATH)return;
+  const ok=await chooseModel(RESULT_PATH);
+  if(ok){await refreshModels();go("run")}
 });
 
 function demoConvert(){
@@ -676,9 +1707,11 @@ function demoConvert(){
     paintStages(order[si],pct);
     if(pct>=100){clearInterval(t);paintStages("done",100);$("#pctTxt").textContent="DONE";
       logAppend(["=== DONE in 4.1s ==="]);
-      $("#resultSec").style.display="";
-      $("#rSize").textContent="319.5 MB";$("#rSections").textContent="26 sections";
-      $("#rTime").textContent="4.1 s";$("#rRam").textContent="30.7 MB";
+      paintResult({source_bytes:1976703488,source_files:1,size_bytes:335026528,compression_ratio:5.9,
+        parameters:494000000,bits_per_parameter:5.42,num_sections:26,elapsed_ms:4100,peak_rss_bytes:32212254,
+        max_context:2048,context_source:"model config",kv_cache_bytes:50331648,
+        output_path:"C:\\models\\qwen2.5-0.5b-q4.raimodel",tokenizer_path:"C:\\models\\tokenizer.json",
+        tokenizer_copied:true});
       BUSY=false;paintEngine();$("#convertBtn").disabled=false;toast("Converted 319.5 MB");}
   },80);
 }
@@ -696,47 +1729,24 @@ async function pollJob(){
   if(s.state==="running"){setTimeout(pollJob,700);return}
   BUSY=false;paintEngine();$("#convertBtn").disabled=false;JOB=null;
   if(s.state==="error"){toast("Conversion failed",true);return}
-  const r=s.result||{};
-  $("#resultSec").style.display="";
-  $("#rSize").textContent=human(r.size_bytes||0);
-  $("#rSections").textContent=(r.num_sections||0)+" sections";
-  $("#rTime").textContent=((r.elapsed_ms||0)/1000).toFixed(1)+" s";
-  $("#rRam").textContent=r.peak_rss_bytes?human(r.peak_rss_bytes):"—";
-  toast("Converted "+human(r.size_bytes||0));
-  loadModels();
+  paintResult(s.result||{});
+  toast("Converted "+human((s.result&&s.result.size_bytes)||0));
+  refreshModels();
 }
-
-/* ---------- run ---------- */
-$("#runModel").addEventListener("change",e=>{if(e.target.value)loadModel(e.target.value)});
-function bubble(cls,who,text){
-  const d=document.createElement("div");d.className="msg "+cls;
-  d.innerHTML=`<div class="who">${who}</div><div class="bub"></div>`;
-  d.querySelector(".bub").textContent=text;
-  $("#thread").appendChild(d);$("#thread").scrollTop=$("#thread").scrollHeight;return d;
-}
-async function send(){
-  const p=$("#prompt").value.trim();if(!p)return;
-  if(!INFO||!INFO.loaded)return toast("Load a model first",true);
-  $("#prompt").value="";bubble("me","You",p);
-  const pending=bubble("ai","RAI","…");
-  $("#sendBtn").disabled=true;
-  try{
-    const r=await api("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({message:p,temperature:+$("#temp").value,max_tokens:+$("#maxTok").value})});
-    pending.querySelector(".bub").textContent=r.text||"(no output — try a chat template)";
-    $("#sTps").textContent=(r.tok_per_sec||0).toFixed(1)+" tok/s";
-    $("#sTok").textContent=r.tokens??"—";
-    $("#sPre").textContent=Math.round(r.prefill_ms||0)+" ms";
-    $("#sCtx").textContent=(r.tokens||0)+" / "+(INFO.max_context||0);
-  }catch(e){pending.querySelector(".bub").textContent=e.message;pending.querySelector(".bub").style.color="var(--bad)"}
-  $("#sendBtn").disabled=false;$("#thread").scrollTop=$("#thread").scrollHeight;
-}
-$("#sendBtn").addEventListener("click",send);
-$("#prompt").addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();send()}});
+$("#ctx").addEventListener("change",()=>{
+  $("#ctxCost").textContent="Context is the KV-cache window baked into the file. At "
+    +num($("#ctx").value)+" tokens the cache costs whatever the model shape implies; larger is not free.";
+});
 
 /* ---------- boot ---------- */
-(async()=>{await refreshInfo();await loadModels();
-  if(!INFO||!INFO.loaded)bubble("ai","RAI","Load a model from the Library to start.");
-  else bubble("ai","RAI","Ready. Ask anything — generation runs entirely on this machine.");
+(async()=>{
+  loadChats();
+  if(!CHATS.sessions.length)newSession();else if(!activeSession())CHATS.active=CHATS.sessions[0].id;
+  paintSessionsFoot();paintSessions();fitSidebar();
+  paintPicker();paintChatHeader();paintThread();paintStrip(null,"");
+  await refreshInfo();
+  await refreshModels();
+  paintThread();
+  sizePrompt();
 })();
 </script></body></html>

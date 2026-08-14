@@ -286,6 +286,22 @@ impl ModelConfig {
         self.num_heads as usize * self.head_dim as usize
     }
 
+    /// Bytes a KV cache occupies for `max_ctx` positions.
+    ///
+    /// Lives on the config rather than on the loaded model so that a window
+    /// can be weighed from a header alone — `rai run --draft` has to size the
+    /// draft's cache before it loads the draft's weights, and a second copy of
+    /// this arithmetic is exactly how the two would come to disagree.
+    pub fn kv_cache_bytes(&self, max_ctx: usize) -> usize {
+        // 2 (K and V) * layers * kv_heads * positions * head_dim * f32
+        2usize
+            .saturating_mul(self.num_layers as usize)
+            .saturating_mul(self.num_kv_heads as usize)
+            .saturating_mul(max_ctx)
+            .saturating_mul(self.head_dim as usize)
+            .saturating_mul(std::mem::size_of::<f32>())
+    }
+
     /// KV width, `num_kv_heads * head_dim`.
     pub fn kv_dim(&self) -> usize {
         self.num_kv_heads as usize * self.head_dim as usize

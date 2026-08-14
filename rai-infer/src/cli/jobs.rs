@@ -18,7 +18,9 @@ use std::time::Instant;
 
 use rand::Rng;
 
-use crate::convert::{convert_with_progress, ConvertOptions, ConvertProgress};
+use crate::convert::{
+    convert_with_progress, ConvertOptions, ConvertProgress, ConvertSummary, FOLLOW_MODEL_CONTEXT,
+};
 
 /// Log lines kept per job. A 100-layer model produces a few hundred; the cap
 /// only exists so a pathological model cannot grow the server without bound.
@@ -50,6 +52,13 @@ impl JobPhase {
 }
 
 /// What a finished conversion produced.
+///
+/// The size figures are the point of the whole exercise and used to be
+/// half-recorded: the output size was kept and the *input* size was not, so
+/// nothing downstream could say what a conversion had bought. Everything a
+/// caller needs to answer "was this worth it, and what will it cost to run"
+/// now comes out of the conversion itself rather than being re-derived from
+/// the filesystem by whoever is rendering it.
 #[derive(Debug, Clone)]
 pub struct JobResult {
     pub output_path: PathBuf,
@@ -59,6 +68,50 @@ pub struct JobResult {
     pub tokenizer_copied: bool,
     pub elapsed_ms: u64,
     pub peak_rss_bytes: Option<u64>,
+    /// On-disk bytes of the `.safetensors` shards the conversion read.
+    pub source_bytes: u64,
+    /// How many shard files that was.
+    pub source_files: usize,
+    /// `source_bytes / size_bytes`, to two decimals.
+    pub compression_ratio: f64,
+    /// Parameters implied by the checkpoint's config.
+    pub parameters: u64,
+    /// `size_bytes * 8 / parameters`, to two decimals.
+    pub bits_per_parameter: f64,
+    /// Context stored in the header — the ceiling every later run is held to.
+    pub max_context: u32,
+    /// Where that context came from: `requested`, `model-config` or
+    /// `sliding-window`.
+    pub context_source: &'static str,
+    /// KV cache the runtime allocates if the full stored context is used.
+    pub kv_cache_bytes: u64,
+}
+
+impl JobResult {
+    /// Everything here comes from the [`ConvertSummary`] the conversion
+    /// returned; the two derived ratios are computed once, by the summary, so
+    /// the CLI and the API cannot report different numbers for the same file.
+    fn from_summary(summary: ConvertSummary) -> Self {
+        let compression_ratio = round2_f64(summary.compression_ratio());
+        let bits_per_parameter = round2_f64(summary.bits_per_parameter());
+        Self {
+            size_bytes: summary.bytes_written,
+            num_sections: summary.num_sections,
+            tokenizer_path: summary.tokenizer_path,
+            tokenizer_copied: summary.tokenizer_copied,
+            elapsed_ms: summary.elapsed.as_millis() as u64,
+            peak_rss_bytes: peak_rss_bytes(),
+            source_bytes: summary.source_bytes,
+            source_files: summary.source_files,
+            compression_ratio,
+            parameters: summary.parameters,
+            bits_per_parameter,
+            max_context: summary.context.tokens,
+            context_source: summary.context.source.as_str(),
+            kv_cache_bytes: summary.kv_cache_bytes,
+            output_path: summary.output_path,
+        }
+    }
 }
 
 /// One conversion, running or finished.
@@ -111,7 +164,11 @@ impl Job {
                 "output": self.output.display().to_string(),
                 "group_size": self.group_size,
                 "embed_group_size": self.embed_group_size,
-                "max_context": self.max_context,
+                // What was *asked for*. Null means nothing was: the context
+                // follows the model's own, and `result.max_context` is the one
+                // that was stored.
+                "max_context": (self.max_context != FOLLOW_MODEL_CONTEXT)
+                    .then_some(self.max_context),
             },
             "log": lines,
             "log_from": first + start,
@@ -125,6 +182,14 @@ impl Job {
                 "tokenizer_copied": result.tokenizer_copied,
                 "elapsed_ms": result.elapsed_ms,
                 "peak_rss_bytes": result.peak_rss_bytes,
+                "source_bytes": result.source_bytes,
+                "source_files": result.source_files,
+                "compression_ratio": result.compression_ratio,
+                "parameters": result.parameters,
+                "bits_per_parameter": result.bits_per_parameter,
+                "max_context": result.max_context,
+                "context_source": result.context_source,
+                "kv_cache_bytes": result.kv_cache_bytes,
             })),
             "error": self.error,
         })
@@ -148,6 +213,10 @@ impl Job {
 }
 
 fn round2(value: f32) -> f32 {
+    (value * 100.0).round() / 100.0
+}
+
+fn round2_f64(value: f64) -> f64 {
     (value * 100.0).round() / 100.0
 }
 
@@ -318,15 +387,7 @@ fn run_job(job: &Arc<Mutex<Job>>, options: &ConvertOptions) {
                 job.stage = "done".to_string();
                 job.percent = 100.0;
                 job.layer = None;
-                job.result = Some(JobResult {
-                    size_bytes: summary.bytes_written,
-                    num_sections: summary.num_sections,
-                    tokenizer_path: summary.tokenizer_path,
-                    tokenizer_copied: summary.tokenizer_copied,
-                    elapsed_ms: summary.elapsed.as_millis() as u64,
-                    peak_rss_bytes: peak_rss_bytes(),
-                    output_path: summary.output_path,
-                });
+                job.result = Some(JobResult::from_summary(summary));
             }
             Err(error) => {
                 job.phase = JobPhase::Error;
@@ -418,6 +479,7 @@ fn peak_rss_bytes() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::convert::{ContextSource, ResolvedContext};
 
     fn job() -> Job {
         Job {
@@ -491,5 +553,60 @@ mod tests {
         if let Some(bytes) = peak_rss_bytes() {
             assert!(bytes > 0);
         }
+    }
+
+    /// A finished job has to be able to answer "what did this buy me?".
+    ///
+    /// The output size alone cannot: without the input size there is no
+    /// compression figure, and without the parameter count no bits-per-
+    /// parameter. Both derive from the conversion's own numbers rather than
+    /// from a second measurement taken by whoever renders them.
+    #[test]
+    fn a_finished_job_reports_what_the_conversion_bought() {
+        let mut job = job();
+        job.phase = JobPhase::Done;
+        job.result = Some(JobResult::from_summary(ConvertSummary {
+            output_path: PathBuf::from("out.raimodel"),
+            bytes_written: 619_538_088,
+            num_sections: 26,
+            tokenizer_path: PathBuf::from("tokenizer.json"),
+            tokenizer_copied: true,
+            elapsed: std::time::Duration::from_millis(47_000),
+            source_bytes: 1_503_300_328,
+            source_files: 1,
+            parameters: 596_049_920,
+            context: ResolvedContext {
+                tokens: 40_960,
+                source: ContextSource::ModelConfig,
+            },
+            kv_cache_bytes: 9_395_240_960,
+        }));
+
+        let result = &job.snapshot(0)["result"];
+        assert_eq!(result["source_bytes"], 1_503_300_328u64);
+        assert_eq!(result["source_files"], 1);
+        assert_eq!(result["size_bytes"], 619_538_088u64);
+        // 1_503_300_328 / 619_538_088 = 2.4265..., to two decimals.
+        assert_eq!(result["compression_ratio"], 2.43);
+        assert_eq!(result["parameters"], 596_049_920u64);
+        // 619_538_088 * 8 / 596_049_920 = 8.315..., to two decimals.
+        assert_eq!(result["bits_per_parameter"], 8.32);
+        assert_eq!(result["output_path"], "out.raimodel");
+        // The context that was stored, and what it will cost to run at.
+        assert_eq!(result["max_context"], 40_960);
+        assert_eq!(result["context_source"], "model-config");
+        assert_eq!(result["kv_cache_bytes"], 9_395_240_960u64);
+    }
+
+    /// Nothing requested means the model's own context, which is not the same
+    /// statement as "0 tokens were requested".
+    #[test]
+    fn an_unrequested_context_is_reported_as_absent_not_as_zero() {
+        let mut job = job();
+        job.max_context = FOLLOW_MODEL_CONTEXT;
+        assert!(job.snapshot(0)["request"]["max_context"].is_null());
+
+        job.max_context = 4_096;
+        assert_eq!(job.snapshot(0)["request"]["max_context"], 4_096);
     }
 }

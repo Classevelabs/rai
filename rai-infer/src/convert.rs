@@ -95,6 +95,23 @@ const GEMMA_MODEL_TYPES: [&str; 4] = ["gemma", "gemma2", "gemma3", "gemma3_text"
 /// `pre_feedforward_layernorm` and `post_feedforward_layernorm` per layer.
 const SANDWICH_NORM_MODEL_TYPES: [&str; 3] = ["gemma2", "gemma3", "gemma3_text"];
 
+/// [`ConvertOptions::max_context`] value meaning "store the context the model
+/// itself declares".
+///
+/// The stored context is a permanent ceiling: it sizes the RoPE table written
+/// into the file, and `rai run` / `rai serve` can never allocate a KV cache
+/// past it. A constant default therefore capped every model at that constant
+/// forever — a Qwen3-0.6B whose config says `max_position_embeddings=40960`
+/// was stored at 2048 and could not be persuaded otherwise without a
+/// re-conversion. The default is now this sentinel, resolved per checkpoint by
+/// [`resolve_max_context`].
+///
+/// Zero, rather than `Option<u32>`, because it is not a legal context (the
+/// reader requires `1..=MAX_CONTEXT`) so it cannot collide with a real
+/// request, and because every existing construction of [`ConvertOptions`] —
+/// including the ones in `cli::serve` — keeps compiling unchanged.
+pub const FOLLOW_MODEL_CONTEXT: u32 = 0;
+
 /// Conversion inputs. Defaults match `export_rtn.py`.
 #[derive(Debug, Clone)]
 pub struct ConvertOptions {
@@ -105,6 +122,7 @@ pub struct ConvertOptions {
     pub output: Option<PathBuf>,
     pub group_size: u32,
     pub embed_group_size: u32,
+    /// Context to store, or [`FOLLOW_MODEL_CONTEXT`] to take the model's own.
     pub max_context: u32,
     /// Where `tokenizer.json` is copied; defaults to next to the output.
     pub tokenizer_out: Option<PathBuf>,
@@ -119,11 +137,50 @@ impl Default for ConvertOptions {
             output: None,
             group_size: 128,
             embed_group_size: 64,
-            max_context: 2048,
+            max_context: FOLLOW_MODEL_CONTEXT,
             tokenizer_out: None,
             quiet: false,
         }
     }
+}
+
+/// Where the context a conversion stores came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextSource {
+    /// `--max-context` was given explicitly.
+    Requested,
+    /// The model's own `max_position_embeddings`.
+    ModelConfig,
+    /// The model's `sliding_window`, which is smaller than the position limit
+    /// and is the largest span the container's full causal attention matches.
+    SlidingWindow,
+}
+
+impl ContextSource {
+    /// A stable tag for JSON, so a UI does not have to parse prose.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContextSource::Requested => "requested",
+            ContextSource::ModelConfig => "model-config",
+            ContextSource::SlidingWindow => "sliding-window",
+        }
+    }
+
+    /// How the choice is narrated in the conversion log.
+    fn describe(self) -> &'static str {
+        match self {
+            ContextSource::Requested => "requested with --max-context",
+            ContextSource::ModelConfig => "the model's own max_position_embeddings",
+            ContextSource::SlidingWindow => "the model's sliding_window",
+        }
+    }
+}
+
+/// The context a conversion will store, and why.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedContext {
+    pub tokens: u32,
+    pub source: ContextSource,
 }
 
 /// A progress event, emitted once per line the converter would print.
@@ -156,6 +213,41 @@ pub struct ConvertSummary {
     /// False when an identical `tokenizer.json` was already in place.
     pub tokenizer_copied: bool,
     pub elapsed: Duration,
+    /// On-disk bytes of the `.safetensors` shards this conversion read.
+    ///
+    /// The shards themselves ([`SafeTensorsSet::shard_paths`]), not the
+    /// checkpoint directory: a folder usually also holds `tokenizer.json`, a
+    /// `.cache` subtree and sometimes a second copy of the weights, and
+    /// counting those would overstate what was compressed.
+    pub source_bytes: u64,
+    /// How many shard files that was.
+    pub source_files: usize,
+    /// Parameters implied by the config, in elements.
+    pub parameters: u64,
+    /// Context stored in the header, and where the number came from.
+    pub context: ResolvedContext,
+    /// KV cache the runtime allocates if the full stored context is used.
+    pub kv_cache_bytes: u64,
+}
+
+impl ConvertSummary {
+    /// Source bytes per output byte, e.g. `2.43` for 2.43x smaller.
+    pub fn compression_ratio(&self) -> f64 {
+        if self.bytes_written == 0 {
+            return 0.0;
+        }
+        self.source_bytes as f64 / self.bytes_written as f64
+    }
+
+    /// Stored bits per parameter — the number a quantization scheme is judged
+    /// by. Above 4 for a 4-bit model: group scales, zero points, the 8-bit
+    /// embedding and the f32 norms are all in the file too.
+    pub fn bits_per_parameter(&self) -> f64 {
+        if self.parameters == 0 {
+            return 0.0;
+        }
+        self.bytes_written as f64 * 8.0 / self.parameters as f64
+    }
 }
 
 /// The header fields, i.e. everything the reader validates before touching a
@@ -351,6 +443,21 @@ pub fn convert_with_progress(
         .unwrap_or(true);
     let model_type = hf.get("model_type").and_then(|v| v.as_str()).unwrap_or("?");
 
+    // Settled before anything is planned: the stored context sizes the RoPE
+    // table, is echoed in the header, and is the ceiling every later run is
+    // held to.
+    let context = resolve_max_context(&hf, head_dim, options.max_context)?;
+    let shape = ModelShape {
+        hidden_size,
+        num_layers,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        intermediate_size,
+        vocab_size,
+        tied_embeddings: tied,
+    };
+
     let is_gemma = GEMMA_MODEL_TYPES.contains(&model_type);
     let has_sandwich_norm = SANDWICH_NORM_MODEL_TYPES.contains(&model_type);
     let activation = resolve_activation(&hf, is_gemma)?;
@@ -379,7 +486,7 @@ pub fn convert_with_progress(
         head_dim,
         intermediate_size,
         vocab_size,
-        max_context: options.max_context,
+        max_context: context.tokens,
         rope_theta,
         norm_eps,
         bits: 4,
@@ -454,7 +561,9 @@ pub fn convert_with_progress(
     log(&format!("Output: {}", output_path.display()));
     log(&format!("Reading {}...", options.model_dir.display()));
     let mut store = SafeTensorsSet::open(&options.model_dir)?;
-    assert_exportable_architecture(&hf, Some(&store), options.max_context, num_layers)?;
+    assert_exportable_architecture(&hf, Some(&store), context.tokens, num_layers)?;
+    let (source_bytes, source_files) = checkpoint_source_bytes(&store)?;
+    let parameters = shape.parameter_count();
 
     // Which projections carry biases is a property of the checkpoint, not the
     // config, so it can only be settled once the tensor namespace is open.
@@ -568,6 +677,33 @@ pub fn convert_with_progress(
         "{model_type}: {num_layers}L h={hidden_size} inter={intermediate_size} \
          heads={num_heads}/{num_kv_heads} head_dim={head_dim} vocab={vocab_size}"
     ));
+    log(&format!(
+        "Source: {} in {source_files} safetensors file{}, {} parameters",
+        crate::cli::format_bytes(source_bytes),
+        if source_files == 1 { "" } else { "s" },
+        parameters,
+    ));
+    // The stored context is a permanent property of the file and the thing
+    // that decides how much memory a later run *can* be asked for, so it is
+    // stated with its price rather than left to be discovered at load.
+    let kv_bytes = kv_cache_bytes(num_layers, num_kv_heads, head_dim, context.tokens);
+    log(&format!(
+        "Context: {} tokens ({})",
+        context.tokens,
+        context.source.describe()
+    ));
+    log(&format!(
+        "  KV cache at {} tokens: {} ({} bytes) = 2 x {num_layers} layers x {num_kv_heads} kv \
+         heads x {} pos x {head_dim} head_dim x 4 B",
+        context.tokens,
+        crate::cli::format_bytes(kv_bytes),
+        kv_bytes,
+        context.tokens,
+    ));
+    log(
+        "  That is the ceiling, not the cost of every run: `rai run`/`rai serve` allocate for \
+         their own --max-context, capped at this stored value.",
+    );
     log(&format!(
         "container v{}: activation={:?} rope={:?} bias_mask={:#04x} embed_scale={} \
          flags={:#04x} (qk_norm={} sandwich_norm={}) softcap=attn:{} final:{} attn_scale={}",
@@ -821,20 +957,34 @@ pub fn convert_with_progress(
 
     let elapsed = started.elapsed();
     enter("done", total_units as u32, None);
-    log(&format!(
-        "\n=== DONE in {:.1}s ({:.1} min) ===",
-        elapsed.as_secs_f64(),
-        elapsed.as_secs_f64() / 60.0
-    ));
-
-    Ok(ConvertSummary {
+    let summary = ConvertSummary {
         output_path,
         bytes_written: total_size,
         num_sections,
         tokenizer_path: tokenizer_dst,
         tokenizer_copied,
         elapsed,
-    })
+        source_bytes,
+        source_files,
+        parameters,
+        context,
+        kv_cache_bytes: kv_bytes,
+    };
+    log(&format!(
+        "Compression: {} -> {} ({:.2}x smaller), {:.2} bits per parameter over {parameters} \
+         parameters",
+        crate::cli::format_bytes(summary.source_bytes),
+        crate::cli::format_bytes(summary.bytes_written),
+        summary.compression_ratio(),
+        summary.bits_per_parameter(),
+    ));
+    log(&format!(
+        "\n=== DONE in {:.1}s ({:.1} min) ===",
+        elapsed.as_secs_f64(),
+        elapsed.as_secs_f64() / 60.0
+    ));
+
+    Ok(summary)
 }
 
 // =============================================================================
@@ -850,7 +1000,9 @@ fn validate_options(options: &ConvertOptions) -> Result<()> {
             bail!("{flag} must be an even integer in 2..=254, got {value}");
         }
     }
-    if options.max_context == 0 || options.max_context > MAX_CONTEXT {
+    // Zero is `FOLLOW_MODEL_CONTEXT`, not a context: `resolve_max_context`
+    // turns it into the model's own and enforces the same ceiling on that.
+    if options.max_context > MAX_CONTEXT {
         bail!(
             "--max-context must be in 1..={MAX_CONTEXT}, got {}",
             options.max_context
@@ -946,7 +1098,7 @@ fn validate_model_config(config: &RaiConfig) -> Result<()> {
         }
     }
 
-    let rope_bytes = config.max_context as u64 * (config.head_dim as u64 / 2) * 2 * 4;
+    let rope_bytes = rope_table_bytes(config.head_dim, config.max_context);
     if rope_bytes > MAX_ROPE_TABLE_BYTES {
         bail!(
             "RoPE table would need {rope_bytes} bytes (max_context={}, head_dim={}); the \
@@ -956,6 +1108,181 @@ fn validate_model_config(config: &RaiConfig) -> Result<()> {
         );
     }
     Ok(())
+}
+
+// =============================================================================
+// Context and size arithmetic
+// =============================================================================
+
+/// Bytes the reader's RoPE table needs for `max_context`.
+///
+/// Mirrors `layers::RoPETable::with_scaling`, which allocates `cos` and `sin`
+/// of `max_ctx * (head_dim / 2)` f32 each.
+fn rope_table_bytes(head_dim: u32, max_context: u32) -> u64 {
+    max_context as u64 * (head_dim as u64 / 2) * 2 * 4
+}
+
+/// Largest context whose RoPE table still fits [`MAX_ROPE_TABLE_BYTES`].
+fn rope_table_context_limit(head_dim: u32) -> u32 {
+    let per_position = (head_dim as u64 / 2) * 2 * 4;
+    if per_position == 0 {
+        // head_dim < 2 is rejected by `validate_model_config` on its own terms;
+        // no context is the binding constraint here.
+        return MAX_CONTEXT;
+    }
+    u32::try_from(MAX_ROPE_TABLE_BYTES / per_position).unwrap_or(u32::MAX)
+}
+
+/// KV-cache bytes the runtime allocates for `max_context`.
+///
+/// Mirrors `RaiModel::kv_cache_bytes` in `model.rs`, which describes the
+/// allocation `KVCache::new` actually makes: a K and a V buffer, f32, of
+/// `num_kv_heads * max_ctx * head_dim` elements, per layer. Saturating for the
+/// same reason it is there — a config may legally describe a cache larger than
+/// the address space, and reporting `u64::MAX` bytes beats wrapping to a small
+/// number that looks affordable.
+fn kv_cache_bytes(num_layers: u32, num_kv_heads: u32, head_dim: u32, max_context: u32) -> u64 {
+    2u64.saturating_mul(num_layers as u64)
+        .saturating_mul(num_kv_heads as u64)
+        .saturating_mul(max_context as u64)
+        .saturating_mul(head_dim as u64)
+        .saturating_mul(std::mem::size_of::<f32>() as u64)
+}
+
+/// The sliding-window span that constrains an export, or `None`.
+///
+/// A window only constrains when the model actually uses it: Qwen2.5 ships
+/// `sliding_window` alongside `use_sliding_window: false`, and honouring the
+/// number there would cap a 32k model at 4k for no reason.
+fn sliding_window_limit(hf: &serde_json::Value) -> Option<u64> {
+    let window = hf.get("sliding_window").and_then(|v| v.as_u64())?;
+    let used = hf
+        .get("use_sliding_window")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    (window > 0 && used).then_some(window)
+}
+
+/// The shape numbers a parameter count depends on.
+#[derive(Debug, Clone, Copy)]
+struct ModelShape {
+    hidden_size: u32,
+    num_layers: u32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    intermediate_size: u32,
+    vocab_size: u32,
+    tied_embeddings: bool,
+}
+
+impl ModelShape {
+    /// Parameters implied by the config, in elements: embedding + per-layer
+    /// projections + norms + an untied head.
+    ///
+    /// One implementation, called by both [`preflight`] (which reports it) and
+    /// [`convert_with_progress`] (which divides the output size by it): two
+    /// counts that disagreed would make the bits-per-parameter figure a
+    /// different number depending on which screen the user read it from.
+    fn parameter_count(self) -> u64 {
+        let attention_dim = self.num_heads as u64 * self.head_dim as u64;
+        let kv_dim = self.num_kv_heads as u64 * self.head_dim as u64;
+        let hidden = self.hidden_size as u64;
+        let inter = self.intermediate_size as u64;
+        let per_layer =
+            hidden * attention_dim * 2 + hidden * kv_dim * 2 + hidden * inter * 3 + hidden * 2;
+        self.vocab_size as u64 * hidden
+            + self.num_layers as u64 * per_layer
+            + hidden
+            + if self.tied_embeddings {
+                0
+            } else {
+                self.vocab_size as u64 * hidden
+            }
+    }
+}
+
+/// Settle the context this conversion will store.
+///
+/// With `requested` set, that is the answer and the existing checks apply to
+/// it unchanged. With [`FOLLOW_MODEL_CONTEXT`] the model's own
+/// `max_position_embeddings` is taken instead, lowered only by limits that are
+/// real:
+///
+/// * `sliding_window`, when the model uses one — the container's attention is
+///   always full causal, so beyond the window the export would diverge from
+///   the reference model. Following the window keeps the existing refusal rule
+///   satisfied rather than weakening it, and the choice is narrated.
+/// * [`MAX_ROPE_TABLE_BYTES`] and the [`MAX_CONTEXT`] hard cap — these are
+///   refusals, not clamps: a silently shortened context is exactly the failure
+///   this change exists to remove, so the limit is named and the
+///   `--max-context` that would fit is spelled out.
+///
+/// A config with no `max_position_embeddings` has no context to follow, and
+/// substituting a constant would reintroduce the bug, so it is an error that
+/// names the flag.
+fn resolve_max_context(
+    hf: &serde_json::Value,
+    head_dim: u32,
+    requested: u32,
+) -> Result<ResolvedContext> {
+    if requested != FOLLOW_MODEL_CONTEXT {
+        return Ok(ResolvedContext {
+            tokens: requested,
+            source: ContextSource::Requested,
+        });
+    }
+
+    let declared = optional_u32(hf, "max_position_embeddings")
+        .context(
+            "config.json declares a max_position_embeddings this converter cannot read, so there \
+             is no model context to follow. Pass --max-context <TOKENS> to say what this model \
+             should be built for.",
+        )?
+        .filter(|value| *value > 0)
+        .context(
+            "config.json declares no max_position_embeddings, so there is no model context to \
+             follow. Pass --max-context <TOKENS> to say what this model should be built for.",
+        )?;
+
+    let (tokens, source) = match sliding_window_limit(hf) {
+        Some(window) if u64::from(declared) > window => (
+            u32::try_from(window).unwrap_or(u32::MAX),
+            ContextSource::SlidingWindow,
+        ),
+        _ => (declared, ContextSource::ModelConfig),
+    };
+
+    let rope_limit = rope_table_context_limit(head_dim);
+    let ceiling = rope_limit.min(MAX_CONTEXT);
+    if tokens > ceiling {
+        let limit = if rope_limit <= MAX_CONTEXT {
+            format!(
+                "the {} MiB RoPE table budget (MAX_ROPE_TABLE_BYTES) at head_dim {head_dim}",
+                MAX_ROPE_TABLE_BYTES >> 20
+            )
+        } else {
+            format!("the container's {MAX_CONTEXT}-token maximum (MAX_CONTEXT)")
+        };
+        bail!(
+            "{} is {tokens} tokens, which exceeds {limit}. Nothing was clamped: re-run with \
+             --max-context {ceiling} (or lower) to say what this model should be built for.",
+            source.describe(),
+        );
+    }
+
+    Ok(ResolvedContext { tokens, source })
+}
+
+/// On-disk bytes of the shards a checkpoint is actually read from.
+fn checkpoint_source_bytes(store: &SafeTensorsSet) -> Result<(u64, usize)> {
+    let mut total = 0u64;
+    for path in store.shard_paths() {
+        let metadata =
+            std::fs::metadata(path).with_context(|| format!("measuring {}", path.display()))?;
+        total = total.saturating_add(metadata.len());
+    }
+    Ok((total, store.shard_paths().len()))
 }
 
 /// Resolve `head_dim`, honouring an explicit config value.
@@ -1578,20 +1905,14 @@ fn assert_exportable_architecture(
     // `attn_logit_softcapping` and `final_logit_softcapping` are v2 header
     // fields now; `resolve_softcap` refuses a non-numeric or non-positive one.
 
-    let sliding_window = hf
-        .get("sliding_window")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let uses_sliding = hf
-        .get("use_sliding_window")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-    if sliding_window > 0 && uses_sliding && max_context as u64 > sliding_window {
-        problems.push(format!(
-            "config declares sliding_window={sliding_window} but --max-context is {max_context}; \
-             the reader always uses full causal attention, so exports beyond the window would \
-             diverge. Re-run with --max-context {sliding_window} or lower."
-        ));
+    if let Some(sliding_window) = sliding_window_limit(hf) {
+        if max_context as u64 > sliding_window {
+            problems.push(format!(
+                "config declares sliding_window={sliding_window} but --max-context is \
+                 {max_context}; the reader always uses full causal attention, so exports beyond \
+                 the window would diverge. Re-run with --max-context {sliding_window} or lower."
+            ));
+        }
     }
 
     if !problems.is_empty() {
@@ -1663,6 +1984,17 @@ pub struct PreflightReport {
     pub tied_embeddings: bool,
     /// Parameter count implied by the config, in elements.
     pub parameters: u64,
+    /// Context a conversion would store, after
+    /// [`FOLLOW_MODEL_CONTEXT`] resolution. `None` when no context could be
+    /// settled, in which case `reason` says why.
+    pub max_context: Option<u32>,
+    /// Where that context came from.
+    pub context_source: Option<ContextSource>,
+    /// KV cache the runtime allocates if the full stored context is used.
+    /// This is the memory a later `rai run` can be asked for, and the reason
+    /// a large stored context is worth seeing before conversion rather than
+    /// at load.
+    pub kv_cache_bytes: Option<u64>,
     /// True when `rai convert` would accept this checkpoint.
     pub supported: bool,
     /// Why it would be accepted, or every reason it would not.
@@ -1689,6 +2021,10 @@ pub struct PreflightReport {
 /// `Err` means the config is not a transformer config at all (missing or
 /// malformed required fields). An unsupported *architecture* is a successful
 /// call with `supported: false`.
+///
+/// `max_context` accepts [`FOLLOW_MODEL_CONTEXT`] and resolves it exactly as a
+/// conversion would, so the report describes the file the user would actually
+/// get rather than one built for a number the CLI no longer uses.
 pub fn preflight(
     hf: &serde_json::Value,
     model_dir: Option<&Path>,
@@ -1724,18 +2060,22 @@ pub fn preflight(
         })
         .unwrap_or_default();
 
-    // Elements, not bytes: embedding + per-layer projections + norms + an
-    // untied head. The same arithmetic the shape summary is derived from.
-    let attention_dim = num_heads as u64 * head_dim as u64;
-    let kv_dim = num_kv_heads as u64 * head_dim as u64;
-    let hidden = hidden_size as u64;
-    let inter = intermediate_size as u64;
-    let per_layer =
-        hidden * attention_dim * 2 + hidden * kv_dim * 2 + hidden * inter * 3 + hidden * 2;
-    let parameters = vocab_size as u64 * hidden
-        + num_layers as u64 * per_layer
-        + hidden
-        + if tied { 0 } else { vocab_size as u64 * hidden };
+    let shape = ModelShape {
+        hidden_size,
+        num_layers,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        intermediate_size,
+        vocab_size,
+        tied_embeddings: tied,
+    };
+    let parameters = shape.parameter_count();
+
+    // Resolved here rather than inside the verdict below so the answer — and
+    // the KV cache it implies — is reported even for a checkpoint that turns
+    // out to be unsupported for some other reason.
+    let context = resolve_max_context(hf, head_dim, max_context);
 
     let mut report = PreflightReport {
         model_type: model_type.clone(),
@@ -1753,6 +2093,12 @@ pub fn preflight(
         norm_eps,
         tied_embeddings: tied,
         parameters,
+        max_context: context.as_ref().ok().map(|context| context.tokens),
+        context_source: context.as_ref().ok().map(|context| context.source),
+        kv_cache_bytes: context
+            .as_ref()
+            .ok()
+            .map(|context| kv_cache_bytes(num_layers, num_kv_heads, head_dim, context.tokens)),
         supported: false,
         reason: String::new(),
         container: None,
@@ -1767,9 +2113,15 @@ pub fn preflight(
     report.weights_checked = store.is_some();
 
     let verdict = (|| -> Result<PreflightContainer> {
+        // A context that cannot be resolved is a refusal like any other: the
+        // shape is still reported, `supported` is false, and the reason names
+        // the flag that settles it.
+        let context = *context
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("{error:#}"))?;
         let activation = resolve_activation(hf, is_gemma)?;
         let rope_scaling = resolve_rope_scaling(hf)?;
-        assert_exportable_architecture(hf, store.as_ref(), max_context, num_layers)?;
+        assert_exportable_architecture(hf, store.as_ref(), context.tokens, num_layers)?;
         let bias_mask = match store.as_ref() {
             Some(store) => resolve_bias_mask(store, num_layers)?,
             None => 0,
@@ -1803,7 +2155,7 @@ pub fn preflight(
             head_dim,
             intermediate_size,
             vocab_size,
-            max_context,
+            max_context: context.tokens,
             rope_theta,
             norm_eps,
             bits: 4,
@@ -2867,5 +3219,207 @@ mod tests {
         // A bare root has no final component to name the output after.
         let error = default_output_name(Path::new("/")).unwrap_err().to_string();
         assert!(error.contains("--output"), "{error}");
+    }
+
+    /// The regression this exists to prevent: a default that is a number.
+    ///
+    /// `--max-context` used to default to 2048, so a Qwen3-0.6B declaring
+    /// `max_position_embeddings=40960` was stored at 2048 and every later run
+    /// was capped there, permanently, with nothing in the output saying so.
+    /// Two configs that declare different contexts must resolve to *their own*
+    /// numbers: any constant default fails this, including one that happens to
+    /// equal either model's context.
+    #[test]
+    fn the_default_context_follows_each_model_rather_than_a_constant() {
+        assert_eq!(
+            ConvertOptions::default().max_context,
+            FOLLOW_MODEL_CONTEXT,
+            "the default must be 'follow the model', not a number"
+        );
+
+        for declared in [2_048u32, 4_096, 40_960] {
+            let hf = serde_json::json!({ "max_position_embeddings": declared });
+            let resolved = resolve_max_context(&hf, 128, FOLLOW_MODEL_CONTEXT).unwrap();
+            assert_eq!(resolved.tokens, declared);
+            assert_eq!(resolved.source, ContextSource::ModelConfig);
+        }
+
+        // An explicit request still wins, and is labelled as the user's.
+        let hf = serde_json::json!({ "max_position_embeddings": 40_960 });
+        let resolved = resolve_max_context(&hf, 128, 512).unwrap();
+        assert_eq!(resolved.tokens, 512);
+        assert_eq!(resolved.source, ContextSource::Requested);
+    }
+
+    /// No declared context means there is nothing to follow. Substituting a
+    /// number here is how the original bug would come back, so it is an error
+    /// that names the flag instead.
+    #[test]
+    fn a_model_that_declares_no_context_asks_for_the_flag() {
+        let hf = serde_json::json!({ "hidden_size": 1024 });
+        let error = resolve_max_context(&hf, 128, FOLLOW_MODEL_CONTEXT)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("max_position_embeddings"), "{error}");
+        assert!(error.contains("--max-context"), "{error}");
+        // With the flag given there is no error at all.
+        assert_eq!(resolve_max_context(&hf, 128, 4_096).unwrap().tokens, 4_096);
+    }
+
+    /// The sliding-window rule is a real constraint — the container's
+    /// attention is full causal, so an export past the window diverges from
+    /// the reference model. Following the model means following the window,
+    /// which keeps `assert_exportable_architecture`'s refusal satisfied rather
+    /// than weakening it.
+    #[test]
+    fn a_followed_context_stops_at_the_sliding_window() {
+        let windowed = serde_json::json!({
+            "max_position_embeddings": 32_768,
+            "sliding_window": 4_096,
+        });
+        let resolved = resolve_max_context(&windowed, 128, FOLLOW_MODEL_CONTEXT).unwrap();
+        assert_eq!(resolved.tokens, 4_096);
+        assert_eq!(resolved.source, ContextSource::SlidingWindow);
+        // And the rule it exists to satisfy agrees with it.
+        assert_exportable_architecture(&windowed, None, resolved.tokens, 2).unwrap();
+        let refused = assert_exportable_architecture(&windowed, None, 32_768, 2)
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("sliding_window=4096"), "{refused}");
+
+        // Qwen2.5 ships the field with the feature switched off; capping there
+        // would shorten a 32k model for no reason.
+        let unused = serde_json::json!({
+            "max_position_embeddings": 32_768,
+            "sliding_window": 4_096,
+            "use_sliding_window": false,
+        });
+        let resolved = resolve_max_context(&unused, 128, FOLLOW_MODEL_CONTEXT).unwrap();
+        assert_eq!(resolved.tokens, 32_768);
+        assert_eq!(resolved.source, ContextSource::ModelConfig);
+    }
+
+    /// The two ceilings that are genuinely enforced by the reader name
+    /// themselves and say what to pass. Neither silently shortens the model.
+    #[test]
+    fn a_context_over_a_real_limit_is_refused_by_name() {
+        // head_dim 1024: 4 KiB of RoPE table per position, so 512 MiB buys
+        // 131072 positions and the table budget binds first.
+        let huge = serde_json::json!({ "max_position_embeddings": 200_000 });
+        let error = resolve_max_context(&huge, 1024, FOLLOW_MODEL_CONTEXT)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("MAX_ROPE_TABLE_BYTES"), "{error}");
+        assert!(error.contains("--max-context 131072"), "{error}");
+        assert_eq!(rope_table_context_limit(1024), 131_072);
+        assert!(rope_table_bytes(1024, 131_072) <= MAX_ROPE_TABLE_BYTES);
+        assert!(rope_table_bytes(1024, 131_073) > MAX_ROPE_TABLE_BYTES);
+
+        // head_dim 128: the table would allow 1048576 positions, so the
+        // container's own hard cap is the binding limit instead.
+        let vast = serde_json::json!({ "max_position_embeddings": 2_000_000 });
+        let error = resolve_max_context(&vast, 128, FOLLOW_MODEL_CONTEXT)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("MAX_CONTEXT"), "{error}");
+        assert!(
+            error.contains(&format!("--max-context {MAX_CONTEXT}")),
+            "{error}"
+        );
+    }
+
+    /// Mirrors `RaiModel::kv_cache_bytes`, which describes the allocation
+    /// `KVCache::new` makes: K and V, f32, per layer / KV head / position /
+    /// head-dimension element. `convert_reports_the_kv_cache_the_runtime_
+    /// allocates` in `tests/convert_matches_python.rs` pins the two together
+    /// against a real model file.
+    #[test]
+    fn the_kv_cache_estimate_is_the_runtime_formula() {
+        // Qwen3-0.6B at its own context: 28 layers, 8 KV heads, head_dim 128.
+        assert_eq!(
+            kv_cache_bytes(28, 8, 128, 40_960),
+            2 * 28 * 8 * 40_960 * 128 * 4
+        );
+        assert_eq!(kv_cache_bytes(28, 8, 128, 40_960), 9_395_240_960);
+        // Every bound this converter enforces still fits comfortably.
+        assert!(kv_cache_bytes(MAX_LAYERS, MAX_HEADS, MAX_HIDDEN_SIZE, MAX_CONTEXT) < u64::MAX);
+        // A hostile config cannot make it wrap to a number that looks
+        // affordable; it saturates.
+        assert_eq!(
+            kv_cache_bytes(u32::MAX, u32::MAX, u32::MAX, u32::MAX),
+            u64::MAX
+        );
+    }
+
+    /// One parameter count, so the preflight report and the bits-per-parameter
+    /// figure printed after a conversion can never disagree.
+    #[test]
+    fn the_parameter_count_is_the_configs_own_arithmetic() {
+        // The synthetic checkpoint from tests/convert_matches_python.rs.
+        let shape = ModelShape {
+            hidden_size: 64,
+            num_layers: 2,
+            num_heads: 4,
+            num_kv_heads: 2,
+            head_dim: 16,
+            intermediate_size: 128,
+            vocab_size: 96,
+            tied_embeddings: true,
+        };
+        // 96*64 embedding + 2 * (64*64*2 + 64*32*2 + 64*128*3 + 64*2) + 64.
+        assert_eq!(shape.parameter_count(), 80_192);
+        // An untied head is a second vocab-sized matrix.
+        let untied = ModelShape {
+            tied_embeddings: false,
+            ..shape
+        };
+        assert_eq!(untied.parameter_count(), 80_192 + 96 * 64);
+
+        // And it is the number `preflight` reports, from the same config.
+        let hf = serde_json::json!({
+            "model_type": "llama",
+            "hidden_size": 64,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 16,
+            "intermediate_size": 128,
+            "vocab_size": 96,
+            "max_position_embeddings": 4_096,
+        });
+        let report = preflight(&hf, None, 64, 64, FOLLOW_MODEL_CONTEXT).unwrap();
+        assert_eq!(report.parameters, 80_192);
+        assert_eq!(report.max_context, Some(4_096));
+        assert_eq!(report.context_source, Some(ContextSource::ModelConfig));
+        assert_eq!(report.kv_cache_bytes, Some(kv_cache_bytes(2, 2, 16, 4_096)));
+    }
+
+    /// A preflight that cannot settle a context is a "no" with a reason, not a
+    /// crash and not a guess — the shape is still reported so the user can see
+    /// what they are holding.
+    #[test]
+    fn a_preflight_without_a_context_reports_why() {
+        let hf = serde_json::json!({
+            "model_type": "llama",
+            "hidden_size": 64,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 16,
+            "intermediate_size": 128,
+            "vocab_size": 96,
+        });
+        let report = preflight(&hf, None, 64, 64, FOLLOW_MODEL_CONTEXT).unwrap();
+        assert!(!report.supported);
+        assert!(report.max_context.is_none());
+        assert!(report.kv_cache_bytes.is_none());
+        assert!(report.reason.contains("--max-context"), "{}", report.reason);
+        assert_eq!(report.num_layers, 2);
+
+        // The same config with a context given is supported.
+        let report = preflight(&hf, None, 64, 64, 2_048).unwrap();
+        assert!(report.supported, "{}", report.reason);
+        assert_eq!(report.max_context, Some(2_048));
+        assert_eq!(report.context_source, Some(ContextSource::Requested));
     }
 }

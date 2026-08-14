@@ -223,6 +223,18 @@ impl SafeTensorsSet {
         })
     }
 
+    /// The shard files this set reads, in the order they were opened.
+    ///
+    /// Exactly the files [`SafeTensorsSet::open`] resolved — the `weight_map`
+    /// of the shard index, or the single `model.safetensors`. A caller that
+    /// wants the checkpoint's on-disk size must use these rather than walk the
+    /// directory: a checkpoint folder also holds the tokenizer, a `.cache`
+    /// subtree, and often a second copy of the weights in another format, none
+    /// of which the converter reads.
+    pub fn shard_paths(&self) -> &[PathBuf] {
+        &self.files
+    }
+
     /// Metadata for one tensor, or `None` when it is absent.
     pub fn info(&self, name: &str) -> Option<&TensorInfo> {
         self.tensors.get(name)

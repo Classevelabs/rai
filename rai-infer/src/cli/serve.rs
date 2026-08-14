@@ -14,7 +14,9 @@
 //! | Route | What it does |
 //! |---|---|
 //! | `GET /api/info` | the loaded model, or `loaded: false` |
+//! | `GET /api/system` | what this machine is actually running on |
 //! | `POST /api/chat` | generate a reply |
+//! | `POST /api/chat/stream` | the same reply, a token at a time (ndjson) |
 //! | `GET /api/models` | `.raimodel` files in a directory, from headers only |
 //! | `POST /api/load` | load a model into this server |
 //! | `POST /api/inspect` | would `rai convert` accept this checkpoint? |
@@ -22,13 +24,22 @@
 //! | `GET /api/convert/<id>` | poll that job |
 //! | `GET /api/convert` | every job this server has run |
 //!
+//! `POST /api/chat/stream` is the only route that does not answer with one
+//! JSON body. It answers `application/x-ndjson` over chunked transfer
+//! encoding, one JSON object per line, each flushed to the socket as it is
+//! produced. It passes exactly the same `Host`, `Origin`, `Content-Type` and
+//! body-size checks as every other `POST` — those run before routing, so no
+//! route can be added that skips them — and the page's own
+//! `connect-src 'self'` allows it, because it is a same-origin `fetch` to the
+//! very origin that served the page.
+//!
 //! Paths in requests are the user's own filesystem paths and are not confined
 //! to a root: this server is the local application's own back end, reachable
 //! only from the machine it runs on, and it can do exactly what the `rai`
 //! command line can do for the user running it — no more.
 
 use std::fmt;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -42,14 +53,22 @@ use tiny_http::{Header, Method, Response, Server, StatusCode};
 use crate::chat_template::ChatTemplate;
 use crate::cli::catalog;
 use crate::cli::jobs::{Jobs, StartError};
+use crate::cli::run::incremental_suffix;
 use crate::cli::{load_tokenizer, resolve_tokenizer};
 use crate::convert::ConvertOptions;
+use crate::kv_cache::KVCache;
 use crate::model::{InferenceWork, RaiModel};
 use crate::ponder::{pondered_forward, PonderConfig};
 use crate::sampler::{apply_repetition_penalty, sample_token, SamplerConfig};
 
 const MAX_CHAT_REQUEST_BYTES: usize = 64 * 1024;
-const MAX_CHAT_GENERATION_TOKENS: usize = 512;
+/// Tokens generated for a request that does not ask for a number.
+///
+/// This is a *default*, not a ceiling. The ceiling is whatever the prompt
+/// leaves free in the loaded model's context window — see
+/// [`resolve_max_tokens`] — because a fixed one silently truncated every reply
+/// on a model with a 40k window.
+const DEFAULT_CHAT_GENERATION_TOKENS: usize = 200;
 const MAX_ENSEMBLE_SIZE: usize = 8;
 const MAX_ENTROPY_THRESHOLD: f32 = 32.0;
 /// Directories one `GET /api/models` will scan. Only ever 1-2 today; the cap
@@ -116,6 +135,16 @@ impl ChatHttpError {
         }
     }
 
+    /// Chunked transfer encoding is an HTTP/1.1 feature, so the streaming
+    /// route cannot answer an HTTP/1.0 client at all. Saying which route to
+    /// use instead is more useful than a truncated stream.
+    fn http_version_not_supported() -> Self {
+        Self {
+            status: 505,
+            message: "streaming responses require HTTP/1.1; use POST /api/chat instead".to_string(),
+        }
+    }
+
     fn internal(error: impl fmt::Display) -> Self {
         eprintln!("chat request failed: {error}");
         Self {
@@ -139,9 +168,11 @@ pub struct ServeOptions {
     /// Port to listen on (loopback only)
     #[arg(long, default_value = "8090")]
     pub port: u16,
-    /// Context window to allocate the KV cache for, in tokens
-    #[arg(long, default_value = "512")]
-    pub max_context: usize,
+    /// Context window to allocate the KV cache for, in tokens. Defaults to the
+    /// context window the model itself was stored with; a smaller value trades
+    /// history for memory, a larger one is clamped to what the model supports.
+    #[arg(long)]
+    pub max_context: Option<usize>,
     /// Chat template: auto, none, few-shot, mistral, llama3, chatml, zephyr
     #[arg(long, default_value = "auto")]
     pub chat_template: String,
@@ -169,6 +200,20 @@ struct Loaded {
     path: PathBuf,
     tokenizer_path: PathBuf,
     load_ms: u64,
+    /// Allocated once here rather than per request.
+    ///
+    /// Two reasons, both of which became load-bearing when the context window
+    /// started following the model instead of a constant 512: a 40k-token
+    /// window on a mid-sized model is hundreds of megabytes that would
+    /// otherwise be allocated and zeroed on every single message, and — more
+    /// importantly — allocating it here is what turns "this context does not
+    /// fit in memory" into an error at load time, naming the size, instead of
+    /// a failure on the user's first message.
+    ///
+    /// Reuse is safe because every generation resets the watermark with
+    /// `truncate(0)` and the cache refuses reads above it: nothing from a
+    /// previous conversation can be attended to.
+    kv_cache: KVCache,
 }
 
 /// Everything the request loop owns.
@@ -188,11 +233,11 @@ impl Loaded {
     fn open(
         model_path: &Path,
         tokenizer_arg: Option<&Path>,
-        requested_context: usize,
+        requested_context: Option<usize>,
         chat_template: &str,
     ) -> Result<Self> {
         anyhow::ensure!(
-            requested_context > 0,
+            !matches!(requested_context, Some(0)),
             "max_context must be greater than zero"
         );
         anyhow::ensure!(
@@ -203,7 +248,25 @@ impl Loaded {
         let started = Instant::now();
         let tokenizer_path = resolve_tokenizer(model_path, tokenizer_arg)?;
         let model = RaiModel::load(model_path)?;
-        let max_context = requested_context.min(model.config.max_context as usize);
+        let choice = choose_context_window(
+            requested_context,
+            model.config.max_context as usize,
+            |ctx| model.kv_cache_bytes(ctx),
+        )?;
+        if let Some(note) = context_choice_note(choice, |ctx| model.kv_cache_bytes(ctx)) {
+            eprintln!("  {note}");
+        }
+        let max_context = choice.context;
+        let kv_bytes = model.kv_cache_bytes(max_context);
+        // Still checked: an explicit request skips the auto-fit entirely, and
+        // this is where such a request is refused by name.
+        check_kv_cache_fits(kv_bytes, max_context)?;
+        let kv_cache = model.create_kv_cache(max_context).with_context(|| {
+            format!(
+                "a {max_context}-token context needs a {} KV cache",
+                crate::cli::format_bytes(kv_bytes as u64)
+            )
+        })?;
         let tokenizer = load_tokenizer(&tokenizer_path)?;
         let template = ChatTemplate::from_str_arg(chat_template, &tokenizer);
         Ok(Self {
@@ -214,6 +277,7 @@ impl Loaded {
             path: model_path.to_path_buf(),
             tokenizer_path,
             load_ms: started.elapsed().as_millis() as u64,
+            kv_cache,
         })
     }
 
@@ -247,7 +311,8 @@ impl Loaded {
             "biased_projections": catalog::biased_projections(config.bias_mask),
             "tied_lm_head": !self.model.has_separate_lm_head,
             "size_bytes": self.model.file_size(),
-            "kv_cache_bytes": self.model.kv_cache_bytes(self.max_context),
+            // The cache that actually exists, not an estimate of one.
+            "kv_cache_bytes": self.kv_cache.memory_bytes(),
             "load_ms": self.load_ms,
         })
     }
@@ -316,13 +381,11 @@ fn build_ponder(req: &ChatRequest) -> Result<PonderConfig, ChatHttpError> {
 
 fn validate_chat_options(req: &ChatRequest) -> Result<(), ChatHttpError> {
     validate_optional_f32("temperature", req.temperature, 0.01, 2.0)?;
-    if req
-        .max_tokens
-        .is_some_and(|value| !(1..=MAX_CHAT_GENERATION_TOKENS).contains(&value))
-    {
-        return Err(ChatHttpError::bad_request(format!(
-            "max_tokens must be between 1 and {MAX_CHAT_GENERATION_TOKENS}"
-        )));
+    // Only the floor can be checked without the model. The ceiling is the
+    // context the prompt leaves free, and that needs the tokenizer — see
+    // [`resolve_max_tokens`], which runs once the prompt has been encoded.
+    if req.max_tokens.is_some_and(|value| value == 0) {
+        return Err(ChatHttpError::bad_request("max_tokens must be at least 1"));
     }
     if req.ponder_strategy.as_deref().is_some_and(|strategy| {
         !matches!(
@@ -407,39 +470,206 @@ fn validate_prompt_tokens(
     Ok(())
 }
 
-fn handle_generate(state: &Loaded, chat_req: &ChatRequest) -> Result<String, ChatHttpError> {
-    validate_chat_options(chat_req)?;
-    let temperature = chat_req.temperature.unwrap_or(0.7);
-    let max_tokens = chat_req.max_tokens.unwrap_or(200);
-    let ponder_config = build_ponder(chat_req)?;
+/// Room left in the context window after the prompt, in tokens.
+///
+/// A conversation of `prompt_len + generated` tokens is what the window has to
+/// hold, so this is simply the difference. `validate_prompt_tokens` has
+/// already established `1 <= prompt_len <= max_ctx`, so the subtraction cannot
+/// wrap; it saturates rather than relying on that from a distance.
+///
+/// The decode loop could in fact sample one token beyond this, because the
+/// last token generated is never written back into the cache. That token is
+/// not offered: it cannot be continued from, and counting it would make
+/// `context_used` report one more than `max_context` — a full meter that reads
+/// past full is worse than a token nobody asked for.
+fn remaining_generation_tokens(prompt_len: usize, max_ctx: usize) -> usize {
+    max_ctx.saturating_sub(prompt_len)
+}
 
-    let sampler_config = SamplerConfig {
-        temperature,
+/// How many tokens to generate, given what the caller asked for.
+///
+/// A caller who names a number that cannot fit is told so with both numbers,
+/// rather than being handed a short reply and left to wonder why. A caller who
+/// names nothing gets the default, shortened to fit if the prompt is long —
+/// that is a default being chosen, not a request being clipped.
+fn resolve_max_tokens(
+    requested: Option<usize>,
+    prompt_len: usize,
+    max_ctx: usize,
+) -> Result<usize, ChatHttpError> {
+    let remaining = remaining_generation_tokens(prompt_len, max_ctx);
+    if remaining == 0 {
+        return Err(ChatHttpError::bad_request(format!(
+            "a {prompt_len}-token prompt fills the whole {max_ctx}-token context window, \
+             leaving no room for a reply"
+        )));
+    }
+    match requested {
+        Some(value) if value > remaining => Err(ChatHttpError::bad_request(format!(
+            "max_tokens {value} does not fit: a {prompt_len}-token prompt leaves {remaining} \
+             of the {max_ctx}-token context window free"
+        ))),
+        Some(value) => Ok(value),
+        None => Ok(DEFAULT_CHAT_GENERATION_TOKENS.min(remaining)),
+    }
+}
+
+/// Why generation stopped. These are the only three ways out of the decode
+/// loop, which is what lets the streaming client treat `done` as final.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopReason {
+    Eos,
+    MaxTokens,
+    StopSequence,
+}
+
+impl StopReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            StopReason::Eos => "eos",
+            StopReason::MaxTokens => "max_tokens",
+            StopReason::StopSequence => "stop_sequence",
+        }
+    }
+}
+
+/// Everything a chat request needs from the model, worked out before
+/// generation starts.
+///
+/// This exists so that both chat routes reject the same bad request with the
+/// same status code *before* either has written a byte. A streaming route that
+/// has already sent `200 OK` can only report a bad request from inside the
+/// stream, which is a far worse thing to consume.
+struct Prepared {
+    prompt_tokens: Vec<usize>,
+    max_tokens: usize,
+    sampler: SamplerConfig,
+    ponder: PonderConfig,
+    max_ctx: usize,
+}
+
+/// What one completed generation produced.
+struct Outcome {
+    text: String,
+    tokens_generated: usize,
+    prefill_ms: f64,
+    decode_ms: f64,
+    tok_per_sec: f64,
+    avg_passes: f64,
+    hard_tokens_pct: f64,
+    stop_reason: StopReason,
+}
+
+/// Something worth telling a streaming client about, as it happens.
+enum GenerationEvent<'a> {
+    /// The prompt is in the KV cache; decoding is about to start.
+    Prefilled { prefill_ms: f64 },
+    /// Newly decoded text, already safe to display (see [`emittable_len`]).
+    Text(&'a str),
+}
+
+/// Why a generation ended early.
+enum GenerateFailure {
+    /// The server failed. Reportable to the client, sanitized as usual.
+    Http(ChatHttpError),
+    /// The client went away mid-stream. There is nobody left to tell.
+    Client(std::io::Error),
+}
+
+fn prepare(loaded: &Loaded, chat_req: &ChatRequest) -> Result<Prepared, ChatHttpError> {
+    validate_chat_options(chat_req)?;
+    let ponder = build_ponder(chat_req)?;
+    let sampler = SamplerConfig {
+        temperature: chat_req.temperature.unwrap_or(0.7),
         top_k: 40,
         top_p: 0.9,
         repetition_penalty: 1.1,
     };
 
     // Format prompt using the configured chat template
-    let prompt = state.template.format_prompt(&chat_req.message);
-    let encoding = state
+    let prompt = loaded.template.format_prompt(&chat_req.message);
+    let encoding = loaded
         .tokenizer
         .encode(prompt.as_str(), false)
         .map_err(|_| ChatHttpError::bad_request("message could not be tokenized"))?;
     let prompt_tokens: Vec<usize> = encoding.get_ids().iter().map(|&id| id as usize).collect();
 
-    let max_ctx = state
-        .max_context
-        .min(state.model.config.max_context as usize);
+    // `Loaded::open` already clamped this to the model, and the KV cache was
+    // allocated for exactly this many positions.
+    let max_ctx = loaded.max_context;
     validate_prompt_tokens(
         &prompt_tokens,
         max_ctx,
-        state.model.config.vocab_size as usize,
+        loaded.model.config.vocab_size as usize,
     )?;
-    let mut kv_cache = state
-        .model
-        .create_kv_cache(max_ctx)
-        .map_err(ChatHttpError::internal)?;
+    let max_tokens = resolve_max_tokens(chat_req.max_tokens, prompt_tokens.len(), max_ctx)?;
+
+    Ok(Prepared {
+        prompt_tokens,
+        max_tokens,
+        sampler,
+        ponder,
+        max_ctx,
+    })
+}
+
+/// How much of `pending` can be shown to a reader right now.
+///
+/// Two things must not escape early. A chat template's stop sequence is cut
+/// from the final text, so streaming its opening bytes would leave `<|im_` on
+/// screen; and a trailing U+FFFD almost always means a multi-byte character is
+/// split across two tokens and will resolve on the next one. Both are held
+/// back until the next token settles them, and the flush after the loop
+/// releases whatever is genuinely final.
+fn emittable_len(pending: &str, stops: &[&str]) -> usize {
+    let mut safe = pending.len();
+    while pending[..safe].ends_with('\u{FFFD}') {
+        safe -= '\u{FFFD}'.len_utf8();
+    }
+
+    let head = &pending[..safe];
+    let mut held = 0usize;
+    for stop in stops {
+        // The longest *proper* prefix of this stop sequence that `head` ends
+        // with. A complete match is not this function's business: the caller
+        // has already searched for one and truncated.
+        let mut length = stop.len().saturating_sub(1).min(head.len());
+        while length > 0 {
+            if stop.is_char_boundary(length) && head.ends_with(&stop[..length]) {
+                held = held.max(length);
+                break;
+            }
+            length -= 1;
+        }
+    }
+    safe - held
+}
+
+/// Run one generation, reporting progress as it happens.
+///
+/// `on_event` is the only difference between `POST /api/chat` and
+/// `POST /api/chat/stream`: the former ignores every event and reads the
+/// [`Outcome`], the latter writes each one to the socket. Having one loop
+/// means the two routes cannot drift into producing different text.
+fn generate(
+    loaded: &mut Loaded,
+    prepared: &Prepared,
+    mut on_event: impl FnMut(GenerationEvent<'_>) -> std::io::Result<()>,
+) -> Result<Outcome, GenerateFailure> {
+    let Loaded {
+        model,
+        tokenizer,
+        template,
+        kv_cache,
+        ..
+    } = loaded;
+    let prompt_tokens = &prepared.prompt_tokens;
+
+    // Reset the watermark instead of reallocating. Stores always start at
+    // position 0 and the cache refuses any read at or above the watermark, so
+    // no residue of the previous conversation is reachable.
+    kv_cache.truncate(0);
+
     let mut work = InferenceWork::new();
     let mut work2 = InferenceWork::new();
     let mut rng = rand::rngs::StdRng::from_entropy();
@@ -452,63 +682,74 @@ fn handle_generate(state: &Loaded, chat_req: &ChatRequest) -> Result<String, Cha
     // here and then processing the last one again at the next position duplicates it.
     for &token_id in &prompt_tokens[..prompt_tokens.len() - 1] {
         let _ = pondered_forward(
-            &state.model,
+            model,
             token_id,
             pos,
-            &mut kv_cache,
+            kv_cache,
             &PonderConfig::none(),
             &mut work,
             &mut work2,
             &mut rng,
         )
-        .map_err(ChatHttpError::internal)?;
+        .map_err(|error| GenerateFailure::Http(ChatHttpError::internal(error)))?;
         pos += 1;
     }
     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+    on_event(GenerationEvent::Prefilled { prefill_ms }).map_err(GenerateFailure::Client)?;
 
     // Decode
     let t_decode = Instant::now();
     let mut generated_text = String::new();
+    let mut emitted = String::new();
     let mut tokens_generated = 0;
     let mut total_passes = 0;
     let mut hard_tokens = 0;
+    let mut stop_reason = StopReason::MaxTokens;
 
-    for _ in 0..max_tokens {
-        if pos >= max_ctx {
+    // Hoisted out of the loop: the answer cannot change between tokens.
+    let eos_ids: Vec<usize> = ["</s>", "<|endoftext|>", "<|eot_id|>", "<|end_of_text|>"]
+        .iter()
+        .filter_map(|name| tokenizer.token_to_id(name).map(|id| id as usize))
+        .collect();
+    let stops = template.stop_sequences();
+
+    for _ in 0..prepared.max_tokens {
+        // Unreachable while `max_tokens` is bounded by the free context, and
+        // kept because that is an invariant of this function's caller, not of
+        // this loop.
+        if pos >= prepared.max_ctx {
             break;
         }
         let last_token = all_tokens.last().copied().ok_or_else(|| {
-            ChatHttpError::bad_request("message produced no usable prompt tokens")
+            GenerateFailure::Http(ChatHttpError::bad_request(
+                "message produced no usable prompt tokens",
+            ))
         })?;
         let (mut logits, metrics) = pondered_forward(
-            &state.model,
+            model,
             last_token,
             pos,
-            &mut kv_cache,
-            &ponder_config,
+            kv_cache,
+            &prepared.ponder,
             &mut work,
             &mut work2,
             &mut rng,
         )
-        .map_err(ChatHttpError::internal)?;
+        .map_err(|error| GenerateFailure::Http(ChatHttpError::internal(error)))?;
         total_passes += metrics.forward_passes;
         if metrics.was_hard_token {
             hard_tokens += 1;
         }
 
-        apply_repetition_penalty(&mut logits, &all_tokens, sampler_config.repetition_penalty);
-        let next_token = sample_token(&mut logits, &sampler_config, &mut rng);
+        apply_repetition_penalty(
+            &mut logits,
+            &all_tokens,
+            prepared.sampler.repetition_penalty,
+        );
+        let next_token = sample_token(&mut logits, &prepared.sampler, &mut rng);
 
-        // Check all common EOS tokens
-        let is_eos = ["</s>", "<|endoftext|>", "<|eot_id|>", "<|end_of_text|>"]
-            .iter()
-            .any(|tok| {
-                state
-                    .tokenizer
-                    .token_to_id(tok)
-                    .is_some_and(|id| next_token == id as usize)
-            });
-        if is_eos {
+        if eos_ids.contains(&next_token) {
+            stop_reason = StopReason::Eos;
             break;
         }
 
@@ -521,24 +762,45 @@ fn handle_generate(state: &Loaded, chat_req: &ChatRequest) -> Result<String, Cha
             .iter()
             .map(|&t| t as u32)
             .collect();
-        generated_text = state.tokenizer.decode(&gen_ids, false).unwrap_or_default();
+        generated_text = tokenizer.decode(&gen_ids, false).unwrap_or_default();
 
         // Stop if model generates a template-specific stop sequence
-        let mut should_stop = false;
-        for stop in state.template.stop_sequences() {
-            if generated_text.contains(stop) {
-                generated_text = generated_text.split(stop).next().unwrap_or("").to_string();
-                should_stop = true;
+        let mut hit_stop = false;
+        for stop in stops {
+            if let Some(cut) = generated_text.find(stop) {
+                generated_text.truncate(cut);
+                hit_stop = true;
                 break;
             }
         }
-        if should_stop {
+
+        let unemitted = incremental_suffix(&emitted, &generated_text);
+        let length = if hit_stop {
+            // Nothing more is coming, so nothing needs holding back.
+            unemitted.len()
+        } else {
+            emittable_len(unemitted, stops)
+        };
+        if length > 0 {
+            let chunk = &unemitted[..length];
+            on_event(GenerationEvent::Text(chunk)).map_err(GenerateFailure::Client)?;
+            emitted.push_str(chunk);
+        }
+
+        if hit_stop {
+            stop_reason = StopReason::StopSequence;
             break;
         }
     }
 
+    // Whatever the hold-back was still sitting on is final now.
+    let unemitted = incremental_suffix(&emitted, &generated_text);
+    if !unemitted.is_empty() {
+        on_event(GenerationEvent::Text(unemitted)).map_err(GenerateFailure::Client)?;
+    }
+
     let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
-    let decode_tps = if decode_ms > 0.0 {
+    let tok_per_sec = if decode_ms > 0.0 {
         tokens_generated as f64 / (decode_ms / 1000.0)
     } else {
         0.0
@@ -548,29 +810,178 @@ fn handle_generate(state: &Loaded, chat_req: &ChatRequest) -> Result<String, Cha
     } else {
         0.0
     };
-    let hard_pct = if tokens_generated > 0 {
+    let hard_tokens_pct = if tokens_generated > 0 {
         100.0 * hard_tokens as f64 / tokens_generated as f64
     } else {
         0.0
     };
 
+    Ok(Outcome {
+        text: generated_text,
+        tokens_generated,
+        prefill_ms,
+        decode_ms,
+        tok_per_sec,
+        avg_passes,
+        hard_tokens_pct,
+        stop_reason,
+    })
+}
+
+/// `POST /api/chat` — one JSON body, unchanged since before streaming existed.
+fn handle_generate(loaded: &mut Loaded, chat_req: &ChatRequest) -> Result<String, ChatHttpError> {
+    let prepared = prepare(loaded, chat_req)?;
+    let outcome = match generate(loaded, &prepared, |_| Ok(())) {
+        Ok(outcome) => outcome,
+        // The callback above cannot fail, so the client arm is unreachable
+        // here; mapping it rather than unwrapping keeps that a fact about the
+        // code and not an assumption.
+        Err(GenerateFailure::Http(error)) => return Err(error),
+        Err(GenerateFailure::Client(error)) => return Err(ChatHttpError::internal(error)),
+    };
+
     let response = serde_json::json!({
-        "text": generated_text.trim(),
-        "tokens": tokens_generated,
-        "prefill_ms": prefill_ms,
-        "decode_ms": decode_ms,
-        "tok_per_sec": decode_tps,
-        "avg_passes": avg_passes,
-        "hard_tokens_pct": hard_pct,
-        "strategy": format!("{:?}", ponder_config.strategy),
+        "text": outcome.text.trim(),
+        "tokens": outcome.tokens_generated,
+        "prefill_ms": outcome.prefill_ms,
+        "decode_ms": outcome.decode_ms,
+        "tok_per_sec": outcome.tok_per_sec,
+        "avg_passes": outcome.avg_passes,
+        "hard_tokens_pct": outcome.hard_tokens_pct,
+        "strategy": format!("{:?}", prepared.ponder.strategy),
     });
 
     Ok(response.to_string())
 }
 
+// =============================================================================
+// POST /api/chat/stream
+// =============================================================================
+
+/// One ndjson response, written straight to the socket.
+///
+/// tiny_http's own `Response` cannot do this: it drives the body from a
+/// `Read`, and pipes it through a chunked encoder whose 8 KiB buffer is only
+/// flushed when it fills. Tokens would arrive in blocks, or all at once at the
+/// end, which is not streaming. Taking the writer means framing each chunk
+/// here — a length line, the payload, a blank line — and flushing it, which is
+/// what puts a token on the wire the instant it exists.
+struct NdjsonStream {
+    writer: Box<dyn Write + Send + 'static>,
+}
+
+impl NdjsonStream {
+    fn start(request: tiny_http::Request) -> std::io::Result<Self> {
+        // tiny_http closes the socket after this response on its own when the
+        // client asked it to, but the client is owed the header that says so.
+        let closing = request
+            .headers()
+            .iter()
+            .find(|header| header.field.equiv("Connection"))
+            .is_some_and(|header| header.value.as_str().to_ascii_lowercase().contains("close"));
+
+        let mut writer = request.into_writer();
+        writer.write_all(
+            b"HTTP/1.1 200 OK\r\n\
+              Content-Type: application/x-ndjson\r\n\
+              Transfer-Encoding: chunked\r\n\
+              Cache-Control: no-store\r\n\
+              X-Content-Type-Options: nosniff\r\n",
+        )?;
+        if closing {
+            writer.write_all(b"Connection: close\r\n")?;
+        }
+        writer.write_all(b"\r\n")?;
+        writer.flush()?;
+        Ok(Self { writer })
+    }
+
+    fn send(&mut self, value: &Value) -> std::io::Result<()> {
+        write_ndjson_chunk(&mut self.writer, value)?;
+        self.writer.flush()
+    }
+
+    fn finish(mut self) -> std::io::Result<()> {
+        self.writer.write_all(b"0\r\n\r\n")?;
+        self.writer.flush()
+    }
+}
+
+/// One JSON object, one line, one chunk.
+///
+/// `serde_json` escapes newlines inside strings, so a serialized value can
+/// never contain the byte that separates records: the ndjson framing holds for
+/// whatever the model generates, including a reply that is nothing but
+/// newlines.
+fn write_ndjson_chunk(writer: &mut dyn Write, value: &Value) -> std::io::Result<()> {
+    let mut line = value.to_string();
+    line.push('\n');
+    write!(writer, "{:x}\r\n", line.len())?;
+    writer.write_all(line.as_bytes())?;
+    writer.write_all(b"\r\n")
+}
+
+/// Generate into an already-opened stream.
+///
+/// Everything that could have been a 4xx was decided in [`prepare`], before
+/// the response line went out. What is left can only be a server failure, and
+/// it is reported as a terminal `error` record with the same sanitized text a
+/// 500 would carry.
+fn stream_chat(request: tiny_http::Request, loaded: &mut Loaded, prepared: &Prepared) {
+    let mut stream = match NdjsonStream::start(request) {
+        Ok(stream) => stream,
+        Err(error) => {
+            eprintln!("chat stream could not start: {error}");
+            return;
+        }
+    };
+
+    let prompt_tokens = prepared.prompt_tokens.len();
+    let max_ctx = prepared.max_ctx;
+    let outcome = generate(loaded, prepared, |event| match event {
+        GenerationEvent::Prefilled { prefill_ms } => stream.send(&json!({
+            "type": "start",
+            "prompt_tokens": prompt_tokens,
+            "prefill_ms": prefill_ms,
+            "max_context": max_ctx,
+        })),
+        GenerationEvent::Text(text) => stream.send(&json!({
+            "type": "token",
+            "text": text,
+        })),
+    });
+
+    match outcome {
+        Ok(outcome) => {
+            let _ = stream.send(&json!({
+                "type": "done",
+                "tokens": outcome.tokens_generated,
+                "tok_per_sec": outcome.tok_per_sec,
+                "decode_ms": outcome.decode_ms,
+                "context_used": prompt_tokens + outcome.tokens_generated,
+                "max_context": max_ctx,
+                "stop_reason": outcome.stop_reason.as_str(),
+            }));
+            let _ = stream.finish();
+        }
+        Err(GenerateFailure::Http(error)) => {
+            let _ = stream.send(&json!({
+                "type": "error",
+                "message": error.to_string(),
+            }));
+            let _ = stream.finish();
+        }
+        // The socket is already broken; writing a terminator to it would only
+        // produce a second error to ignore.
+        Err(GenerateFailure::Client(error)) => {
+            eprintln!("chat stream ended early: {error}");
+        }
+    }
+}
+
 pub fn run(args: &ServeArgs) -> Result<()> {
     crate::gemm::configure_thread_pool();
-    if args.options.max_context == 0 {
+    if matches!(args.options.max_context, Some(0)) {
         anyhow::bail!("--max-context must be greater than zero");
     }
 
@@ -596,7 +1007,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         }
     };
 
-    let mut state = ServerState {
+    let state = ServerState {
         loaded,
         jobs: Arc::new(Jobs::new()),
         options: args.options.clone(),
@@ -611,58 +1022,92 @@ pub fn run(args: &ServeArgs) -> Result<()> {
     eprintln!("\n  Chat UI: http://localhost:{bound_port}\n");
     eprintln!("  Press Ctrl+C to stop.\n");
 
-    // The server is deliberately single-threaded: requests are handled one at
-    // a time on this loop, so one generation saturates the CPU without a
-    // second request competing for cores, and no synchronization is needed
-    // around the model state. Conversions are the one thing that must not be
-    // serialized with it — they take minutes — so they run on their own
-    // threads and this loop only ever reads their progress.
+    serve_on(&server, state, bound_port);
+    Ok(())
+}
+
+/// The checks every request passes before it can reach a route.
+///
+/// Kept as one function on the near side of the dispatch rather than as
+/// per-route calls: a route added later cannot forget to apply them, because
+/// there is nowhere in the dispatch a request arrives without having been
+/// through here. `Host` is what stops DNS rebinding from pointing a page at
+/// this port; `Origin` is what stops a page on another origin from POSTing to
+/// it; and requiring a JSON `Content-Type` is what stops the "simple request"
+/// form that a cross-origin POST can take without a preflight the browser
+/// would have to show us first.
+fn screen_headers(
+    is_post: bool,
+    host: Option<&str>,
+    origin: Option<&str>,
+    content_type: Option<&str>,
+    port: u16,
+) -> Result<(), ChatHttpError> {
+    if !host.is_some_and(|host| is_allowed_host(host, port)) {
+        return Err(ChatHttpError::forbidden("invalid Host header"));
+    }
+    // Every POST, not just /api/chat: loading a model and starting a
+    // conversion are at least as worth protecting as generating text.
+    if is_post {
+        if origin.is_some_and(|origin| !is_allowed_origin(origin, port)) {
+            return Err(ChatHttpError::forbidden(
+                "cross-origin requests are not allowed",
+            ));
+        }
+        let is_json = content_type.is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+        });
+        if !is_json {
+            return Err(ChatHttpError::unsupported_media_type());
+        }
+    }
+    Ok(())
+}
+
+fn screen_request(request: &tiny_http::Request, port: u16) -> Result<(), ChatHttpError> {
+    // `equiv` compares against a `&'static str`, which is what every call here
+    // passes anyway.
+    let header = |name: &'static str| {
+        request
+            .headers()
+            .iter()
+            .find(|header| header.field.equiv(name))
+            .map(|header| header.value.as_str())
+    };
+    screen_headers(
+        *request.method() == Method::Post,
+        header("Host"),
+        header("Origin"),
+        header("Content-Type"),
+        port,
+    )
+}
+
+/// The request loop.
+///
+/// Split out of [`run`] so a test can drive a real server on a real socket:
+/// the security screening above and the ndjson framing below are properties of
+/// what goes over the wire, and asserting them against anything less than a
+/// socket would be asserting against a re-implementation.
+///
+/// Deliberately single-threaded: requests are handled one at a time here, so
+/// one generation saturates the CPU without a second request competing for
+/// cores, and no synchronization is needed around the model state.
+/// Conversions are the one thing that must not be serialized with it — they
+/// take minutes — so they run on their own threads and this loop only ever
+/// reads their progress.
+fn serve_on(server: &Server, mut state: ServerState, bound_port: u16) {
     for mut request in server.incoming_requests() {
         let url = request.url().to_string();
         let (path, query) = split_query(&url);
         let method = request.method().clone();
 
-        let host = request
-            .headers()
-            .iter()
-            .find(|header| header.field.equiv("Host"))
-            .map(|header| header.value.as_str());
-        if !host.is_some_and(|host| is_allowed_host(host, bound_port)) {
-            respond_json_error(request, &ChatHttpError::forbidden("invalid Host header"));
+        if let Err(error) = screen_request(&request, bound_port) {
+            respond_json_error(request, &error);
             continue;
-        }
-
-        // Every POST, not just /api/chat: loading a model and starting a
-        // conversion are at least as worth protecting as generating text.
-        if method == Method::Post {
-            let origin = request
-                .headers()
-                .iter()
-                .find(|header| header.field.equiv("Origin"))
-                .map(|header| header.value.as_str());
-            if origin.is_some_and(|origin| !is_allowed_origin(origin, bound_port)) {
-                respond_json_error(
-                    request,
-                    &ChatHttpError::forbidden("cross-origin requests are not allowed"),
-                );
-                continue;
-            }
-
-            let is_json = request
-                .headers()
-                .iter()
-                .find(|header| header.field.equiv("Content-Type"))
-                .map(|header| header.value.as_str())
-                .is_some_and(|value| {
-                    value
-                        .split(';')
-                        .next()
-                        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
-                });
-            if !is_json {
-                respond_json_error(request, &ChatHttpError::unsupported_media_type());
-                continue;
-            }
         }
 
         match (method, path) {
@@ -699,7 +1144,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                     }
                 };
 
-                let outcome = match state.loaded.as_ref() {
+                let outcome = match state.loaded.as_mut() {
                     Some(loaded) => handle_generate(loaded, &chat_request),
                     None => Err(no_model_loaded()),
                 };
@@ -713,6 +1158,46 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                     Err(error) => respond_json_error(request, &error),
                 }
             }
+            (Method::Post, "/api/chat/stream") => {
+                let body = match read_request_body(request.as_reader()) {
+                    Ok(body) => body,
+                    Err(error) => {
+                        respond_json_error(request, &error);
+                        continue;
+                    }
+                };
+                let chat_request = match parse_chat_request(&body) {
+                    Ok(chat_request) => chat_request,
+                    Err(error) => {
+                        respond_json_error(request, &error);
+                        continue;
+                    }
+                };
+                if *request.http_version() < (1, 1) {
+                    respond_json_error(request, &ChatHttpError::http_version_not_supported());
+                    continue;
+                }
+                // Everything that can be a status code is decided here, while
+                // an ordinary JSON error response is still possible.
+                let prepared = match state.loaded.as_ref() {
+                    Some(loaded) => prepare(loaded, &chat_request),
+                    None => Err(no_model_loaded()),
+                };
+                let prepared = match prepared {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        respond_json_error(request, &error);
+                        continue;
+                    }
+                };
+                match state.loaded.as_mut() {
+                    Some(loaded) => stream_chat(request, loaded, &prepared),
+                    // Unreachable: `prepare` above only succeeds with a model
+                    // loaded, and this loop is the only thing that can unload
+                    // one.
+                    None => respond_json_error(request, &no_model_loaded()),
+                }
+            }
             (Method::Get, "/api/info") => {
                 let info = match state.loaded.as_ref() {
                     Some(loaded) => loaded.info_json(),
@@ -720,10 +1205,17 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                         "loaded": false,
                         "model_path": Value::Null,
                         "chat_template": state.options.chat_template,
+                        // Null, not a number: with no model there is no
+                        // context window yet, and the flag (if any) is only a
+                        // request that the next model may clamp.
                         "max_context": state.options.max_context,
                     }),
                 };
                 respond_json(request, &info);
+            }
+            (Method::Get, "/api/system") => {
+                let system = system_json(&state);
+                respond_json(request, &system);
             }
             (Method::Get, "/api/models") => match handle_models(&state, query) {
                 Ok(value) => respond_json(request, &value),
@@ -793,7 +1285,6 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             }
         }
     }
-    Ok(())
 }
 
 fn announce(loaded: &Loaded) {
@@ -930,8 +1421,10 @@ fn handle_load(state: &mut ServerState, body: &str) -> Result<Value, ChatHttpErr
     let request: LoadRequest = serde_json::from_str(body)
         .map_err(|error| ChatHttpError::bad_request(format!("invalid JSON request: {error}")))?;
 
-    let max_context = request.max_context.unwrap_or(state.options.max_context);
-    if max_context == 0 || max_context > MAX_LOAD_CONTEXT {
+    // Neither the request nor the command line naming a context means "use the
+    // model's own", which `Loaded::open` resolves once the header is read.
+    let max_context = request.max_context.or(state.options.max_context);
+    if max_context.is_some_and(|value| value == 0 || value > MAX_LOAD_CONTEXT) {
         return Err(ChatHttpError::bad_request(format!(
             "max_context must be between 1 and {MAX_LOAD_CONTEXT}"
         )));
@@ -966,6 +1459,373 @@ fn handle_load(state: &mut ServerState, body: &str) -> Result<Value, ChatHttpErr
 
 /// Upper bound on a KV cache a single request may ask this server to allocate.
 const MAX_LOAD_CONTEXT: usize = 1 << 20;
+
+// =============================================================================
+// Context windows and the memory they cost
+// =============================================================================
+
+/// The context window to actually use, given what was asked for.
+///
+/// No request means the window the model was stored with — that is the whole
+/// point of a model declaring one. A request for more than the model has is
+/// clamped down to it, because the RoPE tables were only built that far and
+/// positions past them are undefined rather than merely inadvisable.
+///
+/// Shared with `rai run`, which resolves the same flag against the same rule.
+pub(crate) fn resolve_context_window(requested: Option<usize>, model_max: usize) -> usize {
+    requested.unwrap_or(model_max).min(model_max)
+}
+
+/// The context window actually chosen, and whether the machine forced it down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContextChoice {
+    /// The window to run with.
+    pub context: usize,
+    /// The window the model itself supports.
+    pub model_max: usize,
+    /// Set when no window was asked for and the model's own would not fit, so
+    /// this one was chosen to fit the machine instead.
+    pub reduced_to_fit: bool,
+}
+
+/// Smallest window worth falling back to. Below this a chat is not useful, so
+/// failing with the numbers beats starting something unusable.
+const MIN_AUTOFIT_CONTEXT: usize = 512;
+
+/// Round auto-chosen windows down to this, so the reported number is a size a
+/// person recognizes rather than an artifact of a division.
+const AUTOFIT_GRANULARITY: usize = 256;
+
+/// Leave this share of measured free memory unclaimed. The KV cache is not the
+/// only thing that grows during generation - logits, the tokenizer and the
+/// activations all want room - and a cache sized to the last free byte turns a
+/// working session into a kill halfway through a reply.
+const AUTOFIT_MEMORY_SHARE: f64 = 0.80;
+
+/// Choose the window to run with, given what the machine can actually hold.
+///
+/// The model's own context is the ceiling, never a mandate. Asking for one
+/// explicitly and being refused is correct - the user named a number and
+/// deserves to be told it does not fit. Being refused a window nobody asked
+/// for is not: it turns a model that ran yesterday into one that will not
+/// start, which is a worse failure than a shorter conversation.
+///
+/// So an explicit request is honoured or refused, and an unset one fits itself
+/// to the machine and says what it did.
+pub(crate) fn choose_context_window(
+    requested: Option<usize>,
+    model_max: usize,
+    kv_bytes_for: impl Fn(usize) -> usize,
+) -> Result<ContextChoice> {
+    let ceiling = resolve_context_window(requested, model_max);
+    // An explicit number is the user's call: honour it, and let the caller's
+    // fit check refuse it by name if the machine cannot hold it.
+    if requested.is_some() {
+        return Ok(ContextChoice {
+            context: ceiling,
+            model_max,
+            reduced_to_fit: false,
+        });
+    }
+    let Some(available) = available_memory_bytes() else {
+        // Nothing measurable to fit to; the fallible allocation still guards it.
+        return Ok(ContextChoice {
+            context: ceiling,
+            model_max,
+            reduced_to_fit: false,
+        });
+    };
+    let budget = (available as f64 * AUTOFIT_MEMORY_SHARE) as u64;
+    if kv_bytes_for(ceiling) as u64 <= budget {
+        return Ok(ContextChoice {
+            context: ceiling,
+            model_max,
+            reduced_to_fit: false,
+        });
+    }
+    // The cache is exactly linear in the window (see `kv_cache_bytes`), so the
+    // largest window that fits is one division rather than a search.
+    let per_token = kv_bytes_for(1).max(1) as u64;
+    let fitting = (budget / per_token) as usize;
+    let rounded = (fitting / AUTOFIT_GRANULARITY) * AUTOFIT_GRANULARITY;
+    let context = rounded.min(ceiling);
+    anyhow::ensure!(
+        context >= MIN_AUTOFIT_CONTEXT,
+        "this model needs {} for even a {MIN_AUTOFIT_CONTEXT}-token context, and only {} of          memory is available. Close something, or use a model with fewer layers or KV heads.",
+        crate::cli::format_bytes(kv_bytes_for(MIN_AUTOFIT_CONTEXT) as u64),
+        crate::cli::format_bytes(available),
+    );
+    Ok(ContextChoice {
+        context,
+        model_max,
+        reduced_to_fit: true,
+    })
+}
+
+/// One line explaining an auto-fitted window, or nothing when the model's own
+/// context was used as-is.
+pub(crate) fn context_choice_note(
+    choice: ContextChoice,
+    kv_bytes_for: impl Fn(usize) -> usize,
+) -> Option<String> {
+    if !choice.reduced_to_fit {
+        return None;
+    }
+    Some(format!(
+        "Context: {} of the model's {} — its full window would need a {} KV cache, and this          machine has {} free. Pass --max-context to choose your own.",
+        choice.context,
+        choice.model_max,
+        crate::cli::format_bytes(kv_bytes_for(choice.model_max) as u64),
+        available_memory_bytes()
+            .map(crate::cli::format_bytes)
+            .unwrap_or_else(|| "an unknown amount".to_string()),
+    ))
+}
+
+/// Refuse a KV cache that this machine plainly cannot hold, with the numbers.
+///
+/// Now that the window follows the model, a large model with a long stored
+/// context asks for a cache measured in tens of gigabytes. The allocation
+/// itself is fallible (`try_reserve_exact`), but on a system that overcommits
+/// the reservation succeeds and it is the *filling* of the cache that fails —
+/// as a kill, with no message, several seconds later. Measuring first is what
+/// turns that into a sentence the user can act on.
+///
+/// Where available memory cannot be measured, this says nothing and leaves the
+/// fallible allocation to do its job: a guess would refuse work that would
+/// have succeeded.
+pub(crate) fn check_kv_cache_fits(kv_bytes: usize, max_context: usize) -> Result<()> {
+    let Some(available) = available_memory_bytes() else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        kv_bytes as u64 <= available,
+        "a {max_context}-token context needs a {} KV cache, and only {} of memory is available. \
+         Ask for a smaller window: --max-context on the command line, or \"max_context\" in \
+         POST /api/load.",
+        crate::cli::format_bytes(kv_bytes as u64),
+        crate::cli::format_bytes(available),
+    );
+    Ok(())
+}
+
+// =============================================================================
+// GET /api/system
+// =============================================================================
+
+/// What this machine is, measured rather than assumed.
+///
+/// RAI is CPU-only by construction — there is no GPU path to report on — and
+/// nothing here is a derived or smoothed figure. Anything this platform will
+/// not tell us is `null` rather than a plausible-looking number.
+fn system_json(state: &ServerState) -> Value {
+    let (avx2, fma, f16c) = cpu_features();
+    let (rss_bytes, peak_rss_bytes) = process_memory_bytes();
+    let model = match state.loaded.as_ref() {
+        Some(loaded) => json!({
+            "loaded": true,
+            "weights_bytes": loaded.model.file_size(),
+            "kv_cache_bytes": loaded.kv_cache.memory_bytes(),
+            "max_context": loaded.max_context,
+            "model_max_context": loaded.model.config.max_context,
+        }),
+        None => json!({
+            "loaded": false,
+            "weights_bytes": 0,
+            "kv_cache_bytes": 0,
+            "max_context": 0,
+            "model_max_context": 0,
+        }),
+    };
+
+    json!({
+        "cpu": {
+            "brand": cpu_brand(),
+            "logical_cores": std::thread::available_parallelism().ok().map(|count| count.get()),
+            // The pool the kernels actually run on, not a core count dressed
+            // up as one: `configure_thread_pool` may have sized it from
+            // RAYON_NUM_THREADS or from physical cores.
+            "threads_used": rayon::current_num_threads(),
+            "avx2": avx2,
+            "fma": fma,
+            "f16c": f16c,
+            "kernel": if crate::gemm::has_avx2() { "AVX2 W4A8" } else { "scalar fallback" },
+        },
+        "memory": {
+            "rss_bytes": rss_bytes,
+            "peak_rss_bytes": peak_rss_bytes,
+        },
+        "model": model,
+    })
+}
+
+/// The processor's own name for itself, from CPUID leaves 0x80000002-4.
+///
+/// No new dependency: the instruction is baseline on x86_64 and the leaves are
+/// the ones every vendor fills in. Architectures without CPUID say nothing.
+#[cfg(target_arch = "x86_64")]
+fn cpu_brand() -> Option<String> {
+    // `__cpuid` is a safe intrinsic on x86_64: the instruction is baseline
+    // there. The extended leaves are still only read once leaf 0x80000000 has
+    // reported that they exist, because a CPU that lacks them returns whatever
+    // its highest supported leaf returns rather than failing.
+    let highest_extended = std::arch::x86_64::__cpuid(0x8000_0000).eax;
+    if highest_extended < 0x8000_0004 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(48);
+    for leaf in [0x8000_0002u32, 0x8000_0003, 0x8000_0004] {
+        let result = std::arch::x86_64::__cpuid(leaf);
+        for word in [result.eax, result.ebx, result.ecx, result.edx] {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+    }
+    let end = bytes
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(bytes.len());
+    let brand = String::from_utf8_lossy(&bytes[..end]).trim().to_string();
+    (!brand.is_empty()).then_some(brand)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn cpu_brand() -> Option<String> {
+    None
+}
+
+/// `(avx2, fma, f16c)` — the three the W4A8 kernels are written against.
+#[cfg(target_arch = "x86_64")]
+fn cpu_features() -> (bool, bool, bool) {
+    (
+        is_x86_feature_detected!("avx2"),
+        is_x86_feature_detected!("fma"),
+        is_x86_feature_detected!("f16c"),
+    )
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn cpu_features() -> (bool, bool, bool) {
+    (false, false, false)
+}
+
+/// `(resident, peak resident)` for this process, where the OS will say.
+///
+/// The peak half duplicates what `jobs.rs` reads for a conversion result. It
+/// is written again here rather than shared because `jobs.rs` belongs to
+/// another change in flight and its copy is private; the live figure is needed
+/// regardless, and it comes from the same call. The two should collapse into
+/// one platform module once both changes have landed.
+#[cfg(windows)]
+fn process_memory_bytes() -> (Option<u64>, Option<u64>) {
+    #[repr(C)]
+    #[derive(Default)]
+    struct ProcessMemoryCounters {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        fn K32GetProcessMemoryInfo(
+            process: *mut std::ffi::c_void,
+            counters: *mut ProcessMemoryCounters,
+            size: u32,
+        ) -> i32;
+    }
+
+    let mut counters = ProcessMemoryCounters {
+        cb: std::mem::size_of::<ProcessMemoryCounters>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `counters` is a live, correctly sized PROCESS_MEMORY_COUNTERS,
+    // and its size is passed as the API requires. The pseudo-handle from
+    // GetCurrentProcess needs no closing.
+    let ok = unsafe {
+        K32GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            &mut counters,
+            std::mem::size_of::<ProcessMemoryCounters>() as u32,
+        )
+    };
+    if ok == 0 {
+        return (None, None);
+    }
+    (
+        Some(counters.working_set_size as u64),
+        Some(counters.peak_working_set_size as u64),
+    )
+}
+
+#[cfg(not(windows))]
+fn process_memory_bytes() -> (Option<u64>, Option<u64>) {
+    // /proc/self/status reports both in kB on Linux; elsewhere (macOS, the
+    // BSDs) there is no such file and nothing is claimed.
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return (None, None);
+    };
+    let field = |name: &str| {
+        status
+            .lines()
+            .find(|line| line.starts_with(name))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|kb| kb * 1024)
+    };
+    (field("VmRSS:"), field("VmHWM:"))
+}
+
+/// Physical memory a new allocation could plausibly get, where the OS says.
+#[cfg(windows)]
+fn available_memory_bytes() -> Option<u64> {
+    #[repr(C)]
+    #[derive(Default)]
+    struct MemoryStatusEx {
+        length: u32,
+        memory_load: u32,
+        total_physical: u64,
+        available_physical: u64,
+        total_page_file: u64,
+        available_page_file: u64,
+        total_virtual: u64,
+        available_virtual: u64,
+        available_extended_virtual: u64,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+    }
+
+    let mut status = MemoryStatusEx {
+        length: std::mem::size_of::<MemoryStatusEx>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `status` is a live, correctly sized MEMORYSTATUSEX whose
+    // `length` field is set as the API requires.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+    (ok != 0).then_some(status.available_physical)
+}
+
+#[cfg(not(windows))]
+fn available_memory_bytes() -> Option<u64> {
+    // MemAvailable is the kernel's own estimate of what a new allocation can
+    // have without swapping, which is exactly the question being asked.
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = meminfo
+        .lines()
+        .find(|line| line.starts_with("MemAvailable:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb * 1024)
+}
 
 // =============================================================================
 // POST /api/inspect
@@ -1228,6 +2088,51 @@ mod tests {
         assert!(!is_allowed_origin("https://attacker.example", 8090));
     }
 
+    /// A window nobody asked for must never stop the server starting. This is
+    /// the regression that made a model with a 40,960-token stored context
+    /// refuse to launch at all, where before it had served happily at 512.
+    #[test]
+    fn an_unrequested_window_fits_itself_to_the_machine() {
+        // 1 MB per token: the model's own 40,960 would want 40 GB.
+        let per_token = 1024 * 1024;
+        let kv = |ctx: usize| ctx * per_token;
+        let choice = choose_context_window(None, 40_960, kv).expect("must not refuse to start");
+        assert!(
+            choice.context <= 40_960,
+            "never above the model's own window"
+        );
+        assert!(choice.context >= MIN_AUTOFIT_CONTEXT);
+        assert!(
+            choice.context.is_multiple_of(AUTOFIT_GRANULARITY),
+            "auto-chosen windows are reported at a round size, got {}",
+            choice.context
+        );
+        // Whether it had to shrink depends on this machine's free memory, but
+        // if it did, it must say so rather than shrink in silence.
+        if choice.reduced_to_fit {
+            let note = context_choice_note(choice, kv).expect("a reduced window must explain");
+            assert!(note.contains("--max-context"), "{note}");
+            assert!(
+                note.contains("40960"),
+                "the note names the model's own window: {note}"
+            );
+        }
+    }
+
+    /// An explicitly requested window is the user's decision. It is honoured,
+    /// never quietly shrunk — the fit check refuses it by name instead.
+    #[test]
+    fn an_explicit_window_is_never_silently_reduced() {
+        let kv = |ctx: usize| ctx * 1024 * 1024;
+        let choice = choose_context_window(Some(8192), 40_960, kv).expect("explicit is honoured");
+        assert_eq!(choice.context, 8192);
+        assert!(!choice.reduced_to_fit);
+        assert!(context_choice_note(choice, kv).is_none());
+        // And still clamped to what the model can actually address.
+        let clamped = choose_context_window(Some(99_999), 4096, kv).expect("clamped");
+        assert_eq!(clamped.context, 4096);
+    }
+
     /// The server may bind IPv6 loopback, and a browser may resolve
     /// `localhost` to `::1`; neither is a way in from another machine.
     #[test]
@@ -1391,7 +2296,7 @@ mod tests {
             jobs: Arc::new(Jobs::new()),
             options: ServeOptions {
                 port: 8090,
-                max_context: 512,
+                max_context: Some(512),
                 chat_template: "auto".to_string(),
             },
         };
@@ -1414,7 +2319,7 @@ mod tests {
             jobs: Arc::new(Jobs::new()),
             options: ServeOptions {
                 port: 8090,
-                max_context: 512,
+                max_context: Some(512),
                 chat_template: "auto".to_string(),
             },
         };
@@ -1441,7 +2346,7 @@ mod tests {
             jobs: Arc::new(Jobs::new()),
             options: ServeOptions {
                 port: 8090,
-                max_context: 512,
+                max_context: Some(512),
                 chat_template: "auto".to_string(),
             },
         };
@@ -1456,5 +2361,400 @@ mod tests {
         assert_eq!(value["count"], 0);
         assert!(value["dirs"][0]["error"].is_string());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // =========================================================================
+    // Context windows and generation ceilings
+    // =========================================================================
+
+    /// The old default was the constant 512, which is what made a model stored
+    /// with a 40k window behave as if it had a 512-token one.
+    #[test]
+    fn the_context_window_follows_the_model_and_is_clamped_to_it() {
+        assert_eq!(resolve_context_window(None, 40_960), 40_960);
+        assert_eq!(resolve_context_window(Some(512), 40_960), 512);
+        assert_eq!(resolve_context_window(Some(1_000_000), 40_960), 40_960);
+        assert_eq!(resolve_context_window(None, 512), 512);
+    }
+
+    /// The generation ceiling is the context the prompt leaves free, not a
+    /// constant, and prompt plus reply never exceeds the window.
+    #[test]
+    fn the_generation_ceiling_is_whatever_the_prompt_leaves_free() {
+        assert_eq!(remaining_generation_tokens(1, 2048), 2047);
+        assert_eq!(remaining_generation_tokens(2000, 2048), 48);
+        assert_eq!(remaining_generation_tokens(2048, 2048), 0);
+
+        // The property the `done` record's `context_used` depends on.
+        for prompt_len in [1usize, 2, 999, 2047, 2048] {
+            let used = prompt_len + remaining_generation_tokens(prompt_len, 2048);
+            assert_eq!(used, 2048, "prompt of {prompt_len}");
+        }
+    }
+
+    /// A number that cannot fit is refused with both numbers, rather than
+    /// quietly producing a short reply the caller cannot explain.
+    #[test]
+    fn max_tokens_beyond_the_remaining_context_is_refused_with_the_numbers() {
+        let error = resolve_max_tokens(Some(4000), 100, 2048).unwrap_err();
+        assert_eq!(error.status, 400);
+        assert!(error.message.contains("4000"), "{error}");
+        assert!(error.message.contains("1948"), "{error}");
+        assert!(error.message.contains("2048"), "{error}");
+
+        // Exactly the remaining count is allowed; one more is not.
+        assert_eq!(resolve_max_tokens(Some(1948), 100, 2048).unwrap(), 1948);
+        assert!(resolve_max_tokens(Some(1949), 100, 2048).is_err());
+    }
+
+    /// A prompt with no room left for an answer is said plainly, rather than
+    /// answered with an empty reply.
+    #[test]
+    fn a_prompt_that_fills_the_window_is_refused_rather_than_answered_with_nothing() {
+        for requested in [None, Some(1), Some(200)] {
+            let error = resolve_max_tokens(requested, 2048, 2048).unwrap_err();
+            assert_eq!(error.status, 400);
+            assert!(error.message.contains("no room for a reply"), "{error}");
+        }
+    }
+
+    /// Asking for nothing is not the same as asking for too much: the default
+    /// shortens to fit rather than failing.
+    #[test]
+    fn an_unrequested_token_count_takes_the_default_and_shortens_to_fit() {
+        assert_eq!(
+            resolve_max_tokens(None, 10, 40_960).unwrap(),
+            DEFAULT_CHAT_GENERATION_TOKENS
+        );
+        // 2040-token prompt in a 2048 window leaves 8.
+        assert_eq!(resolve_max_tokens(None, 2040, 2048).unwrap(), 8);
+    }
+
+    /// There is no longer a fixed ceiling to validate against, so a large
+    /// `max_tokens` survives request validation and meets the real limit
+    /// later, with the model's numbers in hand.
+    #[test]
+    fn a_large_token_request_is_no_longer_rejected_by_a_constant() {
+        let request = parse_chat_request(r#"{"message":"hi","max_tokens":8192}"#).unwrap();
+        assert_eq!(request.max_tokens, Some(8192));
+        assert_eq!(
+            parse_chat_request(r#"{"message":"hi","max_tokens":0}"#)
+                .unwrap_err()
+                .status,
+            400
+        );
+    }
+
+    /// The preflight only speaks when the platform gave it a number, and when
+    /// it does it names the size and how to ask for less.
+    #[test]
+    fn an_unaffordable_kv_cache_is_refused_with_its_size() {
+        // 16 EiB will not fit on any machine this runs on.
+        let error = check_kv_cache_fits(usize::MAX, 131_072);
+        match available_memory_bytes() {
+            Some(_) => {
+                let message = format!("{:#}", error.unwrap_err());
+                assert!(message.contains("131072"), "{message}");
+                assert!(message.contains("--max-context"), "{message}");
+            }
+            // Nothing measurable: the fallible allocation is left to answer.
+            None => assert!(error.is_ok()),
+        }
+        // A cache of nothing always fits.
+        assert!(check_kv_cache_fits(0, 1).is_ok());
+    }
+
+    // =========================================================================
+    // Streaming
+    // =========================================================================
+
+    #[test]
+    fn stop_reasons_are_the_three_the_contract_names() {
+        assert_eq!(StopReason::Eos.as_str(), "eos");
+        assert_eq!(StopReason::MaxTokens.as_str(), "max_tokens");
+        assert_eq!(StopReason::StopSequence.as_str(), "stop_sequence");
+    }
+
+    /// Each record is one chunk: a hex length, the JSON, a newline, a CRLF.
+    /// The newline inside the payload is what makes it ndjson; the CRLF is
+    /// chunked transfer encoding and is not part of the record.
+    #[test]
+    fn each_ndjson_record_is_one_chunk_ending_in_exactly_one_newline() {
+        let mut out: Vec<u8> = Vec::new();
+        write_ndjson_chunk(&mut out, &json!({"type":"token","text":"hi"})).unwrap();
+        let framed = String::from_utf8(out).unwrap();
+
+        // <hex length>CRLF <payload> CRLF, and the payload is the JSON object
+        // plus the one newline that separates ndjson records. Key order is
+        // serde_json's, not this file's, and is not part of the contract.
+        let (length, rest) = framed.split_once("\r\n").unwrap();
+        let payload = rest.strip_suffix("\r\n").expect("chunk ends with CRLF");
+        assert_eq!(usize::from_str_radix(length, 16).unwrap(), payload.len());
+        assert_eq!(payload.matches('\n').count(), 1, "{payload:?}");
+        assert!(payload.ends_with('\n'));
+        let record: Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(record["type"], "token");
+        assert_eq!(record["text"], "hi");
+    }
+
+    /// A model that generates newlines must not be able to forge a record
+    /// boundary. `serde_json` escapes them, so the payload stays one line.
+    #[test]
+    fn a_generated_newline_cannot_split_a_record() {
+        let mut out: Vec<u8> = Vec::new();
+        write_ndjson_chunk(&mut out, &json!({"type":"token","text":"a\nb\r\nc"})).unwrap();
+        let framed = String::from_utf8(out).unwrap();
+        let (length, rest) = framed.split_once("\r\n").unwrap();
+        let payload = rest.strip_suffix("\r\n").unwrap();
+        assert_eq!(usize::from_str_radix(length, 16).unwrap(), payload.len());
+        assert_eq!(payload.matches('\n').count(), 1, "{payload:?}");
+        assert!(payload.ends_with('\n'));
+        assert_eq!(
+            serde_json::from_str::<Value>(payload.trim_end()).unwrap()["text"],
+            "a\nb\r\nc"
+        );
+    }
+
+    /// A stop sequence is cut from the final text, so its opening bytes must
+    /// never be streamed: a reader would otherwise watch `<|im_` appear and
+    /// then have to un-see it.
+    #[test]
+    fn text_that_could_still_become_a_stop_sequence_is_held_back() {
+        let stops = ["<|im_end|>", "<|im_start|>"];
+        assert_eq!(emittable_len("hello", &stops), 5);
+        assert_eq!(emittable_len("hello<|im_", &stops), 5);
+        assert_eq!(emittable_len("hello<", &stops), 5);
+        // `<|im` is a prefix of both; the longer hold wins.
+        assert_eq!(emittable_len("<|im_st", &stops), 0);
+        // With no stop sequences configured, nothing is ever held.
+        assert_eq!(emittable_len("hello<|im_", &[]), 10);
+    }
+
+    /// A trailing replacement character nearly always means a multi-byte
+    /// character is split across two tokens; showing it and then correcting it
+    /// is worse than waiting one token.
+    #[test]
+    fn a_trailing_replacement_character_is_held_back_but_a_settled_one_is_not() {
+        assert_eq!(emittable_len("caf\u{FFFD}", &[]), 3);
+        assert_eq!(emittable_len("\u{FFFD}\u{FFFD}", &[]), 0);
+        assert_eq!(emittable_len("caf\u{FFFD}e", &[]), "caf\u{FFFD}e".len());
+        // The boundary it returns is always a character boundary.
+        let held = "caf\u{FFFD}";
+        assert!(held.is_char_boundary(emittable_len(held, &[])));
+    }
+
+    // =========================================================================
+    // The screening every route goes through
+    // =========================================================================
+
+    /// The streaming route is a POST like any other, so it is covered by the
+    /// same three checks — which is the point of screening before routing
+    /// rather than inside each handler.
+    #[test]
+    fn the_streaming_route_is_screened_like_every_other_post() {
+        let json = Some("application/json");
+        // The happy case.
+        assert!(screen_headers(
+            true,
+            Some("localhost:8090"),
+            Some("http://localhost:8090"),
+            json,
+            8090
+        )
+        .is_ok());
+        // A rebound name for our port.
+        assert_eq!(
+            screen_headers(true, Some("attacker.example:8090"), None, json, 8090)
+                .unwrap_err()
+                .status,
+            403
+        );
+        // A page on another origin.
+        assert_eq!(
+            screen_headers(
+                true,
+                Some("localhost:8090"),
+                Some("https://attacker.example"),
+                json,
+                8090
+            )
+            .unwrap_err()
+            .status,
+            403
+        );
+        // The form-post shape that needs no preflight.
+        assert_eq!(
+            screen_headers(
+                true,
+                Some("localhost:8090"),
+                None,
+                Some("text/plain;charset=UTF-8"),
+                8090
+            )
+            .unwrap_err()
+            .status,
+            415
+        );
+        // A GET still has to pass the Host check.
+        assert!(screen_headers(false, Some("127.0.0.1:8090"), None, None, 8090).is_ok());
+        assert_eq!(
+            screen_headers(false, None, None, None, 8090)
+                .unwrap_err()
+                .status,
+            403
+        );
+    }
+
+    // =========================================================================
+    // Against a real socket
+    // =========================================================================
+
+    /// Send one raw request to `port` and return `(status line, body)`.
+    ///
+    /// Raw rather than through a client library because the things being
+    /// asserted — a forged `Host`, a missing `Content-Type` — are exactly the
+    /// things a well-behaved client will not send.
+    #[cfg(test)]
+    fn raw_request(port: u16, request: &str) -> (String, String) {
+        use std::io::Write as _;
+        let mut socket = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        socket.write_all(request.as_bytes()).expect("write");
+        socket.flush().expect("flush");
+        let mut response = String::new();
+        socket.read_to_string(&mut response).expect("read");
+        let (head, body) = response.split_once("\r\n\r\n").unwrap_or((&response, ""));
+        let status = head.lines().next().unwrap_or_default().to_string();
+        (status, body.to_string())
+    }
+
+    /// Run `body` against a real server on a real loopback port.
+    fn with_server(body: impl FnOnce(u16)) {
+        let server = bind_loopback(0).expect("loopback bind");
+        let port = server.server_addr().to_ip().expect("ip socket").port();
+        let state = ServerState {
+            loaded: None,
+            jobs: Arc::new(Jobs::new()),
+            options: ServeOptions {
+                port,
+                max_context: None,
+                chat_template: "auto".to_string(),
+            },
+        };
+        std::thread::scope(|scope| {
+            scope.spawn(|| serve_on(&server, state, port));
+            body(port);
+            server.unblock();
+        });
+    }
+
+    #[test]
+    fn the_stream_route_rejects_a_forged_host_and_a_foreign_origin() {
+        with_server(|port| {
+            let (status, _) = raw_request(
+                port,
+                "POST /api/chat/stream HTTP/1.1\r\nHost: attacker.example\r\n\
+                 Content-Type: application/json\r\nContent-Length: 17\r\n\
+                 Connection: close\r\n\r\n{\"message\":\"hi\"}\n",
+            );
+            assert!(status.contains("403"), "{status}");
+
+            let (status, _) = raw_request(
+                port,
+                &format!(
+                    "POST /api/chat/stream HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+                     Origin: https://attacker.example\r\nContent-Type: application/json\r\n\
+                     Content-Length: 17\r\nConnection: close\r\n\r\n{{\"message\":\"hi\"}}\n"
+                ),
+            );
+            assert!(status.contains("403"), "{status}");
+
+            let (status, _) = raw_request(
+                port,
+                &format!(
+                    "POST /api/chat/stream HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+                     Content-Type: text/plain\r\nContent-Length: 17\r\n\
+                     Connection: close\r\n\r\n{{\"message\":\"hi\"}}\n"
+                ),
+            );
+            assert!(status.contains("415"), "{status}");
+        });
+    }
+
+    /// With nothing loaded the streaming route answers with an ordinary status
+    /// code, not with a 200 whose first record is an error.
+    #[test]
+    fn the_stream_route_answers_a_missing_model_before_it_opens_a_stream() {
+        with_server(|port| {
+            let (status, body) = raw_request(
+                port,
+                &format!(
+                    "POST /api/chat/stream HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+                     Origin: http://127.0.0.1:{port}\r\nContent-Type: application/json\r\n\
+                     Content-Length: 16\r\nConnection: close\r\n\r\n{{\"message\":\"hi\"}}"
+                ),
+            );
+            assert!(status.contains("409"), "{status}");
+            assert!(body.contains("/api/load"), "{body}");
+        });
+    }
+
+    /// `/api/system` reports the machine even with no model loaded, and every
+    /// field the UI contract names is present.
+    #[test]
+    fn the_system_route_reports_this_machine() {
+        with_server(|port| {
+            let (status, body) = raw_request(
+                port,
+                &format!(
+                    "GET /api/system HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+                     Connection: close\r\n\r\n"
+                ),
+            );
+            assert!(status.contains("200"), "{status}");
+            let value: Value = serde_json::from_str(&body).expect(&body);
+
+            assert!(value["cpu"]["logical_cores"].as_u64().unwrap() >= 1);
+            assert!(value["cpu"]["threads_used"].as_u64().unwrap() >= 1);
+            for flag in ["avx2", "fma", "f16c"] {
+                assert!(value["cpu"][flag].is_boolean(), "{flag}");
+            }
+            // Exactly one of the two kernels, never an invented third.
+            let kernel = value["cpu"]["kernel"].as_str().unwrap();
+            assert!(
+                kernel == "AVX2 W4A8" || kernel == "scalar fallback",
+                "{kernel}"
+            );
+            // Nothing fabricated: no GPU, no utilisation percentage.
+            assert!(value["gpu"].is_null());
+            assert!(value["cpu"]["utilisation"].is_null());
+            assert!(value["cpu"]["usage"].is_null());
+            // Measured or null, never a placeholder zero.
+            for field in ["rss_bytes", "peak_rss_bytes"] {
+                let measured = &value["memory"][field];
+                assert!(
+                    measured.is_null() || measured.as_u64().unwrap() > 0,
+                    "{field}"
+                );
+            }
+            assert_eq!(value["model"]["loaded"], false);
+            assert_eq!(value["model"]["max_context"], 0);
+        });
+    }
+
+    /// The brand string, when the architecture can produce one, is a name and
+    /// not padding. On x86_64 there is no "cannot produce one": the brand
+    /// leaves have been mandatory since long before AVX2, which this engine
+    /// needs anyway.
+    #[test]
+    fn the_cpu_brand_is_a_name_or_nothing() {
+        let brand = cpu_brand();
+        if cfg!(target_arch = "x86_64") {
+            let brand = brand.expect("x86_64 always has the CPUID brand leaves");
+            assert_eq!(brand.trim(), brand, "{brand:?}");
+            assert!(!brand.is_empty());
+            assert!(!brand.contains('\0'), "{brand:?}");
+        } else {
+            assert!(brand.is_none());
+        }
     }
 }

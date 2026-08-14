@@ -22,7 +22,7 @@
 use std::path::{Path, PathBuf};
 
 use half::f16;
-use rai_infer::convert::{convert, ConvertOptions};
+use rai_infer::convert::{convert, ContextSource, ConvertOptions};
 use rai_infer::format::RaiModelFile;
 use rai_infer::kv_cache::KVCache;
 use rai_infer::layers::{Activation, RopeScaling};
@@ -1816,4 +1816,176 @@ fn a_gemma2_export_past_its_sliding_window_is_refused() {
         error.contains("sliding_window=128") && error.contains("--max-context 128"),
         "the refusal must name the window and the fix: {error}"
     );
+}
+
+// =============================================================================
+// What the conversion stores, and what it reports having done
+// =============================================================================
+
+/// The stored context follows the model, and nothing else.
+///
+/// `--max-context` used to default to 2048, which is not a property of any
+/// model: a checkpoint declaring `max_position_embeddings=40960` was written
+/// with a 2048-token RoPE table, and because the stored context is a hard
+/// ceiling for every later `rai run` and `rai serve`, that cap could only be
+/// lifted by converting the model again. This converts *the same weights*
+/// under two different declared contexts and requires the file to come back
+/// with each one: any constant default fails, including 2048 itself and
+/// including one that happens to match either model.
+#[test]
+fn the_stored_context_follows_the_model_rather_than_a_constant() {
+    for declared in [1_024u32, 8_192] {
+        let spec = Spec {
+            extra_config: serde_json::json!({ "max_position_embeddings": declared }),
+            ..Spec::default()
+        };
+        let root = scratch_dir(&format!("ctx-{declared}"));
+        let model_dir = root.join("checkpoint");
+        let output = root.join("out").join("ctx.raimodel");
+        write_checkpoint(&model_dir, &spec);
+
+        // Exactly what `rai convert <dir>` with no --max-context does.
+        let summary = convert(&ConvertOptions {
+            model_dir: model_dir.clone(),
+            output: Some(output.clone()),
+            group_size: GROUP_SIZE,
+            embed_group_size: GROUP_SIZE,
+            quiet: true,
+            ..ConvertOptions::default()
+        })
+        .unwrap_or_else(|error| panic!("conversion failed: {error:#}"));
+
+        assert_eq!(summary.context.tokens, declared);
+        assert_eq!(summary.context.source, ContextSource::ModelConfig);
+
+        // The header, not just the summary: this is the number that outlives
+        // the conversion.
+        let file = RaiModelFile::open(&output).expect("reader rejected the model");
+        assert_eq!(
+            file.config.max_context, declared,
+            "stored context must be the model's own, not a constant"
+        );
+        assert_ne!(
+            file.config.max_context, 2_048,
+            "2048 was the old constant default and is not this model's context"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// The KV-cache figure a conversion reports is the allocation the runtime
+/// actually makes for that context — the same arithmetic, checked against a
+/// real model file rather than against a copy of the formula.
+#[test]
+fn the_reported_kv_cache_is_the_one_the_runtime_allocates() {
+    let spec = Spec {
+        extra_config: serde_json::json!({ "max_position_embeddings": 2_048 }),
+        ..Spec::default()
+    };
+    let root = scratch_dir("kv-cost");
+    let model_dir = root.join("checkpoint");
+    let output = root.join("out").join("kv.raimodel");
+    write_checkpoint(&model_dir, &spec);
+
+    let summary = convert(&ConvertOptions {
+        model_dir: model_dir.clone(),
+        output: Some(output.clone()),
+        group_size: GROUP_SIZE,
+        embed_group_size: GROUP_SIZE,
+        quiet: true,
+        ..ConvertOptions::default()
+    })
+    .unwrap_or_else(|error| panic!("conversion failed: {error:#}"));
+
+    let model = RaiModel::load(&output).expect("loading the converted model");
+    assert_eq!(
+        summary.kv_cache_bytes,
+        model.kv_cache_bytes(summary.context.tokens as usize) as u64,
+        "the conversion's KV-cache estimate must be the runtime's own"
+    );
+    // 2 * 2 layers * 2 kv heads * 2048 positions * 16 head_dim * 4 B.
+    assert_eq!(summary.kv_cache_bytes, 2 * 2 * 2 * 2_048 * 16 * 4);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A conversion reports what it read, not what the folder holds.
+///
+/// The input size is the whole basis of a compression figure and used to be
+/// unrecorded. It has to come from the shards the converter actually opened: a
+/// checkpoint directory also holds `tokenizer.json`, the shard index and often
+/// a second copy of the weights in another format, so a directory walk would
+/// report a ratio for bytes nothing ever read.
+#[test]
+fn a_conversion_reports_the_shards_it_read_and_what_they_became() {
+    let spec = Spec {
+        shards: 3,
+        extra_config: serde_json::json!({ "max_position_embeddings": 2_048 }),
+        ..Spec::default()
+    };
+    let root = scratch_dir("metrics");
+    let model_dir = root.join("checkpoint");
+    let output = root.join("out").join("metrics.raimodel");
+    write_checkpoint(&model_dir, &spec);
+
+    let summary = convert(&ConvertOptions {
+        model_dir: model_dir.clone(),
+        output: Some(output.clone()),
+        group_size: GROUP_SIZE,
+        embed_group_size: GROUP_SIZE,
+        quiet: true,
+        ..ConvertOptions::default()
+    })
+    .unwrap_or_else(|error| panic!("conversion failed: {error:#}"));
+
+    // Exactly the three shards, summed from the filesystem.
+    let mut shard_bytes = 0u64;
+    let mut shard_count = 0usize;
+    let mut directory_bytes = 0u64;
+    for entry in std::fs::read_dir(&model_dir).expect("reading the checkpoint dir") {
+        let entry = entry.expect("directory entry");
+        let len = entry.metadata().expect("entry metadata").len();
+        directory_bytes += len;
+        if entry
+            .path()
+            .extension()
+            .is_some_and(|extension| extension == "safetensors")
+        {
+            shard_bytes += len;
+            shard_count += 1;
+        }
+    }
+    assert_eq!(shard_count, 3);
+    assert_eq!(summary.source_files, 3);
+    assert_eq!(summary.source_bytes, shard_bytes);
+    assert!(
+        directory_bytes > shard_bytes,
+        "the checkpoint dir must hold more than the shards, or this proves nothing"
+    );
+    assert!(
+        summary.source_bytes < directory_bytes,
+        "source_bytes must count the shards, not the directory"
+    );
+
+    // The output size is the file on disk, and the two ratios follow from the
+    // pair with no third measurement involved.
+    let produced = std::fs::metadata(&output).expect("output metadata").len();
+    assert_eq!(summary.bytes_written, produced);
+    assert!(
+        (summary.compression_ratio() - shard_bytes as f64 / produced as f64).abs() < 1e-12,
+        "compression_ratio {} does not match {shard_bytes}/{produced}",
+        summary.compression_ratio()
+    );
+
+    // Parameters: 96*64 embedding + 2 * (64*64*2 + 64*32*2 + 64*128*3 + 64*2)
+    // + 64 final norm, with a tied head.
+    assert_eq!(summary.parameters, 80_192);
+    assert!(
+        (summary.bits_per_parameter() - produced as f64 * 8.0 / 80_192.0).abs() < 1e-12,
+        "bits_per_parameter {} does not match the file",
+        summary.bits_per_parameter()
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
 }

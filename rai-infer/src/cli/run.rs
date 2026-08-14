@@ -67,9 +67,11 @@ pub struct GenerationArgs {
     /// Entropy threshold for adaptive strategy
     #[arg(long, default_value = "3.0")]
     pub entropy_threshold: f32,
-    /// Context window to allocate the KV cache for, in tokens
-    #[arg(long, default_value = "512")]
-    pub max_context: usize,
+    /// Context window to allocate the KV cache for, in tokens. Defaults to the
+    /// context window the model itself was stored with; a smaller value trades
+    /// history for memory, a larger one is clamped to what the model supports.
+    #[arg(long)]
+    pub max_context: Option<usize>,
     /// Random seed; the same seed and settings reproduce the same text
     #[arg(long, default_value = "42")]
     pub seed: u64,
@@ -134,8 +136,10 @@ pub fn validate_args(args: &GenerationArgs) -> Result<()> {
         args.max_tokens > 0,
         "--max-tokens must be greater than zero"
     );
+    // `None` means "whatever the model was stored with", which is resolved
+    // once the model is open; an explicit zero is still a mistake.
     ensure!(
-        args.max_context > 0,
+        !matches!(args.max_context, Some(0)),
         "--max-context must be greater than zero"
     );
     validate_f32("--temperature", args.temperature, 0.0, 2.0)?;
@@ -217,7 +221,13 @@ fn validate_f32(name: &str, value: f32, minimum: f32, maximum: f32) -> Result<()
     Ok(())
 }
 
-fn incremental_suffix<'a>(previous: &str, current: &'a str) -> &'a str {
+/// The part of `current` that `previous` does not already cover.
+///
+/// Shared with `rai serve`'s streaming route, which faces the same problem:
+/// the tokenizer is asked to decode the whole generated suffix every step (so
+/// that SentencePiece spacing comes out right), and only the new tail of that
+/// decode should reach the reader.
+pub(crate) fn incremental_suffix<'a>(previous: &str, current: &'a str) -> &'a str {
     let mut common_bytes = 0usize;
     for (before, after) in previous.chars().zip(current.chars()) {
         if before != after {
@@ -272,9 +282,20 @@ pub fn run(args: &RunArgs) -> Result<()> {
         repetition_penalty: generation.repetition_penalty,
     };
 
-    let max_ctx = generation
-        .max_context
-        .min(model.config.max_context as usize);
+    // No flag means the window the model was stored with. A flag that asks for
+    // more than the model has is still clamped down to it: the RoPE tables were
+    // only built that far, so positions beyond it are not defined.
+    let choice = crate::cli::serve::choose_context_window(
+        generation.max_context,
+        model.config.max_context as usize,
+        |ctx| model.kv_cache_bytes(ctx),
+    )?;
+    if let Some(note) =
+        crate::cli::serve::context_choice_note(choice, |ctx| model.kv_cache_bytes(ctx))
+    {
+        eprintln!("{note}");
+    }
+    let max_ctx = choice.context;
     ensure!(
         !prompt_tokens.is_empty(),
         "prompt produced no tokenizer tokens"
@@ -296,6 +317,27 @@ pub fn run(args: &RunArgs) -> Result<()> {
         kv_bytes as f64 / (1024.0 * 1024.0),
         max_ctx
     );
+    // Now that the default follows the model's own window, a large model with a
+    // long stored context asks for a cache measured in tens of gigabytes. Say so
+    // with the numbers before anything is allocated: the allocation itself is
+    // fallible, but on a machine that overcommits it is the *writing* of the
+    // cache that fails, and that arrives as a kill rather than as an error.
+    // A draft model allocates its own cache alongside the target's, so the
+    // preflight has to weigh both or it under-checks by a factor of two.
+    //
+    // The draft is loaded further down, so its header is read here instead:
+    // `read_summary` parses the header alone, without the weights, which is
+    // exactly enough to size its cache before anything is allocated.
+    let draft_kv_bytes = match &generation.draft {
+        Some(path) => {
+            let summary = crate::format::RaiModelFile::read_summary(path)
+                .with_context(|| format!("reading the draft model header at {}", path.display()))?;
+            let config = &summary.config;
+            config.kv_cache_bytes(max_ctx.min(config.max_context as usize))
+        }
+        None => 0,
+    };
+    crate::cli::serve::check_kv_cache_fits(kv_bytes + draft_kv_bytes, max_ctx)?;
     let mut rng = rand::rngs::StdRng::seed_from_u64(generation.seed);
     let mut all_tokens = prompt_tokens.clone();
 
@@ -746,7 +788,7 @@ mod tests {
             ensemble_n: 3,
             noise_sigma: 0.05,
             entropy_threshold: 3.0,
-            max_context: 512,
+            max_context: Some(512),
             seed: 42,
             verbose: false,
             chat_template: "none".to_string(),
@@ -835,6 +877,21 @@ mod tests {
         args.lookup_min_ngram = 0;
         assert!(validate_args(&args).is_err());
         args.lookup_min_ngram = 3;
+        assert!(validate_args(&args).is_ok());
+    }
+
+    /// Omitting `--max-context` is not "512", it is "ask the model". Only an
+    /// explicit zero is an error.
+    #[test]
+    fn an_absent_context_window_is_allowed_and_an_explicit_zero_is_not() {
+        let mut args = valid_args();
+        args.max_context = None;
+        assert!(validate_args(&args).is_ok());
+
+        args.max_context = Some(0);
+        assert!(validate_args(&args).is_err());
+
+        args.max_context = Some(131_072);
         assert!(validate_args(&args).is_ok());
     }
 

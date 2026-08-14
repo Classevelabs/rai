@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 
 use crate::cli::{format_bytes, MODEL_EXTENSION, TOKENIZER_FILENAME};
-use crate::convert::{preflight, PreflightReport};
+use crate::convert::{preflight, ContextSource, PreflightReport, FOLLOW_MODEL_CONTEXT};
 use crate::format::{ModelSummary, RaiModelFile};
 use crate::layers::{Activation, RopeScaling};
 
@@ -296,8 +296,23 @@ fn report_json(
         "weights_checked": report.weights_checked,
         "model_type": report.model_type,
         "architectures": report.architectures,
+        // What the conversion would be built for, which is not always what was
+        // asked for: `max_context` is the context that would be *stored* once
+        // FOLLOW_MODEL_CONTEXT has been resolved against the model's own
+        // config, and `max_context_requested` is null when nothing was asked.
         "checked_with": {
-            "max_context": max_context,
+            "max_context": report.max_context,
+            "max_context_requested": (max_context != FOLLOW_MODEL_CONTEXT).then_some(max_context),
+            "context_source": report.context_source.map(ContextSource::as_str),
+        },
+        // The price of that context at load time. A stored context is a
+        // ceiling rather than an allocation — `rai run --max-context` decides
+        // what is actually taken — but this is the largest KV cache the file
+        // can be asked for, and it is worth seeing before a conversion rather
+        // than after one.
+        "runtime": {
+            "kv_cache_bytes": report.kv_cache_bytes,
+            "kv_cache_human": report.kv_cache_bytes.map(format_bytes),
         },
         "shape": {
             "hidden_size": report.hidden_size,
@@ -468,6 +483,63 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("num_hidden_layers"));
+    }
+
+    /// Studio's Check must describe the file `rai convert` would actually
+    /// write. With no context requested that is the model's own, and the
+    /// report says so — including the KV cache that context implies, which is
+    /// the number a user needs *before* converting an 8 GB model they cannot
+    /// run at full width.
+    #[test]
+    fn an_inspection_reports_the_context_a_conversion_would_store() {
+        let config = serde_json::json!({
+            "model_type": "qwen3",
+            "architectures": ["Qwen3ForCausalLM"],
+            "hidden_size": 1024,
+            "num_hidden_layers": 28,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "intermediate_size": 3072,
+            "vocab_size": 151936,
+            "max_position_embeddings": 40960,
+            "rope_theta": 1000000.0,
+            "tie_word_embeddings": true,
+        });
+
+        let value = inspect(
+            "x",
+            SourceKind::LocalConfigOnly,
+            &config,
+            None,
+            128,
+            64,
+            FOLLOW_MODEL_CONTEXT,
+        );
+        assert_eq!(value["supported"], true, "{}", value["reason"]);
+        assert_eq!(value["checked_with"]["max_context"], 40960);
+        assert_eq!(value["checked_with"]["context_source"], "model-config");
+        assert!(value["checked_with"]["max_context_requested"].is_null());
+        // 2 * 28 layers * 8 kv heads * 40960 positions * 128 head_dim * 4 B,
+        // which is exactly 8.75 GiB — a 0.6B model whose weights are under a
+        // gigabyte, and the reason this number is worth printing.
+        assert_eq!(value["runtime"]["kv_cache_bytes"], 9_395_240_960u64);
+        assert_eq!(value["runtime"]["kv_cache_human"], "8.8 GB");
+
+        // An explicit request is reported as one, and costs proportionally.
+        let value = inspect(
+            "x",
+            SourceKind::LocalConfigOnly,
+            &config,
+            None,
+            128,
+            64,
+            4096,
+        );
+        assert_eq!(value["checked_with"]["max_context"], 4096);
+        assert_eq!(value["checked_with"]["max_context_requested"], 4096);
+        assert_eq!(value["checked_with"]["context_source"], "requested");
+        assert_eq!(value["runtime"]["kv_cache_bytes"], 939_524_096u64);
     }
 
     #[test]
