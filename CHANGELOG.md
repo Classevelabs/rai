@@ -4,7 +4,28 @@ All notable changes to RAI are documented here. The project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and uses semantic
 versioning for its pre-1.0 releases.
 
-## [0.2.0] - Unreleased
+## [0.2.1] - 2026-08-14
+
+### Fixed
+- **Studio could not hold a conversation on a context of 4096 tokens or
+  fewer**, which is every model converted with Studio's own default context of
+  2048: the first message came back as an error, "Try again" failed the same
+  way, and it never recovered. Studio was sending the whole context window as
+  its per-reply `max_tokens`, but the room for a reply is the window *minus the
+  prompt*, so the request was guaranteed to be refused. It was supposed to
+  correct itself by reading the limit out of the server's refusal, except that
+  it was still matching the wording of an older server that enforced one fixed
+  ceiling; against this server, which computes the ceiling per request, the
+  pattern matched nothing and no limit was ever learned. Studio now reads the
+  room out of the refusal this server actually sends, repeats the send once so
+  the reader gets their reply instead of a dead end, and — after any completed
+  reply — sets the ceiling to the window minus what that prompt cost, so the
+  Tuning control shows a number the server would accept. The wording of that
+  refusal is now pinned by a test on both sides, so changing it on one side
+  alone fails the build rather than silently disabling the recovery again.
+  Contexts of 8192 and above were never affected.
+
+## [0.2.0] - 2026-08-14
 
 ### Added
 - **One `rai` binary with four verbs — `rai convert`, `rai run`, `rai serve`,

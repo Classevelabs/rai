@@ -139,6 +139,9 @@ jobs:
           where they do not.
 
           Setup and a sixty-second first run: see `INSTALL.md`.
+
+          What changed in this release, and whether it fixes something you hit:
+          see `CHANGELOG.md`.
           NOTES
 
           # The heredoc body carries this file's YAML indentation; strip it so
