@@ -1,0 +1,54 @@
+name: CodeQL
+
+# RAI parses model files from wherever the user got them and hands the buffers
+# to hand-written AVX2 kernels. A malformed .raimodel that walks off the end of
+# an allocation is the failure that matters here, and it will not show up as a
+# failing test — the test suite only feeds it models that are well formed.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "42 4 * * 3"
+  workflow_dispatch:
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyse ${{ matrix.language }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      security-events: write
+
+    strategy:
+      # Rust support is newer than the rest of CodeQL. If it is unavailable on
+      # the runner, Python findings should still land rather than the whole
+      # workflow going red and taking both with it.
+      fail-fast: false
+      matrix:
+        language: [rust, python]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialise CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          queries: security-and-quality
+
+      - name: Analyse
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:${{ matrix.language }}

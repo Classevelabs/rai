@@ -32,6 +32,9 @@ permissions:
 jobs:
   sweep:
     runs-on: ubuntu-latest
+    # The sweep is a handful of API calls. Anything longer means a call is
+    # hanging, and an hour of that is an hour of the month's minutes.
+    timeout-minutes: 10
     steps:
       - name: Merge what CI has proved, rebase what it has not
         env:
