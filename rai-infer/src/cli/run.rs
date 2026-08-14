@@ -312,10 +312,13 @@ pub fn run(args: &RunArgs) -> Result<()> {
         "tokenizer produced a token outside the model vocabulary"
     );
     let kv_bytes = model.kv_cache_bytes(max_ctx);
+    // The reserved ceiling, not the resident cost: the cache allocates in
+    // steps and only reaches this if the conversation reaches `max_ctx`.
+    // Reporting the ceiling as though it were resident is what made a long
+    // window look unaffordable when it is not.
     eprintln!(
-        "KV cache: {:.1} MB (max_ctx={})",
-        kv_bytes as f64 / (1024.0 * 1024.0),
-        max_ctx
+        "KV cache: up to {} at {max_ctx} tokens (allocated as the conversation grows)",
+        crate::cli::format_bytes(kv_bytes as u64)
     );
     // Now that the default follows the model's own window, a large model with a
     // long stored context asks for a cache measured in tens of gigabytes. Say so
