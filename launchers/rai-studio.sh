@@ -54,11 +54,13 @@ if [ -n "${RAI_MODEL:-}" ]; then
     MODEL="${RAI_MODEL}"
 else
     models=()
+    found=0
     while IFS= read -r -d '' path; do
         models+=("${path}")
+        found=$((found + 1))
     done < <(find "${ROOT}" -maxdepth 1 -type f -name '*.raimodel' -print0 2>/dev/null | sort -z)
 
-    case "${#models[@]}" in
+    case "${found}" in
         0)
             die "  No .raimodel file found in this directory:
     ${ROOT}

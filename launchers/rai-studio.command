@@ -54,11 +54,14 @@ if [ -n "${RAI_MODEL:-}" ]; then
     MODEL="${RAI_MODEL}"
 else
     models=()
-    for path in "${HERE}"/*.raimodel; do
-        [ -f "${path}" ] && models+=("${path}")
+    found=0
+    for path in "${ROOT}"/*.raimodel; do
+        [ -f "${path}" ] || continue
+        models+=("${path}")
+        found=$((found + 1))
     done
 
-    case "${#models[@]}" in
+    case "${found}" in
         0)
             die "  No .raimodel file found in this folder:
     ${ROOT}
