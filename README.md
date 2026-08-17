@@ -480,10 +480,10 @@ RAI is pre-1.0 and interfaces may change. What that means concretely:
   (BENCHMARKS.md). No perplexity sweep has been run, so no perplexity claim is
   made.
 - The optimized paths are x86-64 (AVX2 + FMA + F16C). On ARM — including
-  Apple Silicon — the GEMM falls back to a scalar, single-threaded path, so it
-  runs correctly but far slower than the measured x86-64 figures above. NEON
-  kernels are future work, and no ARM throughput is claimed here because none
-  has been measured.
+  Apple Silicon, which ships a native `aarch64-apple-darwin` archive — the GEMM
+  falls back to a scalar path, so it runs correctly but far slower than the
+  measured x86-64 figures above. NEON kernels are future work, and no ARM
+  throughput is claimed here because none has been measured.
 - The memory/reasoning service and the RC/HRC/SAC compression paths are
   research prototypes. Their confidence, crowding, and modeled-size outputs are
   not validated guarantees.

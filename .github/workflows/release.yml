@@ -7,11 +7,14 @@ name: Release
 # release built that way runs only on CPUs at least as new as whichever runner
 # happened to pick up the job, and fails everywhere else with SIGILL on the
 # first instruction it does not know — after download, after install, with no
-# diagnostic. `.cargo/config.toml` now pins the same portable x86-64-v2 floor
-# this workflow sets, so the two agree; every job below still sets RUSTFLAGS
-# explicitly and asserts it, because that config file is one edit away from
-# being changed back and a release is the wrong place to find out. See the
-# RUSTFLAGS comment in the build job for why the floor is x86-64-v2 and not v3.
+# diagnostic. `.cargo/config.toml` pins the same portable x86-64-v2 floor for
+# x86 targets, so the two agree; every build job still sets RUSTFLAGS from its
+# matrix entry and asserts it, because that config file is one edit away from
+# being changed back and a release is the wrong place to find out.
+#
+# The floor is per-target. aarch64 builds at the toolchain default — an x86 CPU
+# name means nothing there and would fail the build — and the assertion knows
+# which answer to expect for which architecture.
 #
 # Nothing here publishes to crates.io. That is a separate, human-approved act.
 
@@ -35,8 +38,9 @@ permissions:
 env:
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
-  # Portable release floor. NOT target-cpu=native — see the header comment.
-  RUSTFLAGS: "-C target-cpu=x86-64-v2"
+  # The portable floor is per-target and lives in the build matrix: an x86 CPU
+  # name is not a thing aarch64 understands, and setting one here would fail
+  # the ARM build outright. NOT target-cpu=native anywhere — see the header.
 
 jobs:
   prepare:
@@ -121,7 +125,8 @@ jobs:
           fi
 
           cat > notes.md <<'NOTES'
-          Prebuilt binaries for x86-64 Linux, Windows, and macOS (Intel): the
+          Prebuilt binaries for x86-64 Linux and Windows, and for macOS on both
+          Intel and Apple Silicon: the
           `rai` inference CLI (`convert`, `run`, `serve`, `models`) and
           `rai-server`, plus the deprecated `rai-convert`, `rai-generate`, and
           `rai-chat` wrappers.
@@ -133,10 +138,12 @@ jobs:
           sha256sum --ignore-missing -c SHA256SUMS
           ```
 
-          Built with `-C target-cpu=x86-64-v2`, so these start on any x86-64
-          CPU from roughly 2009 onward. The AVX2/FMA/F16C kernels are selected
-          at runtime on CPUs that report them, and fall back to scalar code
-          where they do not.
+          The x86-64 archives are built with `-C target-cpu=x86-64-v2`, so they
+          start on any x86-64 CPU from roughly 2009 onward, and their
+          AVX2/FMA/F16C kernels are selected at runtime on CPUs that report
+          them. The `aarch64-apple-darwin` archive is native Apple Silicon and
+          runs the scalar kernels — there is no NEON path yet, so expect it to
+          be slower than the x86 archives on comparable hardware.
 
           Setup and a sixty-second first run: see `INSTALL.md`.
 
@@ -160,6 +167,8 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: write
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
     strategy:
       fail-fast: false
       matrix:
@@ -167,12 +176,25 @@ jobs:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
+            rustflags: "-C target-cpu=x86-64-v2"
           - os: windows-2025
             target: x86_64-pc-windows-msvc
             archive: zip
+            rustflags: "-C target-cpu=x86-64-v2"
           - os: macos-15-intel
             target: x86_64-apple-darwin
             archive: tar.gz
+            rustflags: "-C target-cpu=x86-64-v2"
+          # Apple Silicon, built natively on an ARM runner. No target-cpu is
+          # pinned: the aarch64 baseline every M-series Mac shares is already
+          # the toolchain default, and there is no NEON kernel to select for,
+          # so the GEMM takes the scalar path. Slower than the x86 archives on
+          # comparable hardware, and still far better than the Intel build
+          # under Rosetta, which emulates no AVX2 at all.
+          - os: macos-15
+            target: aarch64-apple-darwin
+            archive: tar.gz
+            rustflags: ""
 
     steps:
       - name: Checkout
@@ -198,6 +220,8 @@ jobs:
 
       - name: Confirm the portable baseline actually took effect
         shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
 
@@ -206,13 +230,35 @@ jobs:
           # `target-cpu=native` back — or adds a second flag source, or the
           # precedence changes — this build would silently go back to shipping
           # native-only binaries. Assert instead of trusting.
+          #
+          # `native` is refused on every target. What counts as correct beyond
+          # that depends on the architecture, so the check asks per target
+          # rather than demanding one x86 answer everywhere.
           case "$RUSTFLAGS" in
             *target-cpu=native*)
               echo "::error::release build is using target-cpu=native — the artifacts would crash on older CPUs"
               exit 1 ;;
-            *target-cpu=x86-64-v2*) echo "portable baseline confirmed: $RUSTFLAGS" ;;
+          esac
+
+          case "$TARGET" in
+            x86_64-*)
+              case "$RUSTFLAGS" in
+                *target-cpu=x86-64-v2*)
+                  echo "portable x86 baseline confirmed: $RUSTFLAGS" ;;
+                *)
+                  echo "::error::$TARGET must pin target-cpu=x86-64-v2, got: '$RUSTFLAGS'"
+                  exit 1 ;;
+              esac ;;
+            aarch64-*)
+              # The toolchain default is the shared baseline here, and naming
+              # a specific ARM CPU would narrow the archive to one machine.
+              if [ -n "$RUSTFLAGS" ]; then
+                echo "::error::$TARGET must build at the toolchain default, got: '$RUSTFLAGS'"
+                exit 1
+              fi
+              echo "aarch64 baseline confirmed: toolchain default" ;;
             *)
-              echo "::error::RUSTFLAGS does not pin a portable target-cpu: $RUSTFLAGS"
+              echo "::error::no baseline policy for target $TARGET"
               exit 1 ;;
           esac
 

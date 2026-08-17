@@ -4,6 +4,26 @@ All notable changes to RAI are documented here. The project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and uses semantic
 versioning for its pre-1.0 releases.
 
+## [0.2.3] - 2026-08-17
+
+### Added
+- **A native Apple Silicon archive**, `rai-<version>-aarch64-apple-darwin.tar.gz`.
+  Until now the only macOS build was Intel, which on an M-series Mac runs under
+  Rosetta — and Rosetta emulates no AVX2, so it landed on the scalar kernels
+  *and* paid translation on top. The native build takes the same scalar path
+  (there is still no NEON implementation) without the translation, and CI has
+  been building and testing this target since 0.2.0, so nothing about it is new
+  except that it is now downloadable. It is slower than the x86-64 archives on
+  comparable hardware; that is measured nowhere yet and no ARM throughput is
+  claimed.
+
+### Fixed
+- The release workflow pinned `-C target-cpu=x86-64-v2` for every target from
+  one global environment variable, which an aarch64 build refuses outright. The
+  floor is now per-target: x86-64 keeps the portable baseline and asserts it,
+  aarch64 builds at the toolchain default and asserts *that*, and
+  `target-cpu=native` is still refused everywhere.
+
 ## [0.2.2] - 2026-08-17
 
 ### Fixed
