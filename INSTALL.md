@@ -54,6 +54,16 @@ scalar path *and* pays translation on top.
 
 ARM64 Linux still has to build from source, and gets the same scalar path.
 
+**The Linux archive needs glibc 2.34 or newer** — Ubuntu 22.04, Debian 12,
+RHEL 9, or later. It is built on a current runner and links against that
+runner's glibc, so on an older distribution it fails at load with a
+`GLIBC_2.34 not found` message rather than running slowly. Ubuntu 20.04,
+Debian 11, RHEL 8 and Amazon Linux 2 are all below that floor; build from
+source there. Apart from libc the binary needs only `libgcc_s` and `libm`,
+both of which are already present anywhere those exist.
+
+The macOS archives go back to 10.12 and load nothing outside `/usr/lib`.
+
 ## 2. Verify the checksum
 
 Do this before you run anything. Put `SHA256SUMS` in the same directory as the
