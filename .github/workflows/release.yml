@@ -123,21 +123,27 @@ jobs:
           # verifying, which is worse than a late release.
           # The id is recorded and handed downstream because a *draft* release
           # cannot be reliably addressed by tag: `gh release view/download`
-          # resolves drafts by listing them rather than by ref, and it answers
+          # resolves drafts by listing them rather than by ref, and answers
           # "release not found" often enough that the checksum job cannot be
           # built on it. An id is unambiguous whether or not it is a draft.
-          emit_id() {
-            gh api "repos/$REPO/releases" --paginate --jq '.[] | "\(.tag_name) \(.id)"' \
-              | awk -v tag="$TAG" '$1 == tag { print $2; exit }'
+          #
+          # Creating it through the REST API rather than `gh release create` is
+          # what makes the id available without asking for it: the POST returns
+          # the release it just made. Listing releases to find one we already
+          # know we created is an extra dependency on an endpoint that has
+          # returned 503 mid-release, so it is only the fallback for the
+          # already-exists case.
+          list_id() {
+            for attempt in 1 2 3 4 5; do
+              id=$(gh api "repos/$REPO/releases" --paginate \
+                     --jq '.[] | "\(.tag_name) \(.id)"' 2>/dev/null \
+                   | awk -v tag="$TAG" '$1 == tag { print $2; exit }') || true
+              if [ -n "${id:-}" ]; then printf '%s' "$id"; return 0; fi
+              echo "releases list gave nothing (attempt $attempt) — retrying" >&2
+              sleep $((attempt * 5))
+            done
+            return 1
           }
-
-          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-            echo "Release $TAG already exists — reusing it."
-            id=$(emit_id)
-            test -n "$id"
-            echo "release_id=$id" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
 
           cat > notes.md <<'NOTES'
           Prebuilt binaries for x86-64 Linux and Windows, and for macOS on both
@@ -170,12 +176,23 @@ jobs:
           # the release page is not one big code block.
           sed -i 's/^          //' notes.md
 
-          gh release create "$TAG" --repo "$REPO" \
-            --draft \
-            --title "RAI $TAG" \
-            --notes-file notes.md
+          # A 422 here means the release already exists, which is the rerun
+          # case; anything else is a real failure and should stop the release.
+          if id=$(gh api --method POST "repos/$REPO/releases" \
+                    -f tag_name="$TAG" \
+                    -f name="RAI $TAG" \
+                    -F body=@notes.md \
+                    -F draft=true \
+                    -F prerelease=false \
+                    --jq '.id' 2>create.err); then
+            echo "created draft release $id"
+          else
+            cat create.err >&2
+            grep -q 'already_exists\|HTTP 422' create.err || exit 1
+            echo "Release $TAG already exists — reusing it."
+            id=$(list_id)
+          fi
 
-          id=$(emit_id)
           test -n "$id"
           echo "release_id=$id" >> "$GITHUB_OUTPUT"
           echo "draft release id: $id"
@@ -469,9 +486,18 @@ jobs:
           # resolve and nothing to race.
           test -n "$RELEASE_ID"
 
-          gh api --paginate "repos/$REPO/releases/$RELEASE_ID/assets" \
-            --jq '.[] | select(.name | test("^rai-.*\\.(tar\\.gz|zip)$")) | "\(.id) \(.name)"' \
-            > assets.txt
+          # The API has answered 503 mid-release before. A transient outage
+          # should cost a retry, not a release that has to be cut again.
+          for attempt in 1 2 3 4 5; do
+            if gh api --paginate "repos/$REPO/releases/$RELEASE_ID/assets" \
+                 --jq '.[] | select(.name | test("^rai-.*\\.(tar\\.gz|zip)$")) | "\(.id) \(.name)"' \
+                 > assets.txt; then
+              break
+            fi
+            echo "asset listing failed (attempt $attempt) — retrying"
+            sleep $((attempt * 5))
+          done
+          test -s assets.txt
 
           while read -r asset_id asset_name; do
             echo "downloading $asset_name"
