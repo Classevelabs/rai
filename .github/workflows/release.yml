@@ -176,22 +176,41 @@ jobs:
           # the release page is not one big code block.
           sed -i 's/^          //' notes.md
 
-          # A 422 here means the release already exists, which is the rerun
-          # case; anything else is a real failure and should stop the release.
-          if id=$(gh api --method POST "repos/$REPO/releases" \
-                    -f tag_name="$TAG" \
-                    -f name="RAI $TAG" \
-                    -F body=@notes.md \
-                    -F draft=true \
-                    -F prerelease=false \
-                    --jq '.id' 2>create.err); then
-            echo "created draft release $id"
-          else
+          # Three outcomes worth telling apart. 422 means the release already
+          # exists, which is the rerun case. 5xx means GitHub is having a bad
+          # day — that has taken a release down mid-flight, and it deserves a
+          # retry rather than a tag that has to be cut again. Anything else is
+          # a real failure and should stop the release.
+          id=""
+          for attempt in 1 2 3 4 5 6; do
+            if id=$(gh api --method POST "repos/$REPO/releases" \
+                      -f tag_name="$TAG" \
+                      -f name="RAI $TAG" \
+                      -F body=@notes.md \
+                      -F draft=true \
+                      -F prerelease=false \
+                      --jq '.id' 2>create.err); then
+              echo "created draft release $id"
+              break
+            fi
+
             cat create.err >&2
-            grep -q 'already_exists\|HTTP 422' create.err || exit 1
-            echo "Release $TAG already exists — reusing it."
-            id=$(list_id)
-          fi
+
+            if grep -q 'already_exists\|HTTP 422' create.err; then
+              echo "Release $TAG already exists — reusing it."
+              id=$(list_id)
+              break
+            fi
+
+            if grep -qE 'HTTP 5[0-9][0-9]|No server is currently available' create.err; then
+              echo "GitHub returned a server error (attempt $attempt) — retrying"
+              id=""
+              sleep $((attempt * 20))
+              continue
+            fi
+
+            exit 1
+          done
 
           test -n "$id"
           echo "release_id=$id" >> "$GITHUB_OUTPUT"
