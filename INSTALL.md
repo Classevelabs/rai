@@ -57,7 +57,7 @@ Linux and macOS:
 
 ```bash
 sha256sum --ignore-missing -c SHA256SUMS
-# rai-0.2.1-x86_64-unknown-linux-gnu.tar.gz: OK
+# rai-0.2.2-x86_64-unknown-linux-gnu.tar.gz: OK
 ```
 
 macOS without GNU coreutils:
@@ -69,7 +69,7 @@ shasum -a 256 --ignore-missing -c SHA256SUMS
 Windows PowerShell:
 
 ```powershell
-$file = "rai-0.2.1-x86_64-pc-windows-msvc.zip"
+$file = "rai-0.2.2-x86_64-pc-windows-msvc.zip"
 $want = (Select-String -Path SHA256SUMS -Pattern ([regex]::Escape($file))).Line.Split()[0]
 $got  = (Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
 if ($want -eq $got) { "OK" } else { throw "checksum mismatch" }
@@ -86,8 +86,8 @@ self-contained and can live anywhere.
 Linux and macOS:
 
 ```bash
-tar xzf rai-0.2.1-x86_64-unknown-linux-gnu.tar.gz
-cd rai-0.2.1-x86_64-unknown-linux-gnu
+tar xzf rai-0.2.2-x86_64-unknown-linux-gnu.tar.gz
+cd rai-0.2.2-x86_64-unknown-linux-gnu
 install -m 0755 rai rai-server ~/.local/bin/
 rai --help
 ```
@@ -106,8 +106,8 @@ xattr -d com.apple.quarantine rai rai-server
 Windows PowerShell:
 
 ```powershell
-Expand-Archive rai-0.2.1-x86_64-pc-windows-msvc.zip -DestinationPath $HOME\bin
-$dir = "$HOME\bin\rai-0.2.1-x86_64-pc-windows-msvc"
+Expand-Archive rai-0.2.2-x86_64-pc-windows-msvc.zip -DestinationPath $HOME\bin
+$dir = "$HOME\bin\rai-0.2.2-x86_64-pc-windows-msvc"
 [Environment]::SetEnvironmentVariable(
   "Path", "$([Environment]::GetEnvironmentVariable('Path','User'));$dir", "User")
 # open a new terminal, then:

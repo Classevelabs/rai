@@ -1128,6 +1128,26 @@ const LM_CHUNK: usize = 512;
 #[cfg(any(target_arch = "x86_64", test))]
 const PAR_THRESHOLD: usize = 256;
 
+/// Smallest weight matrix, in bytes of packed nibbles, worth handing to rayon
+/// during single-token decode.
+///
+/// A row count alone is the wrong question: 576 rows of 576 columns is 165 KB,
+/// which one thread streams in ~17 µs, while a rayon dispatch costs 20-27 µs
+/// before any work happens. `bw-bench` measures both — steps 3 to 5 — and the
+/// parallel read of that matrix comes back 10-20x slower than the serial one.
+/// Below this size the fan-out is pure loss, so decode walks the rows itself.
+///
+/// Prefill is unaffected: it batches many tokens per weight chunk, so the work
+/// per dispatch is large enough that the overhead disappears into it.
+#[cfg(any(target_arch = "x86_64", test))]
+const PAR_MIN_BYTES: usize = 512 * 1024;
+
+/// Whether a decode-time matvec of this shape is worth parallelizing.
+#[cfg(any(target_arch = "x86_64", test))]
+fn matvec_should_parallelize(rows: usize, cols: usize) -> bool {
+    rows >= PAR_THRESHOLD && rows * cols / 2 >= PAR_MIN_BYTES
+}
+
 /// Adaptive chunk sizing: target ~24KB per chunk to fit L1 cache (32KB).
 /// Each row needs cols/2 bytes of nibble data.
 /// SmolLM (cols=256): 24576/(128)=192→clamped to 64 rows.
@@ -1225,7 +1245,7 @@ fn w4a8_matvec_inner(
     #[cfg(target_arch = "x86_64")]
     {
         if has_avx2() {
-            if rows >= PAR_THRESHOLD {
+            if matvec_should_parallelize(rows, cols) {
                 // Adaptive chunk sizing: keeps per-chunk weight data in L1 (32KB).
                 let cr = chunk_rows_for(cols);
                 let num_chunks = rows.div_ceil(cr);
@@ -2259,9 +2279,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Parallel-path reference tests (rows > PAR_THRESHOLD so the rayon
-    // dispatch runs on AVX2 hosts; on non-AVX2 hosts the same assertions
-    // cover the scalar fallback).
+    // Parallel-path reference tests. The shapes here clear both dispatch
+    // gates -- row count and packed-weight size -- so the rayon branch is the
+    // one under test on AVX2 hosts; on non-AVX2 hosts the same assertions
+    // cover the scalar fallback.
     // -----------------------------------------------------------------------
 
     /// Uniform per-row/per-group f16 (scale, zero) parameters.
@@ -2347,10 +2368,10 @@ mod tests {
 
     #[test]
     fn matvec_parallel_path_matches_dequantized_reference() {
-        let rows = 320; // > PAR_THRESHOLD → parallel branch on AVX2 hosts
+        let rows = 4288; // parallel branch on AVX2 hosts
         let cols = 256;
         let group_size = 64;
-        assert!(rows > PAR_THRESHOLD);
+        assert!(matvec_should_parallelize(rows, cols));
 
         let nibbles = pack_nibbles(rows, cols, 0);
         let params = pack_group_params(rows, cols / group_size, 0.5, -4.0);
@@ -2373,11 +2394,11 @@ mod tests {
 
     #[test]
     fn fused_qkv_parallel_path_matches_per_matvec() {
-        let q_rows = 320; // > PAR_THRESHOLD
+        let q_rows = 4288;
         let kv_rows = 64; // GQA-style narrow K/V
         let cols = 256;
         let group_size = 64;
-        assert!(q_rows > PAR_THRESHOLD);
+        assert!(matvec_should_parallelize(q_rows, cols));
 
         let q_nib = pack_nibbles(q_rows, cols, 0);
         let k_nib = pack_nibbles(kv_rows, cols, 5);
@@ -2438,10 +2459,10 @@ mod tests {
 
     #[test]
     fn fused_gate_up_parallel_path_matches_per_matvec() {
-        let rows = 320; // > PAR_THRESHOLD
+        let rows = 4288;
         let cols = 256;
         let group_size = 64;
-        assert!(rows > PAR_THRESHOLD);
+        assert!(matvec_should_parallelize(rows, cols));
 
         let gate_nib = pack_nibbles(rows, cols, 1);
         let up_nib = pack_nibbles(rows, cols, 7);

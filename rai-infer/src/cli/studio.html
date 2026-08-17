@@ -505,7 +505,10 @@ input:disabled,select:disabled,textarea:disabled{color:var(--fg-3);cursor:not-al
 </div>
 <script>
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
-const esc=s=>String(s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+// Quotes are escaped too: several call sites interpolate into quoted
+// attributes, where &<> alone lets a value close the attribute and open an
+// event handler. The CSP allows inline script, so that handler would run.
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const human=b=>b>=1073741824?(b/1073741824).toFixed(2)+" GB":b>=1048576?(b/1048576).toFixed(1)+" MB":(b/1024).toFixed(0)+" KB";
 const num=n=>Number(n||0).toLocaleString();
 const params=n=>{n=Number(n)||0;return n>=1e9?(n/1e9).toFixed(2)+"B":n>=1e6?(n/1e6).toFixed(1)+"M":num(n)};

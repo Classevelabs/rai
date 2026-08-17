@@ -13,7 +13,7 @@ use rand::SeedableRng;
 use tokenizers::Tokenizer;
 
 use crate::chat_template::ChatTemplate;
-use crate::cli::{load_tokenizer, resolve_tokenizer};
+use crate::cli::{load_tokenizer_for_model, resolve_tokenizer};
 use crate::lookup::{LookupConfig, LookupDecoder};
 use crate::model::{BatchScratch, InferenceWork, RaiModel};
 use crate::ponder::{pondered_forward, PonderConfig, PonderStrategy};
@@ -264,7 +264,7 @@ pub fn run(args: &RunArgs) -> Result<()> {
     );
 
     eprintln!("Loading tokenizer: {}", tokenizer_path.display());
-    let tokenizer = load_tokenizer(&tokenizer_path)?;
+    let tokenizer = load_tokenizer_for_model(&tokenizer_path, cfg.vocab_size as usize)?;
 
     let template = ChatTemplate::from_str_arg(&generation.chat_template, &tokenizer);
     let formatted_prompt = template.format_prompt(&generation.prompt);

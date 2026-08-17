@@ -54,7 +54,7 @@ use crate::chat_template::ChatTemplate;
 use crate::cli::catalog;
 use crate::cli::jobs::{Jobs, StartError};
 use crate::cli::run::incremental_suffix;
-use crate::cli::{load_tokenizer, resolve_tokenizer};
+use crate::cli::{load_tokenizer_for_model, resolve_tokenizer};
 use crate::convert::ConvertOptions;
 use crate::kv_cache::KVCache;
 use crate::model::{InferenceWork, RaiModel};
@@ -267,7 +267,8 @@ impl Loaded {
                 crate::cli::format_bytes(kv_bytes as u64)
             )
         })?;
-        let tokenizer = load_tokenizer(&tokenizer_path)?;
+        let tokenizer =
+            load_tokenizer_for_model(&tokenizer_path, model.config.vocab_size as usize)?;
         let template = ChatTemplate::from_str_arg(chat_template, &tokenizer);
         Ok(Self {
             model,
@@ -1551,7 +1552,8 @@ pub(crate) fn choose_context_window(
     let context = rounded.min(ceiling);
     anyhow::ensure!(
         context >= MIN_AUTOFIT_CONTEXT,
-        "this model needs {} for even a {MIN_AUTOFIT_CONTEXT}-token context, and only {} of          memory is available. Close something, or use a model with fewer layers or KV heads.",
+        "this model needs {} for even a {MIN_AUTOFIT_CONTEXT}-token context, and only {} of \
+         memory is available. Close something, or use a model with fewer layers or KV heads.",
         crate::cli::format_bytes(kv_bytes_for(MIN_AUTOFIT_CONTEXT) as u64),
         crate::cli::format_bytes(available),
     );
@@ -1572,7 +1574,8 @@ pub(crate) fn context_choice_note(
         return None;
     }
     Some(format!(
-        "Context: {} of the model's {} — its full window would need a {} KV cache,          and this machine has {} free. Pass --max-context to choose your own.",
+        "Context: {} of the model's {} — its full window would need a {} KV cache, \
+         and this machine has {} free. Pass --max-context to choose your own.",
         choice.context,
         choice.model_max,
         crate::cli::format_bytes(kv_bytes_for(choice.model_max) as u64),
