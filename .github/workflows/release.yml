@@ -52,6 +52,7 @@ jobs:
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
       version: ${{ steps.resolve.outputs.version }}
+      release_id: ${{ steps.draft.outputs.release_id }}
 
     steps:
       - name: Checkout
@@ -107,6 +108,7 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Open the draft release
+        id: draft
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -119,8 +121,21 @@ jobs:
           # exist first. It stays a draft until SHA256SUMS is attached: a
           # published release missing its checksums teaches people to skip
           # verifying, which is worse than a late release.
+          # The id is recorded and handed downstream because a *draft* release
+          # cannot be reliably addressed by tag: `gh release view/download`
+          # resolves drafts by listing them rather than by ref, and it answers
+          # "release not found" often enough that the checksum job cannot be
+          # built on it. An id is unambiguous whether or not it is a draft.
+          emit_id() {
+            gh api "repos/$REPO/releases" --paginate --jq '.[] | "\(.tag_name) \(.id)"' \
+              | awk -v tag="$TAG" '$1 == tag { print $2; exit }'
+          }
+
           if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
             echo "Release $TAG already exists — reusing it."
+            id=$(emit_id)
+            test -n "$id"
+            echo "release_id=$id" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -159,6 +174,11 @@ jobs:
             --draft \
             --title "RAI $TAG" \
             --notes-file notes.md
+
+          id=$(emit_id)
+          test -n "$id"
+          echo "release_id=$id" >> "$GITHUB_OUTPUT"
+          echo "draft release id: $id"
 
   build:
     name: Build ${{ matrix.target }}
@@ -427,6 +447,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
         shell: bash
         run: |
           set -euo pipefail
@@ -441,31 +462,34 @@ jobs:
           # gh rather than a documented guarantee, so a failure here drops to
           # the REST API, which addresses assets by id and has no such
           # ambiguity. Either way the count is asserted below.
-          if ! gh release download "$TAG" --repo "$REPO" --dir dist \
-                 --pattern 'rai-*.tar.gz' --pattern 'rai-*.zip'; then
-            echo "gh release download did not resolve the draft — falling back to the REST API"
+          # Addressed by id, not tag. `gh release download` resolves a draft by
+          # listing releases rather than by ref and answers "release not found"
+          # often enough that a release cannot be built on it; the id comes
+          # from the job that created the release, so there is nothing to
+          # resolve and nothing to race.
+          test -n "$RELEASE_ID"
 
-            release_id=$(gh api --paginate "repos/$REPO/releases" \
-              --jq "map(select(.tag_name == \"$TAG\")) | .[0].id")
-            test -n "$release_id"
+          gh api --paginate "repos/$REPO/releases/$RELEASE_ID/assets" \
+            --jq '.[] | select(.name | test("^rai-.*\\.(tar\\.gz|zip)$")) | "\(.id) \(.name)"' \
+            > assets.txt
 
-            gh api --paginate "repos/$REPO/releases/$release_id/assets" \
-              --jq '.[] | select(.name | test("^rai-.*\\.(tar\\.gz|zip)$")) | "\(.id) \(.name)"' \
-              | while read -r asset_id asset_name; do
-                  gh api -H "Accept: application/octet-stream" \
-                    "repos/$REPO/releases/assets/$asset_id" > "dist/$asset_name"
-                done
-          fi
+          while read -r asset_id asset_name; do
+            echo "downloading $asset_name"
+            gh api -H "Accept: application/octet-stream" \
+              "repos/$REPO/releases/assets/$asset_id" > "dist/$asset_name"
+          done < assets.txt
 
           ls -l dist
 
-          # Three platforms were built; three archives must be hashed. A short
-          # SHA256SUMS is worse than none — it silently blesses two downloads
-          # and leaves the third unverifiable.
+          # One archive per entry in the build matrix. A short SHA256SUMS is
+          # worse than none — it silently blesses some downloads and leaves the
+          # rest unverifiable — so the count is asserted rather than assumed.
+          # Keep this in step with the matrix in the build job.
+          expected=4
           found=$(find dist -maxdepth 1 -type f \
             \( -name 'rai-*.tar.gz' -o -name 'rai-*.zip' \) | wc -l)
-          if [ "$found" -ne 3 ]; then
-            echo "::error::expected 3 release archives to hash, found $found"
+          if [ "$found" -ne "$expected" ]; then
+            echo "::error::expected $expected release archives to hash, found $found"
             exit 1
           fi
 
@@ -483,9 +507,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
         shell: bash
         run: |
           set -euo pipefail
           gh release upload "$TAG" dist/SHA256SUMS --repo "$REPO" --clobber
-          gh release edit "$TAG" --repo "$REPO" --draft=false
-          gh release view "$TAG" --repo "$REPO"
+
+          # Publish by id for the same reason the download does: the release is
+          # still a draft at this point, so the tag is not a reliable handle.
+          gh api --method PATCH "repos/$REPO/releases/$RELEASE_ID" -F draft=false             --jq '"published \(.tag_name) with \(.assets|length) assets"'
