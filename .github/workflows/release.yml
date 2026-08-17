@@ -459,6 +459,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
           VERSION: ${{ needs.prepare.outputs.version }}
           TARGET: ${{ matrix.target }}
           ARCHIVE: ${{ matrix.archive }}
@@ -467,7 +468,39 @@ jobs:
           set -euo pipefail
           asset="dist/rai-${VERSION}-${TARGET}.${ARCHIVE}"
           test -f "$asset"
-          gh release upload "$TAG" "$asset" --repo "$REPO" --clobber
+          test -n "$RELEASE_ID"
+
+          name=$(basename "$asset")
+
+          # By id, like every other release call here. `gh release upload`
+          # resolves the release by tag, and a draft cannot be found that way
+          # reliably — it failed on two of four runners while the builds
+          # themselves were green.
+          #
+          # An asset of the same name already present is a rerun; the upload
+          # API rejects the duplicate rather than replacing it, so clear it
+          # first. That is what --clobber was doing.
+          existing=$(gh api --paginate "repos/$REPO/releases/$RELEASE_ID/assets" \
+                       --jq ".[] | select(.name == \"$name\") | .id" || true)
+          for old in $existing; do
+            echo "replacing existing asset $old"
+            gh api --method DELETE "repos/$REPO/releases/assets/$old" || true
+          done
+
+          for attempt in 1 2 3 4 5; do
+            if gh api --method POST \
+                 "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=$name" \
+                 -H "Content-Type: application/octet-stream" \
+                 --input "$asset" --silent; then
+              echo "uploaded $name"
+              exit 0
+            fi
+            echo "upload failed (attempt $attempt) — retrying"
+            sleep $((attempt * 15))
+          done
+
+          echo "::error::could not upload $name after 5 attempts"
+          exit 1
 
   checksums:
     name: Publish SHA256SUMS and release
@@ -556,7 +589,28 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh release upload "$TAG" dist/SHA256SUMS --repo "$REPO" --clobber
+          # By id, for the same reason as every other call here.
+          existing=$(gh api --paginate "repos/$REPO/releases/$RELEASE_ID/assets" \
+                       --jq '.[] | select(.name == "SHA256SUMS") | .id' || true)
+          for old in $existing; do
+            gh api --method DELETE "repos/$REPO/releases/assets/$old" || true
+          done
+
+          for attempt in 1 2 3 4 5; do
+            if gh api --method POST \
+                 "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=SHA256SUMS" \
+                 -H "Content-Type: text/plain" \
+                 --input dist/SHA256SUMS --silent; then
+              echo "uploaded SHA256SUMS"
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "::error::could not upload SHA256SUMS after 5 attempts"
+              exit 1
+            fi
+            echo "SHA256SUMS upload failed (attempt $attempt) — retrying"
+            sleep $((attempt * 15))
+          done
 
           # Publish by id for the same reason the download does: the release is
           # still a draft at this point, so the tag is not a reliable handle.
