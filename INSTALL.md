@@ -37,16 +37,22 @@ file, at <https://github.com/Classevelabs/rai/releases>.
 | --- | --- |
 | Linux, x86-64 | `rai-<version>-x86_64-unknown-linux-gnu.tar.gz` |
 | macOS, Intel | `rai-<version>-x86_64-apple-darwin.tar.gz` |
+| macOS, Apple Silicon | `rai-<version>-aarch64-apple-darwin.tar.gz` |
 | Windows, x86-64 | `rai-<version>-x86_64-pc-windows-msvc.zip` |
 
-There are no ARM builds. Apple Silicon and ARM64 Linux have to build from
-source, and will get the scalar path — the optimized kernels are x86-64 AVX2
-and there is no NEON implementation.
-
-The released binaries are built for the **x86-64-v2** baseline, so they start on
+The x86-64 archives are built for the **x86-64-v2** baseline, so they start on
 any x86-64 CPU from roughly 2009 onward. The fast kernels need AVX2, FMA, and
 F16C; RAI probes for those at runtime and uses them when present, so the same
 download is both portable and fast on a modern machine.
+
+**On Apple Silicon, take the `aarch64` archive.** It is a native ARM build, and
+it runs the scalar kernels — the optimized ones are x86-64 AVX2 and there is no
+NEON implementation yet, so expect it to be slower than the x86-64 archives on
+comparable hardware. Take it anyway: the Intel archive runs on Apple Silicon
+only under Rosetta, which emulates no AVX2 at all, so it lands on the same
+scalar path *and* pays translation on top.
+
+ARM64 Linux still has to build from source, and gets the same scalar path.
 
 ## 2. Verify the checksum
 
@@ -57,7 +63,7 @@ Linux and macOS:
 
 ```bash
 sha256sum --ignore-missing -c SHA256SUMS
-# rai-0.2.2-x86_64-unknown-linux-gnu.tar.gz: OK
+# rai-0.2.3-x86_64-unknown-linux-gnu.tar.gz: OK
 ```
 
 macOS without GNU coreutils:
@@ -69,7 +75,7 @@ shasum -a 256 --ignore-missing -c SHA256SUMS
 Windows PowerShell:
 
 ```powershell
-$file = "rai-0.2.2-x86_64-pc-windows-msvc.zip"
+$file = "rai-0.2.3-x86_64-pc-windows-msvc.zip"
 $want = (Select-String -Path SHA256SUMS -Pattern ([regex]::Escape($file))).Line.Split()[0]
 $got  = (Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
 if ($want -eq $got) { "OK" } else { throw "checksum mismatch" }
@@ -86,8 +92,8 @@ self-contained and can live anywhere.
 Linux and macOS:
 
 ```bash
-tar xzf rai-0.2.2-x86_64-unknown-linux-gnu.tar.gz
-cd rai-0.2.2-x86_64-unknown-linux-gnu
+tar xzf rai-0.2.3-x86_64-unknown-linux-gnu.tar.gz
+cd rai-0.2.3-x86_64-unknown-linux-gnu
 install -m 0755 rai rai-server ~/.local/bin/
 rai --help
 ```
@@ -106,8 +112,8 @@ xattr -d com.apple.quarantine rai rai-server
 Windows PowerShell:
 
 ```powershell
-Expand-Archive rai-0.2.2-x86_64-pc-windows-msvc.zip -DestinationPath $HOME\bin
-$dir = "$HOME\bin\rai-0.2.2-x86_64-pc-windows-msvc"
+Expand-Archive rai-0.2.3-x86_64-pc-windows-msvc.zip -DestinationPath $HOME\bin
+$dir = "$HOME\bin\rai-0.2.3-x86_64-pc-windows-msvc"
 [Environment]::SetEnvironmentVariable(
   "Path", "$([Environment]::GetEnvironmentVariable('Path','User'));$dir", "User")
 # open a new terminal, then:
