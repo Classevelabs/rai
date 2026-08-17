@@ -4,6 +4,38 @@ All notable changes to RAI are documented here. The project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and uses semantic
 versioning for its pre-1.0 releases.
 
+## [0.2.2] - 2026-08-17
+
+### Fixed
+- **Decode ran up to 5x slower than it should have**, because single-token
+  matrix-vector products were being handed to rayon regardless of how small
+  they were. A 576x576 projection is 165 KB of packed nibbles, which one thread
+  streams in about 17 microseconds; a rayon dispatch costs 20-27 microseconds
+  before any work starts, so the fan-out was pure loss on every small layer of
+  every model. `bw-bench` had been measuring this the whole time — its parallel
+  read of that matrix comes back 10-20x slower than its serial one. Decode now
+  parallelizes on packed size as well as row count and walks small matrices on
+  one thread. Measured on an i5-10300H: SmolLM2-135M 7.4 -> 37.5 tok/s,
+  TinyLlama-1.1B 2.0 -> 10.9 tok/s. Prefill is unchanged by the gate and gains
+  as well, because decode no longer thrashes the pool it shares.
+- **A model paired with another model's tokenizer generated fluent nonsense and
+  exited zero.** Conversion has always refused to overwrite a tokenizer that
+  differs from the one it is writing, but nothing checked the pairing at load,
+  and `rai run` takes whatever `tokenizer.json` sits beside the model. Only ids
+  past the end of the vocabulary were caught, so the mismatch was invisible
+  whenever the stray tokenizer was the smaller of the two. Both are now
+  compared at load and a mismatch is refused by name. Embedding padding is
+  still accepted: checkpoints routinely round the vocabulary up by a few
+  hundred entries.
+- **Studio could be made to run script from text typed into its own Source
+  box.** The HTML escaper covered `&`, `<` and `>` but not quotes, while four
+  call sites interpolated into quoted attributes, so a value carrying a double
+  quote could close the attribute and open an event handler — which the page's
+  own CSP allows, since a single-file app needs `script-src 'unsafe-inline'`.
+  Quotes are escaped now.
+- Two startup messages carried their own source indentation into the terminal,
+  printing a run of blank space mid-sentence.
+
 ## [0.2.1] - 2026-08-14
 
 ### Fixed
