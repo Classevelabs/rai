@@ -22,6 +22,17 @@ pub struct StoreResponse {
 }
 
 #[derive(Deserialize)]
+pub struct ForgetRequest {
+    pub content: String,
+}
+
+#[derive(Serialize)]
+pub struct ForgetResponse {
+    pub status: String,
+    pub removed: bool,
+}
+
+#[derive(Deserialize)]
 pub struct RecallRequest {
     pub query: String,
 }
@@ -72,6 +83,25 @@ pub async fn store(
     Ok(Json(StoreResponse {
         status: "stored".to_string(),
         interference,
+    }))
+}
+
+/// Remove by exact stored text. "Not found" is a fact about the store, not a
+/// failure, so it comes back 200 with `removed: false` rather than a 404 the
+/// caller would have to special-case.
+pub async fn forget(
+    State(state): State<AppState>,
+    Json(req): Json<ForgetRequest>,
+) -> Result<Json<ForgetResponse>, ApiError> {
+    validate::validate_text("content", &req.content).map_err(client_error)?;
+    let removed = state
+        .forget(&req.content)
+        .await
+        .map_err(|error| rai_error("forget", error))?;
+
+    Ok(Json(ForgetResponse {
+        status: if removed { "forgotten" } else { "not found" }.to_string(),
+        removed,
     }))
 }
 
@@ -180,11 +210,14 @@ fn client_error(message: impl Into<String>) -> ApiError {
 fn rai_error(operation: &'static str, error: rai_core::RaiError) -> ApiError {
     match error {
         rai_core::RaiError::InvalidInput(message) => client_error(message),
-        // The store being full is the caller's problem to resolve, not an internal fault.
+        // The store being full is the caller's problem to resolve, not an
+        // internal fault — and both remedies actually exist, so name them.
         error @ rai_core::RaiError::CapacityExhausted { .. } => (
             StatusCode::CONFLICT,
             Json(ErrorResponse {
-                error: error.to_string(),
+                error: format!(
+                    "{error}; remove a memory via POST /v1/forget or restart with a larger RAI_CAPACITY"
+                ),
             }),
         ),
         error => internal_error(operation, "internal server error", error),
