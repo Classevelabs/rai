@@ -6,7 +6,10 @@ binaries on `PATH`, and a first generation. This page is the reference: build
 requirements, source installs, the container, and model conversion.
 
 RAI is distributed as prebuilt release archives, its public source repository,
-and five crates.io packages.
+and two crates.io packages, `classeve-rai-infer` and `classeve-rai-compress`.
+The memory-service crates (`rai-server`, `rai-core`, `rem-nra`) build from
+source only — they are `publish = false` on purpose; the note at the top of
+their manifests says why.
 
 ## Requirements
 
@@ -53,11 +56,11 @@ cargo install --locked --path rai-infer     # rai, and the deprecated wrappers
 cargo install --locked --path rai-server    # rai-server
 ```
 
-The published crates can be installed by name:
+The published crate can be installed by name — this covers `rai` and the
+wrappers; `rai-server` installs from a checkout only:
 
 ```bash
 cargo install classeve-rai-infer --locked
-cargo install classeve-rai-server --locked
 ```
 
 ## Container
