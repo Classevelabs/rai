@@ -62,7 +62,9 @@ Debian 11, RHEL 8 and Amazon Linux 2 are all below that floor; build from
 source there. Apart from libc the binary needs only `libgcc_s` and `libm`,
 both of which are already present anywhere those exist.
 
-The macOS archives go back to 10.12 and load nothing outside `/usr/lib`.
+The Intel macOS archive goes back to 10.12; the Apple Silicon archive needs
+macOS 11, the first release that arm64 Macs shipped with. Both load nothing
+outside `/usr/lib`.
 
 ## 2. Verify the checksum
 
@@ -173,10 +175,13 @@ To see what is already on the machine:
 rai models .
 ```
 
-Not every checkpoint converts. RAI runs Qwen2/2.5, Llama-2/3/3.1/3.2, Gemma,
-Mistral, TinyLlama, and SmolLM; Qwen3, Gemma2/Gemma3, and mixture-of-experts
-checkpoints are refused at conversion time with the reason named. Check
-[docs/MODELS.md](./docs/MODELS.md) before downloading weights.
+Not every checkpoint converts. RAI runs Qwen2/2.5, Qwen3 (dense and MoE),
+Llama-2/3/3.1/3.2, Gemma 1/2/3, OLMo2, Phi-3, Mistral, Mixtral, TinyLlama, and
+SmolLM. What is refused is refused for something a checkpoint contains — a
+shared expert, a RoPE scheme other than `default` or `llama3`, an `lm_head`
+bias, a module tree that is not Llama-shaped — with the reason named at
+conversion time. Check [docs/MODELS.md](./docs/MODELS.md) before downloading
+weights.
 
 **The one thing that trips everybody up:** instruction-tuned checkpoints need
 the prompt format they were trained on. Pass a bare instruction without

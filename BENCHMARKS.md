@@ -6,6 +6,27 @@ a named machine on 2026-08-09 with the environment recorded in
 be quoted as evidence. Everything after it is the older, author-reported
 development record, kept for context and explicitly not reproduced.
 
+## Reconciling the 0.2.2 numbers, 2026-08-18
+
+The 0.2.2 changelog records TinyLlama decode at 2.0 tok/s before the rayon
+dispatch fix and 10.9 tok/s after it — on the same machine that measured
+21.8 tok/s below. Those figures sat unreconciled, so the run was repeated on
+the 0.2.4 code with the **shipped `x86-64-v2` baseline** (the 2026-08-09 run
+used `target-cpu=native`), the same greedy settings, and the same 91-token
+generation. Ten runs on a machine whose background load came and went:
+
+```
+1.75  2.03  8.36  6.72  17.46  10.53  22.11  23.04  5.14  11.03   tok/s
+```
+
+The two runs that landed in a quiet window — **22.11 and 23.04** — reproduce
+the 21.8-class figure on the shipped baseline; the rest is the same binary
+under background load, and it brackets both 0.2.2 figures. So: the pre-fix 2.0
+was the rayon dispatch regression compounding with load, the post-fix 10.9 was
+a loaded-machine measurement rather than the machine's capability, and the
+quiet-machine headline stands. The honest caveat stands with it: a 4-core
+laptop under load can deliver a tenth of its quiet number.
+
 ## Verified runs, 2026-08-09
 
 **Machine:** Intel Core i5-10300H (4 cores / 8 threads, AVX2 + FMA + F16C),

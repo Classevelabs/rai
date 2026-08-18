@@ -32,11 +32,14 @@ The `.raimodel` file is a flat little-endian binary:
   `norm_eps`, and the quantization configuration — 64 bytes at container v1.
   Version 2 extends it to 128 bytes and adds the activation code, the `llama3`
   RoPE rescaling parameters, the per-projection bias mask, the embedding scale,
-  a capability flag byte, the attention and final logit softcaps, and the
-  attention scale. Bytes 100..128 are reserved and must be zero, so a reader
-  refuses a file written by a future version rather than misreading it. A
-  converter emits v1 whenever none of the v2 fields is needed, so pre-v2
-  checkpoints still produce identical bytes.
+  a capability flag byte, the attention and final logit softcaps, the
+  attention scale, Gemma3's second RoPE base (`rope_local_theta`) with its
+  global-layer stride, and the mixture-of-experts fields (`num_experts`,
+  `experts_per_token`, `moe_flags`). Bytes 109..128 are reserved and must be
+  zero, so a reader refuses a file written by a future version rather than
+  misreading it; `format.rs` holds the byte-exact field table. A converter
+  emits v1 whenever none of the v2 fields is needed, so pre-v2 checkpoints
+  still produce identical bytes.
 - Section index table: 16 bytes per section, offset and size.
 - Section 0: 8-bit quantized embedding table.
 - Sections 1..N: one per transformer layer, each holding seven 4-bit

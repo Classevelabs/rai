@@ -267,24 +267,6 @@ again.
 Each of these is tractable. None is free. They are listed roughly in ascending
 cost.
 
-### Full-width QK norm — OLMo2
-
-RAI stores a `head_dim`-long norm applied inside each head. OLMo2 needs a
-`num_heads * head_dim`-long norm applied to the projection output before it is
-split into heads. That is a different kernel, not a wider vector, and it would
-need its own flag so the two cannot be confused at load time. OLMo2 would also
-need pre-norm made optional, since it has no `input_layernorm` — a structural
-change to the layer, not a stored weight.
-
-### Per-layer RoPE tables — Gemma3
-
-Gemma3 rotates its local and global attention layers at different bases. The
-header carries one `rope_theta` and the runtime builds one table shared by
-every layer, so this needs a second stored base, a per-layer selector, and two
-live tables in memory. The arithmetic is already implemented; what is missing
-is the ability to say "this layer, not that one", which touches the header, the
-layer section, and the attention entry points at once.
-
 ### YaRN and other RoPE schemes — long-context fine-tunes
 
 The header already carries a scaling-type byte and the `llama3` parameters.
@@ -293,18 +275,25 @@ differently, so each needs a `RoPETable::new` branch and its own
 positional-accuracy test — this is where a subtle error shows up as quality
 loss at long context rather than as a failure.
 
-### Mixture of experts — Mixtral, Qwen3-MoE
+### Shared experts — Qwen-MoE variants and DeepSeek-style layers
 
-The largest change. The layer section becomes a router matrix plus N expert
-gate/up/down triples instead of one, so the section layout and the size
-accounting change shape. The forward pass gains a top-k router, per-token
-expert selection, and a gather over the selected experts' weights, which turns
-the MLP from a fixed sequence of three matvecs into a data-dependent dispatch.
-The memory profile changes with it: a 4-bit Mixtral-8x7B is roughly eight times
-the MLP weight of a 7B for the same per-token compute, and the loader's
-one-read-into-heap strategy would need revisiting at that size. Cost: a new
-section layout, a new forward path, new capacity limits, and a benchmark
-rerun — a release of its own, not an increment.
+Routed mixture-of-experts is stored and runs; what has no slot is a *shared*
+expert evaluated for every token alongside the routed ones. The layer section
+would grow one more gate/up/down triple with its own size accounting, and the
+forward pass one unconditional MLP added into the routed sum. Leaving it out
+would remove a pathway rather than degrade one, which is why such checkpoints
+are refused instead of approximated.
+
+### `lm_head` bias
+
+Biases are stored for the seven layer projections only. A head bias is one
+more optional f32 vector in the final section and an add in the last matvec —
+small, but it needs a header bit, and no checkpoint anyone has asked about
+carries one yet.
+
+(Full-width QK norms, Gemma3's per-layer RoPE tables, and routed
+mixture-of-experts each sat in this list once; the support table above records
+where they landed.)
 
 ## See also
 

@@ -43,6 +43,12 @@ rewrite made prefill **~1.3× faster**, and prompt-lookup decoding adds
 **1.12–1.20×** on context-quoting workloads (off by default; it is slower on
 original prose, and BENCHMARKS.md says by how much).
 
+The decode figure is a quiet-machine number, re-verified 2026-08-18 at
+22.1–23.0 tok/s on the shipped `x86-64-v2` baseline; the same binary under
+background load on this 4-core laptop measured as low as 2 tok/s.
+[BENCHMARKS.md](./BENCHMARKS.md) has the full record and the reconciliation
+with the 0.2.2 changelog's loaded-machine figures.
+
 ## Quickstart
 
 ```bash
@@ -210,8 +216,9 @@ python3 rai-infer/scripts/export_raimodel.py \
 
 Both write the model file plus a `tokenizer.json` alongside it, and both refuse
 architectures the format cannot represent. They do not cover the same models:
-`rai convert` writes container v2 and handles Qwen2/2.5, Llama-3.1/3.2, and
-Gemma, while the Python exporters write container v1 and refuse all three.
+`rai convert` writes container v2 and handles Qwen2/2.5, Qwen3 (dense and
+MoE), Llama-3.1/3.2, Gemma 1/2/3, OLMo2, Phi-3, and Mixtral, while the Python
+exporters write container v1 and refuse all of those.
 Check [docs/MODELS.md](./docs/MODELS.md) before downloading a checkpoint;
 [docs/INSTALL.md](./docs/INSTALL.md#converting-a-model) has every flag.
 HuggingFace model and dataset revisions are not pinned by the Python exporters,
@@ -233,9 +240,12 @@ conversion time; pass it explicitly only for a model that was moved away from
 its tokenizer.
 
 Sampling controls: `--temperature`, `--top-k`, `--top-p`,
-`--repetition-penalty`, `--seed`. Test-time compute ("pondering") strategies:
-`--ponder-strategy cfg|ensemble|cfg-ensemble|adaptive` with
-`--guidance-scale`, `--ensemble-n`, `--noise-sigma`, `--entropy-threshold`.
+`--repetition-penalty`, `--seed`. Test-time compute ("pondering") strategies
+exist behind `--ponder-strategy cfg|ensemble|cfg-ensemble|adaptive` with
+`--guidance-scale`, `--ensemble-n`, `--noise-sigma`, `--entropy-threshold`;
+they multiply the forward passes per token and **no measurement in this
+repository shows a quality win from them** — the module doc in
+`rai-infer/src/ponder.rs` says exactly what each one computes. Leave them off.
 
 Set `RAYON_NUM_THREADS` to cap the inference worker count used by `rai run` and
 `rai serve`; it defaults to Rayon's own choice and does not affect `rai-server`.
@@ -275,10 +285,12 @@ rai serve smollm-135m-q4.raimodel --port 8090
 ```
 
 Open `http://localhost:8090` for the built-in web UI, or POST to `/api/chat`
-(JSON) for programmatic access.
-`--chat-template auto|none|few-shot|mistral|llama3|chatml|zephyr` selects prompt
-formatting. The chat server binds to `127.0.0.1` only and limits request bodies
-to 64 KiB.
+(JSON) for programmatic access — either a single `message` or a `messages`
+array carrying the whole conversation, oldest first; the server keeps no chat
+state of its own, and the web UI replays the visible thread the same way.
+`--chat-template auto|none|few-shot|mistral|llama3|chatml|zephyr|phi3|gemma`
+selects prompt formatting. The chat server binds to `127.0.0.1` only and
+limits request bodies to 64 KiB.
 
 ### REST + MCP server
 
@@ -295,6 +307,7 @@ to 64 KiB.
 | Endpoint | Purpose |
 | --- | --- |
 | `POST /v1/store` | Store a fact; returns an address-space crowding report |
+| `POST /v1/forget` | Remove a stored fact by its exact text; reports whether anything was removed |
 | `POST /v1/recall` | Return the stored memory with the highest cosine similarity to the query |
 | `POST /v1/intersect` | Retrieve at the normalized average of several concept addresses |
 | `POST /v1/contradict` | Report how a candidate fact would change address-space crowding |
@@ -311,16 +324,18 @@ tiers are a relabelling of that similarity rather than calibrated probabilities.
 `/v1/contradict` (and the `rai_contradict` tool) reports **address-space
 crowding**, not semantic contradiction. Each stored item is scored against its
 nearest other neighbour; the endpoint compares those scores with and without the
-candidate fact. Because appending a memory can only bring a neighbour closer, a
-store can never raise another item's score — so under the current semantics this
-cannot detect a contradiction, and an empty report is not evidence that a fact
-agrees with memory. The same caveat applies to the interference report returned
-by `/v1/store`.
+candidate fact and reports the items the candidate would crowd — addresses it
+lands close enough to that recall could confuse them. That is geometry, not
+meaning: two facts can contradict from far-apart addresses, so an empty report
+is not evidence that a fact agrees with memory. The same caveat applies to the
+interference report returned by `/v1/store`.
 
-The store holds **512 items by default** (`num_units`); a store beyond that
-returns HTTP 409 with the limit in the message rather than a generic failure.
-The service is **single-writer**: reads run concurrently, every mutation takes
-an exclusive lock, and a durable store publishes in memory only after its
+The store holds **512 items by default**; set `RAI_CAPACITY` to raise the
+ceiling (up to 100,000), and remove memories with `POST /v1/forget` (or the
+`rai_forget` MCP tool, which is mutation-gated like `rai_store`). A store
+beyond capacity returns HTTP 409 naming the limit and both remedies. The
+service is **single-writer**: reads run concurrently, every mutation takes an
+exclusive lock, and a durable store publishes in memory only after its
 snapshot is on disk.
 
 REST request bodies are limited to 64 KiB and individual text fields to 16 KiB
@@ -352,7 +367,7 @@ because file access inherits that directory's ACL. An unreadable or invalid
 snapshot fails startup instead of silently starting with empty memory.
 
 In MCP mode the same operations are exposed as tools (`rai_store`,
-`rai_recall`, `rai_intersect`, `rai_contradict`, `rai_surprise`,
+`rai_forget`, `rai_recall`, `rai_intersect`, `rai_contradict`, `rai_surprise`,
 `rai_explain_confidence`, `rai_memory_health`). Example MCP client
 configuration:
 
@@ -369,8 +384,9 @@ configuration:
 
 MCP is a trusted local stdio transport and inherits the launching client's OS
 permissions. It has no independent network-authentication boundary. `rai_store`
-is hidden and denied by default; set `RAI_MCP_MUTATIONS_ENABLED=true` only when
-that MCP client should be allowed to modify and persist memory.
+and `rai_forget` are hidden and denied by default; set
+`RAI_MCP_MUTATIONS_ENABLED=true` only when that MCP client should be allowed
+to modify and persist memory.
 
 Embeddings default to a deterministic built-in mock provider intended only for
 tests and demonstrations; startup prints a warning whenever it is active. Set
@@ -388,7 +404,8 @@ at startup rather than silently falling back to mock embeddings.
 | `RAI_EMBEDDING_PROVIDER` | `mock` | `mock` for demonstrations or `openai` |
 | `OPENAI_API_KEY` | unset | Required when the provider is `openai` |
 | `RAI_DATA_PATH` | unset | Snapshot file; state is ephemeral when unset |
-| `RAI_MCP_MUTATIONS_ENABLED` | `false` | Exact `true`/`false`; exposes mutating MCP tools when true |
+| `RAI_CAPACITY` | `512` | Maximum stored memories, up to 100,000; also raises the ceiling of a loaded snapshot |
+| `RAI_MCP_MUTATIONS_ENABLED` | `false` | Exact `true`/`false`; exposes mutating MCP tools (`rai_store`, `rai_forget`) when true |
 
 A variable whose value is not valid Unicode fails startup rather than being
 ignored. `rai-server --help` prints the mode and variable summary;
