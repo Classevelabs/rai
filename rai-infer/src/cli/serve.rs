@@ -50,7 +50,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 
-use crate::chat_template::ChatTemplate;
+use crate::chat_template::{ChatTemplate, Role};
 use crate::cli::catalog;
 use crate::cli::jobs::{Jobs, StartError};
 use crate::cli::run::incremental_suffix;
@@ -319,9 +319,22 @@ impl Loaded {
     }
 }
 
+/// One prior turn, as the client stores it.
+#[derive(Debug, Deserialize)]
+struct ChatMessage {
+    role: String,
+    content: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct ChatRequest {
-    message: String,
+    /// Single-message form — the original wire contract, still accepted so
+    /// existing scripts keep working.
+    message: Option<String>,
+    /// Whole-thread form: ordered oldest first, ending with the user message
+    /// being answered. The server re-renders the thread through the model's
+    /// chat template every request; it keeps no conversation state of its own.
+    messages: Option<Vec<ChatMessage>>,
     temperature: Option<f32>,
     max_tokens: Option<usize>,
     ponder_strategy: Option<String>,
@@ -335,10 +348,45 @@ fn parse_chat_request(req_body: &str) -> Result<ChatRequest, ChatHttpError> {
     let request: ChatRequest = serde_json::from_str(req_body)
         .map_err(|error| ChatHttpError::bad_request(format!("invalid JSON request: {error}")))?;
 
-    if request.message.trim().is_empty() {
-        return Err(ChatHttpError::bad_request(
-            "message must contain at least one non-whitespace character",
-        ));
+    match (&request.message, &request.messages) {
+        (Some(_), Some(_)) => {
+            return Err(ChatHttpError::bad_request(
+                "send either message or messages, not both",
+            ));
+        }
+        (None, None) => {
+            return Err(ChatHttpError::bad_request(
+                "request needs a message or a messages array",
+            ));
+        }
+        (Some(message), None) => {
+            if message.trim().is_empty() {
+                return Err(ChatHttpError::bad_request(
+                    "message must contain at least one non-whitespace character",
+                ));
+            }
+        }
+        (None, Some(messages)) => {
+            for entry in messages {
+                if entry.role != "user" && entry.role != "assistant" {
+                    return Err(ChatHttpError::bad_request(format!(
+                        "message role must be \"user\" or \"assistant\", not {:?}",
+                        entry.role
+                    )));
+                }
+                if entry.content.trim().is_empty() {
+                    return Err(ChatHttpError::bad_request(
+                        "every message must contain at least one non-whitespace character",
+                    ));
+                }
+            }
+            // Covers the empty array too: there is no last message to answer.
+            if messages.last().is_none_or(|last| last.role != "user") {
+                return Err(ChatHttpError::bad_request(
+                    "the last message must have role \"user\" — it is the one being answered",
+                ));
+            }
+        }
     }
 
     validate_chat_options(&request)?;
@@ -587,17 +635,61 @@ fn prepare(loaded: &Loaded, chat_req: &ChatRequest) -> Result<Prepared, ChatHttp
         repetition_penalty: 1.1,
     };
 
-    // Format prompt using the configured chat template
-    let prompt = loaded.template.format_prompt(&chat_req.message);
-    let encoding = loaded
-        .tokenizer
-        .encode(prompt.as_str(), false)
-        .map_err(|_| ChatHttpError::bad_request("message could not be tokenized"))?;
-    let prompt_tokens: Vec<usize> = encoding.get_ids().iter().map(|&id| id as usize).collect();
-
     // `Loaded::open` already clamped this to the model, and the KV cache was
     // allocated for exactly this many positions.
     let max_ctx = loaded.max_context;
+
+    // `prepends_bos` and not `false`: Gemma's reference template opens with a
+    // `<bos>` the turn markers do not spell, and `rai run` already encodes
+    // with it — serving the same model must not produce a different prompt.
+    let encode = |prompt: &str| {
+        loaded
+            .tokenizer
+            .encode(prompt, loaded.template.prepends_bos())
+            .map_err(|_| ChatHttpError::bad_request("message could not be tokenized"))
+    };
+
+    // Render the request through the configured chat template. Multi-turn
+    // requests replay the whole thread; the server holds no conversation
+    // state between requests, so the prompt is the only memory there is.
+    //
+    // A replayed thread eventually outgrows the window even though every
+    // individual message was fine, and the client cannot know where the token
+    // boundary falls — only this side holds the tokenizer. So the oldest
+    // turns are dropped until the rendering fits, the turn being answered is
+    // never dropped, and a quarter of the window stays reserved for the reply
+    // so a long history cannot trim itself into a one-token answer. A lone
+    // final turn that still does not fit falls through to the same refusal a
+    // single over-long message has always received.
+    let encoding = match &chat_req.messages {
+        Some(messages) => {
+            let turns: Vec<(Role, &str)> = messages
+                .iter()
+                .map(|entry| {
+                    let role = if entry.role == "assistant" {
+                        Role::Assistant
+                    } else {
+                        Role::User
+                    };
+                    (role, entry.content.as_str())
+                })
+                .collect();
+            let reserve = (max_ctx / 4).max(1);
+            let start = thread_trim_start(turns.len(), max_ctx, reserve, |start| {
+                let prompt = loaded.template.format_conversation(&turns[start..]);
+                Ok(encode(&prompt)?.get_ids().len())
+            })?;
+            let prompt = loaded.template.format_conversation(&turns[start..]);
+            encode(&prompt)?
+        }
+        None => {
+            let prompt = loaded
+                .template
+                .format_prompt(chat_req.message.as_deref().unwrap_or_default());
+            encode(&prompt)?
+        }
+    };
+    let prompt_tokens: Vec<usize> = encoding.get_ids().iter().map(|&id| id as usize).collect();
     validate_prompt_tokens(
         &prompt_tokens,
         max_ctx,
@@ -612,6 +704,31 @@ fn prepare(loaded: &Loaded, chat_req: &ChatRequest) -> Result<Prepared, ChatHttp
         ponder,
         max_ctx,
     })
+}
+
+/// First turn of the longest thread suffix whose rendering leaves `reserve`
+/// tokens of the window free.
+///
+/// `tokens_for_suffix(start)` is the rendered token count of `turns[start..]`
+/// — re-rendered per candidate, because chat templates are not
+/// prefix-additive. Walks forward from the oldest turn and stops at the last
+/// turn no matter what: dropping the message being answered is never an
+/// option, and whether a lone over-long turn is refused stays the caller's
+/// decision.
+fn thread_trim_start(
+    turn_count: usize,
+    max_ctx: usize,
+    reserve: usize,
+    mut tokens_for_suffix: impl FnMut(usize) -> Result<usize, ChatHttpError>,
+) -> Result<usize, ChatHttpError> {
+    let mut start = 0;
+    while start + 1 < turn_count {
+        if tokens_for_suffix(start)? + reserve <= max_ctx {
+            break;
+        }
+        start += 1;
+    }
+    Ok(start)
 }
 
 /// How much of `pending` can be shown to a reader right now.
@@ -829,7 +946,9 @@ fn generate(
     })
 }
 
-/// `POST /api/chat` — one JSON body, unchanged since before streaming existed.
+/// `POST /api/chat` — one JSON body. Accepts the original single `message`
+/// form and the `messages` thread form; both flow through the same
+/// [`prepare`]/[`generate`] pair as streaming.
 fn handle_generate(loaded: &mut Loaded, chat_req: &ChatRequest) -> Result<String, ChatHttpError> {
     let prepared = prepare(loaded, chat_req)?;
     let outcome = match generate(loaded, &prepared, |_| Ok(())) {
@@ -2177,7 +2296,8 @@ mod tests {
     #[test]
     fn expensive_request_values_are_clamped() {
         let request = ChatRequest {
-            message: "hello".to_string(),
+            message: Some("hello".to_string()),
+            messages: None,
             temperature: Some(100.0),
             max_tokens: Some(usize::MAX),
             ponder_strategy: Some("ensemble".to_string()),
@@ -2188,6 +2308,47 @@ mod tests {
         };
         let error = build_ponder(&request).unwrap_err();
         assert_eq!(error.status, 400);
+    }
+
+    #[test]
+    fn thread_form_is_parsed_and_validated() {
+        let parsed = parse_chat_request(
+            r#"{"messages":[{"role":"user","content":"hi"},
+                {"role":"assistant","content":"hello"},
+                {"role":"user","content":"more"}]}"#,
+        )
+        .expect("valid thread");
+        assert_eq!(parsed.messages.as_ref().map(Vec::len), Some(3));
+
+        // Ambiguous, empty, wrong-role, and wrong-tail threads are refused.
+        for body in [
+            r#"{"message":"hi","messages":[{"role":"user","content":"hi"}]}"#,
+            r#"{"messages":[]}"#,
+            r#"{}"#,
+            r#"{"messages":[{"role":"system","content":"hi"}]}"#,
+            r#"{"messages":[{"role":"user","content":"   "}]}"#,
+            r#"{"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"yo"}]}"#,
+        ] {
+            let error = parse_chat_request(body).unwrap_err();
+            assert_eq!(error.status, 400, "{body} should be a 400");
+        }
+    }
+
+    #[test]
+    fn thread_trimming_drops_the_oldest_turns_and_never_the_last() {
+        // Suffix token counts for a 3-turn thread: the whole thread renders
+        // to 100 tokens, the newest two turns to 60, the final turn to 30.
+        let counts = [100usize, 60, 30];
+        let count_for = |start: usize| Ok(counts[start]);
+
+        // 30 + 16 fits a 64-token window; 60 + 16 does not.
+        assert_eq!(thread_trim_start(3, 64, 16, count_for).unwrap(), 2);
+        // Everything fits: nothing is dropped.
+        assert_eq!(thread_trim_start(3, 200, 16, count_for).unwrap(), 0);
+        // Even the final turn alone is too long: it is still kept, because
+        // whether to refuse it is prepare()'s decision, not the trimmer's.
+        assert_eq!(thread_trim_start(3, 20, 16, count_for).unwrap(), 2);
+        assert_eq!(thread_trim_start(1, 20, 16, |_| Ok(100)).unwrap(), 0);
     }
 
     #[test]
