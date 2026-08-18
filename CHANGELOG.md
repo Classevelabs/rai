@@ -4,6 +4,64 @@ All notable changes to RAI are documented here. The project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and uses semantic
 versioning for its pre-1.0 releases.
 
+## [0.2.4] - 2026-08-18
+
+### Added
+- **Multi-turn chat.** `POST /api/chat` and `/api/chat/stream` accept a
+  `messages` array carrying the whole conversation; every chat template
+  renders history the way its reference template does, and a one-message
+  thread produces byte-identical prompts to the old single-`message` form,
+  which is still accepted. Studio now replays the visible thread on every
+  request — until now it *showed* a conversation but sent each message alone,
+  so the model never saw what it had already been asked.
+- **`rai-server` memories can be deleted, and the capacity is configurable.**
+  `POST /v1/forget` and the mutation-gated `rai_forget` MCP tool remove a
+  memory by its exact stored text; `RAI_CAPACITY` raises the 512-item default
+  (up to 100,000), including over a snapshot written at the old ceiling. The
+  capacity-exhausted error now names two remedies that exist.
+
+### Fixed
+- **The 0.2.2 decode-dispatch fix missed the two fused entry points.** The
+  packed-size gate was wired into `w4a8_matvec` only, while decode reaches QKV
+  through `w4a8_fused_qkv` and the MLP through `w4a8_fused_gate_up`, so small
+  models kept paying the rayon fan-out on two of the four decode GEMMs per
+  layer. The gate now applies to the combined fused matrix.
+- **A failed re-conversion destroyed the previous good model.** Conversion
+  wrote its minutes-long output straight into the target file through a
+  truncating create, so a Ctrl+C, crash, or disk error mid-write left nothing.
+  The bytes now go to a sibling `.partial` file that is fsynced and renamed
+  over the target only after the size check passes; a failure leaves the old
+  model untouched and removes the partial.
+- **`rai serve` dropped Gemma's `<bos>`.** The serve path encoded prompts
+  without the beginning-of-sequence token that `rai run` adds for Gemma, so
+  the same model produced different prompts depending on which front end ran
+  it.
+- **The interference report could never fire.** Storing a fact can only bring
+  an existing memory's nearest neighbour closer — a score *drop* — but the
+  detector reported score *rises*, a direction a store cannot produce, and its
+  critical tier sat above the ceiling of the score scale. `/v1/contradict`,
+  `rai_contradict`, and the store-time report now flag the memories a
+  candidate would crowd, and a coincident duplicate reaches the critical tier.
+- The 0.2.2 changelog's TinyLlama figures (2.0 and 10.9 tok/s) sat
+  unreconciled against the README's quiet-machine 21.8. Re-measured on this
+  release at the shipped `x86-64-v2` baseline: 22.1-23.0 tok/s quiet,
+  2-17 tok/s under background load — the 0.2.2 numbers were loaded-machine
+  measurements. BENCHMARKS.md carries the run record.
+- Release builds are now executed before they are packaged: every shipped
+  binary must answer `--version` with the release's version on the runner that
+  built it. The Docker build compiles with the pinned 1.95.0 toolchain instead
+  of a newer image default no other build used.
+- Stale documentation that contradicted the code: INSTALL and MODELS said
+  Qwen3, Gemma2/3, OLMo2, and mixture-of-experts checkpoints are refused (they
+  convert and run, and MODELS.md's own support table said so); ARCHITECTURE
+  described header bytes 100..128 as reserved (they carry the Gemma3 and MoE
+  fields); the chat-template lists omitted `phi3` and `gemma`; `--max-context`
+  documented a 2048 default the code does not have; the macOS floor claim
+  ignored the Apple Silicon archive; RELEASE.md described a three-target
+  matrix and a `cargo package` gate that cannot pass. The pondering
+  strategies' "significant quality improvement" claims are demoted to what
+  they are — unmeasured — in the module doc, the CLI help, and the README.
+
 ## [0.2.3] - 2026-08-17
 
 ### Added
@@ -108,10 +166,14 @@ versioning for its pre-1.0 releases.
   context-quoting workloads and a loss on original prose, both measured in
   BENCHMARKS.md.
 - Converter preflight that refuses checkpoints the `.raimodel` format cannot
-  represent — per-head QK norms (Qwen3, OLMo2, Gemma3), mixture-of-experts
-  routing, logit softcapping (Gemma2), unsupported `rope_type` and activation
-  values, and non-Llama module trees. These previously exported "successfully"
-  and generated nonsense.
+  represent, with the blocker named. Per-head and full-width QK norms (Qwen3,
+  OLMo2), Gemma2's softcapping and sandwich norms, Gemma3's per-layer RoPE
+  bases, Phi-3's fused tree, and routed mixture-of-experts (Mixtral,
+  Qwen3-MoE) all gained container fields inside this release and convert; what
+  the preflight still refuses is a shared expert, `rope_type` values other
+  than `default` and `llama3`, an `lm_head` bias, unsupported activations, and
+  non-Llama module trees. These previously exported "successfully" and
+  generated nonsense.
 - Chat templates `chatml` (`<|im_start|>`) and `zephyr` (`<|user|>`), with
   auto-detection for ChatML. Zephyr-style models (TinyLlama-Chat) need the
   template passed explicitly because their markers are plain text, not

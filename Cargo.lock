@@ -381,7 +381,7 @@ checksum = "3a822ea5bc7590f9d40f1ba12c0dc3c2760f3482c6984db1573ad11031420831"
 
 [[package]]
 name = "classeve-rai-compress"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "criterion",
  "nalgebra",
@@ -391,7 +391,7 @@ dependencies = [
 
 [[package]]
 name = "classeve-rai-core"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "async-trait",
  "classeve-rai-rem-nra",
@@ -408,7 +408,7 @@ dependencies = [
 
 [[package]]
 name = "classeve-rai-infer"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -425,7 +425,7 @@ dependencies = [
 
 [[package]]
 name = "classeve-rai-rem-nra"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "nalgebra",
  "rand 0.8.6",
@@ -436,7 +436,7 @@ dependencies = [
 
 [[package]]
 name = "classeve-rai-server"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "axum",
  "classeve-rai-core",
