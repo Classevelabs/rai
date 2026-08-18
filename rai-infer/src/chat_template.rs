@@ -36,33 +36,145 @@ pub enum ChatTemplate {
     Gemma,
 }
 
+/// Who said a turn. The template decides how each side is spelled — Gemma
+/// writes the assistant as `model`, Llama-3 as `assistant` — so callers hand
+/// over the role, never the marker text.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Role {
+    User,
+    Assistant,
+}
+
 impl ChatTemplate {
     /// Format a user message into a model-ready prompt.
+    ///
+    /// Single-turn shorthand for [`format_conversation`](Self::format_conversation);
+    /// both produce identical bytes for a one-message thread.
     pub fn format_prompt(&self, user_message: &str) -> String {
+        self.format_conversation(&[(Role::User, user_message)])
+    }
+
+    /// Format a whole conversation into a model-ready prompt, ending with the
+    /// opener for the assistant's next turn.
+    ///
+    /// `turns` is ordered oldest first and normally ends with the user message
+    /// being answered. Each family renders history the way its reference
+    /// template does: Llama-3 repeats header blocks, Mistral closes an
+    /// assistant turn with `</s>` before the next `[INST]`, ChatML/Zephyr/
+    /// Phi-3/Gemma repeat their turn markers. `None` has no turn syntax to
+    /// spell, so the texts are joined with newlines.
+    pub fn format_conversation(&self, turns: &[(Role, &str)]) -> String {
         match self {
-            ChatTemplate::None => user_message.to_string(),
-            ChatTemplate::FewShot => format!(
-                "User: Hello!\n\
-                 Assistant: Hello! How can I help you today?\n\
-                 User: What is the capital of France?\n\
-                 Assistant: The capital of France is Paris.\n\
-                 User: {}\n\
-                 Assistant:",
-                user_message
-            ),
-            ChatTemplate::MistralInstruct => format!("<s>[INST] {} [/INST]", user_message),
-            ChatTemplate::Llama3Instruct => format!(
-                "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n\
-                 {}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
-                user_message
-            ),
-            ChatTemplate::ChatML => {
-                format!("<|im_start|>user\n{user_message}<|im_end|>\n<|im_start|>assistant\n")
+            ChatTemplate::None => turns
+                .iter()
+                .map(|&(_, text)| text)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            ChatTemplate::FewShot => {
+                let mut out = String::from(
+                    "User: Hello!\n\
+                     Assistant: Hello! How can I help you today?\n\
+                     User: What is the capital of France?\n\
+                     Assistant: The capital of France is Paris.\n",
+                );
+                for &(role, text) in turns {
+                    match role {
+                        Role::User => out.push_str("User: "),
+                        Role::Assistant => out.push_str("Assistant: "),
+                    }
+                    out.push_str(text);
+                    out.push('\n');
+                }
+                out.push_str("Assistant:");
+                out
             }
-            ChatTemplate::Zephyr => format!("<|user|>\n{user_message}</s>\n<|assistant|>\n"),
-            ChatTemplate::Phi3 => format!("<|user|>\n{user_message}<|end|>\n<|assistant|>\n"),
+            ChatTemplate::MistralInstruct => {
+                let mut out = String::from("<s>");
+                for &(role, text) in turns {
+                    match role {
+                        Role::User => {
+                            out.push_str("[INST] ");
+                            out.push_str(text);
+                            out.push_str(" [/INST]");
+                        }
+                        Role::Assistant => {
+                            out.push_str(text);
+                            out.push_str("</s>");
+                        }
+                    }
+                }
+                out
+            }
+            ChatTemplate::Llama3Instruct => {
+                let mut out = String::from("<|begin_of_text|>");
+                for &(role, text) in turns {
+                    let name = match role {
+                        Role::User => "user",
+                        Role::Assistant => "assistant",
+                    };
+                    out.push_str("<|start_header_id|>");
+                    out.push_str(name);
+                    out.push_str("<|end_header_id|>\n\n");
+                    out.push_str(text);
+                    out.push_str("<|eot_id|>");
+                }
+                out.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+                out
+            }
+            ChatTemplate::ChatML => {
+                let mut out = String::new();
+                for &(role, text) in turns {
+                    let name = match role {
+                        Role::User => "user",
+                        Role::Assistant => "assistant",
+                    };
+                    out.push_str("<|im_start|>");
+                    out.push_str(name);
+                    out.push('\n');
+                    out.push_str(text);
+                    out.push_str("<|im_end|>\n");
+                }
+                out.push_str("<|im_start|>assistant\n");
+                out
+            }
+            ChatTemplate::Zephyr => {
+                let mut out = String::new();
+                for &(role, text) in turns {
+                    out.push_str(match role {
+                        Role::User => "<|user|>\n",
+                        Role::Assistant => "<|assistant|>\n",
+                    });
+                    out.push_str(text);
+                    out.push_str("</s>\n");
+                }
+                out.push_str("<|assistant|>\n");
+                out
+            }
+            ChatTemplate::Phi3 => {
+                let mut out = String::new();
+                for &(role, text) in turns {
+                    out.push_str(match role {
+                        Role::User => "<|user|>\n",
+                        Role::Assistant => "<|assistant|>\n",
+                    });
+                    out.push_str(text);
+                    out.push_str("<|end|>\n");
+                }
+                out.push_str("<|assistant|>\n");
+                out
+            }
             ChatTemplate::Gemma => {
-                format!("<start_of_turn>user\n{user_message}<end_of_turn>\n<start_of_turn>model\n")
+                let mut out = String::new();
+                for &(role, text) in turns {
+                    out.push_str(match role {
+                        Role::User => "<start_of_turn>user\n",
+                        Role::Assistant => "<start_of_turn>model\n",
+                    });
+                    out.push_str(text);
+                    out.push_str("<end_of_turn>\n");
+                }
+                out.push_str("<start_of_turn>model\n");
+                out
             }
         }
     }
@@ -265,6 +377,94 @@ What is 2+2?<end_of_turn>
         assert!(ChatTemplate::Gemma
             .stop_sequences()
             .contains(&"<end_of_turn>"));
+    }
+
+    /// A one-message thread through `format_conversation` must be the same
+    /// bytes `format_prompt` produced before multi-turn existed — the serve
+    /// path switched to the conversation form and single-turn requests must
+    /// not shift by a byte under a model that was working.
+    #[test]
+    fn single_turn_conversation_matches_format_prompt() {
+        let all = [
+            ChatTemplate::None,
+            ChatTemplate::FewShot,
+            ChatTemplate::MistralInstruct,
+            ChatTemplate::Llama3Instruct,
+            ChatTemplate::ChatML,
+            ChatTemplate::Zephyr,
+            ChatTemplate::Phi3,
+            ChatTemplate::Gemma,
+        ];
+        for template in all {
+            assert_eq!(
+                template.format_conversation(&[(Role::User, "What is 2+2?")]),
+                template.format_prompt("What is 2+2?"),
+                "{}",
+                template.display_name()
+            );
+        }
+    }
+
+    #[test]
+    fn multi_turn_llama3_repeats_header_blocks() {
+        let turns = [
+            (Role::User, "Hi"),
+            (Role::Assistant, "Hello!"),
+            (Role::User, "What is 2+2?"),
+        ];
+        assert_eq!(
+            ChatTemplate::Llama3Instruct.format_conversation(&turns),
+            "<|begin_of_text|>\
+             <|start_header_id|>user<|end_header_id|>\n\nHi<|eot_id|>\
+             <|start_header_id|>assistant<|end_header_id|>\n\nHello!<|eot_id|>\
+             <|start_header_id|>user<|end_header_id|>\n\nWhat is 2+2?<|eot_id|>\
+             <|start_header_id|>assistant<|end_header_id|>\n\n"
+        );
+    }
+
+    #[test]
+    fn multi_turn_mistral_closes_assistant_turns_with_eos() {
+        let turns = [
+            (Role::User, "Hi"),
+            (Role::Assistant, "Hello!"),
+            (Role::User, "What is 2+2?"),
+        ];
+        assert_eq!(
+            ChatTemplate::MistralInstruct.format_conversation(&turns),
+            "<s>[INST] Hi [/INST]Hello!</s>[INST] What is 2+2? [/INST]"
+        );
+    }
+
+    #[test]
+    fn multi_turn_chatml_repeats_im_blocks() {
+        let turns = [
+            (Role::User, "Hi"),
+            (Role::Assistant, "Hello!"),
+            (Role::User, "What is 2+2?"),
+        ];
+        assert_eq!(
+            ChatTemplate::ChatML.format_conversation(&turns),
+            "<|im_start|>user\nHi<|im_end|>\n\
+             <|im_start|>assistant\nHello!<|im_end|>\n\
+             <|im_start|>user\nWhat is 2+2?<|im_end|>\n\
+             <|im_start|>assistant\n"
+        );
+    }
+
+    #[test]
+    fn multi_turn_gemma_spells_the_assistant_as_model() {
+        let turns = [
+            (Role::User, "Hi"),
+            (Role::Assistant, "Hello!"),
+            (Role::User, "More"),
+        ];
+        assert_eq!(
+            ChatTemplate::Gemma.format_conversation(&turns),
+            "<start_of_turn>user\nHi<end_of_turn>\n\
+             <start_of_turn>model\nHello!<end_of_turn>\n\
+             <start_of_turn>user\nMore<end_of_turn>\n\
+             <start_of_turn>model\n"
+        );
     }
 
     /// Phi-3 and Zephyr differ by one token, and picking the wrong one costs

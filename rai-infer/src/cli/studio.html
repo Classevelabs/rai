@@ -1219,8 +1219,31 @@ function paintStrip(stats,hint){
   $("#sStop").textContent=stats&&stats.stop_reason?stats.stop_reason:"—";
   $("#sHint").textContent=hint||"";
 }
-function requestBody(text){
-  return{message:text,temperature:Number($("#temp").value)||0.7,
+/* The server keeps no conversation state: every request replays the visible
+   thread, oldest first, ending with the message being answered. Reasoning
+   scratchpads and failed replies are not something the model said out loud,
+   so they are not sent back to it. Long threads are trimmed from the front to
+   stay inside the 64 KB request cap — the newest turns are the ones a reply
+   depends on, and the byte count is measured on the encoded JSON so
+   multi-byte text cannot sneak past the cap. */
+function threadMessages(s){
+  const msgs=[];
+  for(const m of (s?s.messages:[])){
+    if(m===LIVE)continue;
+    if(m.role==="user"){
+      const t=(m.text||"").trim();
+      if(t)msgs.push({role:"user",content:t});
+    }else if(m.role==="assistant"&&!m.error){
+      const t=splitThinking(m.raw||"").body.trim();
+      if(t)msgs.push({role:"assistant",content:t});
+    }
+  }
+  const CAP=48*1024,bytes=x=>new TextEncoder().encode(JSON.stringify(x)).length;
+  while(msgs.length>1&&bytes(msgs)>CAP)msgs.shift();
+  return msgs;
+}
+function requestBody(s){
+  return{messages:threadMessages(s),temperature:Number($("#temp").value)||0.7,
     max_tokens:Math.max(1,Math.min(Number($("#maxTok").value)||512,genCeiling()))};
 }
 async function retrySend(message){
@@ -1248,7 +1271,7 @@ async function send(){
   paintThread();
   STICK=true;scrollThread(true);
   setGenerating(true);paintStrip(null,"Generating…");
-  const body=requestBody(text);
+  const body=requestBody(s);
   /* The prompt cost is only in the start event and the speed only in the done
      event, so the two are merged; a reply that reports one and not the other
      would leave a dash in the strip for a number the server did send. */
