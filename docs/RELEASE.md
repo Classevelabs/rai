@@ -18,7 +18,7 @@ cargo test --workspace --doc --locked
 cargo build --workspace --release --locked
 cargo install cargo-audit --version 0.22.2 --locked --no-default-features
 cargo audit --deny warnings
-cargo package --workspace --locked
+cargo package -p classeve-rai-infer -p classeve-rai-compress --locked
 python -m compileall -q rai-infer/scripts
 docker build -t rai-release-candidate .
 ```
@@ -67,15 +67,19 @@ which needs no manual step:
 1. Verifies the tag against the workspace version and opens a **draft** release.
 2. Builds `rai` and `rai-server`, plus the deprecated `rai-convert`,
    `rai-generate`, and `rai-chat` wrappers, on `ubuntu-24.04`, `windows-2025`,
-   and `macos-15-intel` with `RUSTFLAGS="-C target-cpu=x86-64-v2"`, packaging
-   each platform as `rai-<version>-<target>.{tar.gz,zip}` with LICENSE, NOTICE,
-   README.md, INSTALL.md, the `launchers/` scripts, and RUNNING.txt.
-3. Downloads the three archives back from the release, writes `SHA256SUMS` from
-   what the release actually serves, attaches it, and only then clears the draft
-   flag.
+   `macos-15-intel`, and `macos-15` (Apple Silicon) — the x86 targets with
+   `RUSTFLAGS="-C target-cpu=x86-64-v2"` — then **executes every binary** and
+   requires `--version` to answer with the release's version before anything
+   is packaged, and packages each platform as
+   `rai-<version>-<target>.{tar.gz,zip}` with LICENSE, NOTICE, README.md,
+   INSTALL.md, the `launchers/` scripts, and RUNNING.txt.
+3. Downloads the four archives back from the release, asserts the count,
+   writes `SHA256SUMS` from what the release actually serves, attaches it, and
+   only then clears the draft flag.
 
-`workflow_dispatch` accepts an existing tag and re-runs the same path; asset
-uploads use `--clobber`, so a re-run replaces rather than duplicates.
+`workflow_dispatch` accepts an existing tag and re-runs the same path,
+addressing the draft by release id rather than by tag so a draft re-run can
+find it.
 
 **Never let this workflow build with `target-cpu=native`.** Such binaries die
 with SIGILL on any CPU older than the runner that built them, after download,
