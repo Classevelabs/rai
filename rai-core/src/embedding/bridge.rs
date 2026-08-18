@@ -66,6 +66,23 @@ impl TextIndex {
         id
     }
 
+    /// Remove a text, if present.
+    ///
+    /// `insert` assigns `id = entries.len()`, so ids equal positions; the
+    /// entries behind the removed one shift down and both their `id` fields
+    /// and the lookup map are rewritten to keep that invariant.
+    pub fn remove(&mut self, text: &str) -> bool {
+        let Some(id) = self.text_to_id.remove(text) else {
+            return false;
+        };
+        self.entries.remove(id);
+        for (position, entry) in self.entries.iter_mut().enumerate().skip(id) {
+            entry.id = position;
+            self.text_to_id.insert(entry.text.clone(), position);
+        }
+        true
+    }
+
     /// Recompute every cached value projection after a load.
     fn rebuild_value_projections(&mut self, projection: &Projection) -> Result<(), RaiError> {
         for entry in &mut self.entries {

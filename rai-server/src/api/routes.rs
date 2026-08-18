@@ -50,6 +50,7 @@ pub fn build_router(state: AppState, api_token: Option<String>, port: u16) -> Ro
 
     Router::new()
         .route("/v1/store", post(handlers::store))
+        .route("/v1/forget", post(handlers::forget))
         .route("/v1/recall", post(handlers::recall))
         .route("/v1/intersect", post(handlers::intersect))
         .route("/v1/contradict", post(handlers::contradict))

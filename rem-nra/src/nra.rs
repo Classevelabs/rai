@@ -123,6 +123,19 @@ impl NonlinearResonanceMemory {
         Ok(())
     }
 
+    /// Remove the item at `index`. Later items shift down, matching however
+    /// the enclosing store keeps its parallel structures aligned.
+    pub fn remove(&mut self, index: usize) -> Result<()> {
+        if index >= self.items.len() {
+            return Err(MemoryError::InvalidData(format!(
+                "remove index {index} is out of range for {} stored items",
+                self.items.len()
+            )));
+        }
+        self.items.remove(index);
+        Ok(())
+    }
+
     /// Return the value of the single best-matching stored item.
     ///
     /// Retrieval is nearest-neighbour by cosine similarity over the stored addresses. Blending

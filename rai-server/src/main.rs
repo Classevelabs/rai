@@ -31,8 +31,8 @@ Getting started:
   RAI_DATA_PATH=./rai.json rai-server rest    keep memories across restarts
 
 Configuration is read from the environment: RAI_HOST, RAI_PORT, RAI_API_TOKEN,
-RAI_EMBEDDING_PROVIDER, OPENAI_API_KEY, RAI_DATA_PATH, RAI_MCP_MUTATIONS_ENABLED.
-See the README for defaults and accepted values.
+RAI_EMBEDDING_PROVIDER, OPENAI_API_KEY, RAI_DATA_PATH, RAI_CAPACITY,
+RAI_MCP_MUTATIONS_ENABLED. See the README for defaults and accepted values.
 
 Two defaults worth knowing: without RAI_DATA_PATH every memory is lost on exit,
 and MCP write tools stay disabled until RAI_MCP_MUTATIONS_ENABLED=true.";
@@ -102,7 +102,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "WARNING: RAI_DATA_PATH is not set; all stored memories are ephemeral and will be lost on shutdown"
         );
     }
-    let manager = Arc::new(load_or_create_manager(data_path.as_deref(), bridge).await?);
+    let manager =
+        Arc::new(load_or_create_manager(data_path.as_deref(), bridge, config.capacity).await?);
     let state = AppState::new(manager, data_path);
 
     if mode == "mcp" {
@@ -129,6 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         println!("RAI server listening on {addr}");
         println!("  POST /v1/store       - Store a fact");
+        println!("  POST /v1/forget      - Remove a stored fact by its exact text");
         println!("  POST /v1/recall      - Retrieve with a score tier");
         println!("  POST /v1/intersect   - Concept intersection query");
         println!("  POST /v1/contradict  - Report address-space crowding for a candidate fact");
@@ -164,9 +166,14 @@ async fn shutdown_signal() {
 async fn load_or_create_manager(
     data_path: Option<&Path>,
     bridge: Arc<EmbeddingBridge>,
+    capacity: Option<usize>,
 ) -> Result<MemoryManager, Box<dyn std::error::Error>> {
+    let fresh = |bridge| match capacity {
+        Some(capacity) => MemoryManager::try_new_with_capacity(bridge, capacity),
+        None => MemoryManager::try_new(bridge),
+    };
     let Some(path) = data_path else {
-        return Ok(MemoryManager::try_new(bridge)?);
+        return Ok(fresh(bridge)?);
     };
 
     if path.is_dir() {
@@ -179,7 +186,7 @@ async fn load_or_create_manager(
 
     if path.exists() {
         log::info!("Loading persisted state from {}", path.display());
-        return Ok(MemoryManager::load(path, bridge).await?);
+        return Ok(MemoryManager::load_with_capacity(path, bridge, capacity).await?);
     }
 
     if let Some(parent) = path
@@ -192,5 +199,5 @@ async fn load_or_create_manager(
         "Persistence enabled; a snapshot will be created at {} after the first mutation",
         path.display()
     );
-    Ok(MemoryManager::try_new(bridge)?)
+    Ok(fresh(bridge)?)
 }

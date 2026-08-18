@@ -281,6 +281,25 @@ async fn handle_tool_call(
             }
         }
 
+        "rai_forget" => {
+            if !mutations_enabled {
+                return ToolCallResult::error(
+                    "rai_forget is disabled; set RAI_MCP_MUTATIONS_ENABLED=true to opt in".into(),
+                );
+            }
+            let content = match required_text(&args, "content") {
+                Ok(content) => content,
+                Err(error) => return error,
+            };
+            match state.forget(content).await {
+                Ok(true) => ToolCallResult::text("Forgotten.".into()),
+                Ok(false) => ToolCallResult::text(
+                    "No stored memory has exactly that text; nothing was removed.".into(),
+                ),
+                Err(error) => tool_error("forget", &error),
+            }
+        }
+
         "rai_recall" => {
             let query = match required_text(&args, "query") {
                 Ok(query) => query,
@@ -416,7 +435,8 @@ fn tool_error(operation: &str, error: &RaiError) -> ToolCallResult {
     match error {
         RaiError::InvalidInput(message) => ToolCallResult::error(message.clone()),
         RaiError::CapacityExhausted { .. } => ToolCallResult::error(format!(
-            "{error}; remove memories or raise the configured capacity before storing again"
+            "{error}; remove memories with rai_forget or restart the server with a larger \
+             RAI_CAPACITY before storing again"
         )),
         other => {
             log::error!("MCP {operation} failed: {other}");

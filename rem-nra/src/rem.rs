@@ -83,6 +83,25 @@ impl ResidualEquilibriumMemory {
         Ok(())
     }
 
+    /// Remove the item at `index`.
+    ///
+    /// Individual residuals are not recorded — the snapshot format keeps only
+    /// their mean, and `from_snapshot` rebuilds the sum from it — so the sum
+    /// is scaled to keep that mean unchanged, exactly as a save/load round
+    /// trip of the shrunken store would.
+    pub fn remove(&mut self, index: usize) -> Result<()> {
+        if index >= self.items.len() {
+            return Err(MemoryError::InvalidData(format!(
+                "remove index {index} is out of range for {} stored items",
+                self.items.len()
+            )));
+        }
+        let len = self.items.len() as f64;
+        self.items.remove(index);
+        self.residual_sum *= (len - 1.0) / len;
+        Ok(())
+    }
+
     /// Value of the stored key with the highest cosine similarity to `key`.
     pub fn predict(&self, key: &Vec64) -> Vec64 {
         if self.items.is_empty() {
@@ -231,6 +250,32 @@ mod tests {
             Vec64::from_row_slice(&[f64::INFINITY, 0.0]),
         )];
         assert!(ResidualEquilibriumMemory::from_snapshot(config, non_finite, 0.0).is_err());
+    }
+
+    #[test]
+    fn remove_preserves_the_mean_residual_norm() {
+        let mut memory = ResidualEquilibriumMemory::new(two_dimensional());
+        memory
+            .store(
+                &Vec64::from_row_slice(&[1.0, 0.0]),
+                &Vec64::from_row_slice(&[3.0, 0.0]),
+            )
+            .unwrap();
+        memory
+            .store(
+                &Vec64::from_row_slice(&[0.0, 1.0]),
+                &Vec64::from_row_slice(&[0.0, 4.0]),
+            )
+            .unwrap();
+        let mean_before = memory.mean_residual_norm();
+
+        memory.remove(0).unwrap();
+        assert_eq!(memory.items().len(), 1);
+        // Individual residuals are not recorded, so removal keeps the mean —
+        // the same answer a save/load round trip of the shrunken store gives.
+        assert!((memory.mean_residual_norm() - mean_before).abs() < 1e-12);
+
+        assert!(memory.remove(5).is_err());
     }
 
     #[test]

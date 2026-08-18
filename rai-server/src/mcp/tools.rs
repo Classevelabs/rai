@@ -2,7 +2,7 @@ use crate::mcp::schema::{ToolAnnotations, ToolDefinition};
 use crate::validate::{MAX_INTERSECTION_CONCEPTS, MAX_TEXT_BYTES};
 use serde_json::json;
 
-/// Return the 7 MCP tool definitions.
+/// Return the 8 MCP tool definitions.
 pub fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
@@ -25,6 +25,27 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                 "additionalProperties": false
             }),
             annotations: mutating_annotations(),
+        },
+        ToolDefinition {
+            name: "rai_forget".to_string(),
+            description: "Remove a stored memory whose text exactly matches `content`. \
+                          Returns whether anything was removed. Exact match only — this \
+                          tool never guesses at a nearby memory."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_TEXT_BYTES,
+                        "description": "The exact stored text to remove"
+                    }
+                },
+                "required": ["content"],
+                "additionalProperties": false
+            }),
+            annotations: forgetting_annotations(),
         },
         ToolDefinition {
             name: "rai_recall".to_string(),
@@ -74,11 +95,12 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "rai_contradict".to_string(),
-            description: "Report how storing a candidate fact would change crowding among the \
-                          stored address vectors. This measures address-space crowding only: \
-                          adding a memory can never push its neighbours apart, so this tool \
-                          cannot detect a semantic contradiction. Do not treat an empty report \
-                          as evidence that the fact is consistent with memory."
+            description: "Report which stored memories the candidate fact would crowd — \
+                          existing items whose addresses it lands close enough to that recall \
+                          could confuse them. This measures address-space geometry only, not \
+                          meaning: two facts can contradict from far-apart addresses. Do not \
+                          treat an empty report as evidence that the fact is consistent with \
+                          memory."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -162,6 +184,17 @@ fn mutating_annotations() -> ToolAnnotations {
     }
 }
 
+/// Forgetting deletes data, and forgetting the same text twice removes it
+/// once: destructive and idempotent, unlike a store.
+fn forgetting_annotations() -> ToolAnnotations {
+    ToolAnnotations {
+        read_only_hint: false,
+        destructive_hint: true,
+        idempotent_hint: true,
+        open_world_hint: false,
+    }
+}
+
 fn read_only_annotations() -> ToolAnnotations {
     ToolAnnotations {
         read_only_hint: true,
@@ -182,7 +215,15 @@ mod tests {
         assert!(!store.annotations.read_only_hint);
         assert!(!store.annotations.idempotent_hint);
 
-        for tool in tools.iter().filter(|tool| tool.name != "rai_store") {
+        let forget = tools.iter().find(|tool| tool.name == "rai_forget").unwrap();
+        assert!(!forget.annotations.read_only_hint);
+        assert!(forget.annotations.destructive_hint);
+        assert!(forget.annotations.idempotent_hint);
+
+        for tool in tools
+            .iter()
+            .filter(|tool| tool.name != "rai_store" && tool.name != "rai_forget")
+        {
             assert!(tool.annotations.read_only_hint, "{}", tool.name);
             assert!(tool.annotations.idempotent_hint, "{}", tool.name);
             assert!(!tool.annotations.destructive_hint, "{}", tool.name);

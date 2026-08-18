@@ -29,6 +29,16 @@ impl AppState {
         let _guard = self.persistence_lock.lock().await;
         sanitize_persistence_error(self.manager.store_and_save(content, path.as_ref()).await)
     }
+
+    /// Forget through the same durable mutation boundary as [`store`](Self::store).
+    pub async fn forget(&self, content: &str) -> Result<bool, RaiError> {
+        let Some(path) = &self.persistence_path else {
+            return self.manager.forget(content).await;
+        };
+
+        let _guard = self.persistence_lock.lock().await;
+        sanitize_persistence_error(self.manager.forget_and_save(content, path.as_ref()).await)
+    }
 }
 
 fn sanitize_persistence_error<T>(result: Result<T, RaiError>) -> Result<T, RaiError> {

@@ -43,6 +43,8 @@ pub struct ServerConfig {
     pub dim_key: usize,
     /// Path for persistence.
     pub data_path: Option<String>,
+    /// Maximum number of stored memories. `None` keeps the library default.
+    pub capacity: Option<usize>,
 }
 
 impl Default for ServerConfig {
@@ -58,6 +60,7 @@ impl Default for ServerConfig {
             dim_value: 64,
             dim_key: 32,
             data_path: None,
+            capacity: None,
         }
     }
 }
@@ -100,6 +103,18 @@ impl ServerConfig {
         }
         if let Some(path) = env_var("RAI_DATA_PATH")? {
             config.data_path = Some(path);
+        }
+        if let Some(capacity) = env_var("RAI_CAPACITY")? {
+            let parsed = capacity.parse::<usize>().map_err(|_| {
+                ConfigError::new(format!(
+                    "invalid RAI_CAPACITY '{capacity}'; expected a positive integer"
+                ))
+            })?;
+            if parsed == 0 {
+                return Err(ConfigError::new("RAI_CAPACITY must be greater than zero"));
+            }
+            // The library enforces its own ceiling; failing there names it.
+            config.capacity = Some(parsed);
         }
 
         config.validate()?;

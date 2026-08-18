@@ -52,7 +52,10 @@ pub struct AffectedItem {
     pub energy_before: f64,
     /// Crowding score after the comparison point.
     pub energy_after: f64,
-    /// Score delta; only positive deltas (less crowding) are reported.
+    /// Raw score move, `energy_after - energy_before`. An item is reported
+    /// only when its score *dropped* — the candidate crowded its address —
+    /// so every reported delta is negative, at least the detector's minor
+    /// threshold in magnitude.
     pub delta: f64,
 }
 

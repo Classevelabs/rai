@@ -63,6 +63,27 @@ impl MemoryManager {
         Self::with_configs(bridge, NRAConfig::default(), REMConfig::default())
     }
 
+    /// [`try_new`](Self::try_new) with a caller-chosen memory capacity.
+    ///
+    /// Everything else stays at the validated defaults. The bounds are
+    /// checked here by name — the generic config validation would fold an
+    /// out-of-range capacity into an error that names no field and no limit.
+    pub fn try_new_with_capacity(
+        bridge: Arc<EmbeddingBridge>,
+        capacity: usize,
+    ) -> Result<Self, RaiError> {
+        if capacity == 0 || capacity > MAX_STORED_ITEMS {
+            return Err(RaiError::InvalidInput(format!(
+                "capacity must be between 1 and {MAX_STORED_ITEMS}"
+            )));
+        }
+        let nra_config = NRAConfig {
+            num_units: capacity,
+            ..NRAConfig::default()
+        };
+        Self::with_configs(bridge, nra_config, REMConfig::default())
+    }
+
     /// Create with custom store configs.
     pub fn with_configs(
         bridge: Arc<EmbeddingBridge>,
@@ -183,6 +204,89 @@ impl MemoryManager {
         Ok(report)
     }
 
+    /// Remove the memory whose stored text is exactly `content`.
+    ///
+    /// Returns `false` when nothing matches. Exact match is deliberate: the
+    /// caller got the text from `recall` or stored it themselves, and a
+    /// fuzzy delete that guesses would be a data-loss feature.
+    pub async fn forget(&self, content: &str) -> Result<bool, RaiError> {
+        self.forget_with_optional_snapshot(content, None).await
+    }
+
+    /// [`forget`](Self::forget), atomically persisting the shrunken state
+    /// before publishing it in memory — the same transaction discipline as
+    /// [`store_and_save`](Self::store_and_save).
+    pub async fn forget_and_save(&self, content: &str, path: &Path) -> Result<bool, RaiError> {
+        self.forget_with_optional_snapshot(content, Some(path))
+            .await
+    }
+
+    async fn forget_with_optional_snapshot(
+        &self,
+        content: &str,
+        snapshot_path: Option<&Path>,
+    ) -> Result<bool, RaiError> {
+        validate_text("content", content)?;
+        let mut published = Arc::clone(&self.inner).write_owned().await;
+
+        // `texts` is index-aligned with the item stores by construction:
+        // store appends to all of them in one transaction, so the text's
+        // position is the item's position everywhere.
+        let Some(index) = published.texts.iter().position(|text| text == content) else {
+            return Ok(false);
+        };
+
+        let mut staged_nra = published.nra.clone();
+        let mut staged_rem = published.rem.clone();
+        let mut staged_texts = published.texts.clone();
+        let mut staged_text_index = self.bridge.text_index().await;
+        staged_nra
+            .remove(index)
+            .map_err(|e| RaiError::MemoryError(format!("NRA remove: {e}")))?;
+        staged_rem
+            .remove(index)
+            .map_err(|e| RaiError::MemoryError(format!("REM remove: {e}")))?;
+        staged_texts.remove(index);
+        // The text index deduplicates while `texts` does not, so when the same
+        // text was stored twice this removes only one item — the decode entry
+        // has to survive for the copies still stored.
+        if !staged_texts.iter().any(|text| text == content) {
+            staged_text_index.remove(content);
+        }
+
+        if let Some(path) = snapshot_path {
+            let snapshot = self.snapshot_from_parts(
+                &staged_nra,
+                &staged_rem,
+                staged_text_index.clone(),
+                staged_texts.clone(),
+            );
+            let path = path.to_path_buf();
+            let bridge = Arc::clone(&self.bridge);
+            return tokio::task::spawn_blocking(move || {
+                snapshot.save(&path)?;
+                published.nra = staged_nra;
+                published.rem = staged_rem;
+                published.texts = staged_texts;
+                bridge.restore_text_index_blocking(staged_text_index);
+                drop(published);
+                Ok(true)
+            })
+            .await
+            .map_err(|error| {
+                RaiError::PersistenceError(format!("snapshot transaction failed: {error}"))
+            })?;
+        }
+
+        *self.bridge.text_index_for_update().await = staged_text_index;
+        published.nra = staged_nra;
+        published.rem = staged_rem;
+        published.texts = staged_texts;
+        drop(published);
+
+        Ok(true)
+    }
+
     /// Recall a memory with its score diagnostics.
     pub async fn recall(&self, query: &str) -> Result<RetrievalResult, RaiError> {
         validate_text("query", query)?;
@@ -249,10 +353,11 @@ impl MemoryManager {
         })
     }
 
-    /// Report how storing a candidate fact would change crowding in the address space.
+    /// Report which stored memories the candidate fact would crowd, without storing it.
     ///
-    /// This reports address-space crowding only. Appending an item can never raise another
-    /// item's crowding score, so the report cannot flag a semantic contradiction.
+    /// This is address-space geometry only: an item is flagged when the candidate lands close
+    /// enough that recall could confuse the two. Two facts can contradict from far-apart
+    /// addresses, so an empty report is not evidence of consistency.
     pub async fn check_contradiction(&self, fact: &str) -> Result<InterferenceReport, RaiError> {
         validate_text("fact", fact)?;
         let (omega, _key, value, _embedding) = self.bridge.project_text(fact).await?;
@@ -371,7 +476,31 @@ impl MemoryManager {
 
     /// Load state from disk. Returns a new MemoryManager.
     pub async fn load(path: &Path, bridge: Arc<EmbeddingBridge>) -> Result<Self, RaiError> {
-        let snapshot = MemorySnapshot::load(path)?;
+        Self::load_with_capacity(path, bridge, None).await
+    }
+
+    /// [`load`](Self::load), overriding the snapshot's stored capacity.
+    ///
+    /// A snapshot written at the old 512-unit default would otherwise pin the
+    /// store to it forever. The override must still hold every persisted item
+    /// — `from_snapshot` refuses a capacity below the item count.
+    pub async fn load_with_capacity(
+        path: &Path,
+        bridge: Arc<EmbeddingBridge>,
+        capacity: Option<usize>,
+    ) -> Result<Self, RaiError> {
+        let mut snapshot = MemorySnapshot::load(path)?;
+        if let Some(capacity) = capacity {
+            // The snapshot's own num_units was validated at load; an override
+            // must clear the same ceiling, and `from_snapshot` still refuses
+            // one below the persisted item count.
+            if capacity == 0 || capacity > MAX_STORED_ITEMS {
+                return Err(RaiError::InvalidInput(format!(
+                    "capacity must be between 1 and {MAX_STORED_ITEMS}"
+                )));
+            }
+            snapshot.nra_config.num_units = capacity;
+        }
         // Version 0 files predate the parallel `texts` field, so labels can only be rebuilt from
         // the text index — which deduplicates. When the same text was stored twice the missing
         // labels are unrecoverable, so say so instead of failing later as an opaque count
@@ -670,12 +799,9 @@ mod persistence_tests {
     }
 
     /// Leave-one-out crowding scores have to move when neighbours arrive, and their magnitudes
-    /// have to cross the detector's tiers.
-    ///
-    /// Note the direction: an append-only store can only bring an item's nearest neighbour
-    /// closer, so every delta a store produces is non-positive. The detector's positive-delta
-    /// tier is exercised by the opposite comparison — the same memories without the crowding
-    /// neighbour present.
+    /// have to cross the detector's tiers in the direction a store actually
+    /// produces: a new neighbour drops an existing item's score, and the
+    /// detector reports the drop.
     #[tokio::test]
     async fn leave_one_out_energy_varies_and_reaches_the_interference_detector() {
         let embedder = Arc::new(MockEmbedder::new(384));
@@ -707,7 +833,7 @@ mod persistence_tests {
 
         let texts = manager.inner.read().await.texts[..sparse.len()].to_vec();
         let report =
-            InterferenceDetector::default().detect(&crowded[..sparse.len()], &sparse, &texts);
+            InterferenceDetector::default().detect(&sparse, &crowded[..sparse.len()], &texts);
         assert!(report.has_interference);
         assert_ne!(report.severity, InterferenceSeverity::None);
         assert!(report
@@ -716,11 +842,13 @@ mod persistence_tests {
             .any(|item| item.content == "alpha fact"));
     }
 
-    /// A store can only lower a neighbour's crowding score, so the report it returns is always
-    /// empty under the current semantics. That has to stay true, or the honest description of
-    /// `/v1/contradict` in the docs is wrong.
+    /// The report a store returns has to fire on the case it exists for: a
+    /// candidate landing on an existing address. A coincident duplicate takes
+    /// its neighbour's similarity from 0 to 1 — the full width of the scale —
+    /// so it must reach the critical tier through both `store` and
+    /// `/v1/contradict`'s manager path.
     #[tokio::test]
-    async fn storing_never_reports_interference_in_the_store_direction() {
+    async fn storing_a_coincident_duplicate_reports_critical_interference() {
         let bridge = Arc::new(EmbeddingBridge::new(
             Arc::new(MockEmbedder::new(384)),
             32,
@@ -730,15 +858,100 @@ mod persistence_tests {
         let manager = MemoryManager::try_new(bridge).unwrap();
         manager.store("the sky is blue").await.unwrap();
 
-        let report = manager.store("the sky is blue").await.unwrap();
-        assert!(!report.has_interference);
-        assert_eq!(report.severity, InterferenceSeverity::None);
-
-        let contradiction = manager
-            .check_contradiction("the sky is green")
+        let preview = manager
+            .check_contradiction("the sky is blue")
             .await
             .unwrap();
-        assert!(!contradiction.has_interference);
+        assert!(preview.has_interference);
+        assert_eq!(preview.severity, InterferenceSeverity::Critical);
+        // The preview stages nothing: the store still holds one memory.
+        assert_eq!(manager.len().await, 1);
+
+        let report = manager.store("the sky is blue").await.unwrap();
+        assert!(report.has_interference);
+        assert_eq!(report.severity, InterferenceSeverity::Critical);
+        assert_eq!(report.affected_items[0].content, "the sky is blue");
+    }
+
+    #[tokio::test]
+    async fn forget_removes_exactly_the_named_fact() {
+        let bridge = Arc::new(EmbeddingBridge::new(
+            Arc::new(MeanBiasedEmbedder { dim: 384 }),
+            32,
+            32,
+            64,
+        ));
+        let manager = MemoryManager::try_new(bridge).unwrap();
+        for fact in &DISTINCT_FACTS[..5] {
+            manager.store(fact).await.unwrap();
+        }
+
+        assert!(!manager.forget("never stored").await.unwrap());
+        assert_eq!(manager.len().await, 5);
+
+        assert!(manager.forget(DISTINCT_FACTS[2]).await.unwrap());
+        assert_eq!(manager.len().await, 4);
+        // Forgetting is idempotent in effect: the second call removes nothing.
+        assert!(!manager.forget(DISTINCT_FACTS[2]).await.unwrap());
+
+        // The survivors — including the ones whose indices shifted — still
+        // recall themselves, which exercises the text-index reindexing.
+        for fact in DISTINCT_FACTS[..5]
+            .iter()
+            .filter(|f| **f != DISTINCT_FACTS[2])
+        {
+            assert_eq!(manager.recall(fact).await.unwrap().content, *fact);
+        }
+    }
+
+    /// The text index deduplicates while `texts` does not, so forgetting one
+    /// copy of a twice-stored text must leave the survivor decodable.
+    #[tokio::test]
+    async fn forgetting_one_copy_of_a_duplicate_keeps_the_other_recallable() {
+        let bridge = Arc::new(EmbeddingBridge::new(
+            Arc::new(MeanBiasedEmbedder { dim: 384 }),
+            32,
+            32,
+            64,
+        ));
+        let manager = MemoryManager::try_new(bridge).unwrap();
+        manager.store(DISTINCT_FACTS[0]).await.unwrap();
+        manager.store(DISTINCT_FACTS[0]).await.unwrap();
+
+        assert!(manager.forget(DISTINCT_FACTS[0]).await.unwrap());
+        assert_eq!(manager.len().await, 1);
+        assert_eq!(
+            manager.recall(DISTINCT_FACTS[0]).await.unwrap().content,
+            DISTINCT_FACTS[0]
+        );
+
+        assert!(manager.forget(DISTINCT_FACTS[0]).await.unwrap());
+        assert_eq!(manager.len().await, 0);
+    }
+
+    /// The 512-unit default was a dead end: full meant full forever. Both
+    /// exits have to work — deleting frees a slot, and a configured capacity
+    /// raises the ceiling.
+    #[tokio::test]
+    async fn forget_frees_capacity_and_capacity_is_configurable() {
+        let bridge = Arc::new(EmbeddingBridge::new(
+            Arc::new(MeanBiasedEmbedder { dim: 384 }),
+            32,
+            32,
+            64,
+        ));
+        let manager = MemoryManager::try_new_with_capacity(bridge, 1).unwrap();
+        manager.store(DISTINCT_FACTS[0]).await.unwrap();
+
+        let error = manager.store(DISTINCT_FACTS[1]).await.unwrap_err();
+        assert!(matches!(error, RaiError::CapacityExhausted { limit: 1 }));
+
+        assert!(manager.forget(DISTINCT_FACTS[0]).await.unwrap());
+        manager.store(DISTINCT_FACTS[1]).await.unwrap();
+        assert_eq!(
+            manager.recall(DISTINCT_FACTS[1]).await.unwrap().content,
+            DISTINCT_FACTS[1]
+        );
     }
 
     #[test]
