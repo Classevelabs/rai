@@ -1,38 +1,44 @@
-//! Pondering v2: Test-time compute strategies that actually improve output quality.
+//! Pondering: experimental test-time compute strategies at the logit level.
 //!
 //! The old approach (looping hidden states back through layers) fails because the model
 //! was trained to receive embeddings at layer 0, not post-transformer outputs.
-//!
-//! The new approach operates at the **logit level** using three proven techniques:
+//! These strategies operate on logits instead. They are **experimental and
+//! unmeasured**: no benchmark in this repository has demonstrated a quality
+//! win for any of them, and every extra forward pass is paid at full price.
+//! (Contrast `lookup.rs`, whose speculation experiment is kept with its
+//! measured 0.93x result on record.) Until a measurement lands here, the only
+//! honest default is `None`.
 //!
 //! # Strategies
 //!
-//! ## 1. Classifier-Free Guidance (CFG)
-//! Borrowed from diffusion models. Run two forward passes:
+//! ## 1. Contrastive guidance (CFG-style)
+//! Two forward passes per token:
 //! - **Conditional**: embed(actual_token) → layers → logits_cond
-//! - **Unconditional**: embed(null_token) → layers → logits_uncond (no KV write)
+//! - **Contrast**: embed(null_token) → layers → logits_uncond (no KV write)
 //!
 //! Final logits = logits_uncond + guidance_scale * (logits_cond - logits_uncond)
 //!
-//! With guidance_scale > 1.0, this amplifies context-dependent predictions — tokens
-//! the model specifically chose BECAUSE of the context, not generic next-word guesses.
-//! Cost: 2 forward passes. Quality improvement: significant.
+//! This is *not* the classifier-free guidance of the diffusion literature:
+//! the contrast pass still attends the full context through the KV cache
+//! (including the real token's K/V at the current position), so it contrasts
+//! the identity of the current token, not the presence of the context. What
+//! that buys at guidance_scale > 1.0 has not been measured here.
+//! Cost: 2 forward passes per token.
 //!
-//! ## 2. Embedding Noise Ensemble
-//! Add Gaussian noise to the embedding, run N forward passes, average logits.
-//! This is Monte Carlo marginalization over input uncertainty — the average is a
-//! better estimate than any single noisy sample.
+//! ## 2. Embedding noise ensemble
+//! Add Gaussian noise to the embedding, run N forward passes, average logits —
+//! Monte Carlo marginalization over input uncertainty.
 //! - Pass 1: clean (writes KV cache normally)
 //! - Pass 2..N: noisy (read-only, don't modify KV cache)
 //!
-//! Cost: N forward passes. Quality: smoother, more calibrated distributions.
+//! Cost: N forward passes per token. Unmeasured here.
 //!
-//! ## 3. Adaptive Confidence Gating
-//! Don't waste compute on easy tokens. Run 1 forward pass, check entropy:
-//! - Low entropy (confident) → emit immediately. 1 forward pass.
-//! - High entropy (uncertain) → apply CFG + ensemble. 2-N forward passes.
+//! ## 3. Adaptive confidence gating
+//! Run 1 forward pass, check entropy: low entropy emits immediately, high
+//! entropy pays for the contrastive/ensemble passes. The entropy threshold
+//! and the 0.7/0.3 blend in `forward_adaptive` are unvalidated constants.
 //!
-//! Average cost: 1.3-1.8x depending on text difficulty. Maximum quality gain.
+//! Cost: 1x on confident tokens, 2-N x on uncertain ones.
 
 // Pondering passes coordinate several cache/work buffers by index, and the explicit function
 // arguments make mutation and cache-write policy visible at each strategy boundary.
@@ -47,7 +53,8 @@ use rand::Rng;
 pub enum PonderStrategy {
     /// No pondering. Standard single forward pass.
     None,
-    /// Classifier-Free Guidance: 2 forward passes, amplify contextual signal.
+    /// Contrastive guidance: 2 forward passes per token (see the module doc
+    /// for what the contrast pass actually sees).
     CFG,
     /// Embedding noise ensemble: N forward passes with noise, average logits.
     Ensemble,
@@ -61,7 +68,8 @@ pub enum PonderStrategy {
 #[derive(Debug, Clone)]
 pub struct PonderConfig {
     pub strategy: PonderStrategy,
-    /// CFG guidance scale. 1.0 = no effect. 1.5 = recommended. 2.0+ = aggressive.
+    /// CFG guidance scale. 1.0 = no effect; larger values push harder on an
+    /// unmeasured contrast — there is no benchmarked recommendation.
     pub guidance_scale: f32,
     /// Token ID used for unconditional CFG pass. Usually 0 (padding/unk).
     pub null_token_id: usize,
@@ -266,7 +274,8 @@ fn forward_standard(
     Ok(std::mem::take(&mut work.scratch.logits))
 }
 
-/// Classifier-Free Guidance: amplify context-dependent predictions.
+/// Contrastive guidance pass pair (see the module doc for the caveat about
+/// what the second pass attends).
 fn forward_cfg(
     model: &RaiModel,
     token_id: usize,

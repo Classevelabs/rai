@@ -55,7 +55,8 @@ pub struct GenerationArgs {
     /// Pondering strategy: none, cfg, ensemble, cfg-ensemble, adaptive
     #[arg(long, default_value = "none")]
     pub ponder_strategy: String,
-    /// CFG guidance scale (1.0 = no effect, 1.5 = recommended)
+    /// CFG guidance scale (1.0 = no effect; the strategies are experimental
+    /// and unmeasured — see ponder.rs)
     #[arg(long, default_value = "1.5")]
     pub guidance_scale: f32,
     /// Number of ensemble passes
