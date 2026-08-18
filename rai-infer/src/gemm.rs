@@ -1387,6 +1387,11 @@ pub fn w4a8_matvec(
 /// Shared input_sums computed once. K/V rows (below PAR_THRESHOLD individually)
 /// become parallel alongside Q rows via work-stealing.
 ///
+/// The decode dispatch floor applies to the combined matrix: when Q+K+V packed
+/// together stay under `PAR_MIN_BYTES`, one thread walks all three projections
+/// itself — the same policy `w4a8_matvec` applies, for the same measured
+/// reason (`bw-bench` steps 3-5).
+///
 /// # Panics
 /// Panics if any projection fails the [`w4a8_matvec`] buffer/dimension
 /// checks, or if the three projections disagree on `cols` or `group_size`.
@@ -1427,6 +1432,29 @@ pub fn w4a8_fused_qkv(
     #[cfg(target_arch = "x86_64")]
     {
         if has_avx2() {
+            let total_rows = q_proj.rows + k_proj.rows + v_proj.rows;
+            if !matvec_should_parallelize(total_rows, cols) {
+                for (out, proj) in [(q_out, q_proj), (k_out, k_proj), (v_out, v_proj)] {
+                    unsafe {
+                        matvec_chunk_i8(
+                            out.as_mut_ptr(),
+                            proj.nibble_data.as_ptr(),
+                            proj.group_params,
+                            input.as_ptr(),
+                            input_even.as_ptr(),
+                            input_odd.as_ptr(),
+                            &input_scales,
+                            &input_sums,
+                            0,
+                            proj.rows,
+                            cols,
+                            group_size,
+                            num_groups,
+                        );
+                    }
+                }
+                return;
+            }
             let cr = chunk_rows_for(cols);
             let q_chunks = q_proj.rows.div_ceil(cr);
             let k_chunks = k_proj.rows.div_ceil(cr);
@@ -1529,7 +1557,9 @@ pub fn w4a8_fused_qkv(
 }
 
 /// Fused gate+up projections: single parallel dispatch over all gate+up rows.
-/// Shared input_sums computed once.
+/// Shared input_sums computed once. The combined gate+up matrix is held to the
+/// same `PAR_MIN_BYTES` decode floor as [`w4a8_matvec`]; under it, one thread
+/// walks both projections.
 ///
 /// # Panics
 /// Panics if either projection fails the [`w4a8_matvec`] buffer/dimension
@@ -1569,6 +1599,29 @@ pub fn w4a8_fused_gate_up(
     #[cfg(target_arch = "x86_64")]
     {
         if has_avx2() {
+            let total_rows = gate_proj.rows + up_proj.rows;
+            if !matvec_should_parallelize(total_rows, cols) {
+                for (out, proj) in [(gate_out, gate_proj), (up_out, up_proj)] {
+                    unsafe {
+                        matvec_chunk_i8(
+                            out.as_mut_ptr(),
+                            proj.nibble_data.as_ptr(),
+                            proj.group_params,
+                            input.as_ptr(),
+                            input_even.as_ptr(),
+                            input_odd.as_ptr(),
+                            &input_scales,
+                            &input_sums,
+                            0,
+                            proj.rows,
+                            cols,
+                            group_size,
+                            num_groups,
+                        );
+                    }
+                }
+                return;
+            }
             let cr = chunk_rows_for(cols);
             let g_chunks = gate_proj.rows.div_ceil(cr);
             let u_chunks = up_proj.rows.div_ceil(cr);
@@ -2458,6 +2511,71 @@ mod tests {
     }
 
     #[test]
+    fn fused_qkv_decode_size_stays_serial_and_matches() {
+        // SmolLM-class shape: Q+K+V packed together is 276 KB, under the
+        // dispatch floor, so the fused path must walk the rows on one thread.
+        let q_rows = 576;
+        let kv_rows = 192;
+        let cols = 576;
+        let group_size = 64;
+        assert!(!matvec_should_parallelize(q_rows + 2 * kv_rows, cols));
+
+        let q_nib = pack_nibbles(q_rows, cols, 3);
+        let k_nib = pack_nibbles(kv_rows, cols, 7);
+        let v_nib = pack_nibbles(kv_rows, cols, 11);
+        let q_par = pack_group_params(q_rows, cols / group_size, 0.25, -2.0);
+        let k_par = pack_group_params(kv_rows, cols / group_size, 0.5, -4.0);
+        let v_par = pack_group_params(kv_rows, cols / group_size, 0.125, -1.0);
+        let input = exact_quant_input(cols, group_size, 127);
+
+        let q_proj = QuantizedLinear {
+            rows: q_rows,
+            cols,
+            group_params: &q_par,
+            nibble_data: &q_nib,
+            group_size,
+        };
+        let k_proj = QuantizedLinear {
+            rows: kv_rows,
+            cols,
+            group_params: &k_par,
+            nibble_data: &k_nib,
+            group_size,
+        };
+        let v_proj = QuantizedLinear {
+            rows: kv_rows,
+            cols,
+            group_params: &v_par,
+            nibble_data: &v_nib,
+            group_size,
+        };
+
+        let mut q_out = vec![0.0f32; q_rows];
+        let mut k_out = vec![0.0f32; kv_rows];
+        let mut v_out = vec![0.0f32; kv_rows];
+        w4a8_fused_qkv(
+            &mut q_out, &mut k_out, &mut v_out, &q_proj, &k_proj, &v_proj, &input,
+        );
+
+        let mut q_ref = vec![0.0f32; q_rows];
+        let mut k_ref = vec![0.0f32; kv_rows];
+        let mut v_ref = vec![0.0f32; kv_rows];
+        w4a8_matvec(&mut q_ref, &q_nib, &q_par, &input, q_rows, cols, group_size);
+        w4a8_matvec(
+            &mut k_ref, &k_nib, &k_par, &input, kv_rows, cols, group_size,
+        );
+        w4a8_matvec(
+            &mut v_ref, &v_nib, &v_par, &input, kv_rows, cols, group_size,
+        );
+        assert_close(&q_out, &q_ref, 1e-4, "serial fused Q vs matvec");
+        assert_close(&k_out, &k_ref, 1e-4, "serial fused K vs matvec");
+        assert_close(&v_out, &v_ref, 1e-4, "serial fused V vs matvec");
+
+        let q_expected = reference_matvec(&q_nib, 0.25, -2.0, &input, q_rows, cols);
+        assert_close(&q_out, &q_expected, 5e-3, "serial fused Q vs reference");
+    }
+
+    #[test]
     fn fused_gate_up_parallel_path_matches_per_matvec() {
         let rows = 4288;
         let cols = 256;
@@ -2514,6 +2632,71 @@ mod tests {
 
         let gate_expected = reference_matvec(&gate_nib, 0.25, -2.0, &input, rows, cols);
         assert_close(&gate_out, &gate_expected, 5e-3, "fused gate vs reference");
+    }
+
+    #[test]
+    fn fused_gate_up_decode_size_stays_serial_and_matches() {
+        // 331 KB combined: under the dispatch floor, serial branch.
+        let rows = 576;
+        let cols = 576;
+        let group_size = 64;
+        assert!(!matvec_should_parallelize(2 * rows, cols));
+
+        let gate_nib = pack_nibbles(rows, cols, 2);
+        let up_nib = pack_nibbles(rows, cols, 13);
+        let gate_par = pack_group_params(rows, cols / group_size, 0.25, -2.0);
+        let up_par = pack_group_params(rows, cols / group_size, 0.5, -3.0);
+        let input = exact_quant_input(cols, group_size, 127);
+
+        let gate_proj = QuantizedLinear {
+            rows,
+            cols,
+            group_params: &gate_par,
+            nibble_data: &gate_nib,
+            group_size,
+        };
+        let up_proj = QuantizedLinear {
+            rows,
+            cols,
+            group_params: &up_par,
+            nibble_data: &up_nib,
+            group_size,
+        };
+
+        let mut gate_out = vec![0.0f32; rows];
+        let mut up_out = vec![0.0f32; rows];
+        w4a8_fused_gate_up(&mut gate_out, &mut up_out, &gate_proj, &up_proj, &input);
+
+        let mut gate_ref = vec![0.0f32; rows];
+        let mut up_ref = vec![0.0f32; rows];
+        w4a8_matvec(
+            &mut gate_ref,
+            &gate_nib,
+            &gate_par,
+            &input,
+            rows,
+            cols,
+            group_size,
+        );
+        w4a8_matvec(
+            &mut up_ref,
+            &up_nib,
+            &up_par,
+            &input,
+            rows,
+            cols,
+            group_size,
+        );
+        assert_close(&gate_out, &gate_ref, 1e-4, "serial fused gate vs matvec");
+        assert_close(&up_out, &up_ref, 1e-4, "serial fused up vs matvec");
+
+        let gate_expected = reference_matvec(&gate_nib, 0.25, -2.0, &input, rows, cols);
+        assert_close(
+            &gate_out,
+            &gate_expected,
+            5e-3,
+            "serial fused gate vs reference",
+        );
     }
 
     #[test]
