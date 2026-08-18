@@ -74,16 +74,12 @@ const LAYER_LINEAR_NAMES: [&str; 7] = PROJECTION_NAMES;
 /// `GemmaFolds`). `gemma2` came off it once the header gained the two softcaps
 /// and the layer section gained the sandwich norms.
 ///
-/// `gemma3` stays, and the reason is not softcapping or QK norm — the container
-/// now stores both. It is the RoPE base: Gemma3 interleaves sliding and global
-/// attention layers and gives them *different* rotary bases
-/// (`rope_local_base_freq` = 10 000 for the sliding layers, `rope_theta` =
-/// 1 000 000 for the global ones; see `transformers`
-/// `models/gemma3/configuration_gemma3.py:144-150`). The header carries one
-/// `rope_theta` and the runtime builds one RoPE table from it, so five layers in
-/// six would be rotated at the wrong frequency. That is a per-layer
-/// architectural variation, not a missing parameter, so it is refused rather
-/// than approximated.
+/// `gemma3` was the last entry off: its blocker was the two rotary bases
+/// (`rope_local_base_freq` for the sliding layers, `rope_theta` for the global
+/// ones), and the header now carries `rope_local_theta` plus
+/// `global_layer_stride` so the runtime builds both tables. The list is empty
+/// today; it stays here because the refusal machinery and its message are the
+/// contract for whatever architecture shows up next.
 const UNSUPPORTED_MODEL_TYPES: [(&str, &str); 0] = [];
 
 /// Model families that need the container's Gemma-specific conversion folds:
@@ -404,6 +400,22 @@ impl RaiConfig {
 struct GemmaFolds {
     /// Add 1.0 to every RMSNorm weight before writing it.
     norm_plus_one: bool,
+}
+
+/// Deletes the `.partial` conversion output on drop unless the write finished
+/// and the file was renamed into place (`keep` flipped to true). Covers early
+/// `?` returns and panics on the conversion thread alike.
+struct PartialOutput<'a> {
+    path: &'a Path,
+    keep: bool,
+}
+
+impl Drop for PartialOutput<'_> {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = std::fs::remove_file(self.path);
+        }
+    }
 }
 
 /// Convert a HuggingFace checkpoint directory to `.raimodel`.
@@ -746,8 +758,24 @@ pub fn convert_with_progress(
     // of disk should be a sentence up front rather than an OS error minutes
     // in, after the work is done and a truncated file is on disk.
     check_output_space(&output_path, total_size)?;
-    let mut file = File::create(&output_path)
-        .with_context(|| format!("creating {}", output_path.display()))?;
+    // Quantization takes minutes and the target name may already hold the
+    // previous good model, so the bytes go to a sibling temp file that is
+    // renamed over the target only after the size check and fsync. A failure
+    // part-way leaves the old model untouched, and the guard removes the
+    // partial so it cannot be mistaken for a model later. (A hard kill —
+    // Ctrl+C included, which does not unwind on Windows — can still leave a
+    // stale .partial behind; the next conversion truncates it.)
+    let tmp_path = {
+        let mut name = output_path.clone().into_os_string();
+        name.push(".partial");
+        PathBuf::from(name)
+    };
+    let mut tmp_guard = PartialOutput {
+        path: &tmp_path,
+        keep: false,
+    };
+    let mut file =
+        File::create(&tmp_path).with_context(|| format!("creating {}", tmp_path.display()))?;
     write_header(&mut file, &config, num_sections as u32)?;
     for (offset, size) in offsets.iter().zip(&section_sizes) {
         file.write_all(&offset.to_le_bytes())?;
@@ -934,8 +962,21 @@ pub fn convert_with_progress(
     if written != total_size {
         bail!("internal error: wrote {written} bytes, planned {total_size}");
     }
-    file.flush()?;
+    file.sync_all()?;
     drop(file);
+    // Disarmed before the rename, not after: from here the temp file holds a
+    // complete, fsynced model, and if the rename fails — the target held open
+    // by a scanner, or marked read-only — deleting minutes of finished work
+    // would be worse than leaving a .partial the error can point at.
+    tmp_guard.keep = true;
+    std::fs::rename(&tmp_path, &output_path).with_context(|| {
+        format!(
+            "moving {} into place as {}; the finished conversion is intact at the \
+             first path — move or rename it by hand",
+            tmp_path.display(),
+            output_path.display()
+        )
+    })?;
 
     enter("tokenizer", total_units as u32, None);
     let quant_elapsed = quant_started.elapsed().as_secs_f64();
