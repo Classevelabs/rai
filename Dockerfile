@@ -24,7 +24,10 @@
 # its own baseline to x86-64 and so leaves aarch64 at the toolchain default.
 ARG RUST_TARGET_CPU=x86-64-v3
 
-FROM rust:1.97.1-slim-bookworm@sha256:96c0af8cf054fd006435089f0076729716784ec9be485bd655de59c55df105ce AS toolchain
+# The tag tracks rust-toolchain.toml: the container must compile with the
+# same compiler every other build of this repo uses, or the image is the one
+# artifact built by a compiler nothing else tested.
+FROM rust:1.95.0-slim-bookworm@sha256:d7482085ff5b415f84dba5647ae71606650bdef00db7aeb69f4b3d170c3e4082 AS toolchain
 
 WORKDIR /src
 COPY . .
