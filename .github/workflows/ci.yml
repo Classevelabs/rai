@@ -198,6 +198,9 @@ jobs:
           grep -q '"rai_store"' /tmp/rai-mcp-surface.json \
             && { echo "::error::rai_store is advertised with mutations disabled — the write tool must be hidden by default"; exit 1; }
 
+          grep -q '"rai_forget"' /tmp/rai-mcp-surface.json \
+            && { echo "::error::rai_forget is advertised with mutations disabled — the delete tool must be hidden by default"; exit 1; }
+
           grep -q 'rai_store is disabled' /tmp/rai-mcp-surface.json \
             || { echo "::error::rai_store was NOT refused by default — the mutation opt-in has regressed"; exit 1; }
 

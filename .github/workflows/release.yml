@@ -327,6 +327,30 @@ jobs:
             --package classeve-rai-infer \
             --package classeve-rai-server
 
+      # A compile is not an execution: a green build has shipped a stale or
+      # broken exe before. Every binary the archive will carry answers
+      # --version here, on the same runner and target that built it, and the
+      # answer must name this release — not whatever was in a cache.
+      - name: Run every shipped binary before packaging it
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          ext=""
+          if [ "${RUNNER_OS}" = "Windows" ]; then ext=".exe"; fi
+          for bin in rai rai-server rai-convert rai-generate rai-chat; do
+            out="$("./target/release/${bin}${ext}" --version)"
+            printf '%s: %s\n' "$bin" "$out"
+            # Anchored to the end: a substring match would let 0.2.10 pass a
+            # 0.2.1 gate.
+            case "$out" in
+              *" $VERSION") ;;
+              *) echo "::error::${bin} --version answered '${out}', not ${VERSION}"
+                 exit 1 ;;
+            esac
+          done
+
       - name: Stage archive contents
         shell: bash
         env:
