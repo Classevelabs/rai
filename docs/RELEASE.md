@@ -103,11 +103,16 @@ benchmark notes when performance claims changed.
 
 ## Publishing crates
 
-The crates use the `classeve-rai-*` namespace for crates.io compatibility.
-Publication is separate from the GitHub release and requires maintainer
-credentials plus a publish-order check for the internal path dependencies:
-`rem-nra`, then `rai-core`, then `rai-server`; `rai-compress` and `rai-infer`
-are independent.
+Two crates publish, under the `classeve-rai-*` namespace:
+`classeve-rai-infer` and `classeve-rai-compress`. They have no path
+dependencies on each other, so there is no ordering. The other three crates
+are `publish = false` and stay that way; their 0.1.0 releases are yanked.
+
+Publication is separate from the GitHub release: dispatch the `Publish`
+workflow by hand. It authenticates through crates.io trusted publishing (an
+OIDC exchange scoped to this repository and workflow file — no long-lived
+token exists anywhere), refuses to republish a version the index already
+carries, and publishes with `--locked`.
 
 ## Rollback
 
