@@ -8,8 +8,8 @@ when practical. Older crates and GitHub releases may not receive backports.
 ## Reporting a vulnerability
 
 Do not open a public issue for a suspected vulnerability. Use the repository's
-private GitHub Security Advisory form. If that is unavailable, use the contact
-channel at <https://classeve.com> and include the affected component,
+private GitHub Security Advisory form, or email <security@classeve.com>.
+Include the affected component,
 reproduction steps, likely impact, and any safe-to-share model or request
 fixture.
 
