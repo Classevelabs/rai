@@ -364,8 +364,7 @@ pub fn search_channel_scales(
             .iter()
             .map(|&e| (e.max(1e-12)).powf(0.5 * alpha))
             .collect();
-        let log_mean =
-            scales.iter().map(|s| s.ln()).sum::<f64>() / cols as f64;
+        let log_mean = scales.iter().map(|s| s.ln()).sum::<f64>() / cols as f64;
         let norm = log_mean.exp();
         if !norm.is_finite() || norm <= 0.0 {
             continue;
@@ -431,7 +430,10 @@ pub fn matmul_t(
     cols: usize,
 ) -> Result<()> {
     ensure!(input.len() == tokens * cols, "input is not {tokens}x{cols}");
-    ensure!(weights.len() == rows * cols, "weights are not {rows}x{cols}");
+    ensure!(
+        weights.len() == rows * cols,
+        "weights are not {rows}x{cols}"
+    );
     ensure!(out.len() == tokens * rows, "output is not {tokens}x{rows}");
     if let Some(bias) = bias {
         ensure!(bias.len() == rows, "bias is not {rows} long");
@@ -478,8 +480,10 @@ pub fn causal_attention(
     head_dim: usize,
     scale: f32,
 ) -> Result<()> {
-    ensure!(num_kv_heads > 0 && num_heads.is_multiple_of(num_kv_heads),
-        "{num_heads} query heads do not divide into {num_kv_heads} key/value heads");
+    ensure!(
+        num_kv_heads > 0 && num_heads.is_multiple_of(num_kv_heads),
+        "{num_heads} query heads do not divide into {num_kv_heads} key/value heads"
+    );
     let q_dim = num_heads * head_dim;
     let kv_dim = num_kv_heads * head_dim;
     ensure!(q.len() == seq * q_dim, "queries are not {seq}x{q_dim}");
@@ -500,8 +504,8 @@ pub fn causal_attention(
 
                 let mut max = f32::NEG_INFINITY;
                 for (u, score) in scores.iter_mut().enumerate() {
-                    let kh = &k[u * kv_dim + kv_head * head_dim
-                        ..u * kv_dim + (kv_head + 1) * head_dim];
+                    let kh =
+                        &k[u * kv_dim + kv_head * head_dim..u * kv_dim + (kv_head + 1) * head_dim];
                     let dot: f32 = qh.iter().zip(kh.iter()).map(|(a, b)| a * b).sum();
                     *score = dot * scale;
                     max = max.max(*score);
@@ -518,8 +522,8 @@ pub fn causal_attention(
                 dst.fill(0.0);
                 for (u, &weight) in scores.iter().enumerate() {
                     let w = weight * inv;
-                    let vh = &v[u * kv_dim + kv_head * head_dim
-                        ..u * kv_dim + (kv_head + 1) * head_dim];
+                    let vh =
+                        &v[u * kv_dim + kv_head * head_dim..u * kv_dim + (kv_head + 1) * head_dim];
                     for (slot, &value) in dst.iter_mut().zip(vh.iter()) {
                         *slot += w * value;
                     }
@@ -545,10 +549,15 @@ pub fn apply_rope(
 ) -> Result<()> {
     let width = heads * head_dim;
     ensure!(x.len() == seq * width, "tensor is not {seq}x{width}");
-    ensure!(head_dim.is_multiple_of(2), "head_dim {head_dim} must be even");
+    ensure!(
+        head_dim.is_multiple_of(2),
+        "head_dim {head_dim} must be even"
+    );
     let half = head_dim / 2;
-    ensure!(cos.len() >= seq * half && sin.len() >= seq * half,
-        "RoPE tables are shorter than {seq} positions");
+    ensure!(
+        cos.len() >= seq * half && sin.len() >= seq * half,
+        "RoPE tables are shorter than {seq} positions"
+    );
 
     for t in 0..seq {
         for h in 0..heads {
@@ -709,7 +718,11 @@ mod tests {
                 let min = group.iter().cloned().fold(f64::INFINITY, f64::min);
                 let max = group.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
                 let span = max - min;
-                let scale = if span < 1e-15 { 1.0 } else { span / (levels - 1.0) };
+                let scale = if span < 1e-15 {
+                    1.0
+                } else {
+                    span / (levels - 1.0)
+                };
                 for (offset, &w) in group.iter().enumerate() {
                     let code = ((w - min) / scale).round().clamp(0.0, levels - 1.0);
                     let delta = w - (code * scale + min);
@@ -741,13 +754,8 @@ mod tests {
                 let group = &weights[r * cols + start..r * cols + end];
                 let slice = &energy[start..end];
                 let (scale, zero) = group_params_weighted(group, slice, bits, 8);
-                calibrated += super::weighted_group_error(
-                    group,
-                    slice,
-                    scale,
-                    zero,
-                    f64::from(1u32 << bits),
-                );
+                calibrated +=
+                    super::weighted_group_error(group, slice, scale, zero, f64::from(1u32 << bits));
                 start = end;
             }
         }
@@ -778,12 +786,20 @@ mod tests {
         let hidden: Vec<f64> = (0..cols).map(|c| 0.3 - 0.05 * (c % 7) as f64).collect();
 
         let scales = search_channel_scales(
-            &weights, &energy, rows, cols, 4, 4, &[0.0, 0.25, 0.5, 0.75, 1.0],
+            &weights,
+            &energy,
+            rows,
+            cols,
+            4,
+            4,
+            &[0.0, 0.25, 0.5, 0.75, 1.0],
         );
         assert!(scales.iter().all(|s| s.is_finite() && *s > 0.0));
 
         for r in 0..rows {
-            let original: f64 = (0..cols).map(|c| weights[r * cols + c] * norm[c] * hidden[c]).sum();
+            let original: f64 = (0..cols)
+                .map(|c| weights[r * cols + c] * norm[c] * hidden[c])
+                .sum();
             let folded: f64 = (0..cols)
                 .map(|c| (weights[r * cols + c] * scales[c]) * (norm[c] / scales[c]) * hidden[c])
                 .sum();
@@ -818,8 +834,7 @@ mod tests {
     #[test]
     fn calibration_rope_matches_the_engine() {
         let (heads, head_dim, seq) = (3usize, 8usize, 5usize);
-        let table = crate::layers::RoPETable::new(head_dim, seq, 10000.0)
-            .expect("RoPE table");
+        let table = crate::layers::RoPETable::new(head_dim, seq, 10000.0).expect("RoPE table");
 
         let width = heads * head_dim;
         let original: Vec<f32> = (0..seq * width)
@@ -868,7 +883,10 @@ mod tests {
 
         causal_attention(&mut out, &q, &k, &v, 1, heads, heads, head_dim, 0.5).unwrap();
         for (index, (got, want)) in out.iter().zip(v.iter()).enumerate() {
-            assert!((got - want).abs() < 1e-6, "element {index}: {got} vs {want}");
+            assert!(
+                (got - want).abs() < 1e-6,
+                "element {index}: {got} vs {want}"
+            );
         }
     }
 
@@ -927,7 +945,10 @@ mod tests {
             let want = if h < 2 { 2.0 } else { 9.0 };
             for i in 0..head_dim {
                 let got = out[h * head_dim + i];
-                assert!((got - want).abs() < 1e-6, "head {h} element {i}: {got} vs {want}");
+                assert!(
+                    (got - want).abs() < 1e-6,
+                    "head {h} element {i}: {got} vs {want}"
+                );
             }
         }
     }
@@ -936,8 +957,12 @@ mod tests {
     #[test]
     fn matmul_matches_the_obvious_loop() {
         let (tokens, rows, cols) = (5usize, 7usize, 9usize);
-        let input: Vec<f32> = (0..tokens * cols).map(|i| (i % 13) as f32 * 0.1 - 0.5).collect();
-        let weights: Vec<f32> = (0..rows * cols).map(|i| (i % 17) as f32 * 0.05 - 0.3).collect();
+        let input: Vec<f32> = (0..tokens * cols)
+            .map(|i| (i % 13) as f32 * 0.1 - 0.5)
+            .collect();
+        let weights: Vec<f32> = (0..rows * cols)
+            .map(|i| (i % 17) as f32 * 0.05 - 0.3)
+            .collect();
         let bias: Vec<f32> = (0..rows).map(|i| i as f32 * 0.01).collect();
 
         let mut got = vec![0.0f32; tokens * rows];

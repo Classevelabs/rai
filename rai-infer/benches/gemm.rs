@@ -288,7 +288,12 @@ fn main() {
         } else {
             println!(
                 "{:<14} {:>6} {:>7} {:>12.1} {:>9.2} {:>7.2}",
-                "", cols, rows, sample.median_ns / 1e6, gflops, sample.iqr_pct
+                "",
+                cols,
+                rows,
+                sample.median_ns / 1e6,
+                gflops,
+                sample.iqr_pct
             );
         }
     }

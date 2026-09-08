@@ -879,7 +879,7 @@ pub fn convert_with_progress(
             group_size: embed_group_size,
             bits: 8,
             emit_dims: false,
-        channel_energy: None,
+            channel_energy: None,
         },
     )?;
     log(&format!(
@@ -924,7 +924,7 @@ pub fn convert_with_progress(
                     group_size,
                     bits: 4,
                     emit_dims: true,
-        channel_energy,
+                    channel_energy,
                 },
             )?;
             if *name == "q_proj" || *name == "down_proj" {
@@ -992,7 +992,7 @@ pub fn convert_with_progress(
                             group_size,
                             bits: 4,
                             emit_dims: true,
-        channel_energy: None,
+                            channel_energy: None,
                         },
                     )?;
                 }
@@ -1037,7 +1037,7 @@ pub fn convert_with_progress(
                 group_size,
                 bits: 4,
                 emit_dims: true,
-        channel_energy: None,
+                channel_energy: None,
             },
         )?;
         log(&format!(
@@ -2666,9 +2666,7 @@ fn collect_calibration_energy(
     seq_len: usize,
     log: &dyn Fn(&str),
 ) -> Result<CalibrationEnergy> {
-    use crate::calibrate::{
-        accumulate_channel_energy, apply_rope, causal_attention, matmul_t,
-    };
+    use crate::calibrate::{accumulate_channel_energy, apply_rope, causal_attention, matmul_t};
 
     ensure!(
         expert_layout.is_none(),
@@ -2755,7 +2753,15 @@ fn collect_calibration_energy(
             let source = layout.source(layer as u32, index, linear_dims);
             read_projection_f32(store, &source, rows, &mut weights)?;
             let bias = read_projection_bias(store, config, layer as u32, index, rows)?;
-            matmul_t(out, &normed, &weights, bias.as_deref(), tokens.len(), rows, cols)?;
+            matmul_t(
+                out,
+                &normed,
+                &weights,
+                bias.as_deref(),
+                tokens.len(),
+                rows,
+                cols,
+            )?;
         }
 
         if config.has_qk_norm || config.has_full_qk_norm {
@@ -2767,11 +2773,23 @@ fn collect_calibration_energy(
         // ---- rotary position embedding, per sequence ------------------------
         for s in 0..sequences {
             let q_span = &mut q[s * seq_len * attn_dim..(s + 1) * seq_len * attn_dim];
-            apply_rope(q_span, &rope.cos[..seq_len * half], &rope.sin[..seq_len * half],
-                       seq_len, heads, head_dim)?;
+            apply_rope(
+                q_span,
+                &rope.cos[..seq_len * half],
+                &rope.sin[..seq_len * half],
+                seq_len,
+                heads,
+                head_dim,
+            )?;
             let k_span = &mut k[s * seq_len * kv_dim..(s + 1) * seq_len * kv_dim];
-            apply_rope(k_span, &rope.cos[..seq_len * half], &rope.sin[..seq_len * half],
-                       seq_len, kv_heads, head_dim)?;
+            apply_rope(
+                k_span,
+                &rope.cos[..seq_len * half],
+                &rope.sin[..seq_len * half],
+                seq_len,
+                kv_heads,
+                head_dim,
+            )?;
         }
 
         // ---- attention, per sequence ---------------------------------------
@@ -2781,7 +2799,11 @@ fn collect_calibration_energy(
                 &q[s * seq_len * attn_dim..(s + 1) * seq_len * attn_dim],
                 &k[s * seq_len * kv_dim..(s + 1) * seq_len * kv_dim],
                 &v[s * seq_len * kv_dim..(s + 1) * seq_len * kv_dim],
-                seq_len, heads, kv_heads, head_dim, scale,
+                seq_len,
+                heads,
+                kv_heads,
+                head_dim,
+                scale,
             )?;
         }
         accumulate_channel_energy(&mut energy.o[layer], &attn, tokens.len(), attn_dim);
@@ -2791,7 +2813,15 @@ fn collect_calibration_energy(
         let source = layout.source(layer as u32, 3, linear_dims);
         read_projection_f32(store, &source, rows, &mut weights)?;
         let bias = read_projection_bias(store, config, layer as u32, 3, rows)?;
-        matmul_t(&mut projected, &attn, &weights, bias.as_deref(), tokens.len(), rows, cols)?;
+        matmul_t(
+            &mut projected,
+            &attn,
+            &weights,
+            bias.as_deref(),
+            tokens.len(),
+            rows,
+            cols,
+        )?;
         for (h, p) in hidden_state.iter_mut().zip(projected.iter()) {
             *h += *p;
         }
@@ -2814,7 +2844,15 @@ fn collect_calibration_energy(
             let source = layout.source(layer as u32, index, linear_dims);
             read_projection_f32(store, &source, rows, &mut weights)?;
             let bias = read_projection_bias(store, config, layer as u32, index, rows)?;
-            matmul_t(out, &normed, &weights, bias.as_deref(), tokens.len(), rows, cols)?;
+            matmul_t(
+                out,
+                &normed,
+                &weights,
+                bias.as_deref(),
+                tokens.len(),
+                rows,
+                cols,
+            )?;
         }
         for t in 0..tokens.len() {
             crate::layers::glu_mul_inplace(
@@ -2831,7 +2869,15 @@ fn collect_calibration_energy(
         let source = layout.source(layer as u32, 6, linear_dims);
         read_projection_f32(store, &source, rows, &mut weights)?;
         let bias = read_projection_bias(store, config, layer as u32, 6, rows)?;
-        matmul_t(&mut projected, &gate, &weights, bias.as_deref(), tokens.len(), rows, cols)?;
+        matmul_t(
+            &mut projected,
+            &gate,
+            &weights,
+            bias.as_deref(),
+            tokens.len(),
+            rows,
+            cols,
+        )?;
         for (h, p) in hidden_state.iter_mut().zip(projected.iter()) {
             *h += *p;
         }
@@ -2840,7 +2886,12 @@ fn collect_calibration_energy(
     // The Hessian diagonal is a mean, not a sum, so the shrink search behaves
     // the same whatever calibration size was chosen.
     let n = tokens.len() as f64;
-    for group in [&mut energy.qkv, &mut energy.o, &mut energy.gate_up, &mut energy.down] {
+    for group in [
+        &mut energy.qkv,
+        &mut energy.o,
+        &mut energy.gate_up,
+        &mut energy.down,
+    ] {
         for vector in group.iter_mut() {
             for value in vector.iter_mut() {
                 *value /= n;
