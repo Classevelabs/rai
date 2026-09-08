@@ -199,10 +199,21 @@ pub fn apply_repetition_penalty(logits: &mut [f32], recent_tokens: &[usize], pen
 }
 
 fn argmax(values: &[f32]) -> usize {
+    // First maximal index wins on ties, matching numpy/torch/HF argmax; std's
+    // max_by returns the LAST equal maximum, which diverges from every reference
+    // greedy decoder on an exact logit tie. reduce keeps the running best and
+    // replaces it only on a STRICTLY greater value, so the earlier token wins.
+    // total_cmp keeps NaN ordering deterministic.
     values
         .iter()
         .enumerate()
-        .max_by(|(_, left), (_, right)| left.total_cmp(right))
+        .reduce(|best, cur| {
+            if cur.1.total_cmp(best.1) == std::cmp::Ordering::Greater {
+                cur
+            } else {
+                best
+            }
+        })
         .map(|(index, _)| index)
         .unwrap_or_default()
 }
@@ -222,6 +233,18 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
         let token = sample_token(&mut logits, &config, &mut rng);
         assert_eq!(token, 1, "greedy should pick index 1 (logit=5.0)");
+    }
+
+    #[test]
+    fn argmax_breaks_ties_to_the_first_index() {
+        // numpy/torch/HF greedy argmax return the FIRST maximal index; std's
+        // max_by returned the LAST, diverging from every reference decoder on an
+        // exact logit tie.
+        assert_eq!(argmax(&[5.0, 5.0]), 0);
+        assert_eq!(argmax(&[3.0, 5.0, 5.0, 1.0]), 1);
+        assert_eq!(argmax(&[1.0, 2.0, 3.0]), 2);
+        assert_eq!(argmax(&[42.0]), 0);
+        assert_eq!(argmax(&[]), 0);
     }
 
     #[test]

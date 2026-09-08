@@ -846,6 +846,20 @@ pub fn silu_mul_inplace(gate: &mut [f32], up: &[f32], n: usize) {
     }
 }
 
+/// Scalar twin of the AVX2 Schraudolph fast-`exp` used in the softmax and SiLU
+/// SIMD bodies (`exp_a * x + exp_b`, clamp to `[0, 2139095040]`, `cvtps_epi32`
+/// round-to-nearest-even, then reinterpret the integer bits as f32). Evaluated
+/// identically so a buffer's SIMD body and its scalar tail cannot use two
+/// different exp curves — the same body/tail doctrine `tanh_poly` upholds for
+/// `tanh_avx2`. `x` is the exponent argument (already <= 0 at both call sites).
+#[inline]
+fn schraudolph_exp(x: f32) -> f32 {
+    const EXP_A: f32 = 12102203.0; // 2^23 / ln(2)
+    const EXP_B: f32 = 1065353216.0 - 486411.0; // 2^23 * 127 - correction
+    let t = (EXP_A * x + EXP_B).clamp(0.0, 2139095040.0);
+    f32::from_bits(t.round_ties_even() as i32 as u32)
+}
+
 /// AVX2 fast SiLU(x) * y using Schraudolph exp approximation.
 /// SiLU(x) = x / (1 + exp(-x)). Approximation error < 2% for |x| < 10.
 ///
@@ -884,9 +898,11 @@ unsafe fn silu_mul_avx2(gate: &mut [f32], up: &[f32], n: usize) {
         _mm256_storeu_ps(gate.as_mut_ptr().add(off), _mm256_mul_ps(silu_x, u));
     }
 
-    // Scalar tail
+    // Scalar tail — mirror the SIMD body's Schraudolph exp so the body and the
+    // trailing <8 lanes of one buffer cannot use two different exp curves.
     for i in (chunks8 * 8)..n {
-        gate[i] = silu(gate[i]) * up[i];
+        let exp_neg_x = schraudolph_exp(-gate[i]);
+        gate[i] = (gate[i] / (1.0 + exp_neg_x)) * up[i];
     }
 }
 
@@ -1351,7 +1367,10 @@ unsafe fn attention_head_avx2(
         _mm_cvtss_f32(_mm_add_ss(s2, hi2))
     };
     for t in (chunks8_s * 8)..n_pos {
-        let v = (*sp.add(t) - max_score).exp();
+        // Same Schraudolph exp as the SIMD body above, so every position in one
+        // softmax uses one exp curve (was accurate .exp() here, which biased the
+        // trailing <8 keys relative to the body).
+        let v = schraudolph_exp(*sp.add(t) - max_score);
         *sp.add(t) = v;
         sum_exp += v;
     }

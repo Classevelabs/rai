@@ -56,7 +56,8 @@ with the 0.2.2 changelog's loaded-machine figures.
 cargo build --workspace --release --locked
 
 # 2. Convert a checkpoint — no Python required
-rai convert /path/to/Qwen2.5-0.5B-Instruct
+#    (-o sets the output name; convert otherwise preserves the checkpoint's case)
+rai convert /path/to/Qwen2.5-0.5B-Instruct -o qwen2.5-0.5b-instruct-q4.raimodel
 
 # 3. Generate
 rai run qwen2.5-0.5b-instruct-q4.raimodel \

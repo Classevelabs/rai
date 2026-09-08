@@ -162,11 +162,22 @@ fn cosine(a: &Vec64, b: &Vec64) -> f64 {
     if a.len() != b.len() {
         return 0.0;
     }
-    let denom = a.norm() * b.norm();
-    if denom <= 1e-12 {
-        0.0
+    // Scale-invariant by construction. Thresholding the PRODUCT of the two norms
+    // against an absolute epsilon made the metric scale-DEPENDENT: two
+    // 1e-7-magnitude vectors (product 1e-14 <= 1e-12) scored 0 despite being an
+    // exact match, and an overflowing norm produced 0/NaN. Guard each norm on its
+    // own — a zero-magnitude vector has no direction (cosine undefined -> 0) — and
+    // divide by the norms separately so their product cannot over/underflow.
+    let na = a.norm();
+    let nb = b.norm();
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    let c = a.dot(b) / na / nb;
+    if c.is_finite() {
+        c.clamp(-1.0, 1.0)
     } else {
-        a.dot(b) / denom
+        0.0
     }
 }
 

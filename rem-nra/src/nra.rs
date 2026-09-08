@@ -225,11 +225,22 @@ fn cosine(a: &Vec64, b: &Vec64) -> f64 {
     if a.len() != b.len() {
         return 0.0;
     }
-    let denom = a.norm() * b.norm();
-    if denom <= 1e-12 {
-        0.0
+    // Scale-invariant by construction. Thresholding the PRODUCT of the two norms
+    // against an absolute epsilon made the metric scale-DEPENDENT: two
+    // 1e-7-magnitude vectors (product 1e-14 <= 1e-12) scored 0 despite being an
+    // exact match, and an overflowing norm produced 0/NaN. Guard each norm on its
+    // own — a zero-magnitude vector has no direction (cosine undefined -> 0) — and
+    // divide by the norms separately so their product cannot over/underflow.
+    let na = a.norm();
+    let nb = b.norm();
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    let c = a.dot(b) / na / nb;
+    if c.is_finite() {
+        c.clamp(-1.0, 1.0)
     } else {
-        a.dot(b) / denom
+        0.0
     }
 }
 
@@ -271,6 +282,42 @@ mod tests {
             .retrieve_with_diagnostics(&Vec64::from_row_slice(&[0.05, 1.0]))
             .expect("retrieve");
         assert_eq!(other.value.as_slice(), &[0.0, 1.0]);
+    }
+
+    #[test]
+    fn cosine_stays_scale_invariant_for_tiny_vectors() {
+        // Thresholding the PRODUCT of the norms against 1e-12 made two
+        // 1e-7-magnitude vectors (product 1e-14) score 0 despite being an exact
+        // match. Cosine depends on direction, not magnitude.
+        let a = Vec64::from_row_slice(&[1e-7, 0.0]);
+        let b = Vec64::from_row_slice(&[1e-7, 0.0]);
+        assert!(
+            (cosine(&a, &b) - 1.0).abs() < 1e-9,
+            "tiny exact match should score 1.0, got {}",
+            cosine(&a, &b)
+        );
+        let orth = Vec64::from_row_slice(&[0.0, 1e-7]);
+        assert!(
+            cosine(&a, &orth).abs() < 1e-9,
+            "orthogonal tiny vectors -> 0"
+        );
+        // A genuinely zero-magnitude vector has no direction -> undefined -> 0.
+        assert_eq!(cosine(&a, &Vec64::from_row_slice(&[0.0, 0.0])), 0.0);
+    }
+
+    #[test]
+    fn tiny_magnitude_addresses_still_retrieve_the_true_match() {
+        // End-to-end: before the fix every tiny address scored 0, so the scan
+        // returned items[0] by storage order instead of the aligned match.
+        let memory = memory_with(&[([1e-7, 0.0], [1.0, 0.0]), ([0.0, 1e-7], [0.0, 1.0])]);
+        let matched = memory
+            .retrieve_with_diagnostics(&Vec64::from_row_slice(&[0.0, 1e-7]))
+            .expect("retrieve");
+        assert_eq!(
+            matched.value.as_slice(),
+            &[0.0, 1.0],
+            "should match the aligned (second) address, not storage order"
+        );
     }
 
     #[test]

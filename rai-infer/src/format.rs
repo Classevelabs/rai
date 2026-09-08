@@ -718,6 +718,37 @@ impl RaiModelFile {
             ] {
                 validate_group_params(linear.group_params, &format!("layer {layer} {name}"))?;
             }
+            // Mixture-of-experts. The gate/up/down validated above are only
+            // expert 0 (LayerRefs::expert(0) returns exactly those). Hold the
+            // router and every remaining expert to the same standard — otherwise
+            // a NaN/0/negative scale in expert 1..N, or a non-finite router
+            // entry, survives open() and yields NaN/garbage (or an all-zero
+            // token) at inference, breaking the "every quantization scale is
+            // checked for finiteness before this returns" contract that dense
+            // files already honour. Reuses the existing validators, no special
+            // casing.
+            if self.config.num_experts > 0 {
+                match refs.router {
+                    Some(bytes) => validate_f32_vector(bytes, &format!("layer {layer} router"))?,
+                    None => bail!(
+                        "layer {layer} declares {} experts but carries no router",
+                        self.config.num_experts
+                    ),
+                }
+                for expert in 1..self.config.num_experts as usize {
+                    let mlp = refs
+                        .expert(expert, &self.config)
+                        .with_context(|| format!("validating layer {layer} expert {expert}"))?;
+                    for (name, linear) in
+                        [("gate", &mlp.gate), ("up", &mlp.up), ("down", &mlp.down)]
+                    {
+                        validate_group_params(
+                            linear.group_params,
+                            &format!("layer {layer} expert {expert} {name}"),
+                        )?;
+                    }
+                }
+            }
             // Every declared bias must be present, exactly `rows` long, and
             // finite — the same standard the norm vectors are held to.
             let dims = self.config.projection_dims();

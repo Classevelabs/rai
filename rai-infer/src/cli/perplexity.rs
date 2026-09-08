@@ -36,8 +36,12 @@
 //! Perplexity is a function of the tokenizer's vocabulary as much as of the
 //! model, so a Qwen number and a Llama number are not comparable to each other
 //! even on identical text. What they are good for is the comparison that
-//! matters here: the same model, same text, same tokenizer, fp16 against
-//! 4-bit — which is exactly the cost of quantization and nothing else.
+//! matters here: the same model, same text, same tokenizer, fp16 against the
+//! shipped 4-bit engine. That gap is dominated by 4-bit weight quantization,
+//! but it also carries the int8 activation quantization and the approximate
+//! fast-exp softmax/SiLU kernels the AVX2 path uses — neither present in the
+//! fp16 reference — so read it as the end-to-end cost of this engine, not
+//! weight quantization alone.
 
 use std::io::Write;
 use std::path::PathBuf;

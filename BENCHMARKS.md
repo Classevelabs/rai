@@ -127,8 +127,9 @@ The sequential per-token attention that looked like the obvious culprit was
 | Decode throughput | — | unchanged by design (decode never calls the batched path) |
 
 Greedy output is **byte-identical** before and after, and the
-sequential-versus-batched logit difference in `tests/model_invariants.rs` is
-exactly **0**.
+sequential-versus-batched logits agree to within **2e-3** — the bound
+`tests/model_invariants.rs` asserts. The two paths sum in different f32 orders,
+so the logit gap is small but not exactly zero; the greedy argmax is identical.
 
 ### Prompt-lookup speculative decoding
 
@@ -369,7 +370,9 @@ is not specific to Qwen.
 Perplexity is a function of the tokenizer as much as of the model, so these
 rows are not comparable to each other, and neither is any of them to a
 published number taken on different text. The comparison each row supports is
-the one inside it: same model, same tokenizer, same tokens, different weights.
+the one inside it: same model, same tokenizer, same tokens — fp16 against the
+shipped 4-bit engine (4-bit weights, int8 activations, and the approximate
+fast-exp softmax/SiLU kernels), not weight quantization in isolation.
 
 **The degradation is not monotonic in model size, and the reason turned out to
 be the model.** Qwen2.5-3B quantizes worse than Qwen2.5-1.5B (+0.191 against

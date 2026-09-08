@@ -265,8 +265,14 @@ fn quantize_input_split(
         let mut col = start;
         while col + 1 < end {
             let k = col / 2;
-            input_even[k] = (input[col] * inv_scale).round().max(-128.0).min(127.0) as i8;
-            input_odd[k] = (input[col + 1] * inv_scale).round().max(-128.0).min(127.0) as i8;
+            input_even[k] = (input[col] * inv_scale)
+                .round_ties_even()
+                .max(-128.0)
+                .min(127.0) as i8;
+            input_odd[k] = (input[col + 1] * inv_scale)
+                .round_ties_even()
+                .max(-128.0)
+                .min(127.0) as i8;
             col += 2;
         }
     }
@@ -369,11 +375,11 @@ unsafe fn quantize_input_split_avx2(
         while col + 1 < end {
             let k = col / 2;
             input_even[k] = (*input.as_ptr().add(col) * inv_scale)
-                .round()
+                .round_ties_even()
                 .max(-128.0)
                 .min(127.0) as i8;
             input_odd[k] = (*input.as_ptr().add(col + 1) * inv_scale)
-                .round()
+                .round_ties_even()
                 .max(-128.0)
                 .min(127.0) as i8;
             col += 2;
@@ -532,8 +538,16 @@ unsafe fn matvec_chunk_i8(
                         + (b >> 4) as f32 * *input_f32.add(col_start + tc + 1);
                     tc += 2;
                 }
-                let tail_v =
-                    _mm256_set_ps(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, *w_scales.get_unchecked(g) * tail_acc);
+                let tail_v = _mm256_set_ps(
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    *w_scales.get_unchecked(g) * tail_acc,
+                );
                 float_acc = _mm256_add_ps(float_acc, tail_v);
             }
         }
@@ -624,8 +638,7 @@ unsafe fn matmul_row_tile<const T: usize>(
 
         for j in 0..T {
             let t = t_base + j;
-            let combined_scale =
-                *w_scales.get_unchecked(g) * *input_scales.add(t * num_groups + g);
+            let combined_scale = *w_scales.get_unchecked(g) * *input_scales.add(t * num_groups + g);
             float_acc[j] = _mm256_add_ps(
                 float_acc[j],
                 _mm256_mul_ps(_mm256_cvtepi32_ps(iacc[j]), _mm256_set1_ps(combined_scale)),
@@ -661,8 +674,16 @@ unsafe fn matmul_row_tile<const T: usize>(
                         + (b >> 4) as f32 * *tok_f32.add(col_start + tc + 1);
                     tc += 2;
                 }
-                let tail_v =
-                    _mm256_set_ps(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, *w_scales.get_unchecked(g) * tail_acc);
+                let tail_v = _mm256_set_ps(
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    *w_scales.get_unchecked(g) * tail_acc,
+                );
                 float_acc[j] = _mm256_add_ps(float_acc[j], tail_v);
             }
         }
@@ -891,8 +912,7 @@ unsafe fn lm_head_chunk_i8(
             }
 
             // Convert to float, multiply by combined scale, accumulate
-            let combined_scale =
-                *w_scales.get_unchecked(g) * *hidden_scales.get_unchecked(g);
+            let combined_scale = *w_scales.get_unchecked(g) * *hidden_scales.get_unchecked(g);
             let dot_f = _mm256_mul_ps(_mm256_cvtepi32_ps(iacc), _mm256_set1_ps(combined_scale));
             float_acc = _mm256_add_ps(float_acc, dot_f);
 
@@ -977,7 +997,10 @@ fn quantize_hidden_i8(
         let inv_scale = 1.0 / scale;
         scales[g] = scale;
         for i in start..end {
-            output[i] = (hidden[i] * inv_scale).round().max(-63.0).min(63.0) as i8;
+            output[i] = (hidden[i] * inv_scale)
+                .round_ties_even()
+                .max(-63.0)
+                .min(63.0) as i8;
         }
     }
 }
@@ -1059,7 +1082,10 @@ unsafe fn quantize_hidden_i8_avx2(
 
         // Scalar tail
         for i in (chunks8 * 8)..len {
-            *(out_ptr.add(i)) = (*inp.add(i) * inv_scale).round().max(-63.0).min(63.0) as i8;
+            *(out_ptr.add(i)) = (*inp.add(i) * inv_scale)
+                .round_ties_even()
+                .max(-63.0)
+                .min(63.0) as i8;
         }
     }
 }
@@ -1287,26 +1313,26 @@ fn w4a8_matvec_inner(
                 (0..num_chunks).into_par_iter().for_each_init(
                     || vec![0.0f32; num_groups],
                     |scratch, ci| {
-                    let start = ci * cr;
-                    let len = cr.min(rows - start);
-                    unsafe {
-                        matvec_chunk_i8(
-                            out_ptr.ptr().add(start),
-                            nib_ptr.ptr(),
-                            group_params,
-                            inp_f32_ptr.ptr(),
-                            inp_even_ptr.ptr(),
-                            inp_odd_ptr.ptr(),
-                            scales,
-                            sums,
-                            start,
-                            len,
-                            cols,
-                            group_size,
-                            num_groups,
-                            scratch,
-                        );
-                    }
+                        let start = ci * cr;
+                        let len = cr.min(rows - start);
+                        unsafe {
+                            matvec_chunk_i8(
+                                out_ptr.ptr().add(start),
+                                nib_ptr.ptr(),
+                                group_params,
+                                inp_f32_ptr.ptr(),
+                                inp_even_ptr.ptr(),
+                                inp_odd_ptr.ptr(),
+                                scales,
+                                sums,
+                                start,
+                                len,
+                                cols,
+                                group_size,
+                                num_groups,
+                                scratch,
+                            );
+                        }
                     },
                 );
             } else {
@@ -1518,39 +1544,39 @@ pub fn w4a8_fused_qkv(
             (0..total_chunks).into_par_iter().for_each_init(
                 || vec![0.0f32; num_groups],
                 |scratch, chunk_idx| {
-                let (out_ptr, nibble_data, group_params, rows, start_row) = if chunk_idx < q_chunks
-                {
-                    let start = chunk_idx * cr;
-                    (q_ptr, q_nib, q_par, q_rows, start)
-                } else if chunk_idx < q_chunks + k_chunks {
-                    let ki = chunk_idx - q_chunks;
-                    let start = ki * cr;
-                    (k_ptr, k_nib, k_par, k_rows, start)
-                } else {
-                    let vi = chunk_idx - q_chunks - k_chunks;
-                    let start = vi * cr;
-                    (v_ptr, v_nib, v_par, v_rows, start)
-                };
+                    let (out_ptr, nibble_data, group_params, rows, start_row) =
+                        if chunk_idx < q_chunks {
+                            let start = chunk_idx * cr;
+                            (q_ptr, q_nib, q_par, q_rows, start)
+                        } else if chunk_idx < q_chunks + k_chunks {
+                            let ki = chunk_idx - q_chunks;
+                            let start = ki * cr;
+                            (k_ptr, k_nib, k_par, k_rows, start)
+                        } else {
+                            let vi = chunk_idx - q_chunks - k_chunks;
+                            let start = vi * cr;
+                            (v_ptr, v_nib, v_par, v_rows, start)
+                        };
 
-                let chunk_len = cr.min(rows - start_row);
-                unsafe {
-                    matvec_chunk_i8(
-                        out_ptr.ptr().add(start_row),
-                        nibble_data.ptr(),
-                        group_params,
-                        inp_f32_ptr.ptr(),
-                        inp_even_ptr.ptr(),
-                        inp_odd_ptr.ptr(),
-                        &scales,
-                        &sums,
-                        start_row,
-                        chunk_len,
-                        cols,
-                        group_size,
-                        num_groups,
-                        scratch,
-                    );
-                }
+                    let chunk_len = cr.min(rows - start_row);
+                    unsafe {
+                        matvec_chunk_i8(
+                            out_ptr.ptr().add(start_row),
+                            nibble_data.ptr(),
+                            group_params,
+                            inp_f32_ptr.ptr(),
+                            inp_even_ptr.ptr(),
+                            inp_odd_ptr.ptr(),
+                            &scales,
+                            &sums,
+                            start_row,
+                            chunk_len,
+                            cols,
+                            group_size,
+                            num_groups,
+                            scratch,
+                        );
+                    }
                 },
             );
             return;
@@ -1686,35 +1712,35 @@ pub fn w4a8_fused_gate_up(
             (0..total_chunks).into_par_iter().for_each_init(
                 || vec![0.0f32; num_groups],
                 |scratch, chunk_idx| {
-                let (out_ptr, nibble_data, group_params, rows, start_row) = if chunk_idx < g_chunks
-                {
-                    let start = chunk_idx * cr;
-                    (g_ptr, g_nib, g_par, g_rows, start)
-                } else {
-                    let ui = chunk_idx - g_chunks;
-                    let start = ui * cr;
-                    (u_ptr, u_nib, u_par, u_rows, start)
-                };
+                    let (out_ptr, nibble_data, group_params, rows, start_row) =
+                        if chunk_idx < g_chunks {
+                            let start = chunk_idx * cr;
+                            (g_ptr, g_nib, g_par, g_rows, start)
+                        } else {
+                            let ui = chunk_idx - g_chunks;
+                            let start = ui * cr;
+                            (u_ptr, u_nib, u_par, u_rows, start)
+                        };
 
-                let chunk_len = cr.min(rows - start_row);
-                unsafe {
-                    matvec_chunk_i8(
-                        out_ptr.ptr().add(start_row),
-                        nibble_data.ptr(),
-                        group_params,
-                        inp_f32_ptr.ptr(),
-                        inp_even_ptr.ptr(),
-                        inp_odd_ptr.ptr(),
-                        &scales,
-                        &sums,
-                        start_row,
-                        chunk_len,
-                        cols,
-                        group_size,
-                        num_groups,
-                        scratch,
-                    );
-                }
+                    let chunk_len = cr.min(rows - start_row);
+                    unsafe {
+                        matvec_chunk_i8(
+                            out_ptr.ptr().add(start_row),
+                            nibble_data.ptr(),
+                            group_params,
+                            inp_f32_ptr.ptr(),
+                            inp_even_ptr.ptr(),
+                            inp_odd_ptr.ptr(),
+                            &scales,
+                            &sums,
+                            start_row,
+                            chunk_len,
+                            cols,
+                            group_size,
+                            num_groups,
+                            scratch,
+                        );
+                    }
                 },
             );
             return;
