@@ -1,5 +1,9 @@
 # Operations
 
+`rai-server` is **not part of RAI** and is in no release archive — it builds
+from this workspace only. See the note at the top of `rai-server/Cargo.toml`.
+This page is its runbook for anyone who builds it from source.
+
 `rai-server` is a local service, not an internet-facing TLS endpoint. Run REST
 on loopback and put any remote-access policy, TLS, rate limiting, and user
 authentication in a separately operated reverse proxy. The proxy must connect

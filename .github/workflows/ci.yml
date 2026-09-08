@@ -149,6 +149,63 @@ jobs:
       - name: Verify publishable crate archives
         run: cargo package -p classeve-rai-infer -p classeve-rai-compress --locked
 
+      # Licenses, bans and sources over the whole graph. Nothing previously
+      # checked what a dependency's license actually permitted, which matters
+      # because a release archive is a binary distribution of every crate below
+      # us. Advisories are deliberately not listed here: `cargo audit` above
+      # owns those and reads `.cargo/audit.toml`, and duplicating the check
+      # would mean a second RustSec parser and a second ignore list.
+      - name: License, ban and source policy
+        run: |
+          cargo install cargo-deny --version 0.18.2 --locked
+          cargo deny --all-features check licenses bans sources
+
+      # The attribution that ships with the binaries has to describe the
+      # binaries that ship. Regenerating and diffing is what makes a dependency
+      # bump change the notices in the same commit, instead of six months later
+      # when somebody notices.
+      - name: Third-party notices are current
+        run: |
+          cargo install cargo-about --version 0.7.1 --locked
+          # cargo-about asks api.clearlydefined.io for the license text of any
+          # crate whose own files do not settle it. When that request fails it
+          # warns and carries on, and the file it then writes groups a dozen
+          # crates under different license texts and drops whole sections — a
+          # real difference, produced by a network blip rather than by the
+          # dependency graph. Diffing that against the committed copy would fail
+          # this job with a message telling the author to regenerate a file that
+          # was already correct. The request is flaky enough to have failed on
+          # three of four attempts from one host while `curl` to the same
+          # endpoint returned 200, so retry it here rather than spend a human on
+          # it, and only give up — with the real reason — if every attempt fails.
+          #
+          # `--offline` would remove the dependency on that service outright and
+          # is deliberately not used: its own documentation says it falls back to
+          # a default license file, "missing eg. copyright information", and
+          # reproducing that information is the entire point of this file.
+          for attempt in 1 2 3 4 5; do
+            cargo about generate --manifest-path rai-infer/Cargo.toml \
+              -c about.toml about.hbs -o /tmp/notices.md 2> /tmp/notices.warn
+            grep -q 'failed to request license information' /tmp/notices.warn || break
+            echo "attempt $attempt: the clearly-defined lookup failed, retrying"
+            sleep $((attempt * 5))
+          done
+          cat /tmp/notices.warn
+
+          if grep -q 'failed to request license information' /tmp/notices.warn; then
+            echo "::error::cargo-about could not reach api.clearlydefined.io on any of"
+            echo "::error::five attempts, so the regenerated notices are incomplete and"
+            echo "::error::this comparison is void. This is a network failure, not a"
+            echo "::error::stale THIRD-PARTY-NOTICES.md."
+            exit 1
+          fi
+
+          if ! diff -u THIRD-PARTY-NOTICES.md /tmp/notices.md; then
+            echo "::error::THIRD-PARTY-NOTICES.md is stale — regenerate it with:"
+            echo "::error::  cargo about generate --manifest-path rai-infer/Cargo.toml -c about.toml about.hbs -o THIRD-PARTY-NOTICES.md"
+            exit 1
+          fi
+
   container:
     name: Container build and MCP smoke
     runs-on: ubuntu-24.04
@@ -160,8 +217,36 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Build pinned image
-        run: docker build --tag rai-audit:local .
+      # Two images, and the default one is asserted to be the product. A bare
+      # `docker build .` used to produce the memory service, so the artifact a
+      # user gets by following the obvious command was not what this repository
+      # ships. The CLI smoke below is what keeps that from drifting back.
+      - name: Build the default image (must be the inference CLI)
+        run: docker build --tag rai-cli:local .
+
+      - name: Smoke-test the default image
+        run: |
+          set -euo pipefail
+          # `rai --help` names every product subcommand. If the default stage
+          # ever points at the server again, this fails immediately.
+          docker run --rm rai-cli:local rai --help | tee /tmp/rai-cli-help.txt
+          for sub in convert run serve models perplexity; do
+            grep -qE "^\s*$sub\b" /tmp/rai-cli-help.txt               || { echo "::error::default image does not offer 'rai $sub' — it is not the inference CLI"; exit 1; }
+          done
+          # The product image must carry no TLS or HTTP stack. Same assertion
+          # the release workflow makes about the archive binaries.
+          cid=$(docker create rai-cli:local)
+          docker cp "$cid:/usr/local/bin/rai" /tmp/rai-bin
+          docker rm "$cid" >/dev/null
+          for marker in rustls webpki BoringSSL reqwest; do
+            if grep -qaiF "$marker" /tmp/rai-bin; then
+              echo "::error::the rai binary contains '$marker' — the engine must carry no TLS or HTTP stack"
+              exit 1
+            fi
+          done
+
+      - name: Build the non-product memory-service image
+        run: docker build --target server --tag rai-audit:local .
 
       # This used to assert only that the initialize response contained
       # "rai-server" — i.e. that the binary starts and can complete a

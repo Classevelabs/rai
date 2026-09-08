@@ -415,6 +415,62 @@ def test_resolve_head_dim():
         raise AssertionError("decoupled head_dim was accepted")
 
 
+def test_read_rope_theta_across_transformers_versions():
+    """The RoPE base must survive both config layouts, and never be guessed.
+
+    transformers 4 exposes `cfg.rope_theta`; transformers 5 moved it into
+    `cfg.rope_parameters` and dropped the attribute. Every exporter used to
+    read it as `getattr(cfg, "rope_theta", 10000.0)`, so on 5.x the fallback
+    won silently and SmolLM2-1.7B exported with 10000 instead of 130000 — a
+    file that validates, loads, and generates with the wrong positional
+    encoding.
+
+    Nothing in this suite caught that, because every fixture here uses a
+    rope_theta of exactly 10000.0 — the value the broken fallback produces —
+    and because no test loaded a real HuggingFace config at all. These stubs
+    stand in for both layouts so the resolver is exercised without needing
+    transformers installed.
+    """
+    class Transformers4:
+        rope_theta = 130000.0
+
+    class Transformers5:
+        rope_parameters = {"rope_theta": 130000.0, "rope_type": "default"}
+
+    class Both:
+        # A 5.x config that still carries the old attribute must prefer the
+        # new location, which is the one transformers keeps current.
+        rope_theta = 10000.0
+        rope_parameters = {"rope_theta": 500000.0, "rope_type": "default"}
+
+    class Neither:
+        pass
+
+    assert raimodel.read_rope_theta(Transformers4()) == 130000.0
+    assert raimodel.read_rope_theta(Transformers5()) == 130000.0
+    assert raimodel.read_rope_theta(Both()) == 500000.0
+
+    # A default here is worse than a failure: it is unrecoverable by the
+    # reader and invisible to the user.
+    try:
+        raimodel.read_rope_theta(Neither())
+    except ValueError as exc:
+        assert "rope_theta" in str(exc)
+    else:
+        raise AssertionError("a config with no RoPE base was silently defaulted")
+
+    # A malformed rope_parameters must not be read as if it were absent-and-fine.
+    class Malformed:
+        rope_parameters = {"rope_type": "default"}
+
+    try:
+        raimodel.read_rope_theta(Malformed())
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("rope_parameters without a rope_theta was accepted")
+
+
 def test_validate_export_options():
     parser = _FakeParser()
     good = argparse.Namespace(
@@ -776,6 +832,7 @@ TESTS = [
     test_embedding_8bit_roundtrip,
     test_validate_model_config,
     test_resolve_head_dim,
+    test_read_rope_theta_across_transformers_versions,
     test_validate_export_options,
     test_require_calibration_chunks,
     test_copy_tokenizer_json,

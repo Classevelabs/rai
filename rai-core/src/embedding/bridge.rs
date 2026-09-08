@@ -9,7 +9,13 @@ use tokio::sync::{RwLock, RwLockWriteGuard};
 
 /// Bridges text to memory vector space via external embeddings + projection.
 pub struct EmbeddingBridge {
-    /// External embedding provider (OpenAI, local, mock).
+    /// The embedding provider. Two implementations exist: `OpenAIEmbedder`,
+    /// which calls an OpenAI-compatible HTTP endpoint, and `MockEmbedder`,
+    /// which is deterministic and carries no semantics at all. There is no
+    /// local model here — this crate contains no inference. Anything stored
+    /// through it is embedded by whatever `RAI_EMBEDDING_PROVIDER` names, and
+    /// with the only real provider that means the text is sent to that
+    /// endpoint.
     embedder: Arc<dyn Embedder>,
     /// Projection from embedding space to the memory address space.
     pub omega_proj: Projection,

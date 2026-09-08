@@ -25,7 +25,7 @@
 //! Binary layout is documented in `format.rs` (the reader) and in the
 //! `raimodel.py` module docstring.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use half::f16;
 use rayon::prelude::*;
 use std::cell::Cell;
@@ -34,8 +34,16 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::format::PROJECTION_NAMES;
-use crate::layers::{Activation, RopeScaling};
+// The container's capacity limits are defined once, by the reader that
+// enforces them (`format.rs`) and by the kernels they protect (`gemm.rs`,
+// `layers.rs`). The writer imports them so a converted file is, by
+// construction, a file this build can load.
+use crate::format::{
+    MAX_CONTEXT, MAX_HEADS, MAX_HIDDEN_SIZE, MAX_INTERMEDIATE_SIZE, MAX_LAYERS, MAX_VOCAB_SIZE,
+    PROJECTION_NAMES,
+};
+use crate::gemm::MAX_GROUPS as MAX_GEMM_GROUPS;
+use crate::layers::{Activation, RopeScaling, MAX_ROPE_TABLE_BYTES};
 use crate::safetensors::SafeTensorsSet;
 
 /// Smallest positive (subnormal) f16; scales are clamped to at least this so a
@@ -43,19 +51,17 @@ use crate::safetensors::SafeTensorsSet;
 /// `float(np.nextafter(np.float16(0), np.float16(1)))`.
 const MIN_F16_SCALE: f64 = 5.960464477539063e-8;
 
+/// Candidate clipping ranges tried per group during a calibrated conversion.
+///
+/// Eight steps walk the group's span down to half of itself. The objective is
+/// flat enough between neighbouring steps that a finer grid buys nothing
+/// measurable, and each extra step costs one more pass over every weight in the
+/// model.
+const CALIBRATION_SHRINK_STEPS: usize = 8;
+
 const HEADER_SIZE_V1: u64 = 64;
 const HEADER_SIZE_V2: u64 = 128;
 const SECTION_ENTRY_SIZE: u64 = 16;
-
-// Reader limits, mirrored so a bad export fails before any work is done.
-const MAX_HIDDEN_SIZE: u32 = 65_536;
-const MAX_INTERMEDIATE_SIZE: u32 = 1_048_576;
-const MAX_LAYERS: u32 = 1_024;
-const MAX_HEADS: u32 = 1_024;
-const MAX_VOCAB_SIZE: u32 = 10_000_000;
-const MAX_CONTEXT: u32 = 1_000_000;
-const MAX_GEMM_GROUPS: usize = 128;
-const MAX_ROPE_TABLE_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Weights read per streaming block, in elements (~8 MB as f32).
 const BLOCK_ELEMENTS: usize = 2 << 20;
@@ -124,6 +130,17 @@ pub struct ConvertOptions {
     pub tokenizer_out: Option<PathBuf>,
     /// Suppress progress output.
     pub quiet: bool,
+    /// Text to calibrate against. `None` is the round-to-nearest path.
+    ///
+    /// Calibration runs this text through the checkpoint and uses what each
+    /// projection actually sees to choose that projection's quantization
+    /// parameters. It costs a forward pass and buys accuracy that looking at
+    /// the weights alone cannot.
+    pub calibration_text: Option<PathBuf>,
+    /// Sequences to calibrate on.
+    pub calibration_sequences: usize,
+    /// Tokens per calibration sequence.
+    pub calibration_seq_len: usize,
 }
 
 impl Default for ConvertOptions {
@@ -136,6 +153,9 @@ impl Default for ConvertOptions {
             max_context: FOLLOW_MODEL_CONTEXT,
             tokenizer_out: None,
             quiet: false,
+            calibration_text: None,
+            calibration_sequences: 16,
+            calibration_seq_len: 512,
         }
     }
 }
@@ -782,6 +802,65 @@ pub fn convert_with_progress(
         file.write_all(&size.to_le_bytes())?;
     }
 
+    // ---- Calibration -------------------------------------------------------
+    //
+    // Runs before anything is written. It reads the original weights, so it is
+    // independent of the quantization that follows and the streaming writer
+    // below is unchanged by its presence.
+    #[cfg(feature = "cli")]
+    let calibration = match options.calibration_text.as_ref() {
+        None => None,
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("reading calibration text {}", path.display()))?;
+            let tokenizer_path = options.model_dir.join("tokenizer.json");
+            let tokens = calibration_tokens(
+                &tokenizer_path,
+                &text,
+                options.calibration_sequences,
+                options.calibration_seq_len,
+            )?;
+            log(&format!(
+                "\n=== CALIBRATION ===\n  {} sequences of {} tokens from {}",
+                options.calibration_sequences,
+                options.calibration_seq_len,
+                path.display()
+            ));
+            let started = Instant::now();
+            let energy = collect_calibration_energy(
+                &mut store,
+                &config,
+                &layout,
+                &linear_dims,
+                expert_layout.as_ref(),
+                &tokens,
+                options.calibration_seq_len,
+                &log,
+            )?;
+            log(&format!(
+                "  calibration finished in {:.1}s",
+                started.elapsed().as_secs_f64()
+            ));
+            Some(energy)
+        }
+    };
+    #[cfg(not(feature = "cli"))]
+    let calibration: Option<()> = None;
+
+    // Calibration is the better path and cannot be the automatic one: it needs
+    // representative text, and a converter that shipped a corpus inside the
+    // binary or fetched one over the network would be trading away two things
+    // this product is defined by. Naming the cost is the honest substitute for
+    // choosing it silently.
+    if options.calibration_text.is_none() {
+        log(
+            "\nQuantizing by round-to-nearest. On SmolLM2-1.7B this costs 30.3% perplexity \
+             against the fp16 checkpoint where --calibration-text costs 16.6%, for a file of \
+             exactly the same size. Pass --calibration-text <file> with a few thousand tokens \
+             of representative text to use it.",
+        );
+    }
+
     let quant_started = Instant::now();
 
     // ---- Section 0: embedding (8-bit) --------------------------------------
@@ -800,6 +879,7 @@ pub fn convert_with_progress(
             group_size: embed_group_size,
             bits: 8,
             emit_dims: false,
+        channel_energy: None,
         },
     )?;
     log(&format!(
@@ -817,6 +897,12 @@ pub fn convert_with_progress(
         for (index, (name, (rows, cols))) in LAYER_LINEAR_NAMES.iter().zip(linear_dims).enumerate()
         {
             let label = format!("L{layer}.{name}");
+            #[cfg(feature = "cli")]
+            let channel_energy = calibration
+                .as_ref()
+                .and_then(|e| e.for_projection(layer as usize, index));
+            #[cfg(not(feature = "cli"))]
+            let channel_energy: Option<&[f64]> = None;
             let source = match (expert_layout, index) {
                 // A sparse layer has no `mlp.gate_proj`: its first expert is
                 // the layer's MLP, which is what keeps a dense file unchanged.
@@ -838,6 +924,7 @@ pub fn convert_with_progress(
                     group_size,
                     bits: 4,
                     emit_dims: true,
+        channel_energy,
                 },
             )?;
             if *name == "q_proj" || *name == "down_proj" {
@@ -905,6 +992,7 @@ pub fn convert_with_progress(
                             group_size,
                             bits: 4,
                             emit_dims: true,
+        channel_energy: None,
                         },
                     )?;
                 }
@@ -949,6 +1037,7 @@ pub fn convert_with_progress(
                 group_size,
                 bits: 4,
                 emit_dims: true,
+        channel_energy: None,
             },
         )?;
         log(&format!(
@@ -1144,7 +1233,9 @@ fn validate_model_config(config: &RaiConfig) -> Result<()> {
     }
 
     let rope_bytes = rope_table_bytes(config.head_dim, config.max_context);
-    if rope_bytes > MAX_ROPE_TABLE_BYTES {
+    // Widening only: `usize` is at least 32 bits everywhere this builds, and
+    // the constant is 512 MiB.
+    if rope_bytes > MAX_ROPE_TABLE_BYTES as u64 {
         bail!(
             "RoPE table would need {rope_bytes} bytes (max_context={}, head_dim={}); the \
              reader's maximum is {MAX_ROPE_TABLE_BYTES}. Lower --max-context.",
@@ -1175,7 +1266,7 @@ fn rope_table_context_limit(head_dim: u32) -> u32 {
         // no context is the binding constraint here.
         return MAX_CONTEXT;
     }
-    u32::try_from(MAX_ROPE_TABLE_BYTES / per_position).unwrap_or(u32::MAX)
+    u32::try_from(MAX_ROPE_TABLE_BYTES as u64 / per_position).unwrap_or(u32::MAX)
 }
 
 /// KV-cache bytes the runtime allocates for `max_context`.
@@ -2456,6 +2547,307 @@ struct MatrixJob<'a> {
     bits: u32,
     /// Linears carry an `[u32 rows][u32 cols]` sub-header; the embedding does not.
     emit_dims: bool,
+    /// Per-input-channel activation energy from calibration, if this
+    /// conversion is calibrated.
+    ///
+    /// `None` is the uncalibrated path and reproduces `export_rtn.py` byte for
+    /// byte. `Some` selects group parameters that minimise the error the layer
+    /// actually makes rather than the error its weights suggest — the same
+    /// quantity, weighted by how much each input channel is used.
+    channel_energy: Option<&'a [f64]>,
+}
+
+/// Read one projection's weights as f32, honouring a fused-tensor row offset.
+#[cfg(feature = "cli")]
+fn read_projection_f32(
+    store: &mut SafeTensorsSet,
+    source: &ProjectionSource,
+    rows: usize,
+    out: &mut Vec<f32>,
+) -> Result<()> {
+    store.read_rows(&source.tensor, source.row_offset, rows, out)
+}
+
+/// Read a projection's bias when the config says it has one.
+#[cfg(feature = "cli")]
+fn read_projection_bias(
+    store: &mut SafeTensorsSet,
+    config: &RaiConfig,
+    layer: u32,
+    index: usize,
+    rows: usize,
+) -> Result<Option<Vec<f32>>> {
+    if !config.has_bias(index) {
+        return Ok(None);
+    }
+    let name = layer_bias_name(layer, LAYER_LINEAR_NAMES[index]);
+    // A bias is 1-D, like the norms.
+    let mut buffer = store.read_all(&name, rows)?;
+    ensure!(
+        buffer.len() >= rows,
+        "bias '{name}' has {} values but the projection has {rows} rows",
+        buffer.len()
+    );
+    buffer.truncate(rows);
+    Ok(Some(buffer))
+}
+
+/// Per-projection input energy for one model, indexed by layer.
+///
+/// Four vectors per layer, one for each group of projections that shares an
+/// input: `q`/`k`/`v` see the attention norm's output, `o` sees the attention
+/// output, `gate`/`up` see the MLP norm's output, and `down` sees the
+/// activation product.
+#[cfg(feature = "cli")]
+pub(crate) struct CalibrationEnergy {
+    qkv: Vec<Vec<f64>>,
+    o: Vec<Vec<f64>>,
+    gate_up: Vec<Vec<f64>>,
+    down: Vec<Vec<f64>>,
+}
+
+#[cfg(feature = "cli")]
+impl CalibrationEnergy {
+    /// The energy vector for one projection index within a layer, in
+    /// [`PROJECTION_NAMES`] order.
+    pub(crate) fn for_projection(&self, layer: usize, index: usize) -> Option<&[f64]> {
+        match index {
+            0..=2 => self.qkv.get(layer).map(Vec::as_slice),
+            3 => self.o.get(layer).map(Vec::as_slice),
+            4 | 5 => self.gate_up.get(layer).map(Vec::as_slice),
+            6 => self.down.get(layer).map(Vec::as_slice),
+            _ => None,
+        }
+    }
+}
+
+/// Tokenize the calibration text and trim it to whole sequences.
+#[cfg(feature = "cli")]
+fn calibration_tokens(
+    tokenizer_path: &std::path::Path,
+    text: &str,
+    sequences: usize,
+    seq_len: usize,
+) -> Result<Vec<u32>> {
+    let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path)
+        .map_err(|error| anyhow::anyhow!("could not read {}: {error}", tokenizer_path.display()))?;
+    // No special tokens: the corpus is continuous prose, and a BOS inserted at
+    // every sequence boundary would be a position the text does not contain.
+    let encoding = tokenizer
+        .encode(text, false)
+        .map_err(|error| anyhow::anyhow!("could not tokenize the calibration text: {error}"))?;
+    let ids = encoding.get_ids();
+
+    let wanted = sequences
+        .checked_mul(seq_len)
+        .context("calibration size overflows")?;
+    ensure!(
+        ids.len() >= wanted,
+        "the calibration text tokenizes to {} tokens but {sequences} sequences of {seq_len}          need {wanted}. Use a longer text, or lower --calibration-sequences.",
+        ids.len()
+    );
+    Ok(ids[..wanted].to_vec())
+}
+
+/// Run the checkpoint over the calibration tokens, collecting per-projection
+/// input energy.
+///
+/// Refuses rather than approximates: every capability the config declares must
+/// be one this pass reproduces, or the statistics describe a different model.
+#[cfg(feature = "cli")]
+#[allow(clippy::too_many_arguments)]
+fn collect_calibration_energy(
+    store: &mut SafeTensorsSet,
+    config: &RaiConfig,
+    layout: &ProjectionLayout,
+    linear_dims: &[(usize, usize); 7],
+    expert_layout: Option<&ExpertLayout>,
+    tokens: &[u32],
+    seq_len: usize,
+    log: &dyn Fn(&str),
+) -> Result<CalibrationEnergy> {
+    use crate::calibrate::{
+        accumulate_channel_energy, apply_rope, causal_attention, matmul_t,
+    };
+
+    ensure!(
+        expert_layout.is_none(),
+        "calibrated conversion does not support mixture-of-experts checkpoints yet: which          expert sees which token is a routing decision this pass would have to reproduce          exactly, and approximating it would quantize the model against activations it never          sees. Convert without --calibrate."
+    );
+    ensure!(
+        !config.has_sandwich_norm && !config.post_norm,
+        "calibrated conversion does not support sandwich-normed or post-norm checkpoints yet.          Convert without --calibrate."
+    );
+
+    let hidden = config.hidden_size as usize;
+    let heads = config.num_heads as usize;
+    let kv_heads = config.num_kv_heads as usize;
+    let head_dim = config.head_dim as usize;
+    let inter = config.intermediate_size as usize;
+    let layers = config.num_layers as usize;
+    let attn_dim = heads * head_dim;
+    let kv_dim = kv_heads * head_dim;
+    let sequences = tokens.len() / seq_len;
+
+    let mut energy = CalibrationEnergy {
+        qkv: vec![vec![0.0; hidden]; layers],
+        o: vec![vec![0.0; attn_dim]; layers],
+        gate_up: vec![vec![0.0; hidden]; layers],
+        down: vec![vec![0.0; inter]; layers],
+    };
+
+    // The residual stream for every calibration token at once.
+    let mut hidden_state = vec![0.0f32; tokens.len() * hidden];
+    let embed_name = "model.embed_tokens.weight";
+    let mut row = Vec::new();
+    for (index, &token) in tokens.iter().enumerate() {
+        store.read_rows(embed_name, token as usize, 1, &mut row)?;
+        let dst = &mut hidden_state[index * hidden..(index + 1) * hidden];
+        dst.copy_from_slice(&row[..hidden]);
+        if config.embed_scale != 1.0 {
+            for value in dst.iter_mut() {
+                *value *= config.embed_scale;
+            }
+        }
+    }
+
+    let rope = crate::layers::RoPETable::with_scaling(
+        head_dim,
+        seq_len,
+        config.rope_theta,
+        config.rope_scaling,
+    )?;
+    let half = head_dim / 2;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    let mut normed = vec![0.0f32; tokens.len() * hidden];
+    let mut q = vec![0.0f32; tokens.len() * attn_dim];
+    let mut k = vec![0.0f32; tokens.len() * kv_dim];
+    let mut v = vec![0.0f32; tokens.len() * kv_dim];
+    let mut attn = vec![0.0f32; tokens.len() * attn_dim];
+    let mut gate = vec![0.0f32; tokens.len() * inter];
+    let mut up = vec![0.0f32; tokens.len() * inter];
+    let mut projected = vec![0.0f32; tokens.len() * hidden];
+    let mut weights = Vec::new();
+
+    for layer in 0..layers {
+        log(&format!("  calibrating layer {}/{layers}", layer + 1));
+
+        // ---- attention input ------------------------------------------------
+        let [attn_norm_name, mlp_norm_name] =
+            tail_norm_names(layer as u32, config.has_sandwich_norm, config.post_norm);
+        // Norms are 1-D vectors, so they need `read_all`; `read_rows` demands a
+        // 2-D matrix and refuses a `[hidden]` tensor outright.
+        let attn_norm = store.read_all(&attn_norm_name, hidden)?;
+        for t in 0..tokens.len() {
+            crate::layers::rms_norm(
+                &mut normed[t * hidden..(t + 1) * hidden],
+                &hidden_state[t * hidden..(t + 1) * hidden],
+                &attn_norm,
+                config.norm_eps,
+            );
+        }
+        accumulate_channel_energy(&mut energy.qkv[layer], &normed, tokens.len(), hidden);
+
+        // ---- q, k, v --------------------------------------------------------
+        for (index, out) in [(0usize, &mut q), (1, &mut k), (2, &mut v)] {
+            let (rows, cols) = linear_dims[index];
+            let source = layout.source(layer as u32, index, linear_dims);
+            read_projection_f32(store, &source, rows, &mut weights)?;
+            let bias = read_projection_bias(store, config, layer as u32, index, rows)?;
+            matmul_t(out, &normed, &weights, bias.as_deref(), tokens.len(), rows, cols)?;
+        }
+
+        if config.has_qk_norm || config.has_full_qk_norm {
+            bail!(
+                "calibrated conversion does not support per-head QK norms yet (Qwen3, Gemma3).                  Convert without --calibrate."
+            );
+        }
+
+        // ---- rotary position embedding, per sequence ------------------------
+        for s in 0..sequences {
+            let q_span = &mut q[s * seq_len * attn_dim..(s + 1) * seq_len * attn_dim];
+            apply_rope(q_span, &rope.cos[..seq_len * half], &rope.sin[..seq_len * half],
+                       seq_len, heads, head_dim)?;
+            let k_span = &mut k[s * seq_len * kv_dim..(s + 1) * seq_len * kv_dim];
+            apply_rope(k_span, &rope.cos[..seq_len * half], &rope.sin[..seq_len * half],
+                       seq_len, kv_heads, head_dim)?;
+        }
+
+        // ---- attention, per sequence ---------------------------------------
+        for s in 0..sequences {
+            causal_attention(
+                &mut attn[s * seq_len * attn_dim..(s + 1) * seq_len * attn_dim],
+                &q[s * seq_len * attn_dim..(s + 1) * seq_len * attn_dim],
+                &k[s * seq_len * kv_dim..(s + 1) * seq_len * kv_dim],
+                &v[s * seq_len * kv_dim..(s + 1) * seq_len * kv_dim],
+                seq_len, heads, kv_heads, head_dim, scale,
+            )?;
+        }
+        accumulate_channel_energy(&mut energy.o[layer], &attn, tokens.len(), attn_dim);
+
+        // ---- output projection and residual ---------------------------------
+        let (rows, cols) = linear_dims[3];
+        let source = layout.source(layer as u32, 3, linear_dims);
+        read_projection_f32(store, &source, rows, &mut weights)?;
+        let bias = read_projection_bias(store, config, layer as u32, 3, rows)?;
+        matmul_t(&mut projected, &attn, &weights, bias.as_deref(), tokens.len(), rows, cols)?;
+        for (h, p) in hidden_state.iter_mut().zip(projected.iter()) {
+            *h += *p;
+        }
+
+        // ---- MLP input ------------------------------------------------------
+        let mlp_norm = store.read_all(&mlp_norm_name, hidden)?;
+        for t in 0..tokens.len() {
+            crate::layers::rms_norm(
+                &mut normed[t * hidden..(t + 1) * hidden],
+                &hidden_state[t * hidden..(t + 1) * hidden],
+                &mlp_norm,
+                config.norm_eps,
+            );
+        }
+        accumulate_channel_energy(&mut energy.gate_up[layer], &normed, tokens.len(), hidden);
+
+        // ---- gate, up, activation -------------------------------------------
+        for (index, out) in [(4usize, &mut gate), (5, &mut up)] {
+            let (rows, cols) = linear_dims[index];
+            let source = layout.source(layer as u32, index, linear_dims);
+            read_projection_f32(store, &source, rows, &mut weights)?;
+            let bias = read_projection_bias(store, config, layer as u32, index, rows)?;
+            matmul_t(out, &normed, &weights, bias.as_deref(), tokens.len(), rows, cols)?;
+        }
+        for t in 0..tokens.len() {
+            crate::layers::glu_mul_inplace(
+                config.activation,
+                &mut gate[t * inter..(t + 1) * inter],
+                &up[t * inter..(t + 1) * inter],
+                inter,
+            );
+        }
+        accumulate_channel_energy(&mut energy.down[layer], &gate, tokens.len(), inter);
+
+        // ---- down projection and residual ------------------------------------
+        let (rows, cols) = linear_dims[6];
+        let source = layout.source(layer as u32, 6, linear_dims);
+        read_projection_f32(store, &source, rows, &mut weights)?;
+        let bias = read_projection_bias(store, config, layer as u32, 6, rows)?;
+        matmul_t(&mut projected, &gate, &weights, bias.as_deref(), tokens.len(), rows, cols)?;
+        for (h, p) in hidden_state.iter_mut().zip(projected.iter()) {
+            *h += *p;
+        }
+    }
+
+    // The Hessian diagonal is a mean, not a sum, so the shrink search behaves
+    // the same whatever calibration size was chosen.
+    let n = tokens.len() as f64;
+    for group in [&mut energy.qkv, &mut energy.o, &mut energy.gate_up, &mut energy.down] {
+        for vector in group.iter_mut() {
+            for value in vector.iter_mut() {
+                *value /= n;
+            }
+        }
+    }
+    Ok(energy)
 }
 
 /// Quantize one matrix straight into the output file and return its MSE.
@@ -2520,6 +2912,7 @@ fn write_matrix(file: &mut File, store: &mut SafeTensorsSet, job: &MatrixJob<'_>
                     row_codes,
                     job.label,
                     row_start + index,
+                    job.channel_energy,
                 )
             })
             .collect::<Result<Vec<f64>>>()?;
@@ -2557,6 +2950,7 @@ fn quantize_row(
     codes_out: &mut [u8],
     label: &str,
     row_index: usize,
+    channel_energy: Option<&[f64]>,
 ) -> Result<f64> {
     let cols = row.len();
     let max_code = (n_levels - 1) as f64;
@@ -2591,9 +2985,25 @@ fn quantize_row(
             }
         }
 
-        let scale = ((max - min) / max_code).max(MIN_F16_SCALE);
+        // Calibrated conversions replace the range fit with a weighted one.
+        // The uncalibrated expression above is left exactly as it was: it is
+        // held byte-identical to the Python exporter by a test, and the
+        // signed-zero tie-breaking in the min/max loop is part of that.
+        let (scale, zero) = match channel_energy {
+            None => (((max - min) / max_code).max(MIN_F16_SCALE), min),
+            Some(energy) => {
+                let values: Vec<f64> = group.iter().map(|&v| v as f64).collect();
+                let (scale, zero) = crate::calibrate::group_params_weighted(
+                    &values,
+                    &energy[group_start..group_end],
+                    n_levels.trailing_zeros() as u8,
+                    CALIBRATION_SHRINK_STEPS,
+                );
+                (scale.max(MIN_F16_SCALE), zero)
+            }
+        };
         let scale_f16 = f16::from_f64(scale);
-        let zero_f16 = f16::from_f64(min);
+        let zero_f16 = f16::from_f64(zero);
         if !scale_f16.is_finite() || scale_f16 <= f16::ZERO || !zero_f16.is_finite() {
             bail!(
                 "{label} row {row_index} group {group_index} produced non-finite or non-positive \
@@ -3472,8 +3882,8 @@ mod tests {
         assert!(error.contains("MAX_ROPE_TABLE_BYTES"), "{error}");
         assert!(error.contains("--max-context 131072"), "{error}");
         assert_eq!(rope_table_context_limit(1024), 131_072);
-        assert!(rope_table_bytes(1024, 131_072) <= MAX_ROPE_TABLE_BYTES);
-        assert!(rope_table_bytes(1024, 131_073) > MAX_ROPE_TABLE_BYTES);
+        assert!(rope_table_bytes(1024, 131_072) <= MAX_ROPE_TABLE_BYTES as u64);
+        assert!(rope_table_bytes(1024, 131_073) > MAX_ROPE_TABLE_BYTES as u64);
 
         // head_dim 128: the table would allow 1048576 positions, so the
         // container's own hard cap is the binding limit instead.

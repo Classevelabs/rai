@@ -8,8 +8,8 @@ requirements, source installs, the container, and model conversion.
 RAI is distributed as prebuilt release archives, its public source repository,
 and two crates.io packages, `classeve-rai-infer` and `classeve-rai-compress`.
 The memory-service crates (`rai-server`, `rai-core`, `rem-nra`) build from
-source only — they are `publish = false` on purpose; the note at the top of
-their manifests says why.
+source only. They are `publish = false` on purpose, they are in no release
+archive, and the note at the top of their manifests says why.
 
 ## Requirements
 
@@ -28,9 +28,11 @@ cd rai
 cargo build --workspace --release --locked
 ```
 
-That produces `rai` (the whole command-line surface) and `rai-server` (the
-memory service), plus the deprecated `rai-convert` / `rai-generate` /
-`rai-chat` wrappers.
+That produces `rai` (the whole command-line surface) plus the deprecated
+`rai-convert` / `rai-generate` / `rai-chat` wrappers — and, because
+`--workspace` builds every crate in the tree, the non-product `rai-server`
+as well. Release archives are built from `--package classeve-rai-infer`
+alone; build that package if you want only what RAI ships.
 
 The repository's `.cargo/config.toml` pins x86-64 builds to `target-cpu=x86-64-v2`,
 the same floor the published release archives use, so the binary you just built
@@ -49,15 +51,14 @@ That binary is for the build machine alone. Run it on any CPU that lacks an
 instruction the compiler chose to use and it dies with SIGILL, on startup, with
 no diagnostic naming the cause.
 
-Install the two end-user binary crates from a checkout:
+Install the end-user binary crate from a checkout:
 
 ```bash
 cargo install --locked --path rai-infer     # rai, and the deprecated wrappers
-cargo install --locked --path rai-server    # rai-server
 ```
 
 The published crate can be installed by name — this covers `rai` and the
-wrappers; `rai-server` installs from a checkout only:
+wrappers:
 
 ```bash
 cargo install classeve-rai-infer --locked
@@ -113,7 +114,18 @@ and refuse all three.
 | --- | --- | --- | --- |
 | Round-to-nearest | `rai convert` | Nothing beyond the RAI build | Default. No Python, no torch. |
 | Round-to-nearest | `export_rtn.py` | Python, torch, transformers | You want the reference implementation to compare against. |
-| GPTQ (calibrated) | `export_raimodel.py`, `export_fast.py` | Python, torch, transformers, datasets, and a calibration corpus | You want calibrated quantization and can spend the time. |
+| GPTQ (calibrated) | `export_raimodel.py`, `export_fast.py` | Python, torch, transformers, datasets, and a calibration corpus | You want calibrated quantization, can spend the time, **and your checkpoint is container-v1 shaped** — see the paragraph above. Qwen2/2.5, Qwen3, Gemma, OLMo2 and Phi-3 are refused by this path. |
+
+**What the calibrated path is worth.** On SmolLM2-1.7B — the one advertised
+checkpoint both paths accept — GPTQ costs **+11.2%** perplexity against the
+fp16 checkpoint where round-to-nearest costs **+30.3%**, and it agrees with
+fp16's greedy token 83.3% of the time against 75.4%. Both files are the same
+size in the same container and load through the same code, so the difference is
+free at run time; it costs an hour of calibration on a GPU. The full
+measurement, including why the paired comparison is the honest one, is in
+[BENCHMARKS.md](../BENCHMARKS.md#the-calibrated-quantizer-measured-end-to-end).
+If your checkpoint is one this path refuses, `rai convert`'s round-to-nearest
+is the only option and that +30.3% is what you are paying.
 
 ### Default path: `rai convert` (no Python)
 
@@ -131,16 +143,42 @@ cargo build --workspace --release --locked
 | --- | --- | --- |
 | `<MODEL_DIR>` | required | Positional: directory holding `config.json`, the safetensors weights, and `tokenizer.json` |
 | `-o`, `--output <FILE>` | `<dirname>-q4.raimodel` | Destination `.raimodel` path |
-| `--group-size <N>` | 128 | Columns per quantization group for the 4-bit linears |
+| `--group-size <N>` | 128 | Columns per quantization group for the 4-bit linears. Lower is more accurate and slightly larger — see [choosing a group size](./MODELS.md#choosing-a-group-size) |
+| `--calibration-text <FILE>` | none | Calibrate against this text. Slower, and measurably more accurate at the same file size |
+| `--calibration-sequences <N>` | 16 | Sequences to calibrate on |
+| `--calibration-seq-len <N>` | 512 | Tokens per calibration sequence |
 | `--embed-group-size <N>` | 64 | Columns per quantization group for the 8-bit embedding table |
 | `--max-context <TOKENS>` | the model's declared context | Context length baked into the RoPE table (hard cap 1,000,000) |
 | `--tokenizer-out <FILE>` | next to the output | Where `tokenizer.json` is copied |
 | `--quiet` | off | Suppress progress output |
 
-Raise `--group-size` for models whose `hidden_size` or `intermediate_size`
-exceeds 16,384; see the shape constraints in
-[MODELS.md](./MODELS.md#shape-constraints-that-apply-to-every-model).
+`--group-size` is the accuracy dial: 64 and 32 quantize in finer groups and
+produce a more accurate model for about 5% and 15% more file size. 128 is the
+default because it is what every previously published model uses and the only
+size older builds can load. See
+[choosing a group size](./MODELS.md#choosing-a-group-size).
+
 Lower `--max-context` for sliding-window models such as Mistral-7B.
+
+**Use `--calibration-text` if you can.** Round-to-nearest picks each weight's
+4-bit code by looking at the weight; calibration picks it by looking at what
+the weight does, which needs a sample of the activations the layer really sees.
+On SmolLM2-1.7B that is 9.22 perplexity against 10.30 — 10.5% better at an
+identical file size, no GPU and no Python:
+
+```bash
+rai convert /path/to/model --calibration-text wiki.train.raw
+```
+
+Any few thousand tokens of text representative of what the model will be used
+for will do; the default reads 16 sequences of 512 tokens from the start of the
+file. Conversion goes from seconds to minutes, and the resulting file is the
+same format and the same size — nothing about running it differs.
+
+Calibration is refused for mixture-of-experts, sandwich-normed and post-norm
+checkpoints and for per-head QK norms (Qwen3, Gemma3): reproducing those
+faithfully is work not yet done, and quantizing against statistics collected
+from a model that behaves differently would be worse than not calibrating.
 
 ### Calibrated path: the Python exporters
 

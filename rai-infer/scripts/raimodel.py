@@ -76,7 +76,7 @@ MAX_LAYERS = 1_024
 MAX_HEADS = 1_024
 MAX_VOCAB_SIZE = 10_000_000
 MAX_CONTEXT = 1_000_000
-MAX_GEMM_GROUPS = 128
+MAX_GEMM_GROUPS = 1024
 MAX_ROPE_TABLE_BYTES = 512 * 1024 * 1024
 
 # Fixed order of the seven quantized linears inside every layer section.
@@ -228,6 +228,48 @@ def resolve_head_dim(config_head_dim, hidden_size, num_heads):
             )
         return head_dim
     return hidden_size // num_heads
+
+
+def read_rope_theta(cfg):
+    """Read the RoPE base from a HuggingFace config, on any transformers version.
+
+    transformers 5 moved this value: on 4.x it is `cfg.rope_theta`, on 5.x it
+    lives in `cfg.rope_parameters["rope_theta"]` and the old attribute is gone.
+    Every exporter used to read it as `getattr(cfg, "rope_theta", 10000.0)`, so
+    on 5.x — which is what `requirements-lock.txt` pins and what a fresh
+    `pip install -r requirements.txt` resolves to — the fallback silently won
+    and the exported header carried the Llama constant instead of the model's
+    own base.
+
+    That is the worst shape a bug can take here. The export succeeds, the file
+    passes every validation, `rai run` loads it, and it generates text with the
+    wrong positional encoding. SmolLM2-1.7B (130000) exported as 10000;
+    Mistral v0.2+ (1000000) and Llama-3 (500000) are affected the same way.
+    Models that happen to use 10000 — TinyLlama, Phi-3, Gemma — were
+    accidentally correct, which is why this survived.
+
+    So: no default. A config this cannot read is a refusal, exactly as an
+    unrepresentable architecture is a refusal in
+    `assert_exportable_architecture`. A wrong RoPE base is not recoverable by
+    the reader and not visible to the user.
+    """
+    parameters = getattr(cfg, "rope_parameters", None)
+    if isinstance(parameters, dict) and parameters.get("rope_theta") is not None:
+        return float(parameters["rope_theta"])
+
+    theta = getattr(cfg, "rope_theta", None)
+    if theta is not None:
+        return float(theta)
+
+    raise ValueError(
+        "this checkpoint's config exposes no rope_theta, in neither the "
+        "transformers 4 location (cfg.rope_theta) nor the transformers 5 one "
+        "(cfg.rope_parameters['rope_theta']). Exporting with a guessed RoPE "
+        "base would produce a model that loads cleanly and generates with the "
+        "wrong positional encoding, so this is refused instead. If the "
+        "architecture genuinely has no RoPE base, it cannot be represented by "
+        "the .raimodel format."
+    )
 
 
 def require_calibration_chunks(num_chunks, seq_len, total_tokens):
@@ -793,7 +835,21 @@ def assert_exportable_architecture(model, config, max_context):
         )
 
     if problems:
+        # Naming the way out matters more here than usual. This path is the only
+        # one that does calibrated GPTQ, and the fallback is not free: on
+        # SmolLM2-1.7B, the one advertised checkpoint both paths accept, GPTQ
+        # costs +11.2% perplexity against fp16 where round-to-nearest costs
+        # +30.3% (BENCHMARKS.md). A user who hits this and is told only "cannot
+        # be represented" has no way to know they are about to pay that.
         raise RuntimeError(
-            "this checkpoint cannot be represented by the .raimodel format:\n  - "
+            "this checkpoint cannot be represented by the .raimodel container "
+            "version these scripts write (v1):\n  - "
             + "\n  - ".join(problems)
+            + "\n\n`rai convert` writes container v2 and does represent all of "
+            "the above, so it will convert this checkpoint. It quantizes by "
+            "round-to-nearest rather than by calibrated GPTQ, and that is a "
+            "measurable difference, not a formality: on the one checkpoint both "
+            "paths accept, round-to-nearest costs +30.3% perplexity against the "
+            "fp16 model where this path costs +11.2%. See "
+            "'The calibrated quantizer, measured end to end' in BENCHMARKS.md."
         )

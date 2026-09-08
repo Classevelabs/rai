@@ -62,6 +62,12 @@ enum Command {
     /// List the .raimodel files in a directory
     #[command(after_help = "EXAMPLE:\n  rai models\n  rai models ~/models")]
     Models(cli::models::ModelsArgs),
+
+    /// Measure perplexity on a text file — what quantization cost this model
+    #[command(
+        after_help = "EXAMPLE:\n  rai perplexity qwen2.5-1.5b-q4.raimodel --text wiki.test.raw\n\nSame method as llama-perplexity: non-overlapping chunks of --context\ntokens with the second half of each scored, so the two numbers are\ndirectly comparable. Compare a model against its own fp16 reference on\nthe same text and tokenizer; perplexity across different tokenizers is\nnot a comparison."
+    )]
+    Perplexity(cli::perplexity::PerplexityArgs),
 }
 
 fn main() -> Result<()> {
@@ -70,5 +76,6 @@ fn main() -> Result<()> {
         Command::Run(args) => cli::run::run(&args),
         Command::Serve(args) => cli::serve::run(&args),
         Command::Models(args) => cli::models::run(&args),
+        Command::Perplexity(args) => cli::perplexity::run(&args),
     }
 }

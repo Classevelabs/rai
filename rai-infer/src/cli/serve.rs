@@ -2030,6 +2030,12 @@ fn handle_convert(state: &ServerState, body: &str) -> Result<Value, ChatHttpErro
         output: Some(request.output),
         group_size: request.group_size.unwrap_or(128),
         embed_group_size: request.embed_group_size.unwrap_or(64),
+        // The conversion API does not expose calibration: it would mean the
+        // server reading a text file the client named, and the endpoint is
+        // deliberately narrow.
+        calibration_text: None,
+        calibration_sequences: 16,
+        calibration_seq_len: 512,
         max_context: request
             .max_context
             .unwrap_or(crate::convert::FOLLOW_MODEL_CONTEXT),
@@ -2122,6 +2128,14 @@ fn bind_loopback(port: u16) -> Result<Server> {
 /// and because a browser resolving `localhost` to `::1` sends the bracketed
 /// literal when the user typed it. It is still loopback: allowing it does not
 /// widen who can reach the server, which is what the `Host` check defends.
+///
+/// The non-product `rai-server` implements this same defence separately, and
+/// deliberately so. It is a different HTTP stack (axum against `tiny_http`),
+/// and sharing this function would mean `rai-server` depending on `rai-infer`
+/// — which would put the whole inference engine, and eventually a network
+/// stack, back on the wrong side of the product boundary. Two small
+/// implementations of one check is the cheaper of the two costs; what makes
+/// that safe is that each is tested against a real socket in its own crate.
 fn is_allowed_host(host: &str, port: u16) -> bool {
     host.eq_ignore_ascii_case(&format!("localhost:{port}"))
         || host == format!("127.0.0.1:{port}")

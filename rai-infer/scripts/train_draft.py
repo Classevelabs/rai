@@ -32,6 +32,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import raimodel  # noqa: E402  (needs the path line above)
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -286,7 +289,12 @@ def create_draft_model(
         num_key_value_heads=4,  # GQA with 4 KV heads
         max_position_embeddings=teacher_config.max_position_embeddings,
         rms_norm_eps=teacher_config.rms_norm_eps,
-        rope_theta=getattr(teacher_config, "rope_theta", 10000.0),
+        # Via raimodel, not a defaulting getattr: transformers 5 moved this
+        # value, and a draft model built with a different RoPE base than its
+        # teacher mismatches on every position. That does not fail — it lowers
+        # the speculative acceptance rate, which reads as "speculation does not
+        # help on this pair" rather than as a bug.
+        rope_theta=raimodel.read_rope_theta(teacher_config),
         tie_word_embeddings=False,
         torch_dtype=torch.float16,
     )

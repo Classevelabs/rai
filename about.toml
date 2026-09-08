@@ -1,0 +1,43 @@
+# cargo-about configuration for THIRD-PARTY-NOTICES.md.
+#
+# The generated file is the attribution that has to travel with the release
+# archives. Rust links its dependencies statically, so every crate below is
+# inside the `rai` executable a user downloads; Apache-2.0 §4(d) and the
+# individual MIT/BSD/ISC/Unicode terms all require their notices to be
+# reproduced with that distribution. `NOTICE` previously pointed at Cargo.lock,
+# which lists versions and no license text at all.
+#
+# Generated over `classeve-rai-infer` with its default `cli` feature — the
+# exact crate and feature set the archives are built from. The memory-service
+# crates are not included because they are in no archive.
+
+accepted = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+]
+
+# Build-time-only crates still end up in no shipped byte, but proc macros are
+# genuinely not linked into the binary and listing them would overstate what is
+# being distributed.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# Every target the release archives are built for.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+
+# A crate whose license file cannot be found is a hole in the attribution, and
+# a hole is the thing this file exists to close.
+private = { ignore = true }

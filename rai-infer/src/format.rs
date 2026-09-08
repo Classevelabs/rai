@@ -149,13 +149,30 @@ const KNOWN_FLAGS: u8 = FLAG_HAS_BIASES
     | FLAG_POST_NORM;
 /// Every `bias_mask` bit this reader understands (one per projection).
 const KNOWN_BIAS_MASK: u8 = 0x7F;
-const MAX_MODEL_FILE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
-const MAX_HIDDEN_SIZE: u32 = 65_536;
-const MAX_INTERMEDIATE_SIZE: u32 = 1_048_576;
-const MAX_LAYERS: u32 = 1_024;
-const MAX_HEADS: u32 = 1_024;
-const MAX_VOCAB_SIZE: u32 = 10_000_000;
-const MAX_CONTEXT: u32 = 1_000_000;
+// ---------------------------------------------------------------------------
+// Container capacity limits — the single definition
+//
+// The reader is the gate: a `.raimodel` that passes `validate_config` is one
+// the kernels are allowed to run, so these belong here, at the point of
+// enforcement, and nowhere else. `convert.rs` imports them rather than
+// declaring its own, because a writer that believed a looser limit than the
+// reader enforces would spend minutes quantizing a file the reader then
+// refuses — and one that believed a tighter one would refuse checkpoints RAI
+// can actually run.
+//
+// The Python exporter (`scripts/raimodel.py`) cannot import Rust, so it is
+// held to these values by `tests/limits_are_single_sourced.rs`, which reads
+// that file and fails on any disagreement. That test is the reason there is
+// no fourth copy waiting to drift.
+// ---------------------------------------------------------------------------
+
+pub const MAX_MODEL_FILE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+pub const MAX_HIDDEN_SIZE: u32 = 65_536;
+pub const MAX_INTERMEDIATE_SIZE: u32 = 1_048_576;
+pub const MAX_LAYERS: u32 = 1_024;
+pub const MAX_HEADS: u32 = 1_024;
+pub const MAX_VOCAB_SIZE: u32 = 10_000_000;
+pub const MAX_CONTEXT: u32 = 1_000_000;
 
 /// Model configuration extracted from the header.
 #[derive(Debug, Clone)]

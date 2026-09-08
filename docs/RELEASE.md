@@ -19,9 +19,32 @@ cargo build --workspace --release --locked
 cargo install cargo-audit --version 0.22.2 --locked --no-default-features
 cargo audit --deny warnings
 cargo package -p classeve-rai-infer -p classeve-rai-compress --locked
+cargo install cargo-deny --version 0.18.2 --locked
+cargo deny --all-features check licenses bans sources
+cargo install cargo-about --version 0.7.1 --locked
+cargo about generate --manifest-path rai-infer/Cargo.toml \
+    -c about.toml about.hbs -o /tmp/notices.md
+diff -u THIRD-PARTY-NOTICES.md /tmp/notices.md
 python -m compileall -q rai-infer/scripts
+python rai-infer/scripts/test_raimodel.py
+cargo bench --package classeve-rai-infer --bench gemm --locked
 docker build -t rai-release-candidate .
 ```
+
+The benchmark is a record, not a gate — throughput depends on the machine, and
+a release must not be blocked by a busy laptop. Read its `iqr%` column first:
+above about 5 the machine moved more than any kernel change is worth, and the
+medians beside it settle nothing. Compare against the previous release's run on
+the *same* machine, ideally alternating between the two builds.
+
+`cargo about` reaches `api.clearlydefined.io` for crates whose own files do not
+settle their license, and that request is flaky. If it warns
+`failed to request license information`, the file it wrote is missing license
+sections and the `diff` above means nothing — retry until it does not, exactly
+as `.github/workflows/ci.yml` does. Do not reach for `--offline` to make it
+quiet: it substitutes a default license file and drops copyright lines that only
+the upstream repository carries, which is the information this file exists to
+reproduce.
 
 `cargo +1.87.0 check` is what keeps `rust-version = "1.87"` honest; the
 repository otherwise builds on the pinned 1.95.0 toolchain.
@@ -65,8 +88,9 @@ Pushing a `v*` tag runs [`.github/workflows/release.yml`](../.github/workflows/r
 which needs no manual step:
 
 1. Verifies the tag against the workspace version and opens a **draft** release.
-2. Builds `rai` and `rai-server`, plus the deprecated `rai-convert`,
-   `rai-generate`, and `rai-chat` wrappers, on `ubuntu-24.04`, `windows-2025`,
+2. Builds `rai` plus the deprecated `rai-convert`,
+   `rai-generate`, and `rai-chat` wrappers — `--package classeve-rai-infer`
+   only, so no non-product crate can reach an archive — on `ubuntu-24.04`, `windows-2025`,
    `macos-15-intel`, and `macos-15` (Apple Silicon) — the x86 targets with
    `RUSTFLAGS="-C target-cpu=x86-64-v2"` — then **executes every binary** and
    requires `--version` to answer with the release's version before anything

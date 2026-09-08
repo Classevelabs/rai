@@ -16,7 +16,9 @@ pub struct ConvertTuning {
     /// Output file; defaults to <model-dir-name>-q4.raimodel
     #[arg(short = 'o', long, value_name = "FILE")]
     pub output: Option<PathBuf>,
-    /// Columns per quantization group for the 4-bit linears
+    /// Columns per quantization group for the 4-bit linears. Smaller is more
+    /// accurate and slightly larger: each group stores one f16 scale and one
+    /// f16 zero, so 64 costs 0.25 bits per weight over 128, and 32 costs 0.75.
     #[arg(long, default_value_t = 128, value_name = "N")]
     pub group_size: u32,
     /// Columns per quantization group for the 8-bit embedding
@@ -32,6 +34,16 @@ pub struct ConvertTuning {
     /// Suppress progress output
     #[arg(long, default_value_t = false)]
     pub quiet: bool,
+    /// Calibrate against this text file instead of quantizing the weights on
+    /// their own. Slower, and produces a measurably more accurate model.
+    #[arg(long, value_name = "FILE")]
+    pub calibration_text: Option<PathBuf>,
+    /// Calibration sequences to read from the text
+    #[arg(long, default_value_t = 16, value_name = "N")]
+    pub calibration_sequences: usize,
+    /// Tokens per calibration sequence
+    #[arg(long, default_value_t = 512, value_name = "N")]
+    pub calibration_seq_len: usize,
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -48,6 +60,9 @@ impl ConvertArgs {
         ConvertOptions {
             model_dir: self.model_dir.clone(),
             output: self.tuning.output.clone(),
+            calibration_text: self.tuning.calibration_text.clone(),
+            calibration_sequences: self.tuning.calibration_sequences,
+            calibration_seq_len: self.tuning.calibration_seq_len,
             group_size: self.tuning.group_size,
             embed_group_size: self.tuning.embed_group_size,
             // No flag means the model's own context, not a constant: see

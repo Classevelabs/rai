@@ -197,7 +197,12 @@ only, so they still refuse everything v2 added:
 | Gemma | Converts | Refused — embedding scale and `(1 + w)` RMSNorm |
 
 Use `rai convert` unless you specifically want calibrated GPTQ quantization,
-which only the Python path implements.
+which only the Python path implements — and note that the trade is real in both
+directions. On SmolLM2, a checkpoint both paths accept, the calibrated export
+costs +11.2% perplexity against fp16 where round-to-nearest costs +30.3%
+([BENCHMARKS.md](../BENCHMARKS.md#the-calibrated-quantizer-measured-end-to-end)).
+So for a model in the "Refused" column above, `rai convert` is not merely the
+easier path, it is the only one, and it is the more expensive one in quality.
 
 ## Why the line falls where it does
 
@@ -254,13 +259,55 @@ file that converts always loads:
 | `num_heads * head_dim` is even | Required by nibble-packed 4-bit weights. |
 | `hidden_size` and `intermediate_size` are even | Required by nibble-packed 4-bit weights. |
 | `num_heads` divisible by `num_kv_heads` | Required by the grouped-query head mapping. |
-| At most 128 quantization groups per row | At the default `--group-size 128`, `hidden_size` and `intermediate_size` must each be at most 16,384. Llama-2-70B's intermediate size of 28,672 exceeds this; it needs `--group-size 224` or larger. |
+| At most 1024 quantization groups per row | `hidden_size` and `intermediate_size` divided by `--group-size` must each be at most 1024. At the default 128 that allows 131,072, which no published architecture approaches; at `--group-size 32` it allows 32,768, which covers every model in the table above. |
 | Group sizes are even and at most 254 | The group size is one header byte. |
 | RoPE table at most 512 MB | The table costs `max_context * head_dim / 2 * 8` bytes. At `head_dim 128` that allows 1,048,576 positions, so the separate hard cap of 1,000,000 on `--max-context` binds first. |
 
 A model refused for one of these is refused over a flag, not over its
 architecture: raise `--group-size`, or lower `--max-context`, and convert it
 again.
+
+### Which checkpoints can be calibrated
+
+`--calibration-text` runs the checkpoint over real text to see what each
+projection receives. That means the pass has to reproduce the model exactly, so
+it covers what it can reproduce and refuses the rest:
+
+| Checkpoint | Calibrated conversion |
+| --- | --- |
+| Llama, Mistral, TinyLlama, SmolLM, SmolLM2 | Yes |
+| Qwen2, Qwen2.5 | Yes — projection biases are handled |
+| Llama-3.1, Llama-3.2 | Yes — `llama3` RoPE rescaling is handled |
+| Qwen3 | **Refused** — per-head QK norms |
+| Gemma2, Gemma3 | **Refused** — sandwich norms, per-head QK norms |
+| OLMo2 | **Refused** — post-norm placement |
+| Mixtral, Qwen3-MoE | **Refused** — expert routing |
+
+A refusal is a clear error naming the reason, not a silent fallback. Convert
+those without `--calibration-text`; round-to-nearest supports every architecture
+in the table at the top of this file.
+
+### Choosing a group size
+
+Weights are quantized in groups of `--group-size` columns, and each group
+carries its own scale and zero point. Smaller groups track the weights more
+closely and cost a little more room:
+
+| `--group-size` | extra bits per weight | when to use it |
+| --- | ---: | --- |
+| 128 | +0.25 | the default, and what every model published before this release uses |
+| 64 | +0.50 | measurably more accurate; the recommended setting when the extra ~5% of file size is acceptable |
+| 32 | +1.00 | matches the granularity llama.cpp's K-quants use; the most accurate setting this format offers |
+
+Sizes are not restricted to powers of two — any even value from 2 to 254 works,
+and a value that does not divide the row evenly simply leaves a shorter final
+group.
+
+**A model converted at a group size other than 128 needs this release to
+load.** Older builds capped the group count at 128 and refuse such a file with
+`model requires N quantization groups; kernel maximum is 128`. It is a clean
+refusal, not a misread — but if a file has to open in an older `rai`, convert
+it at 128.
 
 ## What it would take to support the rest
 

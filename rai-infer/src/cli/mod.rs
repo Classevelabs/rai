@@ -1,10 +1,11 @@
 //! The `rai` command-line surface.
 //!
-//! One binary, four verbs: `convert`, `run`, `serve`, `models`. Every verb's
-//! implementation lives here rather than in `src/bin/`, for two reasons:
+//! One binary, five verbs: `convert`, `run`, `serve`, `models`, `perplexity`.
+//! Every verb's implementation lives here rather than in `src/bin/`, for two
+//! reasons:
 //!
 //! * a single binary can host all of them, so users learn one command name
-//!   instead of four; and
+//!   instead of five; and
 //! * argument validation and the model/tokenizer resolution rules become unit
 //!   testable, which they are not inside a `fn main`.
 //!
@@ -19,6 +20,7 @@ pub mod catalog;
 pub mod convert;
 pub mod jobs;
 pub mod models;
+pub mod perplexity;
 pub mod run;
 pub mod serve;
 

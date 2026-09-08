@@ -48,6 +48,10 @@
 //! `# Panics`.
 
 /// Prompt formatting for instruction-tuned models.
+/// Calibration for the converter's GPTQ path: activation Hessians, gathered
+/// one layer at a time so the better quantizer needs neither Python nor a
+/// machine that can hold every layer's statistics at once.
+pub mod calibrate;
 pub mod chat_template;
 /// The `rai` command-line surface: `convert`, `run`, `serve`, and `models`.
 #[cfg(feature = "cli")]

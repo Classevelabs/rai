@@ -9,7 +9,7 @@ it: inference (`rai-infer`) and the memory/reasoning service (`rai-server` →
 | --- | --- |
 | `classeve-rai-infer` | `.raimodel` loader and writer, AVX2/FMA/F16C W4A8 GEMM kernels, transformer layers, KV cache, sampling, pondering, speculative decoding, and the `rai` binary. |
 | `classeve-rai-compress` | Quantization and compression research toolkit: an independent Rust GPTQ implementation, plus RC/HRC/SAC adaptive residual coding, sparse outlier extraction, and bit-packing. Not on the inference path and not part of the `.raimodel` export pipeline. |
-| `classeve-rai-server` | Local REST and MCP server for the memory/reasoning layer. |
+| `classeve-rai-server` | Local REST and MCP server for the memory/reasoning layer. Not part of RAI; `publish = false`, and in no release archive. |
 | `classeve-rai-core` | Embeddings, memory management, composition, confidence, interference, and surprise primitives. |
 | `classeve-rai-rem-nra` | Resonance memory backend (NRA address/value store plus REM key/value store) used by `rai-core`. |
 

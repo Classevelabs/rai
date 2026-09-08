@@ -13,8 +13,17 @@ use std::sync::Arc;
 
 const USAGE: &str = "\
 rai-server — a local memory service for AI tools. Stores facts, recalls them by
-meaning, and reports how confident it is. Runs on your machine; nothing leaves
-it unless you configure an external embedding provider.
+meaning, and reports how confident it is.
+
+NOT part of RAI, and in no release archive: RAI is the inference engine, and
+this program cannot run a model. It builds from the same workspace and nothing
+else.
+
+Recall by meaning needs an embedding provider, and the only one implemented is
+OpenAI-compatible: with RAI_EMBEDDING_PROVIDER=openai every stored and queried
+text is sent to that endpoint. The 'mock' provider keeps everything local but
+its vectors carry no meaning, so it is for tests and demos only. There is no
+local embedding model here.
 
 Usage: rai-server [rest|mcp]
 

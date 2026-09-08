@@ -1,11 +1,16 @@
 # Two images from one file:
 #
-#   docker build -t rai-server .                 -> MCP/REST memory server (default)
-#   docker build --target cli -t rai-cli .       -> the `rai` inference CLI
+#   docker build -t rai .                        -> the `rai` inference CLI (default)
+#   docker build --target server -t rai-server . -> the non-product memory service
 #
-# The stages are split so the default build stays exactly as cheap as it was:
-# Docker only builds the stages the chosen target depends on, so asking for the
-# server never compiles the inference CLI and vice versa.
+# The default is the product. RAI is the inference engine; the memory service
+# shares this workspace, is `publish = false`, and ships in no release archive.
+# A bare `docker build .` used to produce that service, which meant the default
+# artifact of the product's own Dockerfile was not the product.
+#
+# The stages are split so each build stays as cheap as it was: Docker only
+# builds the stages the chosen target depends on, so asking for the CLI never
+# compiles the server and vice versa.
 
 # The optimized amd64 image is intentionally x86-64-v3. Unlike
 # target-cpu=native, this does not bake the builder host's exact CPU into the
@@ -52,15 +57,30 @@ RUN apt-get update \
     && groupadd --gid 10001 rai \
     && useradd --create-home --uid 10001 --gid 10001 --shell /usr/sbin/nologin rai
 
-# Inference CLI image. Not the default target: it carries no server, and it is
-# useless without a model, which has to be mounted in. Models are far larger
-# than this image and are deliberately not baked into it.
+# The non-product memory service. Reached only by `--target server`; CI
+# smoke-tests it by that name. It is the one image here that can make an
+# outbound connection, and only when an external embedding provider is
+# configured.
+FROM base AS server
+
+COPY --from=build-server /src/target/release/rai-server /usr/local/bin/rai-server
+
+LABEL org.opencontainers.image.source="https://github.com/Classevelabs/rai"       org.opencontainers.image.licenses="Apache-2.0"       org.opencontainers.image.title="RAI server"
+
+USER 10001:10001
+ENTRYPOINT ["/usr/local/bin/rai-server"]
+CMD ["mcp"]
+
+# Inference CLI image — the product, and the default target. Keep this stage
+# last: a bare `docker build .` selects the final stage, and the default
+# artifact of this file must be the thing this repository ships.
 #
-#   docker run --rm -v "$PWD:/work" -w /work rai-cli \
-#     rai convert ./TinyLlama-1.1B-Chat-v1.0 -o ./tinyllama.raimodel
+# It is useless without a model, which has to be mounted in; models are far
+# larger than this image and are deliberately not baked into it.
 #
-#   docker run --rm -v "$PWD:/work" -w /work rai-cli \
-#     rai run ./tinyllama.raimodel --chat-template zephyr --prompt "Hello"
+#   docker run --rm -v "$PWD:/work" -w /work rai #     rai convert ./TinyLlama-1.1B-Chat-v1.0 -o ./tinyllama.raimodel
+#
+#   docker run --rm -v "$PWD:/work" -w /work rai #     rai run ./tinyllama.raimodel --chat-template zephyr --prompt "Hello"
 #
 # `rai serve` is reachable from this image only in principle. It hard-binds
 # 127.0.0.1 and rejects any request whose Host/Origin is not localhost, which is
@@ -70,23 +90,7 @@ FROM base AS cli
 
 COPY --from=build-cli /src/target/release/rai /usr/local/bin/rai
 
-LABEL org.opencontainers.image.source="https://github.com/Classevelabs/rai" \
-      org.opencontainers.image.licenses="Apache-2.0" \
-      org.opencontainers.image.title="RAI inference CLI"
+LABEL org.opencontainers.image.source="https://github.com/Classevelabs/rai"       org.opencontainers.image.licenses="Apache-2.0"       org.opencontainers.image.title="RAI inference CLI"
 
 USER 10001:10001
 CMD ["rai", "--help"]
-
-# Default target — keep this stage last so a bare `docker build .` still
-# produces the MCP server image CI smoke-tests.
-FROM base AS runtime
-
-COPY --from=build-server /src/target/release/rai-server /usr/local/bin/rai-server
-
-LABEL org.opencontainers.image.source="https://github.com/Classevelabs/rai" \
-      org.opencontainers.image.licenses="Apache-2.0" \
-      org.opencontainers.image.title="RAI server"
-
-USER 10001:10001
-ENTRYPOINT ["/usr/local/bin/rai-server"]
-CMD ["mcp"]

@@ -148,9 +148,12 @@ jobs:
           cat > notes.md <<'NOTES'
           Prebuilt binaries for x86-64 Linux and Windows, and for macOS on both
           Intel and Apple Silicon: the
-          `rai` inference CLI (`convert`, `run`, `serve`, `models`) and
-          `rai-server`, plus the deprecated `rai-convert`, `rai-generate`, and
-          `rai-chat` wrappers.
+          `rai` inference CLI (`convert`, `run`, `serve`, `models`), plus the
+          deprecated `rai-convert`, `rai-generate`, and `rai-chat` wrappers.
+
+          Every binary in these archives is the inference engine. Nothing in
+          them opens a network connection to anything but your own loopback
+          interface.
 
           **Verify your download before running it.** Fetch `SHA256SUMS` from
           this release, put it next to the archive, and run:
@@ -318,14 +321,19 @@ jobs:
               exit 1 ;;
           esac
 
-      # Same command the CI release-build step runs, plus --locked. Only the
-      # two crates that own shipped binaries are built.
+      # Same command the CI release-build step runs, plus --locked. RAI is
+      # `rai-infer` plus `rai-compress`, and `rai-infer` owns every shipped
+      # binary, so it is the only package the release compiles. The
+      # memory/reasoning crates (rai-server, rai-core, rem-nra) share this
+      # workspace and are not the product: building them here is what used to
+      # put an OpenAI-calling binary — and its reqwest/rustls/ring dependency
+      # tree — inside an archive whose whole claim is that nothing leaves the
+      # machine.
       - name: Build release binaries
         shell: bash
         run: |
           cargo build --locked --release \
-            --package classeve-rai-infer \
-            --package classeve-rai-server
+            --package classeve-rai-infer
 
       # A compile is not an execution: a green build has shipped a stale or
       # broken exe before. Every binary the archive will carry answers
@@ -339,7 +347,7 @@ jobs:
           set -euo pipefail
           ext=""
           if [ "${RUNNER_OS}" = "Windows" ]; then ext=".exe"; fi
-          for bin in rai rai-server rai-convert rai-generate rai-chat; do
+          for bin in rai rai-convert rai-generate rai-chat; do
             out="$("./target/release/${bin}${ext}" --version)"
             printf '%s: %s\n' "$bin" "$out"
             # Anchored to the end: a substring match would let 0.2.10 pass a
@@ -369,7 +377,7 @@ jobs:
           # a broken release, not a smaller archive — fail loudly. `rai` is the
           # CLI the documentation and the launchers use; the three legacy names
           # are deprecated wrappers kept so existing scripts keep working.
-          for bin in rai rai-server rai-convert rai-generate rai-chat; do
+          for bin in rai rai-convert rai-generate rai-chat; do
             src="target/release/${bin}${ext}"
             if [ ! -f "$src" ]; then
               echo "::error::expected release binary $src was not produced"
@@ -380,7 +388,7 @@ jobs:
 
           # INSTALL.md is referenced from RUNNING.txt below, and the launchers
           # are useless if they are not next to the binary they start.
-          cp LICENSE NOTICE README.md INSTALL.md "$stage/"
+          cp LICENSE NOTICE THIRD-PARTY-NOTICES.md README.md INSTALL.md "$stage/"
           cp -r launchers "$stage/"
 
           # `cp` preserves the checkout's mode, and tar preserves it again, so a
@@ -404,7 +412,6 @@ jobs:
                             rai run <model.raimodel>    generate text
                             rai serve <model.raimodel>  local chat UI (:8090)
                             rai models [dir]            what is on this machine
-            rai-server    local REST + MCP memory service
             launchers/    double-click scripts that start the chat UI
 
             rai-convert, rai-generate and rai-chat are deprecated wrappers over
@@ -440,9 +447,10 @@ jobs:
             runs, on scalar code, slower.
 
           NO GPU IS REQUIRED, AND NOTHING PHONES HOME
-            rai serve and rai-server listen on loopback only. rai-server sends
-            data off the machine only if you configure an external embedding
-            provider yourself.
+            Every binary here is the inference engine. rai serve binds
+            127.0.0.1 and refuses any request whose Host is not loopback.
+            Nothing in this archive contains an HTTP client, a TLS stack, or
+            the address of any server but your own.
 
           MORE
             INSTALL.md, README.md, and https://github.com/Classevelabs/rai
@@ -453,6 +461,63 @@ jobs:
 
           ls -l "$stage"
           cat "$stage/RUNNING.txt"
+
+      # The product boundary, enforced instead of documented.
+      #
+      # RAI is the inference engine. The memory/reasoning crates (rai-server,
+      # rai-core, rem-nra) share this workspace, are `publish = false`, and are
+      # not the product — yet the archive shipped `rai-server` for four
+      # releases because the boundary lived only in prose. Prose does not fail
+      # a build.
+      #
+      # This asserts the staged executable set is exactly the allowlist, and
+      # that nothing in it links a TLS stack or an HTTP client. The second half
+      # matters independently: it is what lets RUNNING.txt say "nothing phones
+      # home" with no conditional attached, and it would fail if a future
+      # dependency edit pulled reqwest back onto the inference path.
+      - name: Assert the archive carries only the product
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          stage="dist/rai-${VERSION}-${TARGET}"
+          ext=""
+          if [ "${RUNNER_OS}" = "Windows" ]; then ext=".exe"; fi
+
+          # `sed` rather than `-exec basename {} "$ext"`: BSD basename on the
+          # macOS runners does not handle an empty suffix the way GNU does, and
+          # this gate has to behave identically on all four targets. LC_ALL=C
+          # so the comparison does not depend on the runner's collation either.
+          expected="rai rai-chat rai-convert rai-generate"
+          actual=$(find "$stage" -maxdepth 1 -type f \
+                     ! -name '*.md' ! -name '*.txt' ! -name 'LICENSE' ! -name 'NOTICE' \
+                   | sed 's#.*/##; s#\.exe$##' \
+                   | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')
+
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::archive binaries are '$actual', expected '$expected'"
+            echo "::error::a binary outside the product allowlist reached the archive"
+            exit 1
+          fi
+          echo "archive binaries: $actual"
+
+          # No shipped binary may carry a TLS implementation or an HTTP client.
+          # Both reach this workspace only through rai-core's OpenAI embedder,
+          # so a hit here means the inference engine grew a network dependency.
+          for bin in $expected; do
+            path="$stage/${bin}${ext}"
+            # `grep -a` rather than `strings`: grep is present on all three
+            # runner images, and binutils is not guaranteed on the Windows one.
+            for marker in rustls webpki BoringSSL reqwest hyper.rs; do
+              if grep -qaiF "$marker" "$path"; then
+                echo "::error::${bin} contains '$marker' — the engine must carry no TLS or HTTP stack"
+                exit 1
+              fi
+            done
+          done
+          echo "no TLS or HTTP stack in any shipped binary"
 
       - name: Create tar.gz
         if: runner.os != 'Windows'

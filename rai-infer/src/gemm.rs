@@ -70,8 +70,6 @@ pub fn has_avx2() -> bool {
 /// as dead code that trips `-D warnings`.
 #[cfg(target_arch = "x86_64")]
 mod parallel_ptr {
-    use super::MAX_GROUPS;
-
     #[derive(Copy, Clone)]
     pub(super) struct SendPtr(pub(super) *mut f32);
     unsafe impl Send for SendPtr {}
@@ -118,12 +116,12 @@ mod parallel_ptr {
 
     /// Per-token quantization parameter arrays shared read-only by every worker.
     #[derive(Copy, Clone)]
-    pub(super) struct SyncGroupPtr(pub(super) *const [f32; MAX_GROUPS]);
+    pub(super) struct SyncGroupPtr(pub(super) *const f32);
     unsafe impl Send for SyncGroupPtr {}
     unsafe impl Sync for SyncGroupPtr {}
     impl SyncGroupPtr {
         #[inline(always)]
-        pub(super) fn ptr(self) -> *const [f32; MAX_GROUPS] {
+        pub(super) fn ptr(self) -> *const f32 {
             self.0
         }
     }
@@ -145,16 +143,27 @@ fn read_f16_le(data: &[u8], offset: usize) -> f32 {
 /// Compute per-group input sums for the factored dequant formula.
 #[inline]
 fn compute_input_sums(input: &[f32], cols: usize, group_size: usize) -> [f32; MAX_GROUPS] {
-    let num_groups = cols.div_ceil(group_size);
     let mut sums = [0.0f32; MAX_GROUPS];
+    compute_input_sums_into(input, &mut sums, cols, group_size);
+    sums
+}
+
+/// As [`compute_input_sums`], writing into a caller-owned slice.
+///
+/// The batch path keeps every token's sums in one flat buffer; returning a
+/// `[f32; MAX_GROUPS]` per token would reintroduce both the memset and the
+/// 4 KB stride this refactor removed.
+#[inline]
+fn compute_input_sums_into(input: &[f32], sums: &mut [f32], cols: usize, group_size: usize) {
+    let num_groups = cols.div_ceil(group_size);
 
     #[cfg(target_arch = "x86_64")]
     {
         if has_avx2() {
             unsafe {
-                compute_input_sums_avx2(input, &mut sums, cols, group_size, num_groups);
+                compute_input_sums_avx2(input, sums, cols, group_size, num_groups);
             }
-            return sums;
+            return;
         }
     }
 
@@ -167,7 +176,6 @@ fn compute_input_sums(input: &[f32], cols: usize, group_size: usize) -> [f32; MA
         }
         sums[g] = s;
     }
-    sums
 }
 
 /// AVX2 per-group input sums.
@@ -181,7 +189,7 @@ fn compute_input_sums(input: &[f32], cols: usize, group_size: usize) -> [f32; MA
 #[target_feature(enable = "avx2")]
 unsafe fn compute_input_sums_avx2(
     input: &[f32],
-    sums: &mut [f32; MAX_GROUPS],
+    sums: &mut [f32],
     cols: usize,
     group_size: usize,
     num_groups: usize,
@@ -219,7 +227,7 @@ fn quantize_input_split(
     input: &[f32],
     input_even: &mut [i8],
     input_odd: &mut [i8],
-    input_scales: &mut [f32; MAX_GROUPS],
+    input_scales: &mut [f32],
     cols: usize,
     group_size: usize,
     num_groups: usize,
@@ -281,7 +289,7 @@ unsafe fn quantize_input_split_avx2(
     input: &[f32],
     input_even: &mut [i8],
     input_odd: &mut [i8],
-    input_scales: &mut [f32; MAX_GROUPS],
+    input_scales: &mut [f32],
     cols: usize,
     group_size: usize,
     num_groups: usize,
@@ -405,13 +413,14 @@ unsafe fn matvec_chunk_i8(
     input_f32: *const f32,
     input_even: *const i8,
     input_odd: *const i8,
-    input_scales: &[f32; MAX_GROUPS],
-    input_sums: &[f32; MAX_GROUPS],
+    input_scales: &[f32],
+    input_sums: &[f32],
     start_row: usize,
     chunk_len: usize,
     cols: usize,
     group_size: usize,
     num_groups: usize,
+    scratch: &mut [f32],
 ) {
     let row_bytes = cols / 2;
     let mask_0f = _mm256_set1_epi8(0x0F);
@@ -419,6 +428,11 @@ unsafe fn matvec_chunk_i8(
     // Adaptive prefetch distance: 3 rows for small rows (~15ns compute each),
     // 1 row for large rows (7B MLP: 7168 bytes/row, plenty of compute to hide latency).
     let pf_dist: usize = if row_bytes > 2048 { 1 } else { 3 };
+    // Caller-owned, reused across every row in the chunk. This used to be a
+    // `[f32; MAX_GROUPS]` declared inside the row loop, which zeroed the whole
+    // array once per row: invisible while the bound was 128, a per-decode-step
+    // memset proportional to the bound once it is not.
+    let w_scales = &mut scratch[..num_groups];
 
     for local in 0..chunk_len {
         let row = start_row + local;
@@ -439,16 +453,15 @@ unsafe fn matvec_chunk_i8(
         // Use unchecked pointer reads to eliminate bounds-check overhead
         // (~275K checks per token in the original version).
         let mut zero_corr = 0.0f32;
-        let mut w_scales = [0.0f32; MAX_GROUPS];
         let gp_ptr = group_params.as_ptr();
         for g in 0..num_groups {
             let param_off = row_param_base + g * 4;
             let bits = (gp_ptr.add(param_off) as *const u32).read_unaligned();
             let v = _mm_cvtsi32_si128(bits as i32);
             let f = _mm_cvtph_ps(v);
-            w_scales[g] = _mm_cvtss_f32(f);
+            *w_scales.get_unchecked_mut(g) = _mm_cvtss_f32(f);
             let f1 = _mm_shuffle_ps(f, f, 1);
-            zero_corr += _mm_cvtss_f32(f1) * input_sums[g];
+            zero_corr += _mm_cvtss_f32(f1) * *input_sums.get_unchecked(g);
         }
 
         // Phase 2: Integer dot product per group using 256-bit PMADDUBSW.
@@ -483,7 +496,7 @@ unsafe fn matvec_chunk_i8(
             }
 
             // Finalize group: convert 256-bit int to float, scale, accumulate
-            let combined_scale = w_scales[g] * input_scales[g];
+            let combined_scale = *w_scales.get_unchecked(g) * *input_scales.get_unchecked(g);
             let dot_f = _mm256_mul_ps(_mm256_cvtepi32_ps(iacc), _mm256_set1_ps(combined_scale));
             float_acc = _mm256_add_ps(float_acc, dot_f);
 
@@ -520,7 +533,7 @@ unsafe fn matvec_chunk_i8(
                     tc += 2;
                 }
                 let tail_v =
-                    _mm256_set_ps(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, w_scales[g] * tail_acc);
+                    _mm256_set_ps(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, *w_scales.get_unchecked(g) * tail_acc);
                 float_acc = _mm256_add_ps(float_acc, tail_v);
             }
         }
@@ -562,13 +575,13 @@ unsafe fn matvec_chunk_i8(
 unsafe fn matmul_row_tile<const T: usize>(
     output: *mut f32,
     nib_row: *const u8,
-    w_scales: &[f32; MAX_GROUPS],
-    w_zeros: &[f32; MAX_GROUPS],
+    w_scales: &[f32],
+    w_zeros: &[f32],
     input_f32: *const f32,
     input_even: *const i8,
     input_odd: *const i8,
-    input_scales: *const [f32; MAX_GROUPS],
-    input_sums: *const [f32; MAX_GROUPS],
+    input_scales: *const f32,
+    input_sums: *const f32,
     t_base: usize,
     row: usize,
     rows: usize,
@@ -611,7 +624,8 @@ unsafe fn matmul_row_tile<const T: usize>(
 
         for j in 0..T {
             let t = t_base + j;
-            let combined_scale = w_scales[g] * (*input_scales.add(t)).get_unchecked(g);
+            let combined_scale =
+                *w_scales.get_unchecked(g) * *input_scales.add(t * num_groups + g);
             float_acc[j] = _mm256_add_ps(
                 float_acc[j],
                 _mm256_mul_ps(_mm256_cvtepi32_ps(iacc[j]), _mm256_set1_ps(combined_scale)),
@@ -648,7 +662,7 @@ unsafe fn matmul_row_tile<const T: usize>(
                     tc += 2;
                 }
                 let tail_v =
-                    _mm256_set_ps(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, w_scales[g] * tail_acc);
+                    _mm256_set_ps(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, *w_scales.get_unchecked(g) * tail_acc);
                 float_acc[j] = _mm256_add_ps(float_acc[j], tail_v);
             }
         }
@@ -664,10 +678,10 @@ unsafe fn matmul_row_tile<const T: usize>(
         let hi = _mm_movehl_ps(s, s);
         let dot = _mm_cvtss_f32(_mm_add_ss(s, hi));
 
-        let sums = &*input_sums.add(t);
+        let sums = core::slice::from_raw_parts(input_sums.add(t * num_groups), num_groups);
         let mut zero_corr = 0.0f32;
         for g in 0..num_groups {
-            zero_corr += w_zeros[g] * sums.get_unchecked(g);
+            zero_corr += *w_zeros.get_unchecked(g) * *sums.get_unchecked(g);
         }
         *output.add(t * rows + row) = dot + zero_corr;
     }
@@ -693,8 +707,8 @@ unsafe fn matmul_chunk_i8(
     input_f32: *const f32,
     input_even: *const i8,
     input_odd: *const i8,
-    input_scales: *const [f32; MAX_GROUPS],
-    input_sums: *const [f32; MAX_GROUPS],
+    input_scales: *const f32,
+    input_sums: *const f32,
     start_row: usize,
     chunk_len: usize,
     rows: usize,
@@ -702,17 +716,16 @@ unsafe fn matmul_chunk_i8(
     group_size: usize,
     num_groups: usize,
     num_tokens: usize,
+    scratch: &mut [f32],
 ) {
     let row_bytes = cols / 2;
     let pf_dist: usize = if row_bytes > 2048 { 1 } else { 3 };
     let gp_ptr = group_params.as_ptr();
 
-    // Hoisted out of the row loop: these are 512 bytes each, and re-declaring
-    // them per row costs a 1 KB stack memset for every row in the chunk. Only
-    // the first `num_groups` entries are ever read, and every row overwrites
-    // exactly those before use.
-    let mut w_scales = [0.0f32; MAX_GROUPS];
-    let mut w_zeros = [0.0f32; MAX_GROUPS];
+    // Caller-owned and reused across every row in the chunk. These were
+    // `[f32; MAX_GROUPS]` locals: correct, but their memset scaled with the
+    // bound rather than with the group size the model was quantized at.
+    let (w_scales, w_zeros) = scratch.split_at_mut(num_groups);
 
     for local in 0..chunk_len {
         let row = start_row + local;
@@ -735,8 +748,8 @@ unsafe fn matmul_chunk_i8(
             let bits = (gp_ptr.add(row_param_base + g * 4) as *const u32).read_unaligned();
             let v = _mm_cvtsi32_si128(bits as i32);
             let f = _mm_cvtph_ps(v);
-            w_scales[g] = _mm_cvtss_f32(f);
-            w_zeros[g] = _mm_cvtss_f32(_mm_shuffle_ps(f, f, 1));
+            *w_scales.get_unchecked_mut(g) = _mm_cvtss_f32(f);
+            *w_zeros.get_unchecked_mut(g) = _mm_cvtss_f32(_mm_shuffle_ps(f, f, 1));
         }
 
         let mut t = 0usize;
@@ -744,8 +757,8 @@ unsafe fn matmul_chunk_i8(
             matmul_row_tile::<4>(
                 output,
                 nib_row,
-                &w_scales,
-                &w_zeros,
+                &*w_scales,
+                &*w_zeros,
                 input_f32,
                 input_even,
                 input_odd,
@@ -764,8 +777,8 @@ unsafe fn matmul_chunk_i8(
             matmul_row_tile::<1>(
                 output,
                 nib_row,
-                &w_scales,
-                &w_zeros,
+                &*w_scales,
+                &*w_zeros,
                 input_f32,
                 input_even,
                 input_odd,
@@ -806,15 +819,20 @@ unsafe fn lm_head_chunk_i8(
     embed_data: *const u8,
     embed_params: &[u8],
     hidden_i8: *const u8, // quantized hidden, treated as unsigned for PMADDUBSW arg2
-    hidden_sums: &[f32; MAX_GROUPS],
-    hidden_scales: &[f32; MAX_GROUPS], // per-group quantization scales
+    hidden_sums: &[f32],
+    hidden_scales: &[f32], // per-group quantization scales
     start_row: usize,
     chunk_len: usize,
     hidden_size: usize,
     group_size: usize,
     num_groups: usize,
+    scratch: &mut [f32],
 ) {
     let ones_16 = _mm256_set1_epi16(1);
+    // Reused across every row in the chunk; see `matvec_chunk_i8`. This kernel
+    // walks the whole vocabulary, so a per-row memset here is the most
+    // expensive place in the engine to leave one.
+    let w_scales = &mut scratch[..num_groups];
 
     for local in 0..chunk_len {
         let v = start_row + local;
@@ -833,14 +851,13 @@ unsafe fn lm_head_chunk_i8(
 
         // Phase 1: Extract scales and zero corrections (unchecked reads)
         let mut zero_corr = 0.0f32;
-        let mut w_scales = [0.0f32; MAX_GROUPS];
         let ep_ptr = embed_params.as_ptr();
         for g in 0..num_groups {
             let param_off = row_param_base + g * 4;
             let bits = (ep_ptr.add(param_off) as *const u32).read_unaligned();
             let fv = _mm_cvtsi32_si128(bits as i32);
             let ff = _mm_cvtph_ps(fv);
-            w_scales[g] = _mm_cvtss_f32(ff);
+            *w_scales.get_unchecked_mut(g) = _mm_cvtss_f32(ff);
             let ff1 = _mm_shuffle_ps(ff, ff, 1);
             zero_corr += _mm_cvtss_f32(ff1) * hidden_sums[g];
         }
@@ -874,7 +891,8 @@ unsafe fn lm_head_chunk_i8(
             }
 
             // Convert to float, multiply by combined scale, accumulate
-            let combined_scale = w_scales[g] * hidden_scales[g];
+            let combined_scale =
+                *w_scales.get_unchecked(g) * *hidden_scales.get_unchecked(g);
             let dot_f = _mm256_mul_ps(_mm256_cvtepi32_ps(iacc), _mm256_set1_ps(combined_scale));
             float_acc = _mm256_add_ps(float_acc, dot_f);
 
@@ -895,7 +913,7 @@ unsafe fn lm_head_chunk_i8(
                         0.0,
                         0.0,
                         0.0,
-                        w_scales[g] * hidden_scales[g] * tail,
+                        *w_scales.get_unchecked(g) * *hidden_scales.get_unchecked(g) * tail,
                     ),
                 );
             }
@@ -924,7 +942,7 @@ unsafe fn lm_head_chunk_i8(
 fn quantize_hidden_i8(
     hidden: &[f32],
     output: &mut [i8],
-    scales: &mut [f32; MAX_GROUPS],
+    scales: &mut [f32],
     hidden_size: usize,
     group_size: usize,
     num_groups: usize,
@@ -976,7 +994,7 @@ fn quantize_hidden_i8(
 unsafe fn quantize_hidden_i8_avx2(
     hidden: &[f32],
     output: &mut [i8],
-    scales: &mut [f32; MAX_GROUPS],
+    scales: &mut [f32],
     hidden_size: usize,
     group_size: usize,
     num_groups: usize,
@@ -1054,7 +1072,7 @@ fn matvec_row_scalar(
     nibble_data: &[u8],
     group_params: &[u8],
     input: &[f32],
-    input_sums: &[f32; MAX_GROUPS],
+    input_sums: &[f32],
     row: usize,
     cols: usize,
     group_size: usize,
@@ -1091,7 +1109,7 @@ fn lm_head_row_scalar(
     embed_data: &[u8],
     embed_params: &[u8],
     hidden: &[f32],
-    hidden_sums: &[f32; MAX_GROUPS],
+    hidden_sums: &[f32],
     v: usize,
     hidden_size: usize,
     group_size: usize,
@@ -1158,13 +1176,23 @@ fn matvec_should_parallelize(rows: usize, cols: usize) -> bool {
 fn chunk_rows_for(cols: usize) -> usize {
     (24_576 / (cols / 2).max(1)).clamp(4, 64)
 }
-/// Maximum number of quantization groups per GEMM call (a 7B MLP at group
-/// size 128 needs 14336/128 = 112 groups, so 128 leaves headroom).
+/// Maximum number of quantization groups per GEMM call.
+///
+/// This is a validation bound, not a working size: no buffer in the hot path is
+/// dimensioned by it. Group data travels as slices of the model's real
+/// `num_groups`, and per-row scratch is allocated once per worker thread, so a
+/// model quantized at group size 128 pays for 128 whatever this constant says.
+///
+/// 1024 covers every architecture the converter accepts at the finest group
+/// size it offers: the widest advertised MLP is Qwen3-32B's 25600, which needs
+/// 800 groups at group size 32. It was 128, which was enough only for group
+/// size 128 on a 7B and silently made the shipped default the sole option
+/// there.
 ///
 /// `format.rs` imports this constant: `.raimodel` validation at load time is
 /// the single gate that keeps accepted model files within kernel capacity, so
 /// the limit is defined once here at its point of enforcement.
-pub const MAX_GROUPS: usize = 128;
+pub const MAX_GROUPS: usize = 1024;
 
 fn validate_weight_buffers(
     output_len: usize,
@@ -1235,8 +1263,8 @@ fn w4a8_matvec_inner(
     input: &[f32],
     input_even: &[i8],
     input_odd: &[i8],
-    input_scales: &[f32; MAX_GROUPS],
-    input_sums: &[f32; MAX_GROUPS],
+    input_scales: &[f32],
+    input_sums: &[f32],
     rows: usize,
     cols: usize,
     group_size: usize,
@@ -1254,9 +1282,11 @@ fn w4a8_matvec_inner(
                 let inp_f32_ptr = SyncF32Ptr(input.as_ptr());
                 let inp_even_ptr = SyncI8Ptr(input_even.as_ptr());
                 let inp_odd_ptr = SyncI8Ptr(input_odd.as_ptr());
-                let scales = *input_scales;
-                let sums = *input_sums;
-                (0..num_chunks).into_par_iter().for_each(|ci| {
+                let scales = input_scales;
+                let sums = input_sums;
+                (0..num_chunks).into_par_iter().for_each_init(
+                    || vec![0.0f32; num_groups],
+                    |scratch, ci| {
                     let start = ci * cr;
                     let len = cr.min(rows - start);
                     unsafe {
@@ -1267,17 +1297,20 @@ fn w4a8_matvec_inner(
                             inp_f32_ptr.ptr(),
                             inp_even_ptr.ptr(),
                             inp_odd_ptr.ptr(),
-                            &scales,
-                            &sums,
+                            scales,
+                            sums,
                             start,
                             len,
                             cols,
                             group_size,
                             num_groups,
+                            scratch,
                         );
                     }
-                });
+                    },
+                );
             } else {
+                let mut scratch = vec![0.0f32; num_groups];
                 unsafe {
                     matvec_chunk_i8(
                         output.as_mut_ptr(),
@@ -1293,6 +1326,7 @@ fn w4a8_matvec_inner(
                         cols,
                         group_size,
                         num_groups,
+                        &mut scratch,
                     );
                 }
             }
@@ -1434,6 +1468,7 @@ pub fn w4a8_fused_qkv(
         if has_avx2() {
             let total_rows = q_proj.rows + k_proj.rows + v_proj.rows;
             if !matvec_should_parallelize(total_rows, cols) {
+                let mut scratch = vec![0.0f32; num_groups];
                 for (out, proj) in [(q_out, q_proj), (k_out, k_proj), (v_out, v_proj)] {
                     unsafe {
                         matvec_chunk_i8(
@@ -1450,6 +1485,7 @@ pub fn w4a8_fused_qkv(
                             cols,
                             group_size,
                             num_groups,
+                            &mut scratch,
                         );
                     }
                 }
@@ -1479,7 +1515,9 @@ pub fn w4a8_fused_qkv(
             let scales = input_scales;
             let sums = input_sums;
 
-            (0..total_chunks).into_par_iter().for_each(|chunk_idx| {
+            (0..total_chunks).into_par_iter().for_each_init(
+                || vec![0.0f32; num_groups],
+                |scratch, chunk_idx| {
                 let (out_ptr, nibble_data, group_params, rows, start_row) = if chunk_idx < q_chunks
                 {
                     let start = chunk_idx * cr;
@@ -1510,9 +1548,11 @@ pub fn w4a8_fused_qkv(
                         cols,
                         group_size,
                         num_groups,
+                        scratch,
                     );
                 }
-            });
+                },
+            );
             return;
         }
     }
@@ -1601,6 +1641,7 @@ pub fn w4a8_fused_gate_up(
         if has_avx2() {
             let total_rows = gate_proj.rows + up_proj.rows;
             if !matvec_should_parallelize(total_rows, cols) {
+                let mut scratch = vec![0.0f32; num_groups];
                 for (out, proj) in [(gate_out, gate_proj), (up_out, up_proj)] {
                     unsafe {
                         matvec_chunk_i8(
@@ -1617,6 +1658,7 @@ pub fn w4a8_fused_gate_up(
                             cols,
                             group_size,
                             num_groups,
+                            &mut scratch,
                         );
                     }
                 }
@@ -1641,7 +1683,9 @@ pub fn w4a8_fused_gate_up(
             let scales = input_scales;
             let sums = input_sums;
 
-            (0..total_chunks).into_par_iter().for_each(|chunk_idx| {
+            (0..total_chunks).into_par_iter().for_each_init(
+                || vec![0.0f32; num_groups],
+                |scratch, chunk_idx| {
                 let (out_ptr, nibble_data, group_params, rows, start_row) = if chunk_idx < g_chunks
                 {
                     let start = chunk_idx * cr;
@@ -1668,9 +1712,11 @@ pub fn w4a8_fused_gate_up(
                         cols,
                         group_size,
                         num_groups,
+                        scratch,
                     );
                 }
-            });
+                },
+            );
             return;
         }
     }
@@ -1806,20 +1852,35 @@ pub fn w4a8_matmul(
     let num_groups = cols.div_ceil(group_size);
     let half_cols = cols / 2;
 
-    // Pre-quantize all token inputs into flat contiguous buffers (2 allocs, not 2*num_tokens)
-    let mut all_sums: Vec<[f32; MAX_GROUPS]> = Vec::with_capacity(num_tokens);
+    // Pre-quantize all token inputs into flat contiguous buffers (4 allocs,
+    // not 4*num_tokens). The group buffers are strided by the model's real
+    // `num_groups`, so one cache line usually covers the same group across
+    // several tokens — which is exactly how the weight-stationary kernel reads
+    // them.
+    let mut all_sums: Vec<f32> = vec![0.0; num_tokens * num_groups];
     let mut all_even_flat: Vec<i8> = vec![0i8; num_tokens * half_cols];
     let mut all_odd_flat: Vec<i8> = vec![0i8; num_tokens * half_cols];
-    let mut all_scales: Vec<[f32; MAX_GROUPS]> = Vec::with_capacity(num_tokens);
+    let mut all_scales: Vec<f32> = vec![0.0; num_tokens * num_groups];
 
     for t in 0..num_tokens {
         let inp = &input[t * cols..(t + 1) * cols];
-        all_sums.push(compute_input_sums(inp, cols, group_size));
+        compute_input_sums_into(
+            inp,
+            &mut all_sums[t * num_groups..(t + 1) * num_groups],
+            cols,
+            group_size,
+        );
         let even = &mut all_even_flat[t * half_cols..(t + 1) * half_cols];
         let odd = &mut all_odd_flat[t * half_cols..(t + 1) * half_cols];
-        let mut scales = [0.0f32; MAX_GROUPS];
-        quantize_input_split(inp, even, odd, &mut scales, cols, group_size, num_groups);
-        all_scales.push(scales);
+        quantize_input_split(
+            inp,
+            even,
+            odd,
+            &mut all_scales[t * num_groups..(t + 1) * num_groups],
+            cols,
+            group_size,
+            num_groups,
+        );
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -1840,58 +1901,72 @@ pub fn w4a8_matmul(
                 // Benchmark-only: drive the batch through the single-token
                 // kernel once per token, as this function did before the
                 // weight-stationary rewrite.
-                (0..num_chunks).into_par_iter().for_each(|ci| {
-                    let start = ci * cr;
-                    let len = cr.min(rows - start);
-                    for t in 0..num_tokens {
-                        unsafe {
-                            matvec_chunk_i8(
-                                out_ptr.ptr().add(t * rows + start),
-                                nib_ptr.ptr(),
-                                group_params,
-                                inp_f32_ptr.ptr().add(t * cols),
-                                inp_even_ptr.ptr().add(t * half_cols),
-                                inp_odd_ptr.ptr().add(t * half_cols),
-                                &*scales_ptr.ptr().add(t),
-                                &*sums_ptr.ptr().add(t),
-                                start,
-                                len,
-                                cols,
-                                group_size,
-                                num_groups,
-                            );
+                (0..num_chunks).into_par_iter().for_each_init(
+                    || vec![0.0f32; num_groups],
+                    |scratch, ci| {
+                        let start = ci * cr;
+                        let len = cr.min(rows - start);
+                        for t in 0..num_tokens {
+                            unsafe {
+                                matvec_chunk_i8(
+                                    out_ptr.ptr().add(t * rows + start),
+                                    nib_ptr.ptr(),
+                                    group_params,
+                                    inp_f32_ptr.ptr().add(t * cols),
+                                    inp_even_ptr.ptr().add(t * half_cols),
+                                    inp_odd_ptr.ptr().add(t * half_cols),
+                                    core::slice::from_raw_parts(
+                                        scales_ptr.ptr().add(t * num_groups),
+                                        num_groups,
+                                    ),
+                                    core::slice::from_raw_parts(
+                                        sums_ptr.ptr().add(t * num_groups),
+                                        num_groups,
+                                    ),
+                                    start,
+                                    len,
+                                    cols,
+                                    group_size,
+                                    num_groups,
+                                    scratch,
+                                );
+                            }
                         }
-                    }
-                });
+                    },
+                );
                 return;
             }
 
             // Weight-stationary parallel dispatch: each thread takes a chunk of
             // rows and drives the whole batch through it, so the weight data it
             // pulls into L1 is unpacked once and reused by every token.
-            (0..num_chunks).into_par_iter().for_each(|ci| {
-                let start = ci * cr;
-                let len = cr.min(rows - start);
-                unsafe {
-                    matmul_chunk_i8(
-                        out_ptr.ptr(),
-                        nib_ptr.ptr(),
-                        group_params,
-                        inp_f32_ptr.ptr(),
-                        inp_even_ptr.ptr(),
-                        inp_odd_ptr.ptr(),
-                        scales_ptr.ptr(),
-                        sums_ptr.ptr(),
-                        start,
-                        len,
-                        rows,
-                        cols,
-                        group_size,
-                        num_groups,
-                        num_tokens,
-                    );
-                }
-            });
+            (0..num_chunks).into_par_iter().for_each_init(
+                || vec![0.0f32; 2 * num_groups],
+                |scratch, ci| {
+                    let start = ci * cr;
+                    let len = cr.min(rows - start);
+                    unsafe {
+                        matmul_chunk_i8(
+                            out_ptr.ptr(),
+                            nib_ptr.ptr(),
+                            group_params,
+                            inp_f32_ptr.ptr(),
+                            inp_even_ptr.ptr(),
+                            inp_odd_ptr.ptr(),
+                            scales_ptr.ptr(),
+                            sums_ptr.ptr(),
+                            start,
+                            len,
+                            rows,
+                            cols,
+                            group_size,
+                            num_groups,
+                            num_tokens,
+                            scratch,
+                        );
+                    }
+                },
+            );
             return;
         }
     }
@@ -1903,7 +1978,7 @@ pub fn w4a8_matmul(
     for row in 0..rows {
         for t in 0..num_tokens {
             let inp = &input[t * cols..(t + 1) * cols];
-            let sums = &all_sums[t];
+            let sums = &all_sums[t * num_groups..(t + 1) * num_groups];
             output[t * rows + row] = matvec_row_scalar(
                 nibble_data,
                 group_params,
@@ -2036,27 +2111,34 @@ pub fn tied_lm_head(
             let out_ptr = SendPtr(logits.as_mut_ptr());
             let emb_ptr = SyncU8Ptr(embed_data.as_ptr());
             let hid_i8_ptr = SyncU8Ptr(hidden_i8.as_ptr() as *const u8);
-            let sums = hidden_sums;
-            let hscales = hidden_scales;
-            (0..num_chunks).into_par_iter().for_each(|ci| {
-                let start = ci * LM_CHUNK;
-                let len = LM_CHUNK.min(vocab_size - start);
-                unsafe {
-                    lm_head_chunk_i8(
-                        out_ptr.ptr().add(start),
-                        emb_ptr.ptr(),
-                        embed_params,
-                        hid_i8_ptr.ptr(),
-                        &sums,
-                        &hscales,
-                        start,
-                        len,
-                        hidden_size,
-                        group_size,
-                        num_groups,
-                    );
-                }
-            });
+            let sums = &hidden_sums[..num_groups];
+            // Slice to the model's real group count: the kernel reads
+            // [0, num_groups) and a longer slice would only invite a caller to
+            // pass one that disagrees with num_groups.
+            let hscales = &hidden_scales[..num_groups];
+            (0..num_chunks).into_par_iter().for_each_init(
+                || vec![0.0f32; num_groups],
+                |scratch, ci| {
+                    let start = ci * LM_CHUNK;
+                    let len = LM_CHUNK.min(vocab_size - start);
+                    unsafe {
+                        lm_head_chunk_i8(
+                            out_ptr.ptr().add(start),
+                            emb_ptr.ptr(),
+                            embed_params,
+                            hid_i8_ptr.ptr(),
+                            sums,
+                            hscales,
+                            start,
+                            len,
+                            hidden_size,
+                            group_size,
+                            num_groups,
+                            scratch,
+                        );
+                    }
+                },
+            );
             return;
         }
     }
@@ -2207,6 +2289,162 @@ mod tests {
                     output_mm[t * rows + r],
                     output_mv[r]
                 );
+            }
+        }
+    }
+
+    /// Build a deterministic 4-bit matrix and its group parameters.
+    ///
+    /// Values are spread across the whole nibble range and the scales differ
+    /// per row and per group, so a kernel that silently used group 0's scale
+    /// for every group — the exact failure a scratch-buffer mistake produces —
+    /// cannot pass by accident.
+    fn synthetic_weights(rows: usize, cols: usize, group_size: usize) -> (Vec<u8>, Vec<u8>) {
+        let num_groups = cols.div_ceil(group_size);
+        let mut group_params = vec![0u8; rows * num_groups * 4];
+        for r in 0..rows {
+            for g in 0..num_groups {
+                let off = (r * num_groups + g) * 4;
+                let scale = f16::from_f32(0.05 + 0.01 * ((r + g) % 7) as f32);
+                let zero = f16::from_f32(-0.4 + 0.05 * ((r * 3 + g) % 9) as f32);
+                group_params[off..off + 2].copy_from_slice(&scale.to_le_bytes());
+                group_params[off + 2..off + 4].copy_from_slice(&zero.to_le_bytes());
+            }
+        }
+
+        let mut nibble_data = vec![0u8; rows * cols / 2];
+        for (i, byte) in nibble_data.iter_mut().enumerate() {
+            let lo = (i * 7 + 3) % 16;
+            let hi = (i * 11 + 5) % 16;
+            *byte = (lo | (hi << 4)) as u8;
+        }
+        (nibble_data, group_params)
+    }
+
+    fn synthetic_input(num_tokens: usize, cols: usize) -> Vec<f32> {
+        (0..num_tokens * cols)
+            .map(|i| {
+                let x = (i % 97) as f32 / 97.0 - 0.5;
+                x * (1.0 + (i % 13) as f32 / 13.0)
+            })
+            .collect()
+    }
+
+    /// The batch kernel and the single-token kernel must agree, at every group
+    /// size a model can be quantized at.
+    ///
+    /// `w4a8_matmul` and `w4a8_matvec` share the input quantization but not the
+    /// inner loop, so this compares two independent implementations rather than
+    /// a function against itself. The tolerance is for f32 summation order,
+    /// which legitimately differs between the two: the batch kernel accumulates
+    /// per group across tokens, the single-token kernel accumulates per row.
+    #[test]
+    fn batched_and_single_token_gemm_agree_at_every_group_size() {
+        let rows = 96;
+        let cols = 512;
+        let num_tokens = 5;
+        let input = synthetic_input(num_tokens, cols);
+
+        // 512 divides evenly by 32/64/128/256; 96 and 160 leave a short tail
+        // group, which the kernels handle on a separate path.
+        for &group_size in &[32usize, 64, 96, 128, 160, 256] {
+            let (nibble_data, group_params) = synthetic_weights(rows, cols, group_size);
+
+            let mut batched = vec![0.0f32; num_tokens * rows];
+            w4a8_matmul(
+                &mut batched,
+                &nibble_data,
+                &group_params,
+                &input,
+                rows,
+                cols,
+                num_tokens,
+                group_size,
+            );
+
+            for t in 0..num_tokens {
+                let mut single = vec![0.0f32; rows];
+                w4a8_matvec(
+                    &mut single,
+                    &nibble_data,
+                    &group_params,
+                    &input[t * cols..(t + 1) * cols],
+                    rows,
+                    cols,
+                    group_size,
+                );
+                for row in 0..rows {
+                    let a = batched[t * rows + row];
+                    let b = single[row];
+                    assert!(
+                        (a - b).abs() <= 1e-3 * b.abs().max(1.0),
+                        "group_size {group_size}, token {t}, row {row}: \
+                         batched {a} vs single-token {b}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The fused projections must match running each projection on its own.
+    ///
+    /// The fused paths have their own chunk scheduler and their own scratch,
+    /// and they are what decode actually calls; a group-size bug that only
+    /// appeared there would be invisible to the test above.
+    #[test]
+    fn fused_projections_match_separate_ones_at_every_group_size() {
+        let cols = 256;
+        let q_rows = 64;
+        let k_rows = 16;
+        let v_rows = 16;
+        let input = synthetic_input(1, cols);
+
+        for &group_size in &[32usize, 64, 128, 192] {
+            let (q_nib, q_par) = synthetic_weights(q_rows, cols, group_size);
+            let (k_nib, k_par) = synthetic_weights(k_rows, cols, group_size);
+            let (v_nib, v_par) = synthetic_weights(v_rows, cols, group_size);
+
+            let mut q_fused = vec![0.0f32; q_rows];
+            let mut k_fused = vec![0.0f32; k_rows];
+            let mut v_fused = vec![0.0f32; v_rows];
+            let q = crate::format::QuantizedLinear {
+                rows: q_rows,
+                cols,
+                group_params: &q_par,
+                nibble_data: &q_nib,
+                group_size,
+            };
+            let k = crate::format::QuantizedLinear {
+                rows: k_rows,
+                cols,
+                group_params: &k_par,
+                nibble_data: &k_nib,
+                group_size,
+            };
+            let v = crate::format::QuantizedLinear {
+                rows: v_rows,
+                cols,
+                group_params: &v_par,
+                nibble_data: &v_nib,
+                group_size,
+            };
+            w4a8_fused_qkv(&mut q_fused, &mut k_fused, &mut v_fused, &q, &k, &v, &input);
+
+            for (fused, nib, par, rows, name) in [
+                (&q_fused, &q_nib, &q_par, q_rows, "q"),
+                (&k_fused, &k_nib, &k_par, k_rows, "k"),
+                (&v_fused, &v_nib, &v_par, v_rows, "v"),
+            ] {
+                let mut separate = vec![0.0f32; rows];
+                w4a8_matvec(&mut separate, nib, par, &input, rows, cols, group_size);
+                for row in 0..rows {
+                    let a = fused[row];
+                    let b = separate[row];
+                    assert!(
+                        (a - b).abs() <= 1e-3 * b.abs().max(1.0),
+                        "group_size {group_size}, {name}[{row}]: fused {a} vs separate {b}"
+                    );
+                }
             }
         }
     }

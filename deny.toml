@@ -1,0 +1,66 @@
+# cargo-deny policy. CI runs `cargo deny --all-features check` and fails on
+# anything below.
+#
+# This exists because a release archive is a binary distribution: every crate in
+# the graph is statically linked into the executables users download, and the
+# license obligations travel with those bytes. `NOTICE` used to point at
+# Cargo.lock, which records versions and says nothing about licenses — so there
+# was no gate at all, and nothing would have failed if a dependency bump had
+# introduced a license this distribution cannot carry.
+#
+# What this file does *not* police is whether the inference engine has grown a
+# network stack. cargo-deny reasons over the whole workspace graph, and the
+# non-product memory service legitimately depends on reqwest/rustls/ring, so
+# any rule written here would either be false or be a lie by exception. That
+# invariant is asserted where it is actually true — against the shipped
+# binaries, in `.github/workflows/release.yml` and the container smoke in
+# `ci.yml`.
+
+[graph]
+# The four platforms release archives are built for. A dependency that appears
+# on only one of them still ships to that one.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+all-features = true
+
+[licenses]
+# Populated from the actual graph, not from a wish list. A dependency bump that
+# introduces a license not on it fails here and gets reviewed rather than
+# shipped.
+# Exactly the licenses the graph contains, and nothing else. Listing a license
+# that is not present makes a future dependency carrying it pass silently; the
+# point of this list is that a new one stops the build and gets read by a
+# person. cargo-deny warns about unmatched entries, which is how this list was
+# trimmed to what is actually here.
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+# No [advisories] section, and no advisory check in CI's cargo-deny invocation.
+# `cargo audit` already gates RustSec advisories and reads its policy from
+# `.cargo/audit.toml`; running both means two parsers for one database and two
+# ignore lists to keep in step. It is also not hypothetical: cargo-deny's
+# advisory parser rejects the current database outright ("unsupported CVSS
+# version: 4.0"), so this check would fail for a reason that has nothing to do
+# with this project's dependencies.
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

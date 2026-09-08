@@ -56,7 +56,7 @@ def main():
     hd = raimodel.resolve_head_dim(getattr(cfg, 'head_dim', None), hs, nh)
     inter = cfg.intermediate_size
     vs = cfg.vocab_size
-    rope = getattr(cfg, 'rope_theta', 10000.0)
+    rope = raimodel.read_rope_theta(cfg)
     eps = getattr(cfg, 'rms_norm_eps', 1e-5)
 
     mc = {

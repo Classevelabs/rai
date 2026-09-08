@@ -58,6 +58,14 @@ memmap2 = { version = "0.9", optional = true }
 # of which features the library was built with.
 serde_json = "1"
 
+# A dependency-free throughput benchmark for the W4A8 kernels. `harness = false`
+# because it is a plain `main`: adding criterion would put a benchmark
+# framework and its tree into the license and advisory gates of a product whose
+# claim is that it carries almost nothing.
+[[bench]]
+name = "gemm"
+harness = false
+
 [[bin]]
 name = "rai-convert"
 path = "src/bin/convert.rs"

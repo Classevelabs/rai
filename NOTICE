@@ -4,5 +4,15 @@ Copyright 2025-2026 ClassEve
 RAI is released under the Apache License, Version 2.0. See LICENSE for the
 license text.
 
-This repository uses third-party Rust dependencies recorded in Cargo.lock.
-Those dependencies remain under their respective licenses.
+THIRD-PARTY SOFTWARE
+
+The `rai` binary is statically linked. Every third-party crate it is built from
+is compiled into the executables in the release archives, and their license
+terms apply to those bytes.
+
+THIRD-PARTY-NOTICES.md, in this archive and in the repository, reproduces the
+full license text of every one of them and names the crates each text covers.
+It is generated from the dependency graph of the crate the archives are built
+from, and CI fails if the committed copy has drifted from that graph.
+
+Cargo.lock records the exact version of each dependency.

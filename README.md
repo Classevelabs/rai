@@ -146,6 +146,9 @@ the RAI product**, are not published to crates.io (0.1.0 yanked 2026-08-13,
 `publish = false` set), and `rai-server` imports `rai-infer` zero times — it
 cannot run a model.
 
+These three are absent from every release archive, and a release-time gate
+fails the build if one of them reaches an archive again.
+
 | Not part of RAI | Purpose |
 | --- | --- |
 | `rai-server` | REST + MCP server for the memory/reasoning layer |
@@ -185,11 +188,14 @@ embedding from the configured provider and stores/queries state through
 cargo build --workspace --release --locked
 ```
 
-That produces `rai` and `rai-server`, plus the deprecated `rai-convert`,
-`rai-generate`, and `rai-chat` wrappers. See [installation](./docs/INSTALL.md)
+That produces `rai`, plus the deprecated `rai-convert`, `rai-generate`, and
+`rai-chat` wrappers — and, because `--workspace` builds everything in the
+tree, the non-product `rai-server` too. Release archives are built from
+`--package classeve-rai-infer` alone. See [installation](./docs/INSTALL.md)
 for source installs and the container. No container image is published; the
-`Dockerfile` builds an MCP stdio image from source by default, and
-`docker build --target cli .` builds an image carrying the `rai` CLI instead.
+`Dockerfile` builds the `rai` CLI by default, and
+`docker build --target server .` builds the non-product memory service
+instead.
 
 Development checks:
 
@@ -248,7 +254,7 @@ repository shows a quality win from them** — the module doc in
 `rai-infer/src/ponder.rs` says exactly what each one computes. Leave them off.
 
 Set `RAYON_NUM_THREADS` to cap the inference worker count used by `rai run` and
-`rai serve`; it defaults to Rayon's own choice and does not affect `rai-server`.
+`rai serve`; it defaults to Rayon's own choice.
 
 ### Speculative decoding
 
@@ -292,132 +298,14 @@ state of its own, and the web UI replays the visible thread the same way.
 selects prompt formatting. The chat server binds to `127.0.0.1` only and
 limits request bodies to 64 KiB.
 
-### REST + MCP server
+### The memory service is not in the archive
 
-`rai-server` exposes an experimental memory/reasoning prototype:
+The `rai-server` REST/MCP memory prototype builds from this workspace but is
+not part of RAI and is not in any release archive — see
+[Workspace layout](#workspace-layout). It runs models zero times, and it is the
+only thing here that can open an outbound connection. If you want to build and
+run it from source, [docs/OPERATIONS.md](./docs/OPERATIONS.md) is its runbook.
 
-```bash
-# REST mode (default 127.0.0.1:3000; configure with RAI_HOST / RAI_PORT)
-./target/release/rai-server
-
-# MCP mode on stdio — for MCP clients such as Claude Desktop or Claude Code
-./target/release/rai-server mcp
-```
-
-| Endpoint | Purpose |
-| --- | --- |
-| `POST /v1/store` | Store a fact; returns an address-space crowding report |
-| `POST /v1/forget` | Remove a stored fact by its exact text; reports whether anything was removed |
-| `POST /v1/recall` | Return the stored memory with the highest cosine similarity to the query |
-| `POST /v1/intersect` | Retrieve at the normalized average of several concept addresses |
-| `POST /v1/contradict` | Report how a candidate fact would change address-space crowding |
-| `POST /v1/surprise` | Residual against the nearest stored key's value |
-| `POST /v1/confidence` | The retrieval score and the tier it falls in |
-| `POST /v1/snapshot` | Per-item crowding scores |
-| `GET /v1/health` | Stored count, mean residual norm, capacity ratio |
-
-The current backend is a cosine nearest-neighbour store, not a validated
-resonance-training system. There is no training: no endpoint, no tool, and no
-optimizer. Retrieval is nearest-vector by cosine similarity, and the confidence
-tiers are a relabelling of that similarity rather than calibrated probabilities.
-
-`/v1/contradict` (and the `rai_contradict` tool) reports **address-space
-crowding**, not semantic contradiction. Each stored item is scored against its
-nearest other neighbour; the endpoint compares those scores with and without the
-candidate fact and reports the items the candidate would crowd — addresses it
-lands close enough to that recall could confuse them. That is geometry, not
-meaning: two facts can contradict from far-apart addresses, so an empty report
-is not evidence that a fact agrees with memory. The same caveat applies to the
-interference report returned by `/v1/store`.
-
-The store holds **512 items by default**; set `RAI_CAPACITY` to raise the
-ceiling (up to 100,000), and remove memories with `POST /v1/forget` (or the
-`rai_forget` MCP tool, which is mutation-gated like `rai_store`). A store
-beyond capacity returns HTTP 409 naming the limit and both remedies. The
-service is **single-writer**: reads run concurrently, every mutation takes an
-exclusive lock, and a durable store publishes in memory only after its
-snapshot is on disk.
-
-REST request bodies are limited to 64 KiB and individual text fields to 16 KiB
-(bytes, not characters — the REST and MCP transports share one limit); concurrent
-work is bounded, a global request ceiling protects the local process from
-accidental overload, and any request still running after 30 seconds is abandoned
-with HTTP 503. Ctrl-C shuts down gracefully so in-flight durable stores finish.
-Local loopback usage needs no token. `rai-server` serves plain HTTP and therefore
-refuses every non-loopback `RAI_HOST`, even when a token is configured. For
-remote access, keep RAI on loopback behind a TLS-terminating reverse proxy and
-have the proxy send a loopback `Host` value (`127.0.0.1:<RAI_PORT>`, or a
-portless `localhost`; a port, when present, must match `RAI_PORT`). Host and
-Origin checks reject DNS-rebinding and browser cross-origin requests.
-
-Set `RAI_API_TOKEN` to a random value of at least 32 bytes to require bearer
-authentication on every `/v1/*` request, including loopback requests:
-
-```bash
-curl -H "Authorization: Bearer $RAI_API_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"query":"example"}' http://127.0.0.1:3000/v1/recall
-```
-
-Set `RAI_DATA_PATH=/path/to/rai-memory.json` to load memory on startup and save
-it after successful REST or opted-in MCP stores. The parent directory is created
-when needed. Snapshots use write-then-rename replacement; Unix files are created
-with mode `0600`. On Windows, place the snapshot in a user-private directory
-because file access inherits that directory's ACL. An unreadable or invalid
-snapshot fails startup instead of silently starting with empty memory.
-
-In MCP mode the same operations are exposed as tools (`rai_store`,
-`rai_forget`, `rai_recall`, `rai_intersect`, `rai_contradict`, `rai_surprise`,
-`rai_explain_confidence`, `rai_memory_health`). Example MCP client
-configuration:
-
-```json
-{
-  "mcpServers": {
-    "rai": {
-      "command": "/path/to/rai-server",
-      "args": ["mcp"]
-    }
-  }
-}
-```
-
-MCP is a trusted local stdio transport and inherits the launching client's OS
-permissions. It has no independent network-authentication boundary. `rai_store`
-and `rai_forget` are hidden and denied by default; set
-`RAI_MCP_MUTATIONS_ENABLED=true` only when that MCP client should be allowed
-to modify and persist memory.
-
-Embeddings default to a deterministic built-in mock provider intended only for
-tests and demonstrations; startup prints a warning whenever it is active. Set
-`RAI_EMBEDDING_PROVIDER=openai` and `OPENAI_API_KEY` to use an
-OpenAI embedding API instead. Any other provider value is rejected
-at startup rather than silently falling back to mock embeddings.
-
-### Server configuration
-
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `RAI_HOST` | `127.0.0.1` | REST bind host; only loopback names/addresses are accepted |
-| `RAI_PORT` | `3000` | REST port, from 1 through 65535 |
-| `RAI_API_TOKEN` | unset | Optional REST bearer token; at least 32 bytes when set |
-| `RAI_EMBEDDING_PROVIDER` | `mock` | `mock` for demonstrations or `openai` |
-| `OPENAI_API_KEY` | unset | Required when the provider is `openai` |
-| `RAI_DATA_PATH` | unset | Snapshot file; state is ephemeral when unset |
-| `RAI_CAPACITY` | `512` | Maximum stored memories, up to 100,000; also raises the ceiling of a loaded snapshot |
-| `RAI_MCP_MUTATIONS_ENABLED` | `false` | Exact `true`/`false`; exposes mutating MCP tools (`rai_store`, `rai_forget`) when true |
-
-A variable whose value is not valid Unicode fails startup rather than being
-ignored. `rai-server --help` prints the mode and variable summary;
-`rai-server --version` prints the version.
-
-Common startup failures are deliberate safeguards: use a loopback
-`RAI_HOST`, provide a 32-byte-or-longer token, set an OpenAI key with the
-`openai` provider, and make `RAI_DATA_PATH` a writable file path rather than a
-directory. A model that fails to load should be regenerated and treated as
-untrusted until its header, dimensions, offsets, and file length are verified.
-See [installation](./docs/INSTALL.md) and [operations](./docs/OPERATIONS.md)
-for the full runbooks.
 
 ## The `.raimodel` format
 
@@ -493,9 +381,16 @@ RAI is pre-1.0 and interfaces may change. What that means concretely:
   for its name: a shared expert, a `rope_scaling` scheme the kernels do not
   implement, an `lm_head` bias, or a module tree that is not Llama-shaped.
   [docs/MODELS.md](./docs/MODELS.md) names each one and what to use instead.
-- Quantization quality is measured as Hessian-weighted output error
-  (BENCHMARKS.md). No perplexity sweep has been run, so no perplexity claim is
-  made.
+- **4-bit conversion costs real quality, and the number is now measured.** On
+  wikitext-2, `rai convert`'s round-to-nearest 4-bit raises perplexity by 13%
+  to 30% over the fp16 checkpoint, across Qwen2.5-0.5B/1.5B/3B and
+  SmolLM2-1.7B, and at `--temperature 0` the 4-bit model emits a different
+  token than fp16 between one time in four and one time in five. llama.cpp's
+  Q4_K_M costs three to eight times less on the same corpus, because it is not
+  uniformly 4-bit — it spends 6 bits on `ffn_down` and `attn_v`, where RAI
+  spends 4 on everything. RAI's files are correspondingly smaller. Method,
+  machine, corpus hash and the full tables are in
+  [BENCHMARKS.md](./BENCHMARKS.md); reproduce any of it with `rai perplexity`.
 - The optimized paths are x86-64 (AVX2 + FMA + F16C). On ARM — including
   Apple Silicon, which ships a native `aarch64-apple-darwin` archive — the GEMM
   falls back to a scalar path, so it runs correctly but far slower than the

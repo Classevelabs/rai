@@ -20,11 +20,14 @@ use rayon::prelude::*;
 
 /// Upper bound on the precomputed RoPE cos/sin table allocation.
 ///
-/// `format.rs` imports this constant: `.raimodel` validation at load time is
-/// the single gate that guarantees a loaded model can never ask
-/// `RoPETable::new` for an over-budget table, so the limit is defined once
-/// here at its point of enforcement.
-pub(crate) const MAX_ROPE_TABLE_BYTES: usize = 512 * 1024 * 1024;
+/// `format.rs` and `convert.rs` both import this constant: `.raimodel`
+/// validation at load time is the single gate that guarantees a loaded model
+/// can never ask `RoPETable::new` for an over-budget table, so the limit is
+/// defined once here at its point of enforcement. Public because the
+/// converter names it in the error a user sees when a context is too large,
+/// and because `tests/limits_are_single_sourced.rs` holds the Python exporter
+/// to it.
+pub const MAX_ROPE_TABLE_BYTES: usize = 512 * 1024 * 1024;
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -634,8 +637,13 @@ impl RoPETable {
 
     /// Apply RoPE rotation to a set of heads at the given position.
     ///
-    /// `heads` is `[num_heads * head_dim]`. Each head's pairs (x[2i], x[2i+1])
-    /// are rotated by the position-dependent angle.
+    /// `heads` is `[num_heads * head_dim]`. Each head is split in half and
+    /// element `i` is rotated against element `i + head_dim/2` by the
+    /// position-dependent angle — the split-half convention Llama and
+    /// HuggingFace use, **not** the interleaved `(x[2i], x[2i+1])` pairing an
+    /// earlier version of this comment described. The two produce different
+    /// models from the same weights, so anything reimplementing this against
+    /// the comment rather than the code would silently disagree.
     ///
     /// # Panics
     /// Panics if `pos >= max_ctx`, the head-count product overflows, or

@@ -3,6 +3,17 @@
 //! Text is embedded by a provider, projected into fixed-dimension address/key/value vectors, and
 //! stored in the `rem-nra` nearest-neighbour tables. Every retrieval, intersection, contradiction,
 //! and confidence output in this crate is derived from cosine similarity over those vectors.
+//!
+//! This crate contains no model and no inference. The only provider that
+//! produces meaningful vectors is [`embedding::OpenAIEmbedder`], which posts
+//! the text to an OpenAI-compatible endpoint;
+//! [`embedding::MockEmbedder`] is deterministic and exists for tests. A local
+//! embedding provider has never been implemented here, so a deployment
+//! without an external endpoint has no semantic retrieval — it is not a
+//! degraded mode, it is a different thing.
+//!
+//! This crate is not part of the RAI product. See the note at the top of
+//! `rai-server/Cargo.toml`.
 
 pub mod embedding;
 pub mod memory;

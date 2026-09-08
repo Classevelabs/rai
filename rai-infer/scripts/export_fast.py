@@ -77,7 +77,7 @@ def main():
     head_dim = raimodel.resolve_head_dim(getattr(cfg, 'head_dim', None), hidden_size, num_heads)
     intermediate_size = cfg.intermediate_size
     vocab_size = cfg.vocab_size
-    rope_theta = getattr(cfg, 'rope_theta', 10000.0)
+    rope_theta = raimodel.read_rope_theta(cfg)
     norm_eps = getattr(cfg, 'rms_norm_eps', 1e-5)
     tied = getattr(cfg, 'tie_word_embeddings', True)
 

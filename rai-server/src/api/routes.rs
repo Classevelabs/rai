@@ -166,6 +166,13 @@ async fn require_auth(State(auth): State<AuthState>, request: Request, next: Nex
 /// The DNS-rebinding defence is the host *name* check: a rebound browser request always carries
 /// the attacker's own hostname. A port is therefore optional — a reverse proxy or a hand-written
 /// `curl -H "Host: localhost"` is legitimate — but when one is present it must be this server's.
+///
+/// `rai serve` in `rai-infer` implements the same defence and requires the
+/// port, because it is only ever reached directly by a browser it served the
+/// page to. The two are separate on purpose: this crate must not depend on
+/// `rai-infer`, and sharing the check is the shortest path to it doing so.
+/// Each is asserted against a real socket in its own crate rather than being
+/// assumed equivalent to the other.
 fn is_allowed_host(host: &str, port: u16) -> bool {
     host.parse::<Authority>().is_ok_and(|authority| {
         !authority.as_str().contains('@')

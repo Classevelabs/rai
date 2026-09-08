@@ -1,11 +1,10 @@
 # Installing RAI
 
-RAI is two command-line programs and no installer:
+RAI is one command-line program and no installer:
 
 | Binary | What it is for |
 | --- | --- |
 | `rai` | Convert checkpoints, generate text, serve a local chat UI, list models |
-| `rai-server` | Local REST + MCP memory service |
 
 `rai` has four subcommands:
 
@@ -21,7 +20,8 @@ are deprecated wrappers over the same code, kept so existing scripts keep
 working; new work should use `rai`.
 
 Nothing runs as a service, nothing writes outside the paths you name, and no
-GPU is required. `rai serve` and `rai-server` listen on loopback only.
+GPU is required. `rai serve` binds loopback only, and the binary carries no
+HTTP client and no TLS stack — there is no server it could reach.
 
 If you want to build from source instead, skip to
 [Installing from source](#installing-from-source). For model export details,
@@ -106,7 +106,7 @@ Linux and macOS:
 ```bash
 tar xzf rai-0.2.3-x86_64-unknown-linux-gnu.tar.gz
 cd rai-0.2.3-x86_64-unknown-linux-gnu
-install -m 0755 rai rai-server ~/.local/bin/
+install -m 0755 rai ~/.local/bin/
 rai --help
 ```
 
@@ -118,7 +118,7 @@ macOS marks downloaded files with a quarantine attribute, and these binaries
 are not notarized. Gatekeeper will refuse them until you clear it:
 
 ```bash
-xattr -d com.apple.quarantine rai rai-server
+xattr -d com.apple.quarantine rai
 ```
 
 Windows PowerShell:
@@ -191,17 +191,6 @@ needs `--chat-template zephyr` specifically — `auto` cannot detect it, because
 its `<|user|>` markers are ordinary text rather than vocabulary entries. See
 [Running a chat model](./docs/INSTALL.md#running-a-chat-model).
 
-The memory service is separate from inference and needs no model:
-
-```bash
-rai-server rest      # REST API on 127.0.0.1:3000
-rai-server mcp       # MCP over stdio, for an MCP client
-```
-
-Read [docs/OPERATIONS.md](./docs/OPERATIONS.md) before pointing anything real at
-`rai-server`; its configuration is entirely environment variables, and the
-defaults are deliberately conservative.
-
 ## Installing from source
 
 You need Rust 1.87 or newer. The repository pins 1.95.0 for repeatable checks,
@@ -211,7 +200,6 @@ which `rustup` will install automatically from `rust-toolchain.toml`.
 git clone https://github.com/Classevelabs/rai.git
 cd rai
 cargo install --locked --path rai-infer     # rai, and the deprecated wrappers
-cargo install --locked --path rai-server    # rai-server
 ```
 
 `cargo install` puts them in `~/.cargo/bin`, which `rustup` already added to

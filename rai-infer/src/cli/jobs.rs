@@ -220,6 +220,19 @@ fn round2_f64(value: f64) -> f64 {
     (value * 100.0).round() / 100.0
 }
 
+/// Take a lock, recovering the guard if a previous holder panicked.
+///
+/// Job state is a progress report, not an invariant that a panic can corrupt
+/// into something dangerous: the worst a poisoned guard carries is a
+/// half-updated stage string. Refusing to read it — which is what
+/// `if let Ok(..)` did in `run_job` — is strictly worse, because the write
+/// being skipped is the one that moves a job out of `Running`, and a job that
+/// never leaves `Running` holds the single conversion slot for the life of the
+/// process.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|error| error.into_inner())
+}
+
 /// Every conversion this server has started.
 #[derive(Debug, Default)]
 pub struct Jobs {
@@ -243,28 +256,23 @@ impl Jobs {
 
     /// True while any job is still running.
     pub fn running(&self) -> bool {
-        let jobs = self.jobs.lock().unwrap_or_else(|error| error.into_inner());
-        jobs.iter().any(|job| {
-            job.lock()
-                .map(|job| job.phase == JobPhase::Running)
-                .unwrap_or(false)
-        })
+        let jobs = lock(&self.jobs);
+        jobs.iter().any(|job| lock(job).phase == JobPhase::Running)
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<Mutex<Job>>> {
-        let index = self.index.lock().unwrap_or_else(|error| error.into_inner());
-        index.get(id).cloned()
+        lock(&self.index).get(id).cloned()
     }
 
     /// Ids newest first, with each job's phase — enough for a UI to show a
     /// history list without polling every id.
     pub fn list(&self) -> serde_json::Value {
-        let jobs = self.jobs.lock().unwrap_or_else(|error| error.into_inner());
+        let jobs = lock(&self.jobs);
         let entries: Vec<serde_json::Value> = jobs
             .iter()
             .rev()
-            .filter_map(|job| job.lock().ok())
             .map(|job| {
+                let job = lock(job);
                 serde_json::json!({
                     "job_id": job.id,
                     "state": job.phase.as_str(),
@@ -293,10 +301,6 @@ impl Jobs {
         let Some(output) = options.output.clone() else {
             return Err(StartError::Invalid("output path is required".to_string()));
         };
-        if self.running_count() >= MAX_RUNNING_JOBS {
-            return Err(StartError::Busy);
-        }
-
         let id = new_job_id();
         let job = Arc::new(Mutex::new(Job {
             id: id.clone(),
@@ -317,26 +321,41 @@ impl Jobs {
             error: None,
         }));
 
+        // Claiming the slot and registering the job happen under one lock.
+        // Counting first and pushing afterwards is a check-then-act: two
+        // callers could both see a free slot and both start a conversion, and
+        // `MAX_RUNNING_JOBS` exists precisely because two at once make each
+        // other slower and double peak memory. The request loop is
+        // single-threaded today, so the race was not reachable — but `Jobs` is
+        // `Send + Sync` and shared with every worker thread, and an invariant
+        // that holds only because of a caller's threading model is not an
+        // invariant this type can rely on.
         {
-            let mut jobs = self.jobs.lock().unwrap_or_else(|error| error.into_inner());
-            let mut index = self.index.lock().unwrap_or_else(|error| error.into_inner());
+            let mut jobs = lock(&self.jobs);
+            let mut index = lock(&self.index);
+
+            if jobs
+                .iter()
+                .filter(|job| lock(job).phase == JobPhase::Running)
+                .count()
+                >= MAX_RUNNING_JOBS
+            {
+                return Err(StartError::Busy);
+            }
+
             jobs.push(Arc::clone(&job));
             index.insert(id.clone(), Arc::clone(&job));
             // Drop the oldest *finished* jobs once the history is full; a
             // running job is never evicted, or its poll would 404 mid-run.
             while jobs.len() > MAX_RETAINED_JOBS {
-                let evictable = jobs.iter().position(|job| {
-                    job.lock()
-                        .map(|job| job.phase != JobPhase::Running)
-                        .unwrap_or(true)
-                });
+                let evictable = jobs
+                    .iter()
+                    .position(|job| lock(job).phase != JobPhase::Running);
                 match evictable {
                     Some(position) => {
                         let old = jobs.remove(position);
-                        let old_id = old.lock().ok().map(|old| old.id.clone());
-                        if let Some(old_id) = old_id {
-                            index.remove(&old_id);
-                        }
+                        let old_id = lock(&old).id.clone();
+                        index.remove(&old_id);
                     }
                     None => break,
                 }
@@ -344,42 +363,78 @@ impl Jobs {
         }
 
         let worker = Arc::clone(&job);
-        std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name(format!("rai-convert-{id}"))
-            .spawn(move || run_job(&worker, &options))
-            .map_err(|error| {
-                StartError::Invalid(format!("cannot start a worker thread: {error}"))
-            })?;
+            .spawn(move || run_job(&worker, &options));
+
+        if let Err(error) = spawned {
+            // The job is already registered and already counted as running. If
+            // it were left that way the slot would never come back: nothing
+            // else transitions a job whose worker does not exist, and a
+            // running job is never evicted from the history either.
+            let message = format!("cannot start a worker thread: {error}");
+            {
+                let mut job = lock(&job);
+                job.phase = JobPhase::Error;
+                job.stage = "error".to_string();
+                job.push_line(&message);
+                job.error = Some(message.clone());
+            }
+            return Err(StartError::Invalid(message));
+        }
 
         Ok(id)
     }
-
-    fn running_count(&self) -> usize {
-        let jobs = self.jobs.lock().unwrap_or_else(|error| error.into_inner());
-        jobs.iter()
-            .filter(|job| {
-                job.lock()
-                    .map(|job| job.phase == JobPhase::Running)
-                    .unwrap_or(false)
-            })
-            .count()
-    }
 }
 
+/// Run one conversion to completion and record how it ended.
+///
+/// Two guarantees this function owes the rest of the server, because
+/// `MAX_RUNNING_JOBS` is 1 and a running job is never evicted from the
+/// history: the job it was handed **always** leaves `Running`, and it leaves
+/// with a reason attached. A worker that returns without doing that costs the
+/// process every future conversion, and the only cure is a restart.
 fn run_job(job: &Arc<Mutex<Job>>, options: &ConvertOptions) {
+    // The backstop, ahead of every path that could return. `Drop` runs during
+    // unwinding as well as on a normal return, so a panic anywhere below —
+    // including inside a dependency, where `catch_unwind` has already done its
+    // job but any later code has not — still frees the slot.
+    let _terminal = TerminalPhaseGuard(job);
+
     let progress = |event: ConvertProgress<'_>| {
-        if let Ok(mut job) = job.lock() {
-            job.stage = event.stage.to_string();
-            job.percent = event.percent;
-            job.layer = event.layer;
-            job.elapsed_ms = job.started.elapsed().as_millis() as u64;
-            job.push_line(event.message);
-        }
+        let mut job = lock(job);
+        job.stage = event.stage.to_string();
+        job.percent = event.percent;
+        job.layer = event.layer;
+        job.elapsed_ms = job.started.elapsed().as_millis() as u64;
+        job.push_line(event.message);
     };
 
-    let outcome = convert_with_progress(options, &progress);
+    // A panic in the conversion is reported as a failed conversion rather than
+    // as a thread that vanished. `AssertUnwindSafe` is the honest annotation
+    // here: the only state shared across the boundary is the job behind its
+    // mutex, whose poisoning this module recovers from by policy (see `lock`),
+    // and the caller-owned `options`, which the conversion only reads.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        convert_with_progress(options, &progress)
+    }));
 
-    if let Ok(mut job) = job.lock() {
+    let outcome = match outcome {
+        Ok(result) => result,
+        Err(payload) => Err(anyhow::anyhow!(
+            "the conversion panicked: {}",
+            panic_message(&payload)
+        )),
+    };
+
+    // Scoped, and the scope is load-bearing rather than stylistic:
+    // `TerminalPhaseGuard::drop` takes this same mutex, `std::sync::Mutex` is
+    // not reentrant, and a guard still held when the drop runs would deadlock
+    // the worker thread — wedging the conversion slot in exactly the way this
+    // guard exists to prevent. Drop order happens to release this first, but
+    // "happens to" is not a property to leave a future edit standing on.
+    {
+        let mut job = lock(job);
         job.elapsed_ms = job.started.elapsed().as_millis() as u64;
         match outcome {
             Ok(summary) => {
@@ -400,6 +455,46 @@ fn run_job(job: &Arc<Mutex<Job>>, options: &ConvertOptions) {
                 job.error = Some(text);
             }
         }
+    }
+}
+
+/// Forces a job out of `Running` if nothing else already did.
+///
+/// This exists for the paths no `match` arm covers: a panic that unwinds past
+/// the normal terminal write, or a future edit that adds an early return. In
+/// the ordinary case the job is already `Done` or `Error` by the time this
+/// drops and it does nothing at all.
+struct TerminalPhaseGuard<'a>(&'a Arc<Mutex<Job>>);
+
+impl Drop for TerminalPhaseGuard<'_> {
+    fn drop(&mut self) {
+        let mut job = lock(self.0);
+        if job.phase != JobPhase::Running {
+            return;
+        }
+        job.phase = JobPhase::Error;
+        job.stage = "error".to_string();
+        job.elapsed_ms = job.started.elapsed().as_millis() as u64;
+        let text = "the conversion worker ended without recording a result;                     the conversion did not finish";
+        job.push_line(text);
+        if job.error.is_none() {
+            job.error = Some(text.to_string());
+        }
+    }
+}
+
+/// The human-readable half of a panic payload, when there is one.
+///
+/// `panic!("...")` and `assert!` produce a `&str` or a `String`; anything else
+/// carries no text worth printing, and saying so is better than printing a
+/// type name.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&'static str>() {
+        (*text).to_string()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "no message".to_string()
     }
 }
 
@@ -499,6 +594,127 @@ mod tests {
             log_dropped: 0,
             result: None,
             error: None,
+        }
+    }
+
+    /// Register an already-running job the way `start` does, without spawning
+    /// a worker for it. This is the state a dead worker used to leave behind.
+    fn registered_running_job(jobs: &Jobs) -> Arc<Mutex<Job>> {
+        let handle = Arc::new(Mutex::new(job()));
+        lock(&jobs.jobs).push(Arc::clone(&handle));
+        lock(&jobs.index).insert("test".to_string(), Arc::clone(&handle));
+        handle
+    }
+
+    #[test]
+    fn the_terminal_guard_forces_a_running_job_to_error() {
+        let handle = Arc::new(Mutex::new(job()));
+        drop(TerminalPhaseGuard(&handle));
+
+        let finished = lock(&handle);
+        assert_eq!(finished.phase, JobPhase::Error);
+        assert_eq!(finished.stage, "error");
+        assert!(finished
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("did not finish")));
+    }
+
+    #[test]
+    fn the_terminal_guard_leaves_a_finished_job_alone() {
+        let handle = Arc::new(Mutex::new(job()));
+        {
+            let mut started = lock(&handle);
+            started.phase = JobPhase::Done;
+            started.stage = "done".to_string();
+        }
+        drop(TerminalPhaseGuard(&handle));
+
+        let finished = lock(&handle);
+        assert_eq!(finished.phase, JobPhase::Done);
+        assert_eq!(finished.stage, "done");
+        assert!(finished.error.is_none());
+    }
+
+    /// The path the guard exists for: a real unwind, not a simulated one.
+    #[test]
+    fn a_panicking_worker_leaves_the_job_in_error_not_running() {
+        let handle = Arc::new(Mutex::new(job()));
+        let worker = Arc::clone(&handle);
+
+        // The default hook would print this deliberate panic and make a
+        // passing run look like a failing one.
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::thread::spawn(move || {
+            let _terminal = TerminalPhaseGuard(&worker);
+            panic!("quantization exploded");
+        })
+        .join();
+        std::panic::set_hook(previous);
+
+        assert!(result.is_err(), "the worker was supposed to panic");
+        assert_eq!(lock(&handle).phase, JobPhase::Error);
+    }
+
+    /// The consequence that made this worth fixing: `MAX_RUNNING_JOBS` is 1,
+    /// and a job stuck in `Running` holds that slot for the life of the
+    /// process, because nothing transitions it and eviction skips it.
+    #[test]
+    fn a_wedged_job_no_longer_holds_the_conversion_slot() {
+        let jobs = Jobs::new();
+        let handle = registered_running_job(&jobs);
+
+        // While it is running, the slot is taken — this is correct behaviour.
+        assert!(jobs.running());
+        // Spread the defaults rather than spelling every field: these tests
+        // care about the model directory and nothing else, and an exhaustive
+        // literal makes every new option a compile error here for no reason.
+        let refused = jobs.start(ConvertOptions {
+            model_dir: std::env::temp_dir(),
+            output: Some(PathBuf::from("out.raimodel")),
+            max_context: 2048,
+            quiet: true,
+            ..ConvertOptions::default()
+        });
+        assert!(
+            matches!(refused, Err(StartError::Busy)),
+            "a running job must hold the single conversion slot"
+        );
+
+        // Once the worker is accounted for, the slot comes back. Before the
+        // guard existed there was no code path that reached this state.
+        drop(TerminalPhaseGuard(&handle));
+        assert!(!jobs.running());
+    }
+
+    #[test]
+    fn a_panic_payload_becomes_a_readable_line() {
+        assert_eq!(panic_message(&"static message"), "static message");
+        assert_eq!(panic_message(&"owned message".to_string()), "owned message");
+        assert_eq!(panic_message(&42u8), "no message");
+    }
+
+    #[test]
+    fn the_conversion_slot_is_claimed_under_the_same_lock_that_registers_it() {
+        // Counting running jobs and pushing the new one happen together, so a
+        // second caller cannot observe a free slot that a first caller has
+        // already taken. Asserted through the public API: the first start
+        // registers, the second is refused, and nothing in between can widen
+        // that window.
+        let jobs = Jobs::new();
+        let _running = registered_running_job(&jobs);
+        for _ in 0..8 {
+            assert!(matches!(
+                jobs.start(ConvertOptions {
+                    model_dir: std::env::temp_dir(),
+                    output: Some(PathBuf::from("out.raimodel")),
+                    max_context: 2048,
+                    quiet: true,
+                    ..ConvertOptions::default()
+                }),
+                Err(StartError::Busy)
+            ));
         }
     }
 

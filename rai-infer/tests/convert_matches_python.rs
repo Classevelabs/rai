@@ -472,6 +472,11 @@ fn options(model_dir: &Path, output: &Path) -> ConvertOptions {
         max_context: MAX_CONTEXT,
         tokenizer_out: None,
         quiet: true,
+        // Uncalibrated: this test's whole purpose is that the default path
+        // still writes the bytes `export_rtn.py` writes.
+        calibration_text: None,
+        calibration_sequences: 16,
+        calibration_seq_len: 512,
     }
 }
 
