@@ -15,7 +15,7 @@ Built by [ClassEve](https://classeve.com). Licensed under Apache-2.0.
 
 ## Measured performance
 
-Measured on an Intel i5-10300H (4 cores / 8 threads), 2026-08-09, RAI 0.2.0.
+Measured on a consumer-grade laptop CPU (4 cores / 8 threads), 2026-08-09, RAI 0.2.0.
 Full method, roofline, and the results that came out negative are in
 [BENCHMARKS.md](./BENCHMARKS.md).
 

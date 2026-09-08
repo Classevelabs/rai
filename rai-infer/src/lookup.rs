@@ -22,7 +22,7 @@
 //! When no n-gram matches at all, no draft is produced and the step degenerates
 //! to a single ordinary decode — verification is never paid for an empty draft.
 //!
-//! MEASURED STATUS ON THIS ENGINE (TinyLlama-1.1B-q4, i5-10300H, 2026-08-13).
+//! MEASURED STATUS ON THIS ENGINE (TinyLlama-1.1B-q4, a consumer laptop CPU, 2026-08-13).
 //! The drafting works; the speedup does not, yet. On a 315-token
 //! context-quoting QA prompt, K=2 accepts 55.8% of drafted tokens, drafts on
 //! 89.6% of steps and yields 1.98 tokens/step — a genuine 2x cut in decode

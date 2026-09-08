@@ -6,6 +6,29 @@ versioning for its pre-1.0 releases.
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-09-08
+
+### Fixed
+- `.raimodel` validation now checks the Mixture-of-Experts router and every
+  expert's quantization scales for finiteness, not only the base projections,
+  so a malformed or hostile file is refused at load instead of producing NaN or
+  garbage output at inference.
+- Cosine similarity in `rem-nra` is scale-invariant, so very small-magnitude
+  vectors retrieve the correct nearest neighbour instead of scoring as zero.
+- The AVX2 attention-softmax and SiLU scalar tails use the same fast-exp
+  approximation as their SIMD bodies, so a single activation buffer never mixes
+  two exp curves.
+- Scalar int8 activation quantization rounds half-to-even, matching the AVX2
+  path and the converter, so the output no longer differs by one code between
+  AVX2 and non-AVX2 machines.
+- Greedy decoding breaks exact logit ties toward the first token, matching
+  NumPy / PyTorch / Hugging Face `argmax`.
+- Documentation: the fp16-versus-4-bit perplexity gap is described as the
+  end-to-end cost of the 4-bit engine (weights, int8 activations, and the
+  approximate fast-exp kernels); the sequential-versus-batched logits are
+  documented as agreeing within 2e-3 rather than exactly zero; and the README
+  quickstart's converter output name matches the run/serve commands.
+
 ### Added
 - **`rai perplexity`.** Measures what quantization cost a model, using
   `llama-perplexity`'s method — non-overlapping chunks of `--context` tokens,
@@ -396,7 +419,7 @@ versioning for its pre-1.0 releases.
   every model. `bw-bench` had been measuring this the whole time — its parallel
   read of that matrix comes back 10-20x slower than its serial one. Decode now
   parallelizes on packed size as well as row count and walks small matrices on
-  one thread. Measured on an i5-10300H: SmolLM2-135M 7.4 -> 37.5 tok/s,
+  one thread. Measured on a consumer laptop CPU: SmolLM2-135M 7.4 -> 37.5 tok/s,
   TinyLlama-1.1B 2.0 -> 10.9 tok/s. Prefill is unchanged by the gate and gains
   as well, because decode no longer thrashes the pool it shares.
 - **A model paired with another model's tokenizer generated fluent nonsense and

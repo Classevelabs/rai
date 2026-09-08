@@ -1,7 +1,7 @@
 # Benchmark record
 
 This file has two parts. The **verified run** below was measured end to end on
-a named machine on 2026-08-09 with the environment recorded in
+a specific machine on 2026-08-09 with the environment recorded in
 `rai-infer/scripts/requirements-lock.txt`, and is the only section that should
 be quoted as evidence. Everything after it is the older, author-reported
 development record, kept for context and explicitly not reproduced.
@@ -29,8 +29,8 @@ laptop under load can deliver a tenth of its quiet number.
 
 ## Verified runs, 2026-08-09
 
-**Machine:** Intel Core i5-10300H (4 cores / 8 threads, AVX2 + FMA + F16C),
-15.8 GB RAM, Windows 11. **Build:** `cargo build --release` with
+**Machine:** a consumer-grade laptop CPU (4 cores / 8 threads, AVX2 + FMA + F16C),
+16 GB RAM, Windows 11. **Build:** `cargo build --release` with
 `RUSTFLAGS="-C target-cpu=native"` (fat LTO), rustc 1.95.0, RAI 0.2.0. Python
 environment pinned in `rai-infer/scripts/requirements-lock.txt`.
 
@@ -206,10 +206,10 @@ mean; over 10,200 tokens the standard error puts about **±2.5%** on any single
 figure, so these are quoted to two decimals and not four. Both
 `rai perplexity` and `scripts/reference_ppl.py` compute and report it.
 
-**Machine.** A 16-vCPU cloud container with AVX2, FMA and F16C. The platform
-does not expose the CPU model, so it is not stated. RAI was built at the
+**Machine.** A multi-core x86-64 CPU server with AVX2, FMA and F16C; the exact
+CPU model is not stated. RAI was built at the
 shipped `x86-64-v2` baseline, not `target-cpu=native`: this has to measure what
-a user downloads. The fp16 references ran on an NVIDIA L4 — they are a
+a user downloads. The fp16 references ran on a GPU — they are a
 correctness ceiling, not a speed comparison, and no CPU-versus-GPU claim is
 made from them.
 
@@ -427,7 +427,7 @@ calibration text. Until now this repository measured that path only by
 *Hessian-weighted output error*, a per-layer proxy. This is the end-to-end
 number, on the same corpus, the same 40 chunks, the same 10,200 tokens.
 
-SmolLM2-1.7B, 128 calibration chunks, exported on an L4 in 60 minutes:
+SmolLM2-1.7B, 128 calibration chunks, exported on a GPU in 60 minutes:
 
 | Path | perplexity | ΔNLL vs fp16 | cost | top-1 agreement | KL over top-64 |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -698,7 +698,7 @@ stronger statement than perplexity, because it is measured on the same tokens
 at the same positions under both models.
 
 The calibrated path, against the same corpus and the same chunk count — an hour
-on an L4 for a 1.7B checkpoint, and it needs a checkpoint container v1 can hold
+on a GPU for a 1.7B checkpoint, and it needs a checkpoint container v1 can hold
 (SmolLM2 can, Qwen2.5 cannot):
 
 ```bash
