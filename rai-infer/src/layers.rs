@@ -852,6 +852,9 @@ pub fn silu_mul_inplace(gate: &mut [f32], up: &[f32], n: usize) {
 /// identically so a buffer's SIMD body and its scalar tail cannot use two
 /// different exp curves — the same body/tail doctrine `tanh_poly` upholds for
 /// `tanh_avx2`. `x` is the exponent argument (already <= 0 at both call sites).
+// Gated to x86_64: the only callers are the AVX2 SiLU and softmax tails, which
+// are #[cfg(target_arch = "x86_64")], so on other arches this is otherwise dead.
+#[cfg(target_arch = "x86_64")]
 #[inline]
 fn schraudolph_exp(x: f32) -> f32 {
     const EXP_A: f32 = 12102203.0; // 2^23 / ln(2)

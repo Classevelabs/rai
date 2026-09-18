@@ -370,10 +370,10 @@ def test_validate_model_config():
     raimodel.validate_model_config(_valid_big_config())
     raimodel.validate_model_config(dict(TINY_CONFIG))
 
-    cfg = _valid_big_config(); cfg["group_size"] = 100  # ceil(14336/100)=144 > 128
+    cfg = _valid_big_config(); cfg["group_size"] = 12  # ceil(14336/12)=1195 > 1024
     _expect_value_error(cfg, "kernel maximum")
 
-    cfg = _valid_big_config(); cfg["embed_group_size"] = 26  # ceil(4096/26)=158 > 128
+    cfg = _valid_big_config(); cfg["embed_group_size"] = 2  # ceil(4096/2)=2048 > 1024
     _expect_value_error(cfg, "kernel maximum")
 
     cfg = _valid_big_config(); cfg["head_dim"] = 100; cfg["num_heads"] = 41
