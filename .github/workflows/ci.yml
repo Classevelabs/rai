@@ -192,12 +192,17 @@ jobs:
           done
           cat /tmp/notices.warn
 
+          # A third-party outage must not rot main. When every retry failed the
+          # regenerated file is incomplete, so the diff below would be a false
+          # positive: the comparison is inconclusive, not stale. Warn and skip
+          # it. A genuinely stale file is still caught on any run where the
+          # lookup succeeds (founder decision 2026-09-18).
           if grep -q 'failed to request license information' /tmp/notices.warn; then
-            echo "::error::cargo-about could not reach api.clearlydefined.io on any of"
-            echo "::error::five attempts, so the regenerated notices are incomplete and"
-            echo "::error::this comparison is void. This is a network failure, not a"
-            echo "::error::stale THIRD-PARTY-NOTICES.md."
-            exit 1
+            echo "::warning::cargo-about could not reach api.clearlydefined.io after"
+            echo "::warning::five attempts; the regenerated notices are incomplete, so the"
+            echo "::warning::staleness check is skipped for this run. Transient network"
+            echo "::warning::failure, not a stale THIRD-PARTY-NOTICES.md."
+            exit 0
           fi
 
           if ! diff -u THIRD-PARTY-NOTICES.md /tmp/notices.md; then
