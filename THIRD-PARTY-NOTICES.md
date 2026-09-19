@@ -3493,7 +3493,7 @@ limitations under the License.
 
 ## Apache License 2.0
 
-Covers `classeve-rai-infer 0.2.4`, `ident_case 1.0.1`.
+Covers `classeve-rai-infer 0.2.5`, `ident_case 1.0.1`.
 
 ```
 Apache License
