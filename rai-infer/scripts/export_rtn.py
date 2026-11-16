@@ -172,6 +172,8 @@ def main():
         print(f"Tokenizer: {td}")
     else:
         print(f"Tokenizer already present (identical): {td}")
+    record = raimodel.chat_record(tokenizer, getattr(model, "generation_config", None))
+    print(f"Chat record: {raimodel.write_chat_record(outpath, record)}")
 
     total = time.time() - t_start
     print(f"\n=== DONE in {total:.1f}s ({total/60:.1f} min) ===")

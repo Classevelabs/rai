@@ -1,8 +1,8 @@
 //! Chat template formatting for instruction-tuned models.
 //!
 //! Supports:
-//! - `MistralInstruct`: `<s>[INST] {msg} [/INST]` (Mistral-7B-Instruct)
-//! - `Llama3Instruct`: `<|begin_of_text|><|start_header_id|>user<|end_header_id|>...`
+//! - `MistralInstruct`: `[INST] {msg} [/INST]` (Mistral-7B-Instruct)
+//! - `Llama3Instruct`: `<|start_header_id|>user<|end_header_id|>...`
 //! - `ChatML`: `<|im_start|>user ... <|im_start|>assistant` (Qwen, many others)
 //! - `Zephyr`: `<|user|> ... </s> <|assistant|>` (TinyLlama-Chat, Zephyr, StableLM)
 //! - `Phi3`: `<|user|> ... <|end|> <|assistant|>` (Phi-3, Phi-3.5)
@@ -17,7 +17,7 @@ pub enum ChatTemplate {
     None,
     /// Few-shot prompt for base models: `User: ...\nAssistant: ...`
     FewShot,
-    /// Mistral-Instruct: `<s>[INST] {msg} [/INST]`
+    /// Mistral-Instruct: `[INST] {msg} [/INST]`
     MistralInstruct,
     /// Llama-3-Instruct: header-based format
     Llama3Instruct,
@@ -43,6 +43,16 @@ pub enum ChatTemplate {
 pub enum Role {
     User,
     Assistant,
+}
+
+impl Role {
+    /// The role as chat templates and the chat API spell it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+        }
+    }
 }
 
 impl ChatTemplate {
@@ -89,7 +99,7 @@ impl ChatTemplate {
                 out
             }
             ChatTemplate::MistralInstruct => {
-                let mut out = String::from("<s>");
+                let mut out = String::new();
                 for &(role, text) in turns {
                     match role {
                         Role::User => {
@@ -106,7 +116,7 @@ impl ChatTemplate {
                 out
             }
             ChatTemplate::Llama3Instruct => {
-                let mut out = String::from("<|begin_of_text|>");
+                let mut out = String::new();
                 for &(role, text) in turns {
                     let name = match role {
                         Role::User => "user",
@@ -193,15 +203,36 @@ impl ChatTemplate {
         }
     }
 
-    /// Whether the tokenizer should prepend its beginning-of-sequence token.
+    /// Whether to encode with the tokenizer's special tokens: always.
     ///
-    /// Most templates spell their own opening marker into the prompt text
-    /// (`<s>` for Mistral, `<|begin_of_text|>` for Llama-3), so asking the
-    /// tokenizer for one as well would emit it twice. Gemma's reference
-    /// template starts with a `<bos>` that is *not* part of the turn markers,
-    /// and Gemma without it degrades badly rather than failing outright.
+    /// No template spells the beginning-of-sequence marker itself, so the
+    /// tokenizer adds it exactly where the model's own tokenizer does —
+    /// `<s>` for Llama 2 and Mistral, `<|begin_of_text|>` for Llama 3, `<bos>`
+    /// for Gemma, nothing for Qwen — raw prompts included, as Hugging Face
+    /// tokenizes text by default. Only Gemma used to get it, and a model
+    /// trained with that marker degrades without it.
     pub fn prepends_bos(&self) -> bool {
-        matches!(self, ChatTemplate::Gemma)
+        true
+    }
+
+    /// Every template's name, as `--chat-template` spells it.
+    pub const NAMES: [&'static str; 8] = [
+        "none", "few-shot", "mistral", "llama3", "chatml", "zephyr", "phi3", "gemma",
+    ];
+
+    /// The template `name` spells, or `None` for a name that is not one.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "none" => ChatTemplate::None,
+            "few-shot" => ChatTemplate::FewShot,
+            "mistral" => ChatTemplate::MistralInstruct,
+            "llama3" => ChatTemplate::Llama3Instruct,
+            "chatml" => ChatTemplate::ChatML,
+            "zephyr" => ChatTemplate::Zephyr,
+            "phi3" => ChatTemplate::Phi3,
+            "gemma" => ChatTemplate::Gemma,
+            _ => return None,
+        })
     }
 
     /// Display name for the UI.
@@ -266,18 +297,12 @@ impl ChatTemplate {
     /// values fall back to tokenizer auto-detection).
     #[cfg(feature = "cli")]
     pub fn from_str_arg(s: &str, tokenizer: &tokenizers::Tokenizer) -> Self {
-        match s {
-            "auto" => Self::auto_detect(tokenizer),
-            "none" => ChatTemplate::None,
-            "few-shot" => ChatTemplate::FewShot,
-            "mistral" => ChatTemplate::MistralInstruct,
-            "llama3" => ChatTemplate::Llama3Instruct,
-            "chatml" => ChatTemplate::ChatML,
-            "zephyr" => ChatTemplate::Zephyr,
-            "phi3" => ChatTemplate::Phi3,
-            "gemma" => ChatTemplate::Gemma,
-            _ => {
-                eprintln!("warning: unknown chat template '{s}'; using auto-detect");
+        match Self::from_name(s) {
+            Some(template) => template,
+            None => {
+                if s != "auto" {
+                    eprintln!("warning: unknown chat template '{s}'; using auto-detect");
+                }
                 Self::auto_detect(tokenizer)
             }
         }
@@ -307,14 +332,14 @@ mod tests {
     fn format_prompt_mistral_wraps_message_in_inst_markers() {
         assert_eq!(
             ChatTemplate::MistralInstruct.format_prompt("Say hi"),
-            "<s>[INST] Say hi [/INST]"
+            "[INST] Say hi [/INST]"
         );
     }
 
     #[test]
     fn format_prompt_llama3_uses_header_format() {
         let prompt = ChatTemplate::Llama3Instruct.format_prompt("Say hi");
-        assert!(prompt.starts_with("<|begin_of_text|><|start_header_id|>user<|end_header_id|>"));
+        assert!(prompt.starts_with("<|start_header_id|>user<|end_header_id|>"));
         assert!(prompt.contains("Say hi<|eot_id|>"));
         assert!(prompt.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"));
     }
@@ -414,8 +439,7 @@ What is 2+2?<end_of_turn>
         ];
         assert_eq!(
             ChatTemplate::Llama3Instruct.format_conversation(&turns),
-            "<|begin_of_text|>\
-             <|start_header_id|>user<|end_header_id|>\n\nHi<|eot_id|>\
+            "<|start_header_id|>user<|end_header_id|>\n\nHi<|eot_id|>\
              <|start_header_id|>assistant<|end_header_id|>\n\nHello!<|eot_id|>\
              <|start_header_id|>user<|end_header_id|>\n\nWhat is 2+2?<|eot_id|>\
              <|start_header_id|>assistant<|end_header_id|>\n\n"
@@ -431,7 +455,7 @@ What is 2+2?<end_of_turn>
         ];
         assert_eq!(
             ChatTemplate::MistralInstruct.format_conversation(&turns),
-            "<s>[INST] Hi [/INST]Hello!</s>[INST] What is 2+2? [/INST]"
+            "[INST] Hi [/INST]Hello!</s>[INST] What is 2+2? [/INST]"
         );
     }
 

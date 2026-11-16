@@ -93,6 +93,12 @@ impl Request {
             .map(|(_, value)| value.as_str())
     }
 
+    /// Whether the client has closed the connection. Its whole body has been
+    /// read, so end of stream here means nobody is waiting for the response.
+    pub fn client_gone(&self) -> bool {
+        peer_closed(&self.stream)
+    }
+
     pub fn body(&self) -> &Body {
         &self.body
     }
@@ -184,7 +190,32 @@ pub struct ChunkedWriter {
     stream: TcpStream,
 }
 
+/// Whether the client has closed its side of the connection, so that work
+/// done for it can stop. A non-blocking peek: end of stream or a reset means
+/// gone; data waiting, or nothing yet, means still there.
+fn peer_closed(stream: &TcpStream) -> bool {
+    if stream.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let mut byte = [0u8; 1];
+    let gone = match stream.peek(&mut byte) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(error) => !matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+        ),
+    };
+    let _ = stream.set_nonblocking(false);
+    gone
+}
+
 impl ChunkedWriter {
+    /// Whether the client has gone; see [`Request::client_gone`].
+    pub fn client_gone(&self) -> bool {
+        peer_closed(&self.stream)
+    }
+
     pub fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
         if bytes.is_empty() {
             // An empty chunk would terminate the body.

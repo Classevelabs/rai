@@ -14,9 +14,13 @@
 //! not a comparison:
 //!
 //! 1. Tokenize the whole text once, with no special tokens added — the corpus
-//!    is continuous prose, not a chat turn, and a BOS inserted every chunk
-//!    would score a position that does not occur in the text.
-//! 2. Cut it into non-overlapping chunks of `--context` tokens.
+//!    is continuous prose, not a chat turn.
+//! 2. Cut it into non-overlapping chunks of `--context` tokens. When the
+//!    model's tokenizer starts every sequence with a beginning-of-sequence
+//!    token (Llama, Mistral, Gemma), the first token of each chunk is replaced
+//!    by it, as `llama-perplexity` does: a model trained with that token
+//!    expects it, and the replaced token is context, never scored. Qwen and
+//!    SmolLM2 add none, so their chunks are the text itself.
 //! 3. Run one batched forward pass per chunk, from an empty KV cache.
 //! 4. Score only the **second half** of each chunk. Every scored token then
 //!    has at least `context / 2` tokens of real context behind it, which is
@@ -428,6 +432,31 @@ pub fn score_tokens(
     })
 }
 
+/// The beginning-of-sequence token this tokenizer puts in front of every
+/// sequence, if it does: the one token encoding with special tokens adds in
+/// front of the same text encoded without.
+fn start_token(tokenizer: &tokenizers::Tokenizer) -> Result<Option<usize>> {
+    let encode = |special: bool| -> Result<Vec<u32>> {
+        Ok(tokenizer
+            .encode("a", special)
+            .map_err(|error| anyhow::anyhow!("{error}"))?
+            .get_ids()
+            .to_vec())
+    };
+    let (plain, marked) = (encode(false)?, encode(true)?);
+    Ok(match marked.split_first() {
+        Some((&first, rest)) if rest.starts_with(&plain) && marked.len() > plain.len() => {
+            Some(first as usize)
+        }
+        _ => None,
+    })
+}
+
+/// Tokens scored per chunk: positions `context / 2 .. context - 1`.
+fn scored_per_chunk(context: usize) -> usize {
+    context.saturating_sub(1).saturating_sub(context / 2)
+}
+
 pub fn run(args: &PerplexityArgs) -> Result<()> {
     crate::gemm::configure_thread_pool();
 
@@ -439,14 +468,18 @@ pub fn run(args: &PerplexityArgs) -> Result<()> {
     let text = std::fs::read_to_string(&args.text)
         .with_context(|| format!("reading {}", args.text.display()))?;
 
-    // `false`: no BOS/EOS. The corpus is continuous prose cut into chunks, and
-    // a special token inserted at every chunk boundary would be scored as if
-    // the text contained it.
+    // `false`: no BOS/EOS. The corpus is continuous prose cut into chunks; the
+    // start token, where the model has one, goes in per chunk below.
     let encoding = tokenizer
         .encode(text.as_str(), false)
         .map_err(|error| anyhow::anyhow!("{error}"))
         .context("tokenizing the text")?;
-    let tokens: Vec<usize> = encoding.get_ids().iter().map(|&id| id as usize).collect();
+    let mut tokens: Vec<usize> = encoding.get_ids().iter().map(|&id| id as usize).collect();
+    if let Some(bos) = start_token(&tokenizer)? {
+        for chunk in tokens.chunks_mut(args.context.max(1)) {
+            chunk[0] = bos;
+        }
+    }
 
     if !args.json {
         eprintln!(
@@ -455,7 +488,7 @@ pub fn run(args: &PerplexityArgs) -> Result<()> {
             args.text.display(),
             tokens.len(),
             args.context,
-            args.context / 2 - 1,
+            scored_per_chunk(args.context),
         );
     }
 
@@ -555,7 +588,17 @@ mod tests {
     /// halves of it, so the reason in the error message stays true.
     #[test]
     fn every_accepted_context_scores_a_meaningful_number_of_tokens() {
-        let scored_at = |context: usize| (context - 1).saturating_sub(context / 2);
+        let scored_at = scored_per_chunk;
+        assert_eq!(
+            scored_at(0),
+            0,
+            "an unvalidated --context 0 prints, not panics"
+        );
+        assert_eq!(
+            scored_at(5),
+            2,
+            "odd contexts score context - 1 - context / 2"
+        );
 
         for context in 4..=4096usize {
             assert!(

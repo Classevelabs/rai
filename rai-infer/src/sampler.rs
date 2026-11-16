@@ -139,11 +139,11 @@ pub fn sample_token(logits: &mut [f32], config: &SamplerConfig, rng: &mut impl R
         // Sort only the ~k candidates (trivial cost)
         candidates.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
 
-        let mut cumsum = 0.0f32;
+        let mut cumsum = 0.0f64;
         let mut cutoff = candidates.len();
         for (rank, &(_, p)) in candidates.iter().enumerate() {
-            cumsum += p;
-            if cumsum >= top_p {
+            cumsum += f64::from(p);
+            if cumsum >= f64::from(top_p) {
                 cutoff = rank + 1;
                 break;
             }
@@ -167,18 +167,34 @@ pub fn sample_token(logits: &mut [f32], config: &SamplerConfig, rng: &mut impl R
         }
     }
 
-    // Random sampling from the distribution
-    let r: f32 = rng.gen();
-    let mut cumsum = 0.0f32;
-    for (i, &p) in logits.iter().enumerate() {
-        cumsum += p;
-        if r < cumsum {
-            return i;
+    draw(logits, rng)
+}
+
+/// Draw an index with probability proportional to `weights`.
+///
+/// In f64 and against the weights' own total, as `sample_correction` does: an
+/// f32 running sum stops moving near 1.0, so tail tokens below half an ulp
+/// could never be drawn and the rounding shortfall fell to the argmax.
+fn draw(weights: &[f32], rng: &mut impl Rng) -> usize {
+    let total: f64 = weights.iter().map(|&p| f64::from(p)).sum();
+    if !(total.is_finite() && total > 0.0) {
+        return argmax(weights);
+    }
+    let target = rng.gen::<f64>() * total;
+    let mut cumsum = 0.0f64;
+    let mut last_drawable = 0;
+    for (i, &p) in weights.iter().enumerate() {
+        if p > 0.0 {
+            cumsum += f64::from(p);
+            last_drawable = i;
+            if target < cumsum {
+                return i;
+            }
         }
     }
-
-    // Fallback: return the highest probability token
-    argmax(logits)
+    // `target` can round up to the total itself; it then belongs to the last
+    // token with any mass, never to a token with none.
+    last_drawable
 }
 
 /// Apply repetition penalty to logits for recently generated tokens.
@@ -337,6 +353,39 @@ mod tests {
         let mut logits = vec![1.0, 3.0, 2.0];
         let mut rng = rand::rngs::StdRng::seed_from_u64(9);
         assert_eq!(sample_token(&mut logits, &config, &mut rng), 1);
+    }
+
+    /// An RNG whose every draw is the largest `f64` below 1.0.
+    struct Topmost;
+
+    impl rand::RngCore for Topmost {
+        fn next_u32(&mut self) -> u32 {
+            u32::MAX
+        }
+        fn next_u64(&mut self) -> u64 {
+            u64::MAX
+        }
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            dest.fill(u8::MAX);
+        }
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand::Error> {
+            dest.fill(u8::MAX);
+            Ok(())
+        }
+    }
+
+    /// Near the top of the distribution an f32 running sum stops moving, so
+    /// the tail was unreachable and its mass went to the argmax.
+    #[test]
+    fn tail_tokens_stay_reachable() {
+        let mut weights = vec![1e-10f32; 1001];
+        weights[0] = 1.0 - f32::EPSILON / 2.0;
+        assert_eq!(draw(&weights, &mut Topmost), 1000);
+
+        // A token with no mass is never drawn, even at the very top.
+        weights[1000] = 0.0;
+        assert_eq!(draw(&weights, &mut Topmost), 999);
+        assert_eq!(draw(&[0.0, 0.0], &mut Topmost), 0, "no mass at all");
     }
 
     #[test]

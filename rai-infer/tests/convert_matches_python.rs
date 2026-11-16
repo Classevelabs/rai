@@ -22,6 +22,7 @@
 use std::path::{Path, PathBuf};
 
 use half::f16;
+use rai_infer::chat_format::ChatRecord;
 use rai_infer::convert::{convert, ContextSource, ConvertOptions};
 use rai_infer::format::RaiModelFile;
 use rai_infer::kv_cache::KVCache;
@@ -2219,6 +2220,64 @@ fn a_calibrated_conversion_runs_and_changes_the_rounding() {
     assert_ne!(a, b, "calibrated codes must differ from round-to-nearest");
     let logits = run_forward(&RaiModel::load(&calibrated).unwrap(), &[1, 5, 9, 13]);
     assert!(logits.iter().all(|value| value.is_finite()));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A conversion records how its model is prompted, beside the model and
+/// named after it: the checkpoint's own template, its two tokens and its end
+/// ids. A base model's record says it has no template.
+#[test]
+fn a_conversion_records_the_checkpoints_chat_template() {
+    let root = scratch_dir("chat-record");
+    let model_dir = root.join("checkpoint");
+    write_checkpoint(&model_dir, &Spec::default());
+
+    // No tokenizer_config.json or generation_config.json: a base model.
+    let base = root.join("out").join("base.raimodel");
+    convert(&options(&model_dir, &base)).unwrap_or_else(|error| panic!("{error:#}"));
+    let record = ChatRecord::read_beside(&base)
+        .expect("readable record")
+        .expect("a record beside the model");
+    assert_eq!(record, ChatRecord::default());
+    assert!(root.join("out").join("base.chat.json").is_file());
+
+    std::fs::write(
+        model_dir.join("tokenizer_config.json"),
+        serde_json::json!({
+            "chat_template": "{% for m in messages %}<{{ m['role'] }}>{{ m['content'] }}{% endfor %}",
+            "bos_token": "<s>",
+            "eos_token": "</s>",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        model_dir.join("generation_config.json"),
+        r#"{"eos_token_id": [2, 3]}"#,
+    )
+    .unwrap();
+    let chat = root.join("out").join("chat.raimodel");
+    convert(&options(&model_dir, &chat)).unwrap_or_else(|error| panic!("{error:#}"));
+    let record = ChatRecord::read_beside(&chat).unwrap().unwrap();
+    assert_eq!(
+        record.chat_template.as_deref(),
+        Some("{% for m in messages %}<{{ m['role'] }}>{{ m['content'] }}{% endfor %}")
+    );
+    assert_eq!(record.bos_token.as_deref(), Some("<s>"));
+    assert_eq!(record.eos_token.as_deref(), Some("</s>"));
+    assert_eq!(record.eos_token_ids, vec![2, 3]);
+    // Each model in the folder keeps its own record; the base one is untouched.
+    assert_eq!(
+        ChatRecord::read_beside(&base).unwrap(),
+        Some(ChatRecord::default())
+    );
+
+    // A malformed config is refused before anything is written.
+    std::fs::write(model_dir.join("generation_config.json"), "{ not json").unwrap();
+    let refused = root.join("out").join("refused.raimodel");
+    assert!(convert(&options(&model_dir, &refused)).is_err());
+    assert!(!refused.exists());
 
     let _ = std::fs::remove_dir_all(&root);
 }

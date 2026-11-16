@@ -155,7 +155,16 @@ impl<'a> SelfSpecDecoder<'a> {
         let vs = self.model.config.vocab_size as usize;
         ensure!(
             pos < self.max_ctx,
-            "decode position exceeds the context window"
+            "decode position {pos} is past the {}-token context window",
+            self.max_ctx
+        );
+        // The cache holds exactly the positions before `pos`; any other value
+        // is a caller error, reported as one rather than as a panic in the
+        // cache's gap check.
+        ensure!(
+            pos == self.kv_cache.filled_min(),
+            "step at position {pos}, but the decoder has processed {} positions",
+            self.kv_cache.filled_min()
         );
         ensure!(
             config.draft_k > 0,

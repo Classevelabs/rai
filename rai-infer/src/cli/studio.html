@@ -385,10 +385,11 @@ input:disabled,select:disabled,textarea:disabled{color:var(--fg-3);cursor:not-al
               <div class="field"><span class="lbl">Group</span><select id="gs"><option>128</option><option>64</option><option>224</option></select></div>
               <div class="field"><span class="lbl">Embed group</span><select id="egs"><option>64</option><option>128</option></select></div>
               <div class="field"><span class="lbl">Context</span><select id="ctx">
-                <option>1024</option><option selected>2048</option><option>4096</option><option>8192</option>
-                <option>16384</option><option>32768</option><option>65536</option><option>131072</option></select></div>
+                <option value="" selected>model's own</option><option>1024</option><option>2048</option>
+                <option>4096</option><option>8192</option><option>16384</option><option>32768</option>
+                <option>65536</option><option>131072</option></select></div>
             </div>
-            <p class="hint" id="ctxCost">Context is the KV-cache window baked into the file. Larger costs memory at run time.</p>
+            <p class="hint" id="ctxCost">Context is the KV-cache window baked into the file. The model's own keeps the window it was trained for; a smaller one saves memory at run time.</p>
             <div class="field" style="margin-top:var(--s3)"><span class="lbl">Output file</span>
               <input type="text" id="out" placeholder="model-q4.raimodel" spellcheck="false"></div>
           </div>
@@ -460,7 +461,7 @@ input:disabled,select:disabled,textarea:disabled{color:var(--fg-3);cursor:not-al
           <div class="tune" id="tunePanel" hidden>
             <div class="row">
               <div class="field"><span class="lbl">Chat template</span>
-                <select id="tpl"><option value="auto">auto</option><option value="chatml">chatml</option>
+                <select id="tpl"><option value="auto">auto (the model's own)</option><option value="chatml">chatml</option>
                   <option value="gemma">gemma</option><option value="llama3">llama3</option>
                   <option value="mistral">mistral</option><option value="phi3">phi3</option>
                   <option value="zephyr">zephyr</option><option value="few-shot">few-shot</option>
@@ -1709,7 +1710,7 @@ $("#inspectBtn").addEventListener("click",async()=>{
   $("#inspectVerdict").textContent="";
   try{
     const r=await api("/api/inspect",jsonPost({source,group_size:+$("#gs").value,
-      embed_group_size:+$("#egs").value,max_context:+$("#ctx").value}));
+      embed_group_size:+$("#egs").value,max_context:+$("#ctx").value||undefined}));
     const s=r.shape||{},c=r.container;
     $("#inspectVerdict").innerHTML=r.supported
       ?'<span style="color:var(--ok)">SUPPORTED</span>':'<span style="color:var(--bad)">NOT SUPPORTED</span>';
@@ -1750,7 +1751,7 @@ $("#convertBtn").addEventListener("click",async()=>{
   try{
     if(DEMO){demoConvert();return}
     const j=await api("/api/convert",jsonPost({source,output,group_size:+$("#gs").value,
-      embed_group_size:+$("#egs").value,max_context:+$("#ctx").value}));
+      embed_group_size:+$("#egs").value,max_context:+$("#ctx").value||undefined}));
     JOB={id:j.job_id,cursor:0};pollJob();
   }catch(e){BUSY=false;paintEngine();$("#convertBtn").disabled=false;toast(e.message,true);
     logAppend([e.message]);}
@@ -1843,8 +1844,11 @@ async function pollJob(){
   refreshModels();
 }
 $("#ctx").addEventListener("change",()=>{
-  $("#ctxCost").textContent="Context is the KV-cache window baked into the file. At "
-    +num($("#ctx").value)+" tokens the cache costs whatever the model shape implies; larger is not free.";
+  const chosen=$("#ctx").value;
+  $("#ctxCost").textContent=chosen
+    ?"Context is the KV-cache window baked into the file. At "+num(chosen)
+      +" tokens the cache costs whatever the model shape implies; larger is not free."
+    :"Context is the KV-cache window baked into the file. The model’s own keeps the window it was trained for; a smaller one saves memory at run time.";
 });
 
 /* ---------- boot ---------- */

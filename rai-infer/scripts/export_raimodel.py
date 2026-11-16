@@ -321,6 +321,8 @@ def main():
         print(f"Tokenizer written to: {tokenizer_dst}")
     else:
         print(f"Tokenizer already present (identical): {tokenizer_dst}")
+    record = raimodel.chat_record(tokenizer, getattr(model, "generation_config", None))
+    print(f"Chat record: {raimodel.write_chat_record(output_path, record)}")
 
     # =========================================================================
     # Summary

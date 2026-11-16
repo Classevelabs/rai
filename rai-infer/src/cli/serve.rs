@@ -49,6 +49,7 @@ use rand::SeedableRng;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::chat_format::ChatFormat;
 use crate::chat_template::{ChatTemplate, Role};
 use crate::cli::catalog;
 use crate::cli::jobs::{Jobs, StartError};
@@ -172,7 +173,8 @@ pub struct ServeOptions {
     /// history for memory, a larger one is clamped to what the model supports.
     #[arg(long)]
     pub max_context: Option<usize>,
-    /// Chat template: auto, none, few-shot, mistral, llama3, chatml, zephyr
+    /// Chat template: auto (the model's own, recorded at conversion), model,
+    /// none, few-shot, mistral, llama3, chatml, zephyr, phi3, gemma
     #[arg(long, default_value = "auto")]
     pub chat_template: String,
 }
@@ -195,7 +197,7 @@ struct Loaded {
     model: RaiModel,
     tokenizer: tokenizers::Tokenizer,
     max_context: usize,
-    template: ChatTemplate,
+    format: ChatFormat,
     path: PathBuf,
     tokenizer_path: PathBuf,
     load_ms: u64,
@@ -254,6 +256,13 @@ impl Loaded {
             "{} is not a file",
             model_path.display()
         );
+        // Refused before the weights are read, not after.
+        anyhow::ensure!(
+            matches!(chat_template, "auto" | "model")
+                || ChatTemplate::from_name(chat_template).is_some(),
+            "unknown chat template '{chat_template}'; expected auto, model, or one of {}",
+            ChatTemplate::NAMES.join(", ")
+        );
         let started = Instant::now();
         let tokenizer_path = resolve_tokenizer(model_path, tokenizer_arg)?;
         let model = RaiModel::load(model_path)?;
@@ -278,12 +287,12 @@ impl Loaded {
         })?;
         let tokenizer =
             load_tokenizer_for_model(&tokenizer_path, model.config.vocab_size as usize)?;
-        let template = ChatTemplate::from_str_arg(chat_template, &tokenizer);
+        let format = ChatFormat::load(chat_template, model_path, &tokenizer)?;
         Ok(Self {
             model,
             tokenizer,
             max_context,
-            template,
+            format,
             path: model_path.to_path_buf(),
             tokenizer_path,
             load_ms: started.elapsed().as_millis() as u64,
@@ -303,7 +312,7 @@ impl Loaded {
             "num_kv_heads": config.num_kv_heads,
             "intermediate_size": config.intermediate_size,
             "vocab_size": config.vocab_size,
-            "chat_template": self.template.display_name(),
+            "chat_template": self.format.name(),
             "weights_mb": self.model.file_size() as f64 / (1024.0 * 1024.0),
             // Added for the model-picker UI; everything above is unchanged.
             "loaded": true,
@@ -347,6 +356,8 @@ struct ChatRequest {
     messages: Option<Vec<ChatMessage>>,
     temperature: Option<f32>,
     max_tokens: Option<usize>,
+    /// Penalty on tokens the reply has already produced; 1.0 disables it.
+    repetition_penalty: Option<f32>,
     ponder_strategy: Option<String>,
     guidance_scale: Option<f32>,
     ensemble_n: Option<usize>,
@@ -436,6 +447,8 @@ fn build_ponder(req: &ChatRequest) -> Result<PonderConfig, ChatHttpError> {
 fn validate_chat_options(req: &ChatRequest) -> Result<(), ChatHttpError> {
     // 0 is greedy decoding, which the sampler implements as an argmax.
     validate_optional_f32("temperature", req.temperature, 0.0, 2.0)?;
+    // The same range `rai run --repetition-penalty` accepts.
+    validate_optional_f32("repetition_penalty", req.repetition_penalty, 0.01, 4.0)?;
     // Only the floor can be checked without the model. The ceiling is the
     // context the prompt leaves free, and that needs the tokenizer — see
     // [`resolve_max_tokens`], which runs once the prompt has been encoded.
@@ -622,6 +635,9 @@ struct Outcome {
 
 /// Something worth telling a streaming client about, as it happens.
 enum GenerationEvent<'a> {
+    /// A prefill chunk is about to run. Nothing to show; the route answers
+    /// whether its client is still there to read the reply.
+    Prefilling,
     /// The prompt is in the KV cache; decoding is about to start. `reused`
     /// leading prompt tokens came from the previous generation's cache.
     Prefilled { prefill_ms: f64, reused: usize },
@@ -644,21 +660,20 @@ fn prepare(loaded: &Loaded, chat_req: &ChatRequest) -> Result<Prepared, ChatHttp
         temperature: chat_req.temperature.unwrap_or(0.7),
         top_k: 40,
         top_p: 0.9,
-        repetition_penalty: 1.1,
+        repetition_penalty: chat_req.repetition_penalty.unwrap_or(1.1),
     };
 
     // `Loaded::open` already clamped this to the model, and the KV cache was
     // allocated for exactly this many positions.
     let max_ctx = loaded.max_context;
 
-    // `prepends_bos` and not `false`: Gemma's reference template opens with a
-    // `<bos>` the turn markers do not spell, and `rai run` already encodes
-    // with it — serving the same model must not produce a different prompt.
-    let encode = |prompt: &str| {
+    // The format decides the special-token policy, so serving a model
+    // produces exactly the prompt `rai run` does.
+    let encode = |turns: &[(Role, &str)]| {
         loaded
-            .tokenizer
-            .encode(prompt, loaded.template.prepends_bos())
-            .map_err(|_| ChatHttpError::bad_request("message could not be tokenized"))
+            .format
+            .encode(&loaded.tokenizer, turns)
+            .map_err(|error| ChatHttpError::bad_request(format!("{error:#}")))
     };
 
     // Render the request through the configured chat template. Multi-turn
@@ -673,35 +688,21 @@ fn prepare(loaded: &Loaded, chat_req: &ChatRequest) -> Result<Prepared, ChatHttp
     // so a long history cannot trim itself into a one-token answer. A lone
     // final turn that still does not fit falls through to the same refusal a
     // single over-long message has always received.
-    let encoding = match &chat_req.messages {
+    let prompt_tokens = match &chat_req.messages {
         Some(messages) => {
-            let turns: Vec<(Role, &str)> = messages
+            let merged = merge_turns(messages);
+            let turns: Vec<(Role, &str)> = merged
                 .iter()
-                .map(|entry| {
-                    let role = if entry.role == "assistant" {
-                        Role::Assistant
-                    } else {
-                        Role::User
-                    };
-                    (role, entry.content.as_str())
-                })
+                .map(|(role, text)| (*role, text.as_str()))
                 .collect();
             let reserve = (max_ctx / 4).max(1);
-            let start = thread_trim_start(turns.len(), max_ctx, reserve, |start| {
-                let prompt = loaded.template.format_conversation(&turns[start..]);
-                Ok(encode(&prompt)?.get_ids().len())
+            let start = thread_trim_start(&turns, max_ctx, reserve, |start| {
+                Ok(encode(&turns[start..])?.len())
             })?;
-            let prompt = loaded.template.format_conversation(&turns[start..]);
-            encode(&prompt)?
+            encode(&turns[start..])?
         }
-        None => {
-            let prompt = loaded
-                .template
-                .format_prompt(chat_req.message.as_deref().unwrap_or_default());
-            encode(&prompt)?
-        }
+        None => encode(&[(Role::User, chat_req.message.as_deref().unwrap_or_default())])?,
     };
-    let prompt_tokens: Vec<usize> = encoding.get_ids().iter().map(|&id| id as usize).collect();
     validate_prompt_tokens(
         &prompt_tokens,
         max_ctx,
@@ -718,29 +719,72 @@ fn prepare(loaded: &Loaded, chat_req: &ChatRequest) -> Result<Prepared, ChatHttp
     })
 }
 
+/// The thread as alternating turns: consecutive messages from one role are
+/// one turn, joined by a blank line.
+///
+/// Templates assume alternation and Gemma's refuses anything else; a client
+/// that drops a failed reply from its history sends two user messages in a
+/// row, and that must not turn into a refusal.
+fn merge_turns(messages: &[ChatMessage]) -> Vec<(Role, String)> {
+    let mut turns: Vec<(Role, String)> = Vec::with_capacity(messages.len());
+    for message in messages {
+        let role = if message.role == "assistant" {
+            Role::Assistant
+        } else {
+            Role::User
+        };
+        match turns.last_mut() {
+            Some((last, text)) if *last == role => {
+                text.push_str("\n\n");
+                text.push_str(&message.content);
+            }
+            _ => turns.push((role, message.content.clone())),
+        }
+    }
+    turns
+}
+
 /// First turn of the longest thread suffix whose rendering leaves `reserve`
 /// tokens of the window free.
 ///
-/// `tokens_for_suffix(start)` is the rendered token count of `turns[start..]`
-/// — re-rendered per candidate, because chat templates are not
-/// prefix-additive. Walks forward from the oldest turn and stops at the last
-/// turn no matter what: dropping the message being answered is never an
-/// option, and whether a lone over-long turn is refused stays the caller's
-/// decision.
-fn thread_trim_start(
-    turn_count: usize,
+/// Only a user turn can start the suffix, so the thread is trimmed by whole
+/// exchanges and never opens on an orphaned reply. `tokens_for_suffix(start)`
+/// is the rendered token count of `turns[start..]`, re-rendered per
+/// candidate because chat templates are not prefix-additive; dropping turns
+/// only shortens a rendering, so the candidates are binary-searched rather
+/// than tried one by one. The final turn is kept no matter what: dropping
+/// the message being answered is never an option, and whether a lone
+/// over-long turn is refused stays the caller's decision.
+fn thread_trim_start<S>(
+    turns: &[(Role, S)],
     max_ctx: usize,
     reserve: usize,
     mut tokens_for_suffix: impl FnMut(usize) -> Result<usize, ChatHttpError>,
 ) -> Result<usize, ChatHttpError> {
-    let mut start = 0;
-    while start + 1 < turn_count {
-        if tokens_for_suffix(start)? + reserve <= max_ctx {
-            break;
+    let starts: Vec<usize> = turns
+        .iter()
+        .enumerate()
+        .filter(|(_, (role, _))| *role == Role::User)
+        .map(|(index, _)| index)
+        .collect();
+    let Some(&last) = starts.last() else {
+        return Ok(turns.len().saturating_sub(1));
+    };
+    // The earliest start that fits, among `starts[low..high]`.
+    let (mut low, mut high) = (0, starts.len() - 1);
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if tokens_for_suffix(starts[middle])? + reserve <= max_ctx {
+            high = middle;
+        } else {
+            low = middle + 1;
         }
-        start += 1;
     }
-    Ok(start)
+    Ok(if low < starts.len() {
+        starts[low]
+    } else {
+        last
+    })
 }
 
 /// How much of `pending` can be shown to a reader right now.
@@ -751,7 +795,7 @@ fn thread_trim_start(
 /// split across two tokens and will resolve on the next one. Both are held
 /// back until the next token settles them, and the flush after the loop
 /// releases whatever is genuinely final.
-fn emittable_len(pending: &str, stops: &[&str]) -> usize {
+pub(crate) fn emittable_len<S: AsRef<str>>(pending: &str, stops: &[S]) -> usize {
     let mut safe = pending.len();
     while pending[..safe].ends_with('\u{FFFD}') {
         safe -= '\u{FFFD}'.len_utf8();
@@ -759,7 +803,7 @@ fn emittable_len(pending: &str, stops: &[&str]) -> usize {
 
     let head = &pending[..safe];
     let mut held = 0usize;
-    for stop in stops {
+    for stop in stops.iter().map(AsRef::as_ref) {
         // The longest *proper* prefix of this stop sequence that `head` ends
         // with. A complete match is not this function's business: the caller
         // has already searched for one and truncated.
@@ -789,7 +833,7 @@ fn generate(
     let Loaded {
         model,
         tokenizer,
-        template,
+        format,
         kv_cache,
         cached_tokens,
         ..
@@ -819,14 +863,21 @@ fn generate(
     let mut all_tokens = prompt_tokens.clone();
 
     let t_prefill = Instant::now();
-    model
-        .prefill(
+    let finished = model
+        .prefill_while(
             &prefix[reused..],
             reused,
             kv_cache,
             &mut BatchScratch::new(),
+            || on_event(GenerationEvent::Prefilling).is_ok(),
         )
         .map_err(|error| GenerateFailure::Http(ChatHttpError::internal(error)))?;
+    if !finished {
+        return Err(GenerateFailure::Client(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "the client left during prefill",
+        )));
+    }
     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
     on_event(GenerationEvent::Prefilled { prefill_ms, reused }).map_err(GenerateFailure::Client)?;
 
@@ -839,12 +890,10 @@ fn generate(
     let mut hard_tokens = 0;
     let mut stop_reason = StopReason::MaxTokens;
 
-    // Hoisted out of the loop: the answer cannot change between tokens.
-    let eos_ids: Vec<usize> = ["</s>", "<|endoftext|>", "<|eot_id|>", "<|end_of_text|>"]
-        .iter()
-        .filter_map(|name| tokenizer.token_to_id(name).map(|id| id as usize))
-        .collect();
-    let stops = template.stop_sequences();
+    // The checkpoint's own end-of-sequence ids, every family's end markers
+    // among the tokenizer's control tokens, and the template's turn markers.
+    let end_ids = format.end_ids();
+    let stops = format.stop_sequences();
 
     // Each step feeds the newest token at the next position: from the last
     // prompt token to the end of the window, and at most `max_tokens` of them.
@@ -872,9 +921,11 @@ fn generate(
             hard_tokens += 1;
         }
 
+        // The reply only: a chat prompt holds the end-of-turn marker the
+        // reply has to end with, and penalizing it kept replies from ending.
         apply_repetition_penalty(
             &mut logits,
-            &all_tokens,
+            &all_tokens[prompt_tokens.len()..],
             prepared.sampler.repetition_penalty,
         );
         let next_token = sample_token(&mut logits, &prepared.sampler, &mut rng);
@@ -882,7 +933,7 @@ fn generate(
         // as `pondered_forward` asks of every caller.
         work.scratch.logits = logits;
 
-        if eos_ids.contains(&next_token) {
+        if end_ids.contains(&next_token) {
             stop_reason = StopReason::Eos;
             break;
         }
@@ -899,12 +950,13 @@ fn generate(
 
         // Stop if model generates a template-specific stop sequence
         let mut hit_stop = false;
-        for stop in stops {
-            if let Some(cut) = generated_text.find(stop) {
-                generated_text.truncate(cut);
-                hit_stop = true;
-                break;
-            }
+        if let Some(cut) = stops
+            .iter()
+            .filter_map(|stop| generated_text.find(stop.as_str()))
+            .min()
+        {
+            generated_text.truncate(cut);
+            hit_stop = true;
         }
 
         let unemitted = incremental_suffix(&emitted, &generated_text);
@@ -972,14 +1024,28 @@ fn generate(
 /// `POST /api/chat` — one JSON body. Accepts the original single `message`
 /// form and the `messages` thread form; both flow through the same
 /// [`prepare`]/[`generate`] pair as streaming.
-fn handle_generate(loaded: &mut Loaded, chat_req: &ChatRequest) -> Result<String, ChatHttpError> {
+fn handle_generate(
+    loaded: &mut Loaded,
+    chat_req: &ChatRequest,
+    client: &Request,
+) -> Result<String, ChatHttpError> {
     let prepared = prepare(loaded, chat_req)?;
-    let outcome = match generate(loaded, &prepared, |_| Ok(())) {
+    // Nothing is sent until the end, so the client is asked whether it is
+    // still there at every chunk of prefill and every piece of text: a caller
+    // that gave up stops the work instead of holding the server for it.
+    let outcome = match generate(loaded, &prepared, |_| {
+        if client.client_gone() {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "the client left",
+            ))
+        } else {
+            Ok(())
+        }
+    }) {
         Ok(outcome) => outcome,
-        // The callback above cannot fail, so the client arm is unreachable
-        // here; mapping it rather than unwrapping keeps that a fact about the
-        // code and not an assumption.
         Err(GenerateFailure::Http(error)) => return Err(error),
+        // Nobody is left to read this.
         Err(GenerateFailure::Client(error)) => return Err(ChatHttpError::internal(error)),
     };
 
@@ -1060,7 +1126,13 @@ fn stream_chat(request: Request, loaded: &mut Loaded, prepared: &Prepared) {
 
     let prompt_tokens = prepared.prompt_tokens.len();
     let max_ctx = prepared.max_ctx;
+    let gone = || std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "the client left");
     let outcome = generate(loaded, prepared, |event| match event {
+        // Studio's Stop closes the connection; a write to it can still
+        // succeed into the socket buffer, so the connection is asked.
+        GenerationEvent::Prefilling if stream.writer.client_gone() => Err(gone()),
+        GenerationEvent::Prefilling => Ok(()),
+        GenerationEvent::Text(_) if stream.writer.client_gone() => Err(gone()),
         GenerationEvent::Prefilled { prefill_ms, reused } => stream.send(&json!({
             "type": "start",
             "prompt_tokens": prompt_tokens,
@@ -1308,7 +1380,7 @@ fn handle_request(request: Request, state: &mut ServerState, bound_port: u16) {
         (Method::Post, "/api/chat") => {
             let outcome =
                 parse_chat_request(&body).and_then(|chat_request| match state.loaded.as_mut() {
-                    Some(loaded) => handle_generate(loaded, &chat_request),
+                    Some(loaded) => handle_generate(loaded, &chat_request, &request),
                     None => Err(no_model_loaded()),
                 });
             match outcome {
@@ -1427,7 +1499,7 @@ fn announce(loaded: &Loaded) {
         loaded.max_context
     );
     eprintln!("Tokenizer: {}", loaded.tokenizer_path.display());
-    eprintln!("Chat template: {}", loaded.template.display_name());
+    eprintln!("Chat template: {}", loaded.format.name());
 }
 
 fn no_model_loaded() -> ChatHttpError {
@@ -2113,9 +2185,10 @@ fn names_another_machine(_path: &Path) -> bool {
     false
 }
 
-/// Where a conversion may write its model: a `.raimodel` file and nothing
-/// else. The converter renames its finished output over this path, so an
-/// unconstrained one let any request replace any file the user can write.
+/// Where a conversion may write its model: a `.raimodel` file, and beside it
+/// only that model's `<name>.chat.json`. The converter renames its finished
+/// output over this path, so an unconstrained one let any request replace any
+/// file the user can write.
 fn conversion_output(raw: &Path) -> Result<PathBuf, ChatHttpError> {
     let output = local_path(raw, "output")?;
     let is_model = output
@@ -2458,6 +2531,7 @@ mod tests {
             messages: None,
             temperature: Some(100.0),
             max_tokens: Some(usize::MAX),
+            repetition_penalty: None,
             ponder_strategy: Some("ensemble".to_string()),
             guidance_scale: Some(100.0),
             ensemble_n: Some(usize::MAX),
@@ -2493,20 +2567,62 @@ mod tests {
     }
 
     #[test]
-    fn thread_trimming_drops_the_oldest_turns_and_never_the_last() {
-        // Suffix token counts for a 3-turn thread: the whole thread renders
-        // to 100 tokens, the newest two turns to 60, the final turn to 30.
-        let counts = [100usize, 60, 30];
+    fn thread_trimming_drops_whole_exchanges_and_never_the_last_turn() {
+        use Role::{Assistant, User};
+        let thread = [
+            (User, ""),
+            (Assistant, ""),
+            (User, ""),
+            (Assistant, ""),
+            (User, ""),
+        ];
+        // Suffix token counts: the whole thread renders to 100 tokens, the
+        // newest exchange plus the question to 60, the question alone to 30.
+        // Odd starts would open on a reply and must never be tried.
+        let counts = [100usize, usize::MAX, 60, usize::MAX, 30];
         let count_for = |start: usize| Ok(counts[start]);
 
         // 30 + 16 fits a 64-token window; 60 + 16 does not.
-        assert_eq!(thread_trim_start(3, 64, 16, count_for).unwrap(), 2);
+        assert_eq!(thread_trim_start(&thread, 64, 16, count_for).unwrap(), 4);
+        // 60 + 16 fits 80: one exchange is dropped.
+        assert_eq!(thread_trim_start(&thread, 80, 16, count_for).unwrap(), 2);
         // Everything fits: nothing is dropped.
-        assert_eq!(thread_trim_start(3, 200, 16, count_for).unwrap(), 0);
+        assert_eq!(thread_trim_start(&thread, 200, 16, count_for).unwrap(), 0);
         // Even the final turn alone is too long: it is still kept, because
         // whether to refuse it is prepare()'s decision, not the trimmer's.
-        assert_eq!(thread_trim_start(3, 20, 16, count_for).unwrap(), 2);
-        assert_eq!(thread_trim_start(1, 20, 16, |_| Ok(100)).unwrap(), 0);
+        assert_eq!(thread_trim_start(&thread, 20, 16, count_for).unwrap(), 4);
+        assert_eq!(
+            thread_trim_start(&[(User, "")], 20, 16, |_| Ok(100)).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn consecutive_turns_from_one_role_become_one() {
+        let message = |role: &str, content: &str| ChatMessage {
+            role: role.to_string(),
+            content: content.to_string(),
+        };
+        let merged = merge_turns(&[
+            message("user", "first"),
+            message("user", "again"),
+            message("assistant", "reply"),
+            message("user", "next"),
+        ]);
+        assert_eq!(
+            merged,
+            vec![
+                (
+                    Role::User,
+                    "first
+
+again"
+                        .to_string()
+                ),
+                (Role::Assistant, "reply".to_string()),
+                (Role::User, "next".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -2887,7 +3003,7 @@ mod tests {
         // `<|im` is a prefix of both; the longer hold wins.
         assert_eq!(emittable_len("<|im_st", &stops), 0);
         // With no stop sequences configured, nothing is ever held.
-        assert_eq!(emittable_len("hello<|im_", &[]), 10);
+        assert_eq!(emittable_len("hello<|im_", &[] as &[&str]), 10);
     }
 
     /// A trailing replacement character nearly always means a multi-byte
@@ -2895,12 +3011,15 @@ mod tests {
     /// is worse than waiting one token.
     #[test]
     fn a_trailing_replacement_character_is_held_back_but_a_settled_one_is_not() {
-        assert_eq!(emittable_len("caf\u{FFFD}", &[]), 3);
-        assert_eq!(emittable_len("\u{FFFD}\u{FFFD}", &[]), 0);
-        assert_eq!(emittable_len("caf\u{FFFD}e", &[]), "caf\u{FFFD}e".len());
+        assert_eq!(emittable_len("caf\u{FFFD}", &[] as &[&str]), 3);
+        assert_eq!(emittable_len("\u{FFFD}\u{FFFD}", &[] as &[&str]), 0);
+        assert_eq!(
+            emittable_len("caf\u{FFFD}e", &[] as &[&str]),
+            "caf\u{FFFD}e".len()
+        );
         // The boundary it returns is always a character boundary.
         let held = "caf\u{FFFD}";
-        assert!(held.is_char_boundary(emittable_len(held, &[])));
+        assert!(held.is_char_boundary(emittable_len(held, &[] as &[&str])));
     }
 
     // =========================================================================

@@ -167,7 +167,9 @@ fn main() -> Result<()> {
 
     // --- Decode profile at each position --------------------------------
     let max_pos = positions.iter().copied().max().unwrap_or(0);
-    let need_ctx = (max_pos + 2).max(args.prefill + 1);
+    let need_ctx = max_pos
+        .saturating_add(2)
+        .max(args.prefill.saturating_add(1));
     let max_ctx = need_ctx.min(cfg.max_context as usize);
     if need_ctx > max_ctx {
         anyhow::bail!(

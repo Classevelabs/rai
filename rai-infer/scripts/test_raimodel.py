@@ -532,6 +532,27 @@ def test_place_tokenizer_json():
         assert sorted(p.name for p in Path(td).iterdir()) == ["tokenizer.json"]
 
 
+def test_chat_record_says_how_the_model_is_prompted():
+    tokenizer = _Stub(chat_template={"tool_use": "tools", "default": "chat"},
+                      bos_token="<s>", eos_token="</s>")
+    record = raimodel.chat_record(tokenizer, _Stub(eos_token_id=[2, 32000]))
+    assert record == {"chat_template": "chat", "bos_token": "<s>", "eos_token": "</s>",
+                      "eos_token_ids": [2, 32000]}
+    # A base model: no template, one eos id, no generation config at all.
+    base = raimodel.chat_record(_Stub(bos_token=None, eos_token="<|endoftext|>"),
+                                _Stub(eos_token_id=0))
+    assert base["chat_template"] is None and base["eos_token_ids"] == [0]
+    assert raimodel.chat_record(_Stub(), None)["eos_token_ids"] == []
+
+    with tempfile.TemporaryDirectory() as td:
+        model = Path(td) / "tiny-q4.raimodel"
+        path = raimodel.write_chat_record(model, record)
+        # Where src/chat_format.rs looks for it: the model's name, `.chat.json`.
+        assert path == Path(td) / "tiny-q4.chat.json"
+        assert json.loads(path.read_text(encoding="utf-8")) == record
+        assert path.read_bytes().endswith(b"}\n")
+
+
 def test_a_failed_write_leaves_nothing_behind():
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "model.raimodel"
@@ -941,6 +962,7 @@ TESTS = [
     test_validate_export_options,
     test_require_calibration_chunks,
     test_place_tokenizer_json,
+    test_chat_record_says_how_the_model_is_prompted,
     test_a_failed_write_leaves_nothing_behind,
     test_write_minimal_model,
     test_write_minimal_model_untied,

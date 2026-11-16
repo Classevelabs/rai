@@ -23,7 +23,12 @@ fn main() {
 
         // Allocate synthetic data
         let nibble_data: Vec<u8> = (0..rows * cols / 2)
-            .map(|i| ((i as u8 * 7 + 3) % 16) | (((i as u8 * 11 + 5) % 16) << 4))
+            // Wrapping: only the low bits matter, and `i * 7` leaves u8 range at i = 37.
+            .map(|i| {
+                let i = i as u8;
+                (i.wrapping_mul(7).wrapping_add(3) % 16)
+                    | ((i.wrapping_mul(11).wrapping_add(5) % 16) << 4)
+            })
             .collect();
 
         let mut group_params = vec![0u8; rows * num_groups * 4];

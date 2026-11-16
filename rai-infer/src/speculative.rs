@@ -16,7 +16,7 @@
 // sequences. Explicit counters keep acceptance positions aligned with KV-cache positions.
 #![allow(clippy::explicit_counter_loop, clippy::needless_range_loop)]
 
-use anyhow::{bail, Result};
+use anyhow::{bail, ensure, Result};
 use rand::Rng;
 
 use crate::kv_cache::KVCache;
@@ -73,7 +73,11 @@ pub struct SpeculativeDecoder<'a> {
     /// Reused draft-logits buffer: avoids a vocab-sized allocation per drafted token.
     draft_logits_buf: Vec<f32>,
     vocab_size: usize, // shared vocab size (validated at construction)
+    /// The decoder's window: the target's.
     max_ctx: usize,
+    /// Positions the draft can hold. Past them the target decodes alone, so a
+    /// draft with a shorter window shortens nothing.
+    draft_ctx: usize,
 }
 
 impl<'a> SpeculativeDecoder<'a> {
@@ -91,8 +95,7 @@ impl<'a> SpeculativeDecoder<'a> {
 
         let draft_ctx = max_ctx.min(draft.config.max_context as usize);
         let target_ctx = max_ctx.min(target.config.max_context as usize);
-        let shared_ctx = draft_ctx.min(target_ctx);
-        if shared_ctx == 0 {
+        if draft_ctx == 0 || target_ctx == 0 {
             bail!("speculative decoding context must be non-zero");
         }
         Ok(Self {
@@ -106,8 +109,21 @@ impl<'a> SpeculativeDecoder<'a> {
             target_batch_scratch: BatchScratch::new(),
             draft_logits_buf: vec![0.0; dvs],
             vocab_size: dvs,
-            max_ctx: shared_ctx,
+            max_ctx: target_ctx,
+            draft_ctx,
         })
+    }
+
+    /// The decoder's context window: the target's, whatever the draft's.
+    pub fn max_context(&self) -> usize {
+        self.max_ctx
+    }
+
+    /// How many tokens the draft may propose from `pos`. It processes
+    /// positions `pos..=pos + k`, the last one only when every draft is
+    /// accepted, so its own window bounds `k` as the target's does.
+    fn draft_room(&self, pos: usize) -> usize {
+        self.draft_ctx.saturating_sub(pos).saturating_sub(1)
     }
 
     /// Prefill both models with prompt tokens.
@@ -123,16 +139,24 @@ impl<'a> SpeculativeDecoder<'a> {
             bail!("prompt must contain at least one token");
         }
         if prompt_tokens.len() > self.max_ctx {
-            bail!("prompt exceeds the speculative context window");
+            bail!(
+                "prompt has {} tokens but the context window is {}",
+                prompt_tokens.len(),
+                self.max_ctx
+            );
         }
 
         // Process tokens 0..N-2 only: step() consumes the final prompt token
         // at position N-1, so prefilling it here would store its KV entry at
         // two positions. Both models take the batched path, each with its own
-        // scratch because their shapes differ.
+        // scratch because their shapes differ. A draft that could not draft
+        // from the end of this prompt is not filled at all: the target
+        // decodes alone from there.
         let prefix = &prompt_tokens[..prompt_tokens.len() - 1];
-        self.draft
-            .prefill(prefix, 0, &mut self.draft_kv, &mut self.draft_batch_scratch)?;
+        if self.draft_room(prefix.len()) > 0 {
+            self.draft
+                .prefill(prefix, 0, &mut self.draft_kv, &mut self.draft_batch_scratch)?;
+        }
         self.target.prefill(
             prefix,
             0,
@@ -166,10 +190,25 @@ impl<'a> SpeculativeDecoder<'a> {
         let vs = self.vocab_size;
         validate_speculative_config(config)?;
         if pos >= self.max_ctx {
-            bail!("decode position exceeds the speculative context window");
+            bail!(
+                "decode position {pos} is past the {}-token context window",
+                self.max_ctx
+            );
         }
+        // The caches hold exactly the positions before `pos`; any other value
+        // is a caller error, reported as one rather than as a panic in the
+        // cache's gap check.
+        ensure!(
+            pos == self.target_kv.filled_min(),
+            "step at position {pos}, but the decoder has processed {} positions",
+            self.target_kv.filled_min()
+        );
+        // Keep one verification position for the last drafted token, in the
+        // target and in the draft (which processes that token when every
+        // draft is accepted).
         let k = config
             .draft_k
+            .min(self.draft_room(pos))
             .min(self.max_ctx.saturating_sub(pos).saturating_sub(1));
 
         if k == 0 {

@@ -62,8 +62,10 @@ def main() -> int:
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    if args.context < 2:
-        parser.error("--context must be at least 2 tokens")
+    # The same floor as `rai perplexity`: below 4 a chunk scores nothing, or
+    # one token from one token of context.
+    if args.context < 4:
+        parser.error("--context must be at least 4 tokens")
 
     dtype = {
         "float16": torch.float16,
@@ -81,10 +83,14 @@ def main() -> int:
     with open(args.text, "r", encoding="utf-8") as handle:
         text = handle.read()
 
-    # add_special_tokens=False: continuous prose cut into chunks. A BOS at every
-    # chunk boundary would score a position the text does not contain, and the
-    # Rust side does not insert one either.
+    # add_special_tokens=False: continuous prose cut into chunks. Where the
+    # tokenizer starts every sequence with a BOS, the first token of each chunk
+    # becomes it, as llama-perplexity and `rai perplexity` both do; it is
+    # context, never scored.
     token_ids = tokenizer(text, add_special_tokens=False, return_tensors=None)["input_ids"]
+    plain = tokenizer("a", add_special_tokens=False)["input_ids"]
+    marked = tokenizer("a", add_special_tokens=True)["input_ids"]
+    bos = marked[0] if len(marked) > len(plain) and marked[1:1 + len(plain)] == plain else None
     total_chunks = len(token_ids) // args.context
     if total_chunks == 0:
         print(
@@ -122,6 +128,8 @@ def main() -> int:
     with torch.inference_mode():
         for chunk in range(chunks):
             window = token_ids[chunk * args.context : (chunk + 1) * args.context]
+            if bos is not None:
+                window = [bos] + window[1:]
             ids = torch.tensor([window], dtype=torch.long, device=args.device)
 
             logits = model(ids).logits[0]  # [context, vocab]

@@ -974,8 +974,25 @@ impl RaiModel {
         kv_cache: &mut KVCache,
         scratch: &mut BatchScratch,
     ) -> Result<()> {
+        self.prefill_while(tokens, start, kv_cache, scratch, || true)
+            .map(|_| ())
+    }
+
+    /// [`Self::prefill`], asking `keep_going` before each chunk.
+    ///
+    /// Returns `Ok(false)` when it said stop, with the chunks before that in
+    /// the cache. A server prefilling a long thread for a client that has left
+    /// stops within one chunk instead of finishing work nobody will read.
+    pub fn prefill_while(
+        &self,
+        tokens: &[usize],
+        start: usize,
+        kv_cache: &mut KVCache,
+        scratch: &mut BatchScratch,
+        mut keep_going: impl FnMut() -> bool,
+    ) -> Result<bool> {
         if tokens.is_empty() {
-            return Ok(());
+            return Ok(true);
         }
         let end = start
             .checked_add(tokens.len())
@@ -995,6 +1012,9 @@ impl RaiModel {
         let mut hiddens = Vec::new();
         let mut positions = Vec::with_capacity(PREFILL_CHUNK.min(tokens.len()));
         for (index, chunk) in tokens.chunks(PREFILL_CHUNK).enumerate() {
+            if !keep_going() {
+                return Ok(false);
+            }
             let first = start + index * PREFILL_CHUNK;
             hiddens.clear();
             hiddens.resize(chunk.len() * hs, 0.0);
@@ -1005,7 +1025,7 @@ impl RaiModel {
             positions.extend(first..first + chunk.len());
             self.forward_batch(&mut hiddens, &positions, kv_cache, scratch)?;
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Compute logits for a batch of hidden states.

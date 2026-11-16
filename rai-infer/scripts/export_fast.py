@@ -266,6 +266,8 @@ def main():
         print(f"  Tokenizer: {tok_dst}")
     else:
         print(f"  Tokenizer already present (identical): {tok_dst}")
+    record = raimodel.chat_record(tokenizer, getattr(model, "generation_config", None))
+    print(f"  Chat record: {raimodel.write_chat_record(output_path, record)}")
 
     print(f"\n=== DONE ===")
     print(f"  Model: {args.output} ({total_size / 1e6:.1f} MB)")

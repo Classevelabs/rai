@@ -32,8 +32,8 @@ fixture.
 - Paths in requests are the user's own filesystem, read as the command line
   would read them. Network and device paths (`\\host\share`, `\\?\UNC\…`,
   `\\.\…`) are refused, because opening one makes Windows authenticate to the
-  host it names. A conversion writes only a `.raimodel` file and a
-  `tokenizer.json`.
+  host it names. A conversion writes only a `.raimodel` file, the
+  `<name>.chat.json` record beside it, and a `tokenizer.json`.
 - Request bodies are limited to 64 KiB, and a larger declared body is refused
   unread. Each connection has a deadline, and a bounded number are read at
   once, so a stalled client cannot hold the server.

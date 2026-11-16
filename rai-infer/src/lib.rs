@@ -32,9 +32,10 @@
 //!
 //! # Features
 //!
-//! The default `cli` feature pulls in `clap`, `tokenizers`, `tiny_http`,
-//! `serde`, `serde_json`, and `memmap2`, and enables [`cli`], [`convert`],
-//! [`safetensors`], and the tokenizer-aware [`chat_template`] helpers.
+//! The default `cli` feature pulls in `clap`, `tokenizers`, `httparse`,
+//! `serde`, `serde_json`, `memmap2` and `minijinja`, and enables [`cli`],
+//! [`convert`], [`safetensors`], [`chat_format`], and the tokenizer-aware
+//! [`chat_template`] helpers.
 //! Building with `--no-default-features` leaves the inference library — format
 //! reader, kernels, model, sampling, and all three speculative decoders —
 //! resting on `half`, `rayon`, `anyhow`, and `rand` alone.
@@ -47,11 +48,15 @@
 //! kernel runs. Every such entry point documents the conditions under
 //! `# Panics`.
 
-/// Prompt formatting for instruction-tuned models.
 /// Calibration for the converter's GPTQ path: activation Hessians, gathered
 /// one layer at a time so the better quantizer needs neither Python nor a
 /// machine that can hold every layer's statistics at once.
 pub mod calibrate;
+/// What a loaded model's prompts look like and where its replies end: the
+/// chat template recorded at conversion, or a built-in one.
+#[cfg(feature = "cli")]
+pub mod chat_format;
+/// Prompt formatting for instruction-tuned models.
 pub mod chat_template;
 /// The `rai` command-line surface: `convert`, `run`, `serve`, and `models`.
 #[cfg(feature = "cli")]

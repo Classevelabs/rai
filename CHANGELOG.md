@@ -6,7 +6,59 @@ versioning for its pre-1.0 releases.
 
 ## [Unreleased]
 
+### Added
+- Every conversion records the checkpoint's own chat template, its special
+  tokens and its end-of-sequence ids beside the model, as `<name>.chat.json`,
+  from `rai convert` and the Python exporters alike. `--chat-template auto`,
+  the `rai serve` default, renders that template as transformers does: on
+  Qwen2.5 and SmolLM2 the prompt text and token ids are identical to
+  `apply_chat_template`, default system prompts included. TinyLlama-Chat,
+  Zephyr and Mistral v0.1/v0.2 spell their turn markers as plain text, so
+  probing the vocabulary sent them to the few-shot prompt; they now get their
+  own. `--chat-template model` asks for it explicitly, and a model converted
+  before keeps the vocabulary probing.
+- `POST /api/chat` takes `repetition_penalty`.
+
 ### Fixed
+- Raw prompts and every built-in template but Gemma's were encoded without
+  the beginning-of-sequence token, so Llama 2, TinyLlama, Mistral and Llama 3
+  ran without the start token they were trained with. The tokenizer adds it
+  now wherever the model's own tokenizer does.
+- Replies ended on a fixed list of token names. Gemma's `<eos>` and Llama 3.1's
+  `<|eom_id|>` never stopped generation, `rai serve` ignored the template's
+  own end-of-turn token, and Qwen2.5's vocabulary holds `</s>` as an ordinary
+  token, which ended any reply that wrote it. The end tokens are now the
+  checkpoint's own ids and the end markers among the tokenizer's control
+  tokens, and `rai run` honours the template's text stop sequences as
+  `rai serve` does.
+- The repetition penalty applied to the whole prompt, including the
+  end-of-turn marker a chat reply has to end with, which kept replies from
+  ending. It applies to the reply only, as the help text always said.
+- The sampler's running sum was f32: tail tokens could never be drawn and
+  their mass went to the most likely token. It runs in f64 against the
+  weights' own total.
+- `rai run --draft` with a draft whose window is shorter than the target's
+  stopped mid-reply with an error, or refused prompts the target could take.
+  Past the draft's window the target now decodes alone.
+- `--ponder-strategy` with `--draft` or `--lookup-k` was ignored without a
+  word; the combination is refused.
+- The speculative decoders return an error for a position they are not at,
+  instead of panicking.
+- `rai serve` trims a long thread by whole exchanges (it could open on an
+  orphaned reply), merges consecutive messages from one role into one turn,
+  and finds the cut by binary search instead of re-rendering every suffix.
+- A client that leaves stops its generation, during prefill too. Studio's Stop,
+  or a dropped `/api/chat` call, held the server until the reply finished.
+- `rai serve --chat-template` and `POST /api/load` refuse an unknown template
+  name, before reading the weights, instead of warning on stderr and guessing.
+- `rai perplexity` and `reference_ppl.py` make the first token of each chunk
+  the start token wherever the tokenizer adds one, as `llama-perplexity`
+  does, so Llama, Mistral and Gemma numbers compare with llama.cpp's; Qwen
+  and SmolLM2 add none and are unchanged. The "scored per chunk" line no
+  longer underflows on a tiny `--context` or miscounts odd ones, and
+  `reference_ppl.py` refuses a context below 4 as `rai perplexity` does.
+- Studio converts at the model's own context window by default, instead of a
+  fixed 2048 baked into every file it made.
 - **`rai convert` read the wrong RoPE settings from transformers 5 configs.**
   transformers 5 writes `rope_theta`, the scaling scheme and Gemma3's
   sliding-layer base into `rope_parameters` and drops the top-level keys, so a

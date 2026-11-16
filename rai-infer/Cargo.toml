@@ -32,6 +32,8 @@ cli = [
     "dep:serde",
     "dep:serde_json",
     "dep:memmap2",
+    "dep:minijinja",
+    "dep:minijinja-contrib",
 ]
 
 # Unix-only, and only for the free-space preflight before a conversion writes.
@@ -60,6 +62,12 @@ httparse = { version = "1.10", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 memmap2 = { version = "0.9", optional = true }
+# Renders the chat template a checkpoint ships, recorded at conversion, the
+# way transformers renders it: Jinja with Python's string methods. The same
+# engine Hugging Face's own Rust inference server uses for these templates;
+# the alternative was a hand-written approximation per model family.
+minijinja = { version = "2.24", features = ["json", "loop_controls"], optional = true }
+minijinja-contrib = { version = "2.24", features = ["pycompat"], optional = true }
 
 [dev-dependencies]
 # The conformance tests read the exporter's .expected.json sidecars regardless

@@ -12,7 +12,8 @@ use anyhow::{ensure, Context, Result};
 use rand::SeedableRng;
 use tokenizers::Tokenizer;
 
-use crate::chat_template::ChatTemplate;
+use crate::chat_format::ChatFormat;
+use crate::chat_template::{ChatTemplate, Role};
 use crate::cli::{load_tokenizer_for_model, resolve_tokenizer};
 use crate::lookup::{LookupConfig, LookupDecoder};
 use crate::model::{BatchScratch, InferenceWork, RaiModel};
@@ -49,7 +50,9 @@ pub struct GenerationArgs {
     /// Keep the smallest set of tokens whose probability sums to P
     #[arg(long, default_value = "0.9")]
     pub top_p: f32,
-    /// Penalty applied to already-generated tokens (1.0 disables)
+    /// Penalty on tokens this run has already generated (1.0 disables). The
+    /// prompt is not penalized: a chat prompt holds the very end-of-turn
+    /// marker the reply has to end with.
     #[arg(long, default_value = "1.1")]
     pub repetition_penalty: f32,
     /// Pondering strategy: none, cfg, ensemble, cfg-ensemble, adaptive
@@ -79,7 +82,8 @@ pub struct GenerationArgs {
     /// Print per-step decoding diagnostics to stderr
     #[arg(long, default_value = "false")]
     pub verbose: bool,
-    /// Chat template: auto, none, few-shot, mistral, llama3, chatml, zephyr, phi3, gemma
+    /// Chat template: auto (the model's own, recorded at conversion), model,
+    /// none, few-shot, mistral, llama3, chatml, zephyr, phi3, gemma
     #[arg(long, default_value = "none")]
     pub chat_template: String,
     /// Draft model for speculative decoding (e.g. smollm-135m-q4.raimodel)
@@ -158,12 +162,11 @@ pub fn validate_args(args: &GenerationArgs) -> Result<()> {
         args.ponder_strategy
     );
     ensure!(
-        matches!(
-            args.chat_template.as_str(),
-            "auto" | "none" | "few-shot" | "mistral" | "llama3" | "chatml" | "zephyr" | "phi3" | "gemma"
-        ),
-        "unknown --chat-template '{}'; expected auto, none, few-shot, mistral, llama3, chatml, zephyr, phi3, or gemma",
-        args.chat_template
+        matches!(args.chat_template.as_str(), "auto" | "model")
+            || ChatTemplate::from_name(&args.chat_template).is_some(),
+        "unknown --chat-template '{}'; expected auto, model, or one of {}",
+        args.chat_template,
+        ChatTemplate::NAMES.join(", ")
     );
     ensure!(
         (1..=MAX_ENSEMBLE_SIZE).contains(&args.ensemble_n),
@@ -209,6 +212,12 @@ pub fn validate_args(args: &GenerationArgs) -> Result<()> {
                 && args.top_p == 1.0
                 && (args.repetition_penalty - 1.0).abs() < f32::EPSILON,
             "speculative decoding currently requires --temperature > 0, --top-k 0, --top-p 1, and --repetition-penalty 1 so verification uses the exact sampled distribution"
+        );
+        // Each speculative loop samples the target directly; pondering would be
+        // skipped without a word.
+        ensure!(
+            args.ponder_strategy == "none",
+            "--ponder-strategy cannot be combined with --draft or --lookup-k"
         );
     }
     Ok(())
@@ -267,12 +276,11 @@ pub fn run(args: &RunArgs) -> Result<()> {
     eprintln!("Loading tokenizer: {}", tokenizer_path.display());
     let tokenizer = load_tokenizer_for_model(&tokenizer_path, cfg.vocab_size as usize)?;
 
-    let template = ChatTemplate::from_str_arg(&generation.chat_template, &tokenizer);
-    let formatted_prompt = template.format_prompt(&generation.prompt);
-    let encoding = tokenizer
-        .encode(formatted_prompt.as_str(), template.prepends_bos())
-        .map_err(|e| anyhow::anyhow!("encode error: {e}"))?;
-    let prompt_tokens: Vec<usize> = encoding.get_ids().iter().map(|&id| id as usize).collect();
+    let format = ChatFormat::load(&generation.chat_template, &args.model, &tokenizer)?;
+    if format.builtin() != Some(ChatTemplate::None) {
+        eprintln!("Chat template: {}", format.name());
+    }
+    let prompt_tokens = format.encode(&tokenizer, &[(Role::User, generation.prompt.as_str())])?;
     eprintln!("Prompt: {} tokens", prompt_tokens.len());
 
     let ponder_config = build_ponder_config(generation)?;
@@ -348,52 +356,63 @@ pub fn run(args: &RunArgs) -> Result<()> {
     print!("{}", generation.prompt);
     io::stdout().flush()?;
 
-    // Which token ids end generation.
-    //
-    // The generic end-of-text markers are not enough on their own: a chat
-    // model ends its *turn* with a token its template names, and Gemma's
-    // <end_of_turn> is in none of the generic lists. Missing it does not fail
-    // — generation simply runs to --max-tokens emitting turn markers — so the
-    // template's own stop tokens are folded in here.
-    let eos_ids: Vec<usize> = ["</s>", "<|endoftext|>", "<|eot_id|>", "<|end_of_text|>"]
-        .iter()
-        .copied()
-        .chain(template.stop_sequences().iter().copied())
-        .filter_map(|name| tokenizer.token_to_id(name).map(|id| id as usize))
-        .collect();
-    let is_eos = |tok: usize| -> bool { eos_ids.contains(&tok) };
+    // Which token ids end generation: the format's, which covers the
+    // checkpoint's own end-of-sequence ids, every family's end markers among
+    // the tokenizer's control tokens, and the template's turn markers.
+    let end_ids = format.end_ids();
+    let is_eos = |tok: usize| -> bool { end_ids.contains(&tok) };
+    let stops = format.stop_sequences();
 
-    // Helper: print newly generated text with correct spacing. A trailing
-    // U+FFFD usually means a multi-byte codepoint is split across tokens;
-    // hold it back so the resolved character prints on a later call instead
-    // of replacement-garbage reaching the terminal.
+    // Helper: print newly generated text with correct spacing, and report
+    // whether a stop sequence ended the reply (its text is never printed). A
+    // trailing U+FFFD usually means a multi-byte codepoint is split across
+    // tokens, and the start of a stop sequence may be one; both are held back
+    // until the next token settles them.
     let print_new_text = |all_tokens: &[usize],
                           prompt_len: usize,
                           previous_text: &mut String,
-                          tokenizer: &Tokenizer| {
+                          tokenizer: &Tokenizer|
+     -> bool {
         let gen_ids: Vec<u32> = all_tokens[prompt_len..].iter().map(|&t| t as u32).collect();
-        let full_text = tokenizer.decode(&gen_ids, false).unwrap_or_default();
-        let mut suffix = incremental_suffix(previous_text, &full_text);
-        let mut held_bytes = 0usize;
-        while suffix.ends_with('\u{FFFD}') {
-            suffix = &suffix[..suffix.len() - '\u{FFFD}'.len_utf8()];
-            held_bytes += '\u{FFFD}'.len_utf8();
+        let mut full_text = tokenizer.decode(&gen_ids, false).unwrap_or_default();
+        let cut = stops
+            .iter()
+            .filter_map(|stop| full_text.find(stop.as_str()))
+            .min();
+        if let Some(cut) = cut {
+            full_text.truncate(cut);
         }
-        if !suffix.is_empty() {
-            print!("{suffix}");
+        let suffix = incremental_suffix(previous_text, &full_text);
+        let length = if cut.is_some() {
+            suffix.len()
+        } else {
+            crate::cli::serve::emittable_len(suffix, stops)
+        };
+        if length > 0 {
+            print!("{}", &suffix[..length]);
             let _ = io::stdout().flush();
         }
-        *previous_text = full_text[..full_text.len() - held_bytes].to_string();
+        let printed = full_text.len() - (suffix.len() - length);
+        *previous_text = full_text[..printed].to_string();
+        cut.is_some()
     };
 
-    // Helper: once decoding ends, print anything the U+FFFD holdback withheld
-    // (a final replacement character is genuine and should be shown).
+    // Helper: once decoding ends, print anything the hold-back withheld (a
+    // final replacement character is genuine and should be shown), short of
+    // any stop sequence.
     let flush_held_text = |all_tokens: &[usize],
                            prompt_len: usize,
                            previous_text: &mut String,
                            tokenizer: &Tokenizer| {
         let gen_ids: Vec<u32> = all_tokens[prompt_len..].iter().map(|&t| t as u32).collect();
-        let full_text = tokenizer.decode(&gen_ids, false).unwrap_or_default();
+        let mut full_text = tokenizer.decode(&gen_ids, false).unwrap_or_default();
+        if let Some(cut) = stops
+            .iter()
+            .filter_map(|stop| full_text.find(stop.as_str()))
+            .min()
+        {
+            full_text.truncate(cut);
+        }
         let suffix = incremental_suffix(previous_text, &full_text);
         if !suffix.is_empty() {
             print!("{suffix}");
@@ -469,7 +488,7 @@ pub fn run(args: &RunArgs) -> Result<()> {
                 }
             }
 
-            print_new_text(
+            let hit_stop = print_new_text(
                 &all_tokens,
                 prompt_tokens.len(),
                 &mut previous_text,
@@ -480,7 +499,7 @@ pub fn run(args: &RunArgs) -> Result<()> {
                 eprint!("[spec:{}d/{}a]", metrics.drafted, metrics.accepted);
             }
 
-            if hit_eos {
+            if hit_eos || hit_stop {
                 break;
             }
         }
@@ -584,7 +603,7 @@ pub fn run(args: &RunArgs) -> Result<()> {
                 }
             }
 
-            print_new_text(
+            let hit_stop = print_new_text(
                 &all_tokens,
                 prompt_tokens.len(),
                 &mut previous_text,
@@ -600,7 +619,7 @@ pub fn run(args: &RunArgs) -> Result<()> {
                 );
             }
 
-            if hit_eos {
+            if hit_eos || hit_stop {
                 break;
             }
         }
@@ -692,7 +711,11 @@ pub fn run(args: &RunArgs) -> Result<()> {
                 eprint!("]");
             }
 
-            apply_repetition_penalty(&mut logits, &all_tokens, sampler_config.repetition_penalty);
+            apply_repetition_penalty(
+                &mut logits,
+                &all_tokens[prompt_tokens.len()..],
+                sampler_config.repetition_penalty,
+            );
             let next_token = sample_token(&mut logits, &sampler_config, &mut rng);
             work.scratch.logits = logits;
 
@@ -702,12 +725,14 @@ pub fn run(args: &RunArgs) -> Result<()> {
 
             all_tokens.push(next_token);
             tokens_generated += 1;
-            print_new_text(
+            if print_new_text(
                 &all_tokens,
                 prompt_tokens.len(),
                 &mut previous_text,
                 &tokenizer,
-            );
+            ) {
+                break;
+            }
         }
 
         let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
@@ -813,6 +838,24 @@ mod tests {
         args.top_p = 1.0;
         args.repetition_penalty = 1.0;
         assert!(validate_args(&args).is_ok());
+    }
+
+    /// The speculative loops sample the target directly, so a strategy given
+    /// alongside them would be dropped without a word.
+    #[test]
+    fn pondering_is_refused_with_either_speculative_mode() {
+        for speculative in [
+            |args: &mut GenerationArgs| args.draft = Some(PathBuf::from("draft.raimodel")),
+            |args: &mut GenerationArgs| args.lookup_k = 4,
+        ] {
+            let mut args = valid_args();
+            exact_sampling(&mut args);
+            speculative(&mut args);
+            assert!(validate_args(&args).is_ok());
+            args.ponder_strategy = "cfg".to_string();
+            let error = validate_args(&args).unwrap_err().to_string();
+            assert!(error.contains("--ponder-strategy"), "{error}");
+        }
     }
 
     #[test]

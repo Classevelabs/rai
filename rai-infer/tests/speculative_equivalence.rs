@@ -167,3 +167,64 @@ fn speculative_runs_complete_and_first_token_distribution_matches_target() {
     assert_eq!(spec_first_counts.iter().sum::<usize>(), RUNS);
     assert_eq!(direct_first_counts.iter().sum::<usize>(), RUNS);
 }
+
+/// A draft whose window is shorter than the target's hands decoding to the
+/// target past it, instead of ending generation or refusing the prompt.
+#[test]
+fn a_shorter_draft_window_hands_over_to_the_target() {
+    const DRAFT_CTX: usize = 8;
+    let mut draft = RaiModel::load(&fixture("tiny-tied.raimodel")).expect("load draft fixture");
+    draft.config.max_context = DRAFT_CTX as u32;
+    let target = RaiModel::load(&fixture("tiny-untied.raimodel")).expect("load target fixture");
+    let vocab = target.config.vocab_size as usize;
+    let config = SpeculativeConfig {
+        draft_k: 3,
+        sampler: exact_sampler(),
+    };
+    let mut rng = StdRng::seed_from_u64(7);
+
+    // A prompt longer than the draft's whole window is accepted and decoded
+    // by the target alone.
+    let long_prompt: Vec<usize> = (0..12).map(|i| (i * 5 + 1) % vocab).collect();
+    let mut decoder = SpeculativeDecoder::new(&draft, &target, MAX_CTX).expect("decoder");
+    assert_eq!(decoder.max_context(), MAX_CTX);
+    let mut pos = decoder
+        .prefill(&long_prompt)
+        .expect("a long prompt fits the target");
+    let mut last = *long_prompt.last().unwrap();
+    while pos < 30 {
+        let (tokens, metrics) = decoder.step(pos, last, &config, &mut rng).expect("step");
+        assert_eq!(
+            metrics.drafted, 0,
+            "nothing is drafted past the draft's window"
+        );
+        pos += metrics.produced;
+        last = *tokens.last().unwrap();
+    }
+
+    // A short prompt drafts while the draft has room, then carries on alone
+    // to the target's window.
+    let mut decoder = SpeculativeDecoder::new(&draft, &target, MAX_CTX).expect("decoder");
+    let mut pos = decoder.prefill(&[1, 2, 3]).expect("prefill");
+    let mut last = 3;
+    let mut drafted = 0;
+    while pos < MAX_CTX - 1 {
+        let (tokens, metrics) = decoder.step(pos, last, &config, &mut rng).expect("step");
+        if pos + 1 >= DRAFT_CTX {
+            assert_eq!(
+                metrics.drafted, 0,
+                "drafted at {pos}, past the draft's window"
+            );
+        }
+        drafted += metrics.drafted;
+        pos += metrics.produced;
+        last = *tokens.last().unwrap();
+    }
+    assert!(drafted > 0, "the draft was never used while it had room");
+
+    // A position the decoder is not at is an error, not a panic.
+    let mut decoder = SpeculativeDecoder::new(&draft, &target, MAX_CTX).expect("decoder");
+    let pos = decoder.prefill(&[1, 2, 3]).expect("prefill");
+    assert!(decoder.step(pos + 1, 3, &config, &mut rng).is_err());
+    assert!(decoder.step(pos, 3, &config, &mut rng).is_ok());
+}

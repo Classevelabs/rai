@@ -188,10 +188,11 @@ and that no perplexity claim was therefore made.
 `rai perplexity`, which implements `llama-perplexity`'s method so the two are a
 comparison rather than two numbers:
 
-1. The corpus is tokenized once, no special tokens. It is continuous prose, and
-   a BOS inserted at every chunk boundary would score a position the text does
-   not contain.
-2. Non-overlapping chunks of `--context` tokens.
+1. The corpus is tokenized once, no special tokens: it is continuous prose.
+2. Non-overlapping chunks of `--context` tokens. Where the tokenizer starts
+   every sequence with a BOS (Llama, Mistral, Gemma), the first token of each
+   chunk becomes it, as `llama-perplexity` does; it is context, never scored.
+   Qwen and SmolLM2, the models measured here, add none.
 3. One batched forward pass per chunk, from an empty KV cache.
 4. Only the **second half** of each chunk is scored, so every scored token has
    at least `context / 2` tokens of real context behind it.

@@ -38,6 +38,7 @@ use std::time::{Duration, Instant};
 // enforces them (`format.rs`) and by the kernels they protect (`gemm.rs`,
 // `layers.rs`). The writer imports them so a converted file is, by
 // construction, a file this build can load.
+use crate::chat_format::ChatRecord;
 use crate::format::{
     MAX_CONTEXT, MAX_HEADS, MAX_HIDDEN_SIZE, MAX_INTERMEDIATE_SIZE, MAX_LAYERS,
     MAX_MODEL_FILE_BYTES, MAX_VOCAB_SIZE, PROJECTION_NAMES,
@@ -612,6 +613,9 @@ pub fn convert_with_progress(
     // model's tokenizer — a pair that loads and produces fluent nonsense. The
     // copy at the end checks again, for a file that appears meanwhile.
     check_tokenizer_destination(&tokenizer_src, &tokenizer_dst)?;
+    // Read now, so a malformed tokenizer_config.json or generation_config.json
+    // is refused before quantizing rather than after.
+    let chat_record = ChatRecord::from_checkpoint(&options.model_dir)?;
 
     // Progress accounting: one unit per section (the embedding, each layer,
     // the final norm, and `lm_head` when untied), so `percent` advances once
@@ -831,7 +835,7 @@ pub fn convert_with_progress(
     // renamed over the target only after the size check and fsync. A failure
     // part-way leaves the old model untouched, and the guard removes the
     // partial so it cannot be mistaken for a model later. (A hard kill —
-    // Ctrl+C included, which does not unwind on Windows — can still leave a
+    // Ctrl+C included, which unwinds on no platform — can still leave a
     // stale .partial behind.)
     //
     let tmp_path = partial_path(&output_path);
@@ -1133,6 +1137,18 @@ pub fn convert_with_progress(
             tokenizer_dst.display()
         ));
     }
+    // Beside the model and named after it, so models sharing a folder (and a
+    // tokenizer) each keep their own template.
+    let record_path = ChatRecord::path_beside(&output_path);
+    write_through_partial(&record_path, &chat_record.to_json())?;
+    log(&match chat_record.chat_template {
+        Some(_) => format!("Chat template: {}", record_path.display()),
+        None => format!(
+            "Chat record: {} (the checkpoint ships no chat template; it is prompted as a base \
+             model)",
+            record_path.display()
+        ),
+    });
 
     let elapsed = started.elapsed();
     enter("done", total_units as u32, None);
@@ -3916,19 +3932,26 @@ fn copy_tokenizer_json(src: &Path, dst: &Path) -> Result<bool> {
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
     }
+    write_through_partial(dst, &source)?;
+    Ok(true)
+}
+
+/// Write `bytes` to `dst` through a partial file renamed into place, as the
+/// model is written, so an interrupted write leaves no truncated file.
+fn write_through_partial(dst: &Path, bytes: &[u8]) -> Result<()> {
     let tmp_path = partial_path(dst);
     let mut file = create_partial(&tmp_path)?;
     let mut guard = PartialOutput {
         path: &tmp_path,
         keep: false,
     };
-    file.write_all(&source)
+    file.write_all(bytes)
         .and_then(|()| file.sync_all())
         .with_context(|| format!("writing {}", tmp_path.display()))?;
     drop(file);
     std::fs::rename(&tmp_path, dst).with_context(|| format!("writing {}", dst.display()))?;
     guard.keep = true;
-    Ok(true)
+    Ok(())
 }
 
 /// Refuse up front a tokenizer destination that already holds a different

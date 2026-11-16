@@ -52,6 +52,7 @@ Section encodings:
   Dequantization:     weight = code * scale + zero
 """
 
+import json
 import math
 import os
 import re
@@ -732,6 +733,46 @@ def place_tokenizer_json(tokenizer_json, dst_path):
         return False
     _write_atomically(dst_path, lambda f: f.write(tokenizer_json))
     return True
+
+
+# =============================================================================
+# Chat record
+# =============================================================================
+
+def chat_record(tokenizer, generation_config):
+    """What the runtime needs to prompt the model as transformers does.
+
+    Mirror of `ChatRecord::from_checkpoint` in src/chat_format.rs: the chat
+    template (the one named `default` when there are several), the two tokens
+    it spells, and the end-of-sequence ids from the generation config.
+    """
+    template = getattr(tokenizer, "chat_template", None)
+    if isinstance(template, dict):
+        template = template.get("default")
+    eos_ids = getattr(generation_config, "eos_token_id", None)
+    if eos_ids is None:
+        eos_ids = []
+    elif isinstance(eos_ids, int):
+        eos_ids = [eos_ids]
+    return {
+        "chat_template": template,
+        "bos_token": getattr(tokenizer, "bos_token", None),
+        "eos_token": getattr(tokenizer, "eos_token", None),
+        "eos_token_ids": [int(token_id) for token_id in eos_ids],
+    }
+
+
+def chat_record_path(model_path):
+    """`<name>.chat.json` beside `<name>.raimodel`, as the runtime looks for it."""
+    return Path(model_path).with_suffix(".chat.json")
+
+
+def write_chat_record(model_path, record):
+    """Write `record` beside the model, as `rai convert` does."""
+    path = chat_record_path(model_path)
+    data = (json.dumps(record, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    _write_atomically(path, lambda f: f.write(data))
+    return path
 
 
 # ---------------------------------------------------------------------------
