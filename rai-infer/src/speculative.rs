@@ -68,6 +68,7 @@ pub struct SpeculativeDecoder<'a> {
     // different hidden sizes, so sharing one workspace would corrupt it.
     draft_scratch: Scratch,
     target_scratch: Scratch,
+    draft_batch_scratch: BatchScratch,
     target_batch_scratch: BatchScratch,
     /// Reused draft-logits buffer: avoids a vocab-sized allocation per drafted token.
     draft_logits_buf: Vec<f32>,
@@ -101,6 +102,7 @@ impl<'a> SpeculativeDecoder<'a> {
             target_kv: target.create_kv_cache(target_ctx)?,
             draft_scratch: Scratch::new(),
             target_scratch: Scratch::new(),
+            draft_batch_scratch: BatchScratch::new(),
             target_batch_scratch: BatchScratch::new(),
             draft_logits_buf: vec![0.0; dvs],
             vocab_size: dvs,
@@ -117,52 +119,27 @@ impl<'a> SpeculativeDecoder<'a> {
     /// Returns the position for the next `step()` call (= N-1 for N tokens,
     /// or 0 for a single-token prompt).
     pub fn prefill(&mut self, prompt_tokens: &[usize]) -> Result<usize> {
-        let dhs = self.draft.config.hidden_size as usize;
-        let ths = self.target.config.hidden_size as usize;
         if prompt_tokens.is_empty() {
             bail!("prompt must contain at least one token");
         }
         if prompt_tokens.len() > self.max_ctx {
             bail!("prompt exceeds the speculative context window");
         }
-        let mut pos = 0;
 
         // Process tokens 0..N-2 only: step() consumes the final prompt token
         // at position N-1, so prefilling it here would store its KV entry at
-        // two positions.
-        let n_to_prefill = if prompt_tokens.len() > 1 {
-            prompt_tokens.len() - 1
-        } else {
-            0
-        };
-
-        let mut draft_hidden = vec![0.0f32; dhs];
-        let mut target_hidden = vec![0.0f32; ths];
-
-        for &token_id in &prompt_tokens[..n_to_prefill] {
-            // Prefill draft
-            self.draft.embed_token(token_id, &mut draft_hidden)?;
-            self.draft.forward_from_hidden(
-                &mut draft_hidden,
-                pos,
-                &mut self.draft_kv,
-                true,
-                &mut self.draft_scratch,
-            )?;
-
-            // Prefill target (uses its own scratch)
-            self.target.embed_token(token_id, &mut target_hidden)?;
-            self.target.forward_from_hidden(
-                &mut target_hidden,
-                pos,
-                &mut self.target_kv,
-                true,
-                &mut self.target_scratch,
-            )?;
-
-            pos += 1;
-        }
-        Ok(pos)
+        // two positions. Both models take the batched path, each with its own
+        // scratch because their shapes differ.
+        let prefix = &prompt_tokens[..prompt_tokens.len() - 1];
+        self.draft
+            .prefill(prefix, 0, &mut self.draft_kv, &mut self.draft_batch_scratch)?;
+        self.target.prefill(
+            prefix,
+            0,
+            &mut self.target_kv,
+            &mut self.target_batch_scratch,
+        )?;
+        Ok(prefix.len())
     }
 
     /// One speculative decoding step with batched verification.

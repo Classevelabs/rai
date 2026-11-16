@@ -181,3 +181,77 @@ fn cleared_cache_rejects_stale_position_reads() {
         "forward at position 1 on a cleared cache should panic via the watermark gate"
     );
 }
+
+/// The logits for the last token after prefilling every earlier one through
+/// `RaiModel::prefill` from `start`, with `0..start` already in the cache.
+fn logits_after_prefill(model: &RaiModel, tokens: &[usize], split: usize) -> Vec<f32> {
+    let hs = model.config.hidden_size as usize;
+    let vs = model.config.vocab_size as usize;
+    let n = tokens.len();
+    let mut kv = model.create_kv_cache(n).unwrap();
+    let mut batch = BatchScratch::new();
+    // Two calls: the second resumes at `split`, the way the server reuses a
+    // previous turn's cache.
+    model
+        .prefill(&tokens[..split], 0, &mut kv, &mut batch)
+        .unwrap();
+    model
+        .prefill(&tokens[split..n - 1], split, &mut kv, &mut batch)
+        .unwrap();
+    assert_eq!(kv.filled_min(), n - 1);
+
+    let mut hidden = vec![0.0f32; hs];
+    model.embed_token(tokens[n - 1], &mut hidden).unwrap();
+    model
+        .forward_from_hidden(&mut hidden, n - 1, &mut kv, true, &mut Scratch::new())
+        .unwrap();
+    let mut normed = vec![0.0f32; hs];
+    let mut logits = vec![0.0f32; vs];
+    model
+        .hidden_to_logits_into(&hidden, &mut normed, &mut logits)
+        .unwrap();
+    logits
+}
+
+/// Prefill runs in `PREFILL_CHUNK`-token batches. Where the chunk boundaries
+/// fall, and whether the prefill resumes from a cached prefix, must not show
+/// in the cache: the next token's logits agree with the fully sequential path.
+#[test]
+fn chunked_and_resumed_prefill_match_the_sequential_path() {
+    use rai_infer::model::PREFILL_CHUNK;
+    let model = RaiModel::load(&fixture("tiny-tied.raimodel")).expect("load fixture model");
+    let vocab = model.config.vocab_size as usize;
+    let n = PREFILL_CHUNK + 37;
+    let tokens = token_sequence(vocab, n);
+    let sequential = sequential_logits(&model, &tokens, n);
+    let expected = sequential.last().unwrap();
+
+    for split in [0, 1, 100, PREFILL_CHUNK, n - 1] {
+        let got = logits_after_prefill(&model, &tokens, split);
+        assert_eq!(
+            argmax(&got),
+            argmax(expected),
+            "argmax diverged (split {split})"
+        );
+        let worst = got
+            .iter()
+            .zip(expected)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(worst <= 2e-3, "split {split}: max logit diff {worst:e}");
+    }
+}
+
+/// A prefill that would leave a gap below its start, or run past the cache,
+/// is refused with an error instead of reaching the cache's panics.
+#[test]
+fn prefill_refuses_a_gap_and_an_overrun() {
+    let model = RaiModel::load(&fixture("tiny-tied.raimodel")).expect("load fixture model");
+    let mut kv = model.create_kv_cache(8).unwrap();
+    let mut batch = BatchScratch::new();
+    let gap = model.prefill(&[1, 2], 3, &mut kv, &mut batch).unwrap_err();
+    assert!(gap.to_string().contains("unwritten"), "{gap}");
+    let overrun = model.prefill(&[1; 9], 0, &mut kv, &mut batch).unwrap_err();
+    assert!(overrun.to_string().contains("exceeds"), "{overrun}");
+    assert_eq!(kv.filled_min(), 0, "a refused prefill stores nothing");
+}

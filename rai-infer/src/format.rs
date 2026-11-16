@@ -32,7 +32,7 @@
 //! | 88..92  | f32  | `attn_logit_softcap` — 0.0 = disabled |
 //! | 92..96  | f32  | `final_logit_softcap` — 0.0 = disabled |
 //! | 96..100 | f32  | `attn_scale` — 0.0 = the default `1/sqrt(head_dim)` |
-//! | 100..104| f32  | `rope_local_theta` — 0.0 = one theta for every layer |
+//! | 100..104| f32  | `rope_local_theta` — 0.0 = one theta for every layer; the local table is never rescaled (`rope_type` applies to the global layers) |
 //! | 104     | u8   | `global_layer_stride` — 0 = unused; else layer *i* uses `rope_theta` when `(i+1) % stride == 0` and `rope_local_theta` otherwise |
 //! | 105..107| u16  | `num_experts` — 0 = a dense MLP |
 //! | 107     | u8   | `experts_per_token` — how many of them each token uses |
@@ -383,6 +383,17 @@ pub struct QuantizedLinear<'a> {
     pub group_size: usize,
 }
 
+impl QuantizedLinear<'_> {
+    /// A placeholder to fill a fixed array before its slots are parsed.
+    const EMPTY: Self = Self {
+        rows: 0,
+        cols: 0,
+        group_params: &[],
+        nibble_data: &[],
+        group_size: 0,
+    };
+}
+
 /// Zero-copy reference to an 8-bit quantized embedding table.
 #[derive(Debug, Clone)]
 pub struct QuantizedEmbedding<'a> {
@@ -447,9 +458,13 @@ pub struct ExpertMlp<'a> {
 impl<'a> LayerRefs<'a> {
     /// Borrow expert `index`'s three projections.
     ///
-    /// Parsed on demand rather than up front: a token uses `experts_per_token`
-    /// of them, which is typically 8 of 64, so eagerly slicing every expert
-    /// would do eight times the work for nothing.
+    /// Every expert after the first has the same three shapes, so expert
+    /// `index` starts at `(index - 1) * expert_bytes` in the block that follows
+    /// the router, and finding it is arithmetic. It used to walk every expert
+    /// before it, formatting a label string per linear: on a 128-expert layer
+    /// that was hundreds of allocations per routed token, per layer.
+    /// [`RaiModelFile::open`] has already checked every expert's sub-headers,
+    /// so the three read here are re-checked only as a guard.
     pub fn expert(&self, index: usize, config: &ModelConfig) -> Result<ExpertMlp<'a>> {
         if index == 0 {
             return Ok(ExpertMlp {
@@ -468,29 +483,42 @@ impl<'a> LayerRefs<'a> {
             );
         }
         let dims = config.projection_dims();
-        let mut offset = 0usize;
-        let mut linears = Vec::with_capacity(3);
-        for expert in 1..=index {
-            linears.clear();
-            for &(rows, cols) in &dims[4..] {
-                let (linear, next) = read_linear(
-                    data,
-                    offset,
-                    rows,
-                    cols,
-                    config.group_size as usize,
-                    &format!("expert {expert}"),
-                )?;
-                linears.push(linear);
-                offset = next;
-            }
-        }
-        Ok(ExpertMlp {
-            gate: linears[0],
-            up: linears[1],
-            down: linears[2],
-        })
+        let group_size = config.group_size as usize;
+        let label = || format!("expert {index}");
+        let start = checked_mul(index - 1, expert_bytes(config)?, "expert offset")?;
+        let (gate, next) = read_linear(data, start, dims[4].0, dims[4].1, group_size, &label)?;
+        let (up, next) = read_linear(data, next, dims[5].0, dims[5].1, group_size, &label)?;
+        let (down, _) = read_linear(data, next, dims[6].0, dims[6].1, group_size, &label)?;
+        Ok(ExpertMlp { gate, up, down })
     }
+}
+
+/// Bytes one quantized linear occupies in a section: the `[u32 rows][u32
+/// cols]` sub-header, `rows * groups * 4` bytes of f16 scale/zero pairs, then
+/// `rows * cols / 2` bytes of packed 4-bit codes.
+fn linear_bytes(rows: usize, cols: usize, group_size: usize) -> Result<usize> {
+    let num_groups = cols.div_ceil(group_size);
+    let params = checked_mul(
+        checked_mul(rows, num_groups, "linear parameter groups")?,
+        4,
+        "linear parameter bytes",
+    )?;
+    let nibbles = checked_mul(rows, cols, "linear elements")?.div_ceil(2);
+    checked_add(
+        checked_add(8, params, "linear size")?,
+        nibbles,
+        "linear size",
+    )
+}
+
+/// Bytes each expert after the first occupies: its gate, up and down linears.
+fn expert_bytes(config: &ModelConfig) -> Result<usize> {
+    let group_size = config.group_size as usize;
+    let mut total = 0usize;
+    for &(rows, cols) in &config.projection_dims()[4..] {
+        total = checked_add(total, linear_bytes(rows, cols, group_size)?, "expert size")?;
+    }
+    Ok(total)
 }
 
 /// Slice one quantized linear out of `data` at `offset`, returning it and the
@@ -498,36 +526,37 @@ impl<'a> LayerRefs<'a> {
 ///
 /// The layout is `[u32 rows][u32 cols][group params][nibbles]`. Both the main
 /// layer loop and the expert parser go through here so the two cannot come to
-/// disagree about a linear's size.
+/// disagree about a linear's size. `label` is only called to build an error,
+/// so the hot path that slices a layer per token allocates nothing.
 fn read_linear<'a>(
     data: &'a [u8],
     offset: usize,
     expect_rows: usize,
     expect_cols: usize,
     group_size: usize,
-    label: &str,
+    label: &dyn Fn() -> String,
 ) -> Result<(QuantizedLinear<'a>, usize)> {
     let header_end = checked_add(offset, 8, "linear header end")?;
     if header_end > data.len() {
-        bail!("{label}: linear header truncated");
+        bail!("{}: linear header truncated", label());
     }
     let rows = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
     let cols = u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap()) as usize;
     if (rows, cols) != (expect_rows, expect_cols) {
-        bail!("{label}: linear is [{rows}, {cols}], expected [{expect_rows}, {expect_cols}]");
+        bail!(
+            "{}: linear is [{rows}, {cols}], expected [{expect_rows}, {expect_cols}]",
+            label()
+        );
     }
-    let num_groups = cols.div_ceil(group_size);
-    let params_size = checked_mul(
-        checked_mul(rows, num_groups, "linear parameter groups")?,
-        4,
-        "linear parameter bytes",
+    let end = checked_add(
+        offset,
+        linear_bytes(rows, cols, group_size)?,
+        "linear data end",
     )?;
-    let nibble_size = checked_mul(rows, cols, "linear elements")?.div_ceil(2);
-    let params_end = checked_add(header_end, params_size, "linear parameter end")?;
-    let end = checked_add(params_end, nibble_size, "linear data end")?;
     if end > data.len() {
-        bail!("{label}: linear data truncated");
+        bail!("{}: linear data truncated", label());
     }
+    let params_end = end - checked_mul(rows, cols, "linear elements")?.div_ceil(2);
     Ok((
         QuantizedLinear {
             rows,
@@ -538,27 +567,6 @@ fn read_linear<'a>(
         },
         end,
     ))
-}
-
-/// The offset just past a linear, without borrowing it.
-fn skip_linear(
-    data: &[u8],
-    offset: usize,
-    rows: usize,
-    cols: usize,
-    group_size: usize,
-    layer_idx: usize,
-    label: &str,
-) -> Result<usize> {
-    let (_, end) = read_linear(
-        data,
-        offset,
-        rows,
-        cols,
-        group_size,
-        &format!("layer {layer_idx}: {label}"),
-    )?;
-    Ok(end)
 }
 
 /// The full model file: header + validated heap-allocated data.
@@ -880,48 +888,17 @@ impl RaiModelFile {
         let gs = self.config.group_size as usize;
         let hidden = self.config.hidden_size as usize;
 
-        // Each linear sub-section: [u32 rows][u32 cols][group_params][nibble_data]
+        // Each linear sub-section: [u32 rows][u32 cols][group_params][nibble_data].
+        // This runs for every layer of every token, so it slices into a fixed
+        // array and formats no label unless something is actually wrong.
         let linear_dims = self.config.projection_dims();
-
+        let label = || format!("layer {layer_idx}");
         let mut offset = 0usize;
-        let mut linears: Vec<QuantizedLinear<'_>> = Vec::with_capacity(NUM_PROJECTIONS);
-
-        for &(rows, cols) in &linear_dims {
-            // Sub-header: 8 bytes (rows: u32, cols: u32)
-            let header_end = checked_add(offset, 8, "linear sub-header")?;
-            if header_end > data.len() {
-                bail!("layer {layer_idx}: truncated linear sub-header at offset {offset}");
-            }
-            let r = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-            let c = u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap()) as usize;
-            if r != rows || c != cols {
-                bail!("layer {layer_idx}: dimension mismatch: expected ({rows},{cols}), got ({r},{c})");
-            }
-            offset += 8;
-
-            let num_groups = cols.div_ceil(gs);
-            let params_size = checked_mul(
-                checked_mul(rows, num_groups, "linear parameter groups")?,
-                4,
-                "linear parameter bytes",
-            )?;
-            let elements = checked_mul(rows, cols, "linear elements")?;
-            let nibble_size = elements.div_ceil(2);
-            let linear_size = checked_add(params_size, nibble_size, "linear data size")?;
-            let linear_end = checked_add(offset, linear_size, "linear data end")?;
-
-            if linear_end > data.len() {
-                bail!("layer {layer_idx}: linear data truncated");
-            }
-
-            linears.push(QuantizedLinear {
-                rows,
-                cols,
-                group_params: &data[offset..offset + params_size],
-                nibble_data: &data[offset + params_size..offset + params_size + nibble_size],
-                group_size: gs,
-            });
-            offset = linear_end;
+        let mut linears = [QuantizedLinear::EMPTY; NUM_PROJECTIONS];
+        for (slot, &(rows, cols)) in linears.iter_mut().zip(&linear_dims) {
+            let (linear, next) = read_linear(data, offset, rows, cols, gs, &label)?;
+            *slot = linear;
+            offset = next;
         }
 
         // Bias block: one `rows * 4`-byte f32 vector per set `bias_mask` bit,
@@ -994,21 +971,17 @@ impl RaiModelFile {
                 checked_mul(experts, hidden, "router elements")?,
                 "router",
             )?;
-            let start = offset;
-            for expert in 1..experts {
-                for (index, &(rows, cols)) in linear_dims[4..].iter().enumerate() {
-                    offset = skip_linear(
-                        data,
-                        offset,
-                        rows,
-                        cols,
-                        self.config.group_size as usize,
-                        layer_idx,
-                        &format!("expert {expert} {}", PROJECTION_NAMES[4 + index]),
-                    )?;
-                }
+            // Every expert has the same three shapes, so the block's length is
+            // arithmetic; `open` checked each expert's sub-headers once, and
+            // `LayerRefs::expert` slices one in constant time.
+            let span = checked_mul(experts - 1, expert_bytes(&self.config)?, "expert block")?;
+            let end = checked_add(offset, span, "expert block end")?;
+            if end > data.len() {
+                bail!("layer {layer_idx}: experts truncated");
             }
-            (Some(router), Some(&data[start..offset]))
+            let block = &data[offset..end];
+            offset = end;
+            (Some(router), Some(block))
         } else {
             (None, None)
         };
@@ -1388,6 +1361,18 @@ fn read_v2_capabilities(data: &[u8], config: &mut ModelConfig) -> Result<()> {
             bail!(
                 "experts_per_token is {} but the layer has {} experts",
                 config.experts_per_token,
+                config.num_experts
+            );
+        }
+        // The bias block stores one vector per projection slot, and a sparse
+        // layer has a gate/up/down per expert: an MLP bias there would belong
+        // to expert 0 alone, or be added inside every expert — the format says
+        // neither, so a file that sets one is refused rather than guessed at.
+        let mlp_biases = (4..NUM_PROJECTIONS).any(|index| config.has_bias(index));
+        if mlp_biases {
+            bail!(
+                "header declares {} experts and MLP projection biases; the format has no \
+                 per-expert bias, so the combination has no defined meaning",
                 config.num_experts
             );
         }
@@ -2185,6 +2170,27 @@ mod tests {
             error.contains("unsupported format version: 3"),
             "got {error:?}"
         );
+    }
+
+    /// An MLP bias on a sparse layer has no defined meaning — expert 0's alone,
+    /// or every expert's? — so the header combination is refused before any
+    /// section is parsed, whatever the rest of the file says.
+    #[test]
+    fn experts_with_mlp_biases_are_refused() {
+        for (label, mask) in [
+            ("gate", 0b001_0000u8),
+            ("up", 0b010_0000),
+            ("down", 0b100_0000),
+        ] {
+            let bytes = build_model_bytes(2, 0, |header| {
+                header[65] = FLAG_HAS_BIASES;
+                header[67] = mask;
+                header[105..107].copy_from_slice(&4u16.to_le_bytes());
+                header[107] = 2;
+            });
+            let error = open_error(&format!("moe-{label}-bias"), bytes);
+            assert!(error.contains("no per-expert bias"), "{label}: {error:?}");
+        }
     }
 
     #[test]

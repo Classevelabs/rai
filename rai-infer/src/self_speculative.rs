@@ -121,7 +121,6 @@ impl<'a> SelfSpecDecoder<'a> {
 
     /// Prefill all prompt tokens except the final token, which the first decode step consumes.
     pub fn prefill(&mut self, prompt_tokens: &[usize]) -> Result<usize> {
-        let hs = self.model.config.hidden_size as usize;
         ensure!(
             !prompt_tokens.is_empty(),
             "prompt must contain at least one token"
@@ -130,21 +129,10 @@ impl<'a> SelfSpecDecoder<'a> {
             prompt_tokens.len() <= self.max_ctx,
             "prompt exceeds the self-speculative context window"
         );
-        let mut pos = 0;
-
-        for &token_id in &prompt_tokens[..prompt_tokens.len() - 1] {
-            self.draft_hidden.resize(hs, 0.0);
-            self.model.embed_token(token_id, &mut self.draft_hidden)?;
-            self.model.forward_from_hidden(
-                &mut self.draft_hidden,
-                pos,
-                &mut self.kv_cache,
-                true,
-                &mut self.draft_scratch,
-            )?;
-            pos += 1;
-        }
-        Ok(pos)
+        let prefix = &prompt_tokens[..prompt_tokens.len() - 1];
+        self.model
+            .prefill(prefix, 0, &mut self.kv_cache, &mut self.batch_scratch)?;
+        Ok(prefix.len())
     }
 
     /// One self-speculative decoding step.

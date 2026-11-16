@@ -58,6 +58,9 @@ use crate::model::{BatchScratch, RaiModel};
 /// llama.cpp perplexity number was taken at.
 const DEFAULT_CONTEXT: usize = 512;
 
+/// Scored positions sent through the output head together.
+const SCORE_BATCH: usize = 32;
+
 #[derive(Args, Debug)]
 pub struct PerplexityArgs {
     /// The .raimodel file to score
@@ -315,8 +318,11 @@ pub fn score_tokens(
     let mut kv_cache = model.create_kv_cache(context)?;
     let mut batch_scratch = BatchScratch::new();
     let mut hiddens = vec![0.0f32; context * hidden_size];
-    let mut normed = vec![0.0f32; hidden_size];
-    let mut logits = vec![0.0f32; vocab_size];
+    // Scored positions go through the head in groups: the batched head reads
+    // its weights once per group instead of once per position, and a group's
+    // logits stay a few megabytes even for a 150k-token vocabulary.
+    let mut normed = vec![0.0f32; SCORE_BATCH * hidden_size];
+    let mut logits = vec![0.0f32; SCORE_BATCH * vocab_size];
     let positions: Vec<usize> = (0..context).collect();
 
     // Scoring starts at the halfway point, so every scored token has at least
@@ -351,30 +357,38 @@ pub fn score_tokens(
         // has no target inside it and is not scored.
         let mut chunk_nll = 0.0f64;
         let mut chunk_scored = 0usize;
-        for index in first_scored..context - 1 {
-            model.hidden_to_logits_into(
-                &hiddens[index * hidden_size..(index + 1) * hidden_size],
-                &mut normed,
-                &mut logits,
+        let mut group_start = first_scored;
+        while group_start < context - 1 {
+            let group = SCORE_BATCH.min(context - 1 - group_start);
+            model.hidden_to_logits_batch(
+                &hiddens[group_start * hidden_size..(group_start + group) * hidden_size],
+                &mut normed[..group * hidden_size],
+                &mut logits[..group * vocab_size],
+                group,
             )?;
-            let target = window[index + 1];
-            ensure!(
-                target < vocab_size,
-                "token id {target} is outside this model's {vocab_size}-token vocabulary; \
+            for offset in 0..group {
+                let index = group_start + offset;
+                let logits = &logits[offset * vocab_size..(offset + 1) * vocab_size];
+                let target = window[index + 1];
+                ensure!(
+                    target < vocab_size,
+                    "token id {target} is outside this model's {vocab_size}-token vocabulary; \
                  the text was tokenized with a different tokenizer than the model was built for"
-            );
-            let log_z = log_sum_exp(&logits);
-            let nll = log_z - f64::from(logits[target]);
-            ensure!(
-                nll.is_finite(),
-                "chunk {chunk} produced a non-finite log-likelihood; the model file is damaged"
-            );
-            if let Some(writer) = writer.as_mut() {
-                writer.push(&logits, target, log_z)?;
+                );
+                let log_z = log_sum_exp(logits);
+                let nll = log_z - f64::from(logits[target]);
+                ensure!(
+                    nll.is_finite(),
+                    "chunk {chunk} produced a non-finite log-likelihood; the model file is damaged"
+                );
+                if let Some(writer) = writer.as_mut() {
+                    writer.push(logits, target, log_z)?;
+                }
+                chunk_nll += nll;
+                nll_sq_sum += nll * nll;
+                chunk_scored += 1;
             }
-            chunk_nll += nll;
-            nll_sq_sum += nll * nll;
-            chunk_scored += 1;
+            group_start += group;
         }
 
         nll_sum += chunk_nll;

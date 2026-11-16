@@ -211,13 +211,11 @@ impl<'a> LookupDecoder<'a> {
     /// Prefill all prompt tokens except the final one, which the first decode
     /// step consumes. Returns the position for the first [`Self::step`] call.
     ///
-    /// Uses one batched pass like the plain decode path in `rai-generate`
-    /// rather than the token-at-a-time loop the other speculative decoders
-    /// use: measured on TinyLlama-1.1B-q4 with a 315-token prompt that was
-    /// 16.2 s instead of 34.9 s, and prompt-lookup's whole reason to exist is
-    /// long context-heavy prompts.
+    /// Goes through [`RaiModel::prefill`], the batched path every decoder
+    /// shares: measured on TinyLlama-1.1B-q4 with a 315-token prompt, one
+    /// batched pass took 16.2 s where token-at-a-time took 34.9 s, and
+    /// prompt-lookup's whole reason to exist is long context-heavy prompts.
     pub fn prefill(&mut self, prompt_tokens: &[usize]) -> Result<usize> {
-        let hs = self.model.config.hidden_size as usize;
         ensure!(
             !prompt_tokens.is_empty(),
             "prompt must contain at least one token"
@@ -226,24 +224,10 @@ impl<'a> LookupDecoder<'a> {
             prompt_tokens.len() <= self.max_ctx,
             "prompt exceeds the prompt-lookup context window"
         );
-        let n = prompt_tokens.len() - 1;
-        if n == 0 {
-            return Ok(0);
-        }
-
-        self.verify_hiddens.resize(n * hs, 0.0);
-        for (i, &token_id) in prompt_tokens[..n].iter().enumerate() {
-            self.model
-                .embed_token(token_id, &mut self.verify_hiddens[i * hs..(i + 1) * hs])?;
-        }
-        let positions: Vec<usize> = (0..n).collect();
-        self.model.forward_batch(
-            &mut self.verify_hiddens,
-            &positions,
-            &mut self.kv_cache,
-            &mut self.batch_scratch,
-        )?;
-        Ok(n)
+        let prefix = &prompt_tokens[..prompt_tokens.len() - 1];
+        self.model
+            .prefill(prefix, 0, &mut self.kv_cache, &mut self.batch_scratch)?;
+        Ok(prefix.len())
     }
 
     /// One prompt-lookup decoding step.

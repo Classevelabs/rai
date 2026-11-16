@@ -8,13 +8,23 @@ use anyhow::{ensure, Context, Result};
 use std::path::Path;
 
 use crate::format::{self, ModelConfig, RaiModelFile, NUM_PROJECTIONS};
-use crate::gemm::{embed_lookup, tied_lm_head, w4a8_matmul, w4a8_matvec};
+use crate::gemm::{
+    embed_lookup, tied_lm_head, tied_lm_head_batch, w4a8_matmul, w4a8_matmul_shared, w4a8_matvec,
+};
 use crate::kv_cache::KVCache;
 use crate::layers::{
     add_bias, attend_batch, glu_mul_inplace, gqa_attention_decode, rms_norm,
     rms_norm_with_residual, route_experts, soft_cap_slice, swiglu_mlp, vec_add, AttentionWork,
     MlpWork, ProjectionBiases, QkNorm, RoPETable, Routing, ScoreShaping,
 };
+
+/// Tokens [`RaiModel::prefill`] pushes through the model per batched pass.
+///
+/// Large enough that each weight read from memory is reused by hundreds of
+/// tokens, small enough that the batch scratch for a long prompt stays the
+/// size of one chunk rather than growing with the prompt (a 32k-token prompt
+/// at once would need gigabytes of MLP activations on a mid-sized model).
+pub const PREFILL_CHUNK: usize = 256;
 
 /// One layer's decoded bias vectors, indexed in `format::PROJECTION_NAMES`
 /// order. Decoded once at load time for the same reason the norm vectors are:
@@ -109,13 +119,17 @@ impl RaiModel {
         // nothing per token; approximating with one would leave five layers in
         // six rotating at the wrong frequency, which degrades quality without
         // ever failing.
+        //
+        // The local table is unscaled whatever the global one does: the
+        // reference builds Gemma3's local rotary embedding from a copy of the
+        // config with `rope_scaling = {"rope_type": "default"}`, so a frequency
+        // rescale applies to the global layers only.
         let rope_local = if config.global_layer_stride > 0 {
             Some(
-                RoPETable::with_scaling(
+                RoPETable::new(
                     config.head_dim as usize,
                     config.max_context as usize,
                     config.rope_local_theta,
-                    config.rope_scaling,
                 )
                 .context("building the local RoPE table")?,
             )
@@ -423,6 +437,9 @@ impl RaiModel {
             pos < self.config.max_context as usize,
             "position exceeds model context"
         );
+        if store_kv {
+            kv_cache.reserve(pos + 1)?;
+        }
 
         scratch.resize(hs);
 
@@ -512,9 +529,12 @@ impl RaiModel {
         ensure!(hidden.len() >= hidden_size, "hidden buffer is too small");
         ensure!(normed_buf.len() >= hidden_size, "norm buffer is too small");
         ensure!(logits.len() >= vocab_size, "logit buffer is too small");
+        // Longer buffers are accepted, so hand the norm exactly the hidden
+        // width it is defined over.
+        let normed_buf = &mut normed_buf[..hidden_size];
         rms_norm(
             normed_buf,
-            hidden,
+            &hidden[..hidden_size],
             &self.final_norm_weights,
             self.config.norm_eps,
         );
@@ -611,6 +631,7 @@ impl RaiModel {
             layer_indices.windows(2).all(|pair| pair[0] < pair[1]),
             "partial forward layers must be strictly ascending"
         );
+        kv_cache.reserve(pos + 1)?;
 
         scratch.resize(hs);
 
@@ -723,6 +744,7 @@ impl RaiModel {
                 .all(|pair| pair[1] == pair[0].saturating_add(1)),
             "batch positions must be strictly consecutive and ascending"
         );
+        kv_cache.reserve(positions[batch - 1] + 1)?;
 
         bs.resize(batch, hs, q_dim, kv_dim, inter);
 
@@ -741,36 +763,16 @@ impl RaiModel {
                 Self::enter_block(norms.before_attn, n, r, h, eps);
             }
 
-            // 2. Batched QKV projection (read weights once for all tokens)
-            w4a8_matmul(
-                &mut bs.q_batch,
-                layer.q_proj.nibble_data,
-                layer.q_proj.group_params,
+            // 2. Batched QKV projection: weights read once for all tokens, and
+            //    the shared input quantized once for all three.
+            w4a8_matmul_shared(
+                vec![
+                    (&mut bs.q_batch[..], &layer.q_proj),
+                    (&mut bs.k_batch[..], &layer.k_proj),
+                    (&mut bs.v_batch[..], &layer.v_proj),
+                ],
                 &bs.normed,
-                q_dim,
-                hs,
                 batch,
-                layer.q_proj.group_size,
-            );
-            w4a8_matmul(
-                &mut bs.k_batch,
-                layer.k_proj.nibble_data,
-                layer.k_proj.group_params,
-                &bs.normed,
-                kv_dim,
-                hs,
-                batch,
-                layer.k_proj.group_size,
-            );
-            w4a8_matmul(
-                &mut bs.v_batch,
-                layer.v_proj.nibble_data,
-                layer.v_proj.group_params,
-                &bs.normed,
-                kv_dim,
-                hs,
-                batch,
-                layer.v_proj.group_size,
             );
 
             // 2b. Projection biases, added outside the quantized inner loop.
@@ -896,25 +898,13 @@ impl RaiModel {
                     )?;
                 }
             } else {
-                w4a8_matmul(
-                    &mut bs.gate_batch,
-                    layer.gate_proj.nibble_data,
-                    layer.gate_proj.group_params,
+                w4a8_matmul_shared(
+                    vec![
+                        (&mut bs.gate_batch[..], &layer.gate_proj),
+                        (&mut bs.up_batch[..], &layer.up_proj),
+                    ],
                     &bs.normed,
-                    inter,
-                    hs,
                     batch,
-                    layer.gate_proj.group_size,
-                );
-                w4a8_matmul(
-                    &mut bs.up_batch,
-                    layer.up_proj.nibble_data,
-                    layer.up_proj.group_params,
-                    &bs.normed,
-                    inter,
-                    hs,
-                    batch,
-                    layer.up_proj.group_size,
                 );
                 add_bias_batch(&mut bs.gate_batch, biases[4], inter, batch);
                 add_bias_batch(&mut bs.up_batch, biases[5], inter, batch);
@@ -958,6 +948,62 @@ impl RaiModel {
                 let m = &bs.mlp_out[b * hs..(b + 1) * hs];
                 vec_add(h, r, m);
             }
+        }
+        Ok(())
+    }
+
+    /// Run `tokens` through every layer at positions `start..start + tokens.len()`,
+    /// storing their keys and values, and compute no logits.
+    ///
+    /// This is the one prefill every decoder and the server use. It goes
+    /// through [`Self::forward_batch`] in chunks of [`PREFILL_CHUNK`] tokens:
+    /// the batched GEMM reads each weight once per chunk instead of once per
+    /// token, the vocabulary-sized output projection — which a prompt token
+    /// never needs — is never computed, and the scratch stays the size of one
+    /// chunk however long the prompt is. Chunking changes no arithmetic: the
+    /// batched path is bit-identical to the sequential one token by token
+    /// (`tests/model_invariants.rs`), so where a chunk boundary falls is
+    /// invisible in the cache.
+    ///
+    /// Positions `0..start` must already be in the cache, which is how a
+    /// caller reuses the K/V of a prefix it has already processed.
+    pub fn prefill(
+        &self,
+        tokens: &[usize],
+        start: usize,
+        kv_cache: &mut KVCache,
+        scratch: &mut BatchScratch,
+    ) -> Result<()> {
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        let end = start
+            .checked_add(tokens.len())
+            .context("prefill range overflows")?;
+        ensure!(
+            end <= kv_cache.max_context(),
+            "prefill to position {end} exceeds the {}-token KV cache",
+            kv_cache.max_context()
+        );
+        ensure!(
+            start <= kv_cache.filled_min(),
+            "prefill from position {start} would leave unwritten KV entries below it \
+             (filled {})",
+            kv_cache.filled_min()
+        );
+        let hs = self.config.hidden_size as usize;
+        let mut hiddens = Vec::new();
+        let mut positions = Vec::with_capacity(PREFILL_CHUNK.min(tokens.len()));
+        for (index, chunk) in tokens.chunks(PREFILL_CHUNK).enumerate() {
+            let first = start + index * PREFILL_CHUNK;
+            hiddens.clear();
+            hiddens.resize(chunk.len() * hs, 0.0);
+            for (slot, &token) in hiddens.chunks_exact_mut(hs).zip(chunk) {
+                self.embed_token(token, slot)?;
+            }
+            positions.clear();
+            positions.extend(first..first + chunk.len());
+            self.forward_batch(&mut hiddens, &positions, kv_cache, scratch)?;
         }
         Ok(())
     }
@@ -1008,19 +1054,18 @@ impl RaiModel {
                 lm.group_size,
             );
         } else {
-            // Tied embedding: process per-token (no batched tied_lm_head)
+            // Tied embedding: one read of the table serves the whole batch.
             let embed = self.file.embedding()?;
-            for b in 0..batch {
-                tied_lm_head(
-                    &mut logits[b * vs..(b + 1) * vs],
-                    &normed[b * hs..(b + 1) * hs],
-                    embed.data,
-                    embed.group_params,
-                    embed.vocab_size,
-                    embed.hidden_size,
-                    embed.group_size,
-                );
-            }
+            tied_lm_head_batch(
+                logits,
+                normed,
+                embed.data,
+                embed.group_params,
+                embed.vocab_size,
+                embed.hidden_size,
+                embed.group_size,
+                batch,
+            );
         }
         // Per token, over exactly the same slice the sequential path caps.
         for b in 0..batch {

@@ -637,41 +637,17 @@ pub fn run(args: &RunArgs) -> Result<()> {
         let mut work = InferenceWork::new();
         let mut work2 = InferenceWork::new();
 
-        // Batched prefill: process prompt tokens 0..N-2 in one pass.
-        // The last prompt token is left for the decode loop, avoiding
-        // duplicate KV entries (same fix as speculative.rs prefill).
+        // Prefill every prompt token but the last, which the first decode step
+        // consumes at its own position; prefilling it too would store its KV
+        // entry twice. The prompt was checked against `max_ctx` above.
         let t_prefill = Instant::now();
-        let hs = model.config.hidden_size as usize;
-        let n_to_prefill = if prompt_tokens.len() > 1 {
-            (prompt_tokens.len() - 1).min(max_ctx.saturating_sub(1))
-        } else {
-            0
-        };
-        let mut pos = n_to_prefill;
-
-        if n_to_prefill > 1 {
-            // Batched prefill: embed tokens 0..N-2, run through all layers in one pass
-            let positions: Vec<usize> = (0..n_to_prefill).collect();
-            let mut hiddens = vec![0.0f32; n_to_prefill * hs];
-            for (i, &tok) in prompt_tokens[..n_to_prefill].iter().enumerate() {
-                model.embed_token(tok, &mut hiddens[i * hs..(i + 1) * hs])?;
-            }
-            let mut batch_scratch = BatchScratch::new();
-            model.forward_batch(&mut hiddens, &positions, &mut kv_cache, &mut batch_scratch)?;
-        } else if n_to_prefill == 1 {
-            // Two-token prompt: prefill first token, decode handles second
-            let _ = pondered_forward(
-                &model,
-                prompt_tokens[0],
-                0,
-                &mut kv_cache,
-                &PonderConfig::none(),
-                &mut work,
-                &mut work2,
-                &mut rng,
-            )?;
-        }
-        // Single-token prompt: n_to_prefill=0, pos=0, decode loop handles it.
+        let n_to_prefill = prompt_tokens.len() - 1;
+        model.prefill(
+            &prompt_tokens[..n_to_prefill],
+            0,
+            &mut kv_cache,
+            &mut BatchScratch::new(),
+        )?;
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
         eprintln!(
             "\nPrefill: {} tokens in {:.1}ms ({:.1} tok/s)",
@@ -687,11 +663,10 @@ pub fn run(args: &RunArgs) -> Result<()> {
         let mut hard_tokens = 0;
         let mut previous_text = String::new();
 
-        for _ in 0..generation.max_tokens {
-            if pos >= max_ctx {
-                break;
-            }
-
+        // Each step feeds the newest token at the next position, so the
+        // positions run from the last prompt token to the end of the window,
+        // and at most `max_tokens` of them.
+        for pos in (n_to_prefill..max_ctx).take(generation.max_tokens) {
             let last_token = *all_tokens.last().unwrap();
             let (mut logits, metrics) = pondered_forward(
                 &model,
@@ -726,7 +701,6 @@ pub fn run(args: &RunArgs) -> Result<()> {
             }
 
             all_tokens.push(next_token);
-            pos += 1;
             tokens_generated += 1;
             print_new_text(
                 &all_tokens,

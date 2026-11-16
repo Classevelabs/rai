@@ -82,3 +82,4 @@ pub mod sampler;
 pub mod self_speculative;
 /// Draft-model speculative decoding with target-model verification.
 pub mod speculative;
+mod topology;

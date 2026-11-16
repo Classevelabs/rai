@@ -28,7 +28,7 @@ default = ["cli"]
 cli = [
     "dep:clap",
     "dep:tokenizers",
-    "dep:tiny_http",
+    "dep:httparse",
     "dep:serde",
     "dep:serde_json",
     "dep:memmap2",
@@ -41,6 +41,12 @@ cli = [
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Windows only, and only to count performance cores for the default thread
+# pool (`src/topology.rs`). Already in the lock file through the workspace, so
+# no new crate enters the dependency tree.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
+
 [dependencies]
 half = "2.4"
 anyhow = "1"
@@ -48,7 +54,9 @@ rand = "0.8"
 rayon = "1.10"
 clap = { version = "4", features = ["derive"], optional = true }
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"], optional = true }
-tiny_http = { version = "0.12", optional = true }
+# The request parser under `rai serve`'s own HTTP/1.1 layer (`src/cli/http.rs`):
+# the one `hyper` uses, no dependencies of its own, already in the lock file.
+httparse = { version = "1.10", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 memmap2 = { version = "0.9", optional = true }

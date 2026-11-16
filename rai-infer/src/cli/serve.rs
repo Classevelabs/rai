@@ -39,16 +39,15 @@
 //! command line can do for the user running it — no more.
 
 use std::fmt;
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::cli::http::{Body, ChunkedWriter, HttpServer, Method, Request, Response};
 use anyhow::{Context, Result};
 use rand::SeedableRng;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tiny_http::{Header, Method, Response, Server, StatusCode};
 
 use crate::chat_template::{ChatTemplate, Role};
 use crate::cli::catalog;
@@ -57,7 +56,7 @@ use crate::cli::run::incremental_suffix;
 use crate::cli::{load_tokenizer_for_model, resolve_tokenizer};
 use crate::convert::ConvertOptions;
 use crate::kv_cache::KVCache;
-use crate::model::{InferenceWork, RaiModel};
+use crate::model::{BatchScratch, InferenceWork, RaiModel};
 use crate::ponder::{pondered_forward, PonderConfig};
 use crate::sampler::{apply_repetition_penalty, sample_token, SamplerConfig};
 
@@ -210,10 +209,20 @@ struct Loaded {
     /// fit in memory" into an error at load time, naming the size, instead of
     /// a failure on the user's first message.
     ///
-    /// Reuse is safe because every generation resets the watermark with
-    /// `truncate(0)` and the cache refuses reads above it: nothing from a
-    /// previous conversation can be attended to.
+    /// Reuse is safe because every generation truncates the watermark to the
+    /// prefix it shares with [`Self::cached_tokens`] and the cache refuses
+    /// reads above it: nothing outside that exact prefix can be attended to.
     kv_cache: KVCache,
+    /// The tokens whose keys and values fill `kv_cache` positions
+    /// `0..cached_tokens.len()`, left behind by the last finished generation.
+    ///
+    /// A chat client re-sends the whole thread every turn, so consecutive
+    /// requests share everything up to the newest message. Reusing that prefix
+    /// means each turn prefills only what is new instead of re-reading the
+    /// whole conversation. Cleared before any generation touches the cache,
+    /// and set again only when one finishes, so an aborted or failed request
+    /// can never leave it describing entries it did not write.
+    cached_tokens: Vec<usize>,
 }
 
 /// Everything the request loop owns.
@@ -279,6 +288,7 @@ impl Loaded {
             tokenizer_path,
             load_ms: started.elapsed().as_millis() as u64,
             kv_cache,
+            cached_tokens: Vec::new(),
         })
     }
 
@@ -394,19 +404,14 @@ fn parse_chat_request(req_body: &str) -> Result<ChatRequest, ChatHttpError> {
     Ok(request)
 }
 
-fn read_request_body(reader: &mut dyn Read) -> Result<String, ChatHttpError> {
-    let mut bytes = Vec::new();
-    reader
-        .take((MAX_CHAT_REQUEST_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(ChatHttpError::internal)?;
-
-    if bytes.len() > MAX_CHAT_REQUEST_BYTES {
-        return Err(ChatHttpError::payload_too_large());
+/// The request body as text. The HTTP layer has already refused to read any
+/// body declared larger than [`MAX_CHAT_REQUEST_BYTES`].
+fn read_request_body(body: &Body) -> Result<String, ChatHttpError> {
+    match body {
+        Body::TooLarge => Err(ChatHttpError::payload_too_large()),
+        Body::Complete(bytes) => String::from_utf8(bytes.clone())
+            .map_err(|_| ChatHttpError::bad_request("request body must be valid UTF-8")),
     }
-
-    String::from_utf8(bytes)
-        .map_err(|_| ChatHttpError::bad_request("request body must be valid UTF-8"))
 }
 
 fn build_ponder(req: &ChatRequest) -> Result<PonderConfig, ChatHttpError> {
@@ -429,7 +434,8 @@ fn build_ponder(req: &ChatRequest) -> Result<PonderConfig, ChatHttpError> {
 }
 
 fn validate_chat_options(req: &ChatRequest) -> Result<(), ChatHttpError> {
-    validate_optional_f32("temperature", req.temperature, 0.01, 2.0)?;
+    // 0 is greedy decoding, which the sampler implements as an argmax.
+    validate_optional_f32("temperature", req.temperature, 0.0, 2.0)?;
     // Only the floor can be checked without the model. The ceiling is the
     // context the prompt leaves free, and that needs the tokenizer — see
     // [`resolve_max_tokens`], which runs once the prompt has been encoded.
@@ -601,6 +607,11 @@ struct Prepared {
 struct Outcome {
     text: String,
     tokens_generated: usize,
+    /// Tokens in the rendered prompt.
+    prompt_tokens: usize,
+    /// How many of them came from the previous generation's cache rather
+    /// than being prefilled again.
+    prompt_tokens_reused: usize,
     prefill_ms: f64,
     decode_ms: f64,
     tok_per_sec: f64,
@@ -611,8 +622,9 @@ struct Outcome {
 
 /// Something worth telling a streaming client about, as it happens.
 enum GenerationEvent<'a> {
-    /// The prompt is in the KV cache; decoding is about to start.
-    Prefilled { prefill_ms: f64 },
+    /// The prompt is in the KV cache; decoding is about to start. `reused`
+    /// leading prompt tokens came from the previous generation's cache.
+    Prefilled { prefill_ms: f64, reused: usize },
     /// Newly decoded text, already safe to display (see [`emittable_len`]).
     Text(&'a str),
 }
@@ -779,41 +791,44 @@ fn generate(
         tokenizer,
         template,
         kv_cache,
+        cached_tokens,
         ..
     } = loaded;
     let prompt_tokens = &prepared.prompt_tokens;
 
-    // Reset the watermark instead of reallocating. Stores always start at
-    // position 0 and the cache refuses any read at or above the watermark, so
-    // no residue of the previous conversation is reachable.
-    kv_cache.truncate(0);
+    // Leave the final prompt token for the first decode pass. Processing every
+    // prompt token here and then the last one again at the next position would
+    // store it twice.
+    let prefix = &prompt_tokens[..prompt_tokens.len() - 1];
+
+    // Keep the K/V of whatever this prompt shares with the last generation and
+    // prefill only the rest. The truncation is what makes that safe: the cache
+    // refuses any read at or above its watermark, so nothing past the shared
+    // prefix — the rest of an older conversation — is reachable.
+    let reused = cached_tokens
+        .iter()
+        .zip(prefix)
+        .take_while(|(cached, new)| cached == new)
+        .count();
+    cached_tokens.clear();
+    kv_cache.truncate(reused);
 
     let mut work = InferenceWork::new();
     let mut work2 = InferenceWork::new();
     let mut rng = rand::rngs::StdRng::from_entropy();
     let mut all_tokens = prompt_tokens.clone();
-    let mut pos = 0;
 
-    // Prefill
     let t_prefill = Instant::now();
-    // Leave the final prompt token for the first decode pass. Processing every prompt token
-    // here and then processing the last one again at the next position duplicates it.
-    for &token_id in &prompt_tokens[..prompt_tokens.len() - 1] {
-        let _ = pondered_forward(
-            model,
-            token_id,
-            pos,
+    model
+        .prefill(
+            &prefix[reused..],
+            reused,
             kv_cache,
-            &PonderConfig::none(),
-            &mut work,
-            &mut work2,
-            &mut rng,
+            &mut BatchScratch::new(),
         )
         .map_err(|error| GenerateFailure::Http(ChatHttpError::internal(error)))?;
-        pos += 1;
-    }
     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
-    on_event(GenerationEvent::Prefilled { prefill_ms }).map_err(GenerateFailure::Client)?;
+    on_event(GenerationEvent::Prefilled { prefill_ms, reused }).map_err(GenerateFailure::Client)?;
 
     // Decode
     let t_decode = Instant::now();
@@ -831,13 +846,11 @@ fn generate(
         .collect();
     let stops = template.stop_sequences();
 
-    for _ in 0..prepared.max_tokens {
-        // Unreachable while `max_tokens` is bounded by the free context, and
-        // kept because that is an invariant of this function's caller, not of
-        // this loop.
-        if pos >= prepared.max_ctx {
-            break;
-        }
+    // Each step feeds the newest token at the next position: from the last
+    // prompt token to the end of the window, and at most `max_tokens` of them.
+    // `max_tokens` is already bounded by the free context; the range keeps the
+    // window bound an invariant of this loop rather than of its caller.
+    for pos in (prefix.len()..prepared.max_ctx).take(prepared.max_tokens) {
         let last_token = all_tokens.last().copied().ok_or_else(|| {
             GenerateFailure::Http(ChatHttpError::bad_request(
                 "message produced no usable prompt tokens",
@@ -865,6 +878,9 @@ fn generate(
             prepared.sampler.repetition_penalty,
         );
         let next_token = sample_token(&mut logits, &prepared.sampler, &mut rng);
+        // Hand the vocabulary-sized buffer back for the next step to reuse,
+        // as `pondered_forward` asks of every caller.
+        work.scratch.logits = logits;
 
         if eos_ids.contains(&next_token) {
             stop_reason = StopReason::Eos;
@@ -872,7 +888,6 @@ fn generate(
         }
 
         all_tokens.push(next_token);
-        pos += 1;
         tokens_generated += 1;
 
         // Decode entire generated suffix for correct SentencePiece spacing
@@ -934,9 +949,17 @@ fn generate(
         0.0
     };
 
+    // The generation finished, so the cache holds exactly the tokens that went
+    // through the model, in order: the prompt, then every generated token but
+    // the last sampled one, which was never fed back.
+    let filled = kv_cache.filled_min().min(all_tokens.len());
+    cached_tokens.extend_from_slice(&all_tokens[..filled]);
+
     Ok(Outcome {
         text: generated_text,
         tokens_generated,
+        prompt_tokens: prompt_tokens.len(),
+        prompt_tokens_reused: reused,
         prefill_ms,
         decode_ms,
         tok_per_sec,
@@ -963,12 +986,15 @@ fn handle_generate(loaded: &mut Loaded, chat_req: &ChatRequest) -> Result<String
     let response = serde_json::json!({
         "text": outcome.text.trim(),
         "tokens": outcome.tokens_generated,
+        "prompt_tokens": outcome.prompt_tokens,
+        "prompt_tokens_reused": outcome.prompt_tokens_reused,
         "prefill_ms": outcome.prefill_ms,
         "decode_ms": outcome.decode_ms,
         "tok_per_sec": outcome.tok_per_sec,
         "avg_passes": outcome.avg_passes,
         "hard_tokens_pct": outcome.hard_tokens_pct,
         "strategy": format!("{:?}", prepared.ponder.strategy),
+        "stop_reason": outcome.stop_reason.as_str(),
     });
 
     Ok(response.to_string())
@@ -978,67 +1004,43 @@ fn handle_generate(loaded: &mut Loaded, chat_req: &ChatRequest) -> Result<String
 // POST /api/chat/stream
 // =============================================================================
 
-/// One ndjson response, written straight to the socket.
+/// One ndjson response, one record per chunk.
 ///
-/// tiny_http's own `Response` cannot do this: it drives the body from a
-/// `Read`, and pipes it through a chunked encoder whose 8 KiB buffer is only
-/// flushed when it fills. Tokens would arrive in blocks, or all at once at the
-/// end, which is not streaming. Taking the writer means framing each chunk
-/// here — a length line, the payload, a blank line — and flushing it, which is
-/// what puts a token on the wire the instant it exists.
+/// Each record is framed and flushed the moment it exists, which is what puts
+/// a token on the wire as it is generated rather than in buffered blocks.
 struct NdjsonStream {
-    writer: Box<dyn Write + Send + 'static>,
+    writer: ChunkedWriter,
 }
 
 impl NdjsonStream {
-    fn start(request: tiny_http::Request) -> std::io::Result<Self> {
-        // tiny_http closes the socket after this response on its own when the
-        // client asked it to, but the client is owed the header that says so.
-        let closing = request
-            .headers()
-            .iter()
-            .find(|header| header.field.equiv("Connection"))
-            .is_some_and(|header| header.value.as_str().to_ascii_lowercase().contains("close"));
-
-        let mut writer = request.into_writer();
-        writer.write_all(
-            b"HTTP/1.1 200 OK\r\n\
-              Content-Type: application/x-ndjson\r\n\
-              Transfer-Encoding: chunked\r\n\
-              Cache-Control: no-store\r\n\
-              X-Content-Type-Options: nosniff\r\n",
-        )?;
-        if closing {
-            writer.write_all(b"Connection: close\r\n")?;
-        }
-        writer.write_all(b"\r\n")?;
-        writer.flush()?;
+    fn start(request: Request) -> std::io::Result<Self> {
+        let writer = request.into_chunked(&[
+            ("Content-Type", "application/x-ndjson"),
+            ("Cache-Control", "no-store"),
+            ("X-Content-Type-Options", "nosniff"),
+        ])?;
         Ok(Self { writer })
     }
 
     fn send(&mut self, value: &Value) -> std::io::Result<()> {
-        write_ndjson_chunk(&mut self.writer, value)?;
-        self.writer.flush()
+        self.writer.send(ndjson_record(value).as_bytes())
     }
 
-    fn finish(mut self) -> std::io::Result<()> {
-        self.writer.write_all(b"0\r\n\r\n")?;
-        self.writer.flush()
+    fn finish(self) -> std::io::Result<()> {
+        self.writer.finish()
     }
 }
 
-/// One JSON object, one line, one chunk.
+/// One JSON object as one ndjson line.
 ///
 /// `serde_json` escapes newlines inside strings, so a serialized value can
 /// never contain the byte that separates records: the ndjson framing holds for
 /// whatever the model generates, including a reply that is nothing but
 /// newlines.
-fn write_ndjson_chunk(writer: &mut dyn Write, value: &Value) -> std::io::Result<()> {
+fn ndjson_record(value: &Value) -> String {
     let mut line = value.to_string();
     line.push('\n');
-    write!(writer, "{:x}\r\n", line.len())?;
-    writer.write_all(line.as_bytes())?;
-    writer.write_all(b"\r\n")
+    line
 }
 
 /// Generate into an already-opened stream.
@@ -1047,7 +1049,7 @@ fn write_ndjson_chunk(writer: &mut dyn Write, value: &Value) -> std::io::Result<
 /// the response line went out. What is left can only be a server failure, and
 /// it is reported as a terminal `error` record with the same sanitized text a
 /// 500 would carry.
-fn stream_chat(request: tiny_http::Request, loaded: &mut Loaded, prepared: &Prepared) {
+fn stream_chat(request: Request, loaded: &mut Loaded, prepared: &Prepared) {
     let mut stream = match NdjsonStream::start(request) {
         Ok(stream) => stream,
         Err(error) => {
@@ -1059,9 +1061,10 @@ fn stream_chat(request: tiny_http::Request, loaded: &mut Loaded, prepared: &Prep
     let prompt_tokens = prepared.prompt_tokens.len();
     let max_ctx = prepared.max_ctx;
     let outcome = generate(loaded, prepared, |event| match event {
-        GenerationEvent::Prefilled { prefill_ms } => stream.send(&json!({
+        GenerationEvent::Prefilled { prefill_ms, reused } => stream.send(&json!({
             "type": "start",
             "prompt_tokens": prompt_tokens,
+            "prompt_tokens_reused": reused,
             "prefill_ms": prefill_ms,
             "max_context": max_ctx,
         })),
@@ -1134,16 +1137,31 @@ pub fn run(args: &ServeArgs) -> Result<()> {
     };
 
     let server = bind_loopback(args.options.port)?;
-    let bound = server
-        .server_addr()
-        .to_ip()
-        .ok_or_else(|| anyhow::anyhow!("server did not bind an IP socket"))?;
+    let bound = server.local_addr();
     let bound_port = bound.port();
-    eprintln!("\n  Chat UI: http://localhost:{bound_port}\n");
+    // The address actually bound: `localhost` can resolve to the other
+    // family first, so on an IPv6-only bind the literal is the URL that works.
+    let url = if bound.is_ipv6() {
+        format!("http://[::1]:{bound_port}")
+    } else {
+        format!("http://localhost:{bound_port}")
+    };
+    eprintln!("\n  Chat UI: {url}\n");
     eprintln!("  Press Ctrl+C to stop.\n");
 
     serve_on(&server, state, bound_port);
     Ok(())
+}
+
+/// The request headers the screening reads.
+#[derive(Debug, Clone, Copy, Default)]
+struct Screened<'a> {
+    host: Option<&'a str>,
+    origin: Option<&'a str>,
+    /// `Sec-Fetch-Site`, which every current browser attaches to every request
+    /// it makes, saying whether the page that caused it is this origin.
+    fetch_site: Option<&'a str>,
+    content_type: Option<&'a str>,
 }
 
 /// The checks every request passes before it can reach a route.
@@ -1151,30 +1169,51 @@ pub fn run(args: &ServeArgs) -> Result<()> {
 /// Kept as one function on the near side of the dispatch rather than as
 /// per-route calls: a route added later cannot forget to apply them, because
 /// there is nowhere in the dispatch a request arrives without having been
-/// through here. `Host` is what stops DNS rebinding from pointing a page at
-/// this port; `Origin` is what stops a page on another origin from POSTing to
-/// it; and requiring a JSON `Content-Type` is what stops the "simple request"
-/// form that a cross-origin POST can take without a preflight the browser
-/// would have to show us first.
+/// through here.
+///
+/// - `Host` stops DNS rebinding from pointing a page at this port.
+/// - For `/api`, `Origin` and `Sec-Fetch-Site` stop a page on another origin
+///   from making the request at all — for every method. A cross-site page can
+///   send a GET without asking anyone (an `<img src>` needs no preflight), and
+///   GET routes read the filesystem: on Windows a GET naming a `\\host\share`
+///   directory was enough to make the machine authenticate to that host.
+/// - For a POST, requiring a JSON `Content-Type` stops the "simple request"
+///   form a cross-origin POST can take without a preflight, for any browser
+///   too old to send `Sec-Fetch-Site`.
+///
+/// The page itself (`/`) only needs the `Host` check: following a link to it
+/// from anywhere is harmless, and its CSP refuses to be framed.
 fn screen_headers(
-    is_post: bool,
-    host: Option<&str>,
-    origin: Option<&str>,
-    content_type: Option<&str>,
+    method: Method,
+    is_api: bool,
+    headers: Screened<'_>,
     port: u16,
 ) -> Result<(), ChatHttpError> {
-    if !host.is_some_and(|host| is_allowed_host(host, port)) {
+    if !headers.host.is_some_and(|host| is_allowed_host(host, port)) {
         return Err(ChatHttpError::forbidden("invalid Host header"));
     }
-    // Every POST, not just /api/chat: loading a model and starting a
-    // conversion are at least as worth protecting as generating text.
-    if is_post {
-        if origin.is_some_and(|origin| !is_allowed_origin(origin, port)) {
+    if is_api {
+        if headers
+            .origin
+            .is_some_and(|origin| !is_allowed_origin(origin, port))
+        {
             return Err(ChatHttpError::forbidden(
                 "cross-origin requests are not allowed",
             ));
         }
-        let is_json = content_type.is_some_and(|value| {
+        // `none` is the user's own action (typing the URL); `same-origin` is
+        // Studio itself. `same-site` is another port on localhost, which is
+        // another program and gets no more trust than any other origin.
+        if headers.fetch_site.is_some_and(|site| {
+            !site.eq_ignore_ascii_case("same-origin") && !site.eq_ignore_ascii_case("none")
+        }) {
+            return Err(ChatHttpError::forbidden(
+                "cross-site requests are not allowed",
+            ));
+        }
+    }
+    if method == Method::Post {
+        let is_json = headers.content_type.is_some_and(|value| {
             value
                 .split(';')
                 .next()
@@ -1187,21 +1226,16 @@ fn screen_headers(
     Ok(())
 }
 
-fn screen_request(request: &tiny_http::Request, port: u16) -> Result<(), ChatHttpError> {
-    // `equiv` compares against a `&'static str`, which is what every call here
-    // passes anyway.
-    let header = |name: &'static str| {
-        request
-            .headers()
-            .iter()
-            .find(|header| header.field.equiv(name))
-            .map(|header| header.value.as_str())
-    };
+fn screen_request(request: &Request, path: &str, port: u16) -> Result<(), ChatHttpError> {
     screen_headers(
-        *request.method() == Method::Post,
-        header("Host"),
-        header("Origin"),
-        header("Content-Type"),
+        request.method(),
+        path.starts_with("/api/"),
+        Screened {
+            host: request.header("Host"),
+            origin: request.header("Origin"),
+            fetch_site: request.header("Sec-Fetch-Site"),
+            content_type: request.header("Content-Type"),
+        },
         port,
     )
 }
@@ -1219,190 +1253,158 @@ fn screen_request(request: &tiny_http::Request, port: u16) -> Result<(), ChatHtt
 /// Conversions are the one thing that must not be serialized with it — they
 /// take minutes — so they run on their own threads and this loop only ever
 /// reads their progress.
-fn serve_on(server: &Server, mut state: ServerState, bound_port: u16) {
-    for mut request in server.incoming_requests() {
-        let url = request.url().to_string();
-        let (path, query) = split_query(&url);
-        let method = request.method().clone();
-
-        if let Err(error) = screen_request(&request, bound_port) {
-            respond_json_error(request, &error);
-            continue;
+fn serve_on(server: &HttpServer, mut state: ServerState, bound_port: u16) {
+    for request in server.incoming_requests() {
+        // One request cannot take the server down with it. A panic inside a
+        // generation (an allocation failing deep in the model, say) unwinds
+        // to here; the state it leaves is consistent by construction: the KV
+        // cache's reuse record is cleared before a generation touches the
+        // cache and only restored when one finishes, and the conversion jobs
+        // recover their own poisoned locks.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handle_request(request, &mut state, bound_port)
+        }));
+        if outcome.is_err() {
+            eprintln!("request failed with an internal error; the server keeps running");
         }
+    }
+}
 
-        match (method, path) {
-            (Method::Get, "/") | (Method::Get, "/index.html") => {
-                let resp = Response::from_data(CHAT_HTML.as_bytes().to_vec())
-                    .with_header(
-                        Header::from_bytes("Content-Type", "text/html; charset=utf-8").unwrap(),
-                    )
-                    .with_header(
-                        Header::from_bytes(
-                            "Content-Security-Policy",
-                            "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
-                        )
-                        .unwrap(),
-                    )
-                    .with_header(
-                        Header::from_bytes("X-Content-Type-Options", "nosniff").unwrap(),
-                    );
-                let _ = request.respond(resp);
+/// Route and answer one request.
+fn handle_request(request: Request, state: &mut ServerState, bound_port: u16) {
+    let url = request.url().to_string();
+    let (path, query) = split_query(&url);
+    let method = request.method();
+
+    if let Err(error) = screen_request(&request, path, bound_port) {
+        respond_json_error(request, &error);
+        return;
+    }
+
+    // Every POST route takes a JSON body; read it once, here.
+    let body = if method == Method::Post {
+        match read_request_body(request.body()) {
+            Ok(body) => body,
+            Err(error) => {
+                respond_json_error(request, &error);
+                return;
             }
-            (Method::Post, "/api/chat") => {
-                let body = match read_request_body(request.as_reader()) {
-                    Ok(body) => body,
-                    Err(error) => {
-                        respond_json_error(request, &error);
-                        continue;
-                    }
-                };
-                let chat_request = match parse_chat_request(&body) {
-                    Ok(chat_request) => chat_request,
-                    Err(error) => {
-                        respond_json_error(request, &error);
-                        continue;
-                    }
-                };
+        }
+    } else {
+        String::new()
+    };
 
-                let outcome = match state.loaded.as_mut() {
+    match (method, path) {
+        (Method::Get | Method::Head, "/" | "/index.html") => {
+            let resp = Response::new(200, CHAT_HTML.as_bytes().to_vec())
+                .with_header("Content-Type", "text/html; charset=utf-8")
+                .with_header(
+                    "Content-Security-Policy",
+                    "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+                )
+                .with_header("X-Content-Type-Options", "nosniff");
+            let _ = request.respond(resp);
+        }
+        (Method::Post, "/api/chat") => {
+            let outcome =
+                parse_chat_request(&body).and_then(|chat_request| match state.loaded.as_mut() {
                     Some(loaded) => handle_generate(loaded, &chat_request),
                     None => Err(no_model_loaded()),
-                };
-                match outcome {
-                    Ok(json) => {
-                        let resp = Response::from_data(json.into_bytes()).with_header(
-                            Header::from_bytes("Content-Type", "application/json").unwrap(),
-                        );
-                        let _ = request.respond(resp);
-                    }
-                    Err(error) => respond_json_error(request, &error),
+                });
+            match outcome {
+                Ok(json) => {
+                    let resp = Response::new(200, json.into_bytes())
+                        .with_header("Content-Type", "application/json");
+                    let _ = request.respond(resp);
                 }
+                Err(error) => respond_json_error(request, &error),
             }
-            (Method::Post, "/api/chat/stream") => {
-                let body = match read_request_body(request.as_reader()) {
-                    Ok(body) => body,
-                    Err(error) => {
-                        respond_json_error(request, &error);
-                        continue;
-                    }
-                };
-                let chat_request = match parse_chat_request(&body) {
-                    Ok(chat_request) => chat_request,
-                    Err(error) => {
-                        respond_json_error(request, &error);
-                        continue;
-                    }
-                };
-                if *request.http_version() < (1, 1) {
-                    respond_json_error(request, &ChatHttpError::http_version_not_supported());
-                    continue;
+        }
+        (Method::Post, "/api/chat/stream") => {
+            let chat_request = match parse_chat_request(&body) {
+                Ok(chat_request) => chat_request,
+                Err(error) => {
+                    respond_json_error(request, &error);
+                    return;
                 }
-                // Everything that can be a status code is decided here, while
-                // an ordinary JSON error response is still possible.
-                let prepared = match state.loaded.as_ref() {
-                    Some(loaded) => prepare(loaded, &chat_request),
-                    None => Err(no_model_loaded()),
-                };
-                let prepared = match prepared {
-                    Ok(prepared) => prepared,
-                    Err(error) => {
-                        respond_json_error(request, &error);
-                        continue;
-                    }
-                };
-                match state.loaded.as_mut() {
-                    Some(loaded) => stream_chat(request, loaded, &prepared),
-                    // Unreachable: `prepare` above only succeeds with a model
-                    // loaded, and this loop is the only thing that can unload
-                    // one.
-                    None => respond_json_error(request, &no_model_loaded()),
+            };
+            if !request.is_http11() {
+                respond_json_error(request, &ChatHttpError::http_version_not_supported());
+                return;
+            }
+            // Everything that can be a status code is decided here, while
+            // an ordinary JSON error response is still possible.
+            let prepared = match state.loaded.as_ref() {
+                Some(loaded) => prepare(loaded, &chat_request),
+                None => Err(no_model_loaded()),
+            };
+            let prepared = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    respond_json_error(request, &error);
+                    return;
                 }
+            };
+            match state.loaded.as_mut() {
+                Some(loaded) => stream_chat(request, loaded, &prepared),
+                // Unreachable: `prepare` above only succeeds with a model
+                // loaded, and this loop is the only thing that can unload
+                // one.
+                None => respond_json_error(request, &no_model_loaded()),
             }
-            (Method::Get, "/api/info") => {
-                let info = match state.loaded.as_ref() {
-                    Some(loaded) => loaded.info_json(),
-                    None => json!({
-                        "loaded": false,
-                        "model_path": Value::Null,
-                        "chat_template": state.options.chat_template,
-                        // Null, not a number: with no model there is no
-                        // context window yet, and the flag (if any) is only a
-                        // request that the next model may clamp.
-                        "max_context": state.options.max_context,
-                    }),
-                };
-                respond_json(request, &info);
+        }
+        (Method::Get, "/api/info") => {
+            let info = match state.loaded.as_ref() {
+                Some(loaded) => loaded.info_json(),
+                None => json!({
+                    "loaded": false,
+                    "model_path": Value::Null,
+                    "chat_template": state.options.chat_template,
+                    // Null, not a number: with no model there is no
+                    // context window yet, and the flag (if any) is only a
+                    // request that the next model may clamp.
+                    "max_context": state.options.max_context,
+                }),
+            };
+            respond_json(request, &info);
+        }
+        (Method::Get, "/api/system") => {
+            let system = system_json(state);
+            respond_json(request, &system);
+        }
+        (Method::Get, "/api/models") => match handle_models(state, query) {
+            Ok(value) => respond_json(request, &value),
+            Err(error) => respond_json_error(request, &error),
+        },
+        (Method::Post, "/api/load") => match handle_load(state, &body) {
+            Ok(value) => respond_json(request, &value),
+            Err(error) => respond_json_error(request, &error),
+        },
+        (Method::Post, "/api/inspect") => match handle_inspect(&body) {
+            Ok(value) => respond_json(request, &value),
+            Err(error) => respond_json_error(request, &error),
+        },
+        (Method::Post, "/api/convert") => match handle_convert(state, &body) {
+            Ok(value) => {
+                let resp = Response::new(202, value.to_string().into_bytes())
+                    .with_header("Content-Type", "application/json");
+                let _ = request.respond(resp);
             }
-            (Method::Get, "/api/system") => {
-                let system = system_json(&state);
-                respond_json(request, &system);
-            }
-            (Method::Get, "/api/models") => match handle_models(&state, query) {
+            Err(error) => respond_json_error(request, &error),
+        },
+        (Method::Get, "/api/convert") => respond_json(request, &state.jobs.list()),
+        (Method::Get, path) if path.starts_with("/api/convert/") => {
+            match handle_job_poll(state, path, query) {
                 Ok(value) => respond_json(request, &value),
                 Err(error) => respond_json_error(request, &error),
-            },
-            (Method::Post, "/api/load") => {
-                let body = match read_request_body(request.as_reader()) {
-                    Ok(body) => body,
-                    Err(error) => {
-                        respond_json_error(request, &error);
-                        continue;
-                    }
-                };
-                match handle_load(&mut state, &body) {
-                    Ok(value) => respond_json(request, &value),
-                    Err(error) => respond_json_error(request, &error),
-                }
             }
-            (Method::Post, "/api/inspect") => {
-                let body = match read_request_body(request.as_reader()) {
-                    Ok(body) => body,
-                    Err(error) => {
-                        respond_json_error(request, &error);
-                        continue;
-                    }
-                };
-                match handle_inspect(&body) {
-                    Ok(value) => respond_json(request, &value),
-                    Err(error) => respond_json_error(request, &error),
-                }
-            }
-            (Method::Post, "/api/convert") => {
-                let body = match read_request_body(request.as_reader()) {
-                    Ok(body) => body,
-                    Err(error) => {
-                        respond_json_error(request, &error);
-                        continue;
-                    }
-                };
-                match handle_convert(&state, &body) {
-                    Ok(value) => {
-                        let resp = Response::from_data(value.to_string().into_bytes())
-                            .with_status_code(StatusCode(202))
-                            .with_header(
-                                Header::from_bytes("Content-Type", "application/json").unwrap(),
-                            );
-                        let _ = request.respond(resp);
-                    }
-                    Err(error) => respond_json_error(request, &error),
-                }
-            }
-            (Method::Get, "/api/convert") => respond_json(request, &state.jobs.list()),
-            (Method::Get, path) if path.starts_with("/api/convert/") => {
-                match handle_job_poll(&state, path, query) {
-                    Ok(value) => respond_json(request, &value),
-                    Err(error) => respond_json_error(request, &error),
-                }
-            }
-            (Method::Options, _) => respond_json_error(
-                request,
-                &ChatHttpError::forbidden("cross-origin preflight is not allowed"),
-            ),
-            _ => {
-                let _ = request.respond(
-                    Response::from_data(b"404".to_vec()).with_status_code(StatusCode(404)),
-                );
-            }
+        }
+        (Method::Options, _) => respond_json_error(
+            request,
+            &ChatHttpError::forbidden("cross-origin preflight is not allowed"),
+        ),
+        _ => {
+            let _ = request.respond(Response::new(404, b"404".to_vec()));
         }
     }
 }
@@ -1483,7 +1485,7 @@ fn handle_models(state: &ServerState, query: &str) -> Result<Value, ChatHttpErro
     };
 
     match query_param(query, "dir") {
-        Some(dir) if !dir.trim().is_empty() => push(PathBuf::from(dir)),
+        Some(dir) if !dir.trim().is_empty() => push(local_path(Path::new(&dir), "dir")?),
         _ => {
             push(std::env::current_dir().map_err(ChatHttpError::internal)?);
             if let Some(loaded) = state.loaded.as_ref() {
@@ -1554,22 +1556,33 @@ fn handle_load(state: &mut ServerState, body: &str) -> Result<Value, ChatHttpErr
         .clone()
         .unwrap_or_else(|| state.options.chat_template.clone());
 
-    if !request.path.is_file() {
+    let path = local_path(&request.path, "path")?;
+    let tokenizer = request
+        .tokenizer
+        .as_deref()
+        .map(|tokenizer| local_path(tokenizer, "tokenizer"))
+        .transpose()?;
+    if !path.is_file() {
         return Err(ChatHttpError::bad_request(format!(
             "{} is not a file",
-            request.path.display()
+            path.display()
         )));
     }
 
-    let loaded = Loaded::open(
-        &request.path,
-        request.tokenizer.as_deref(),
-        max_context,
-        &template,
-    )
-    // A load failure is about the user's own file and is what they need in
-    // order to fix it, so it is reported rather than swallowed into a 500.
-    .map_err(|error| ChatHttpError::bad_request(format!("{error:#}")))?;
+    // The new window is sized against free memory, and a long conversation
+    // can have grown the current model's cache to gigabytes. That memory is
+    // this server's own and is about to be replaced, so it is given back
+    // first; the current model itself stays loaded until the new one has
+    // loaded, so a failed load still leaves a working server.
+    if let Some(current) = state.loaded.as_mut() {
+        current.kv_cache.release();
+        current.cached_tokens.clear();
+    }
+
+    let loaded = Loaded::open(&path, tokenizer.as_deref(), max_context, &template)
+        // A load failure is about the user's own file and is what they need in
+        // order to fix it, so it is reported rather than swallowed into a 500.
+        .map_err(|error| ChatHttpError::bad_request(format!("{error:#}")))?;
 
     announce(&loaded);
     let info = loaded.info_json();
@@ -1992,6 +2005,7 @@ fn handle_inspect(body: &str) -> Result<Value, ChatHttpError> {
         )));
     }
 
+    local_path(Path::new(source), "source")?;
     let resolved = catalog::resolve_local(source).map_err(ChatHttpError::bad_request)?;
     let raw = std::fs::read(&resolved.config_path).map_err(|error| {
         ChatHttpError::bad_request(format!(
@@ -2024,10 +2038,17 @@ fn handle_inspect(body: &str) -> Result<Value, ChatHttpError> {
 fn handle_convert(state: &ServerState, body: &str) -> Result<Value, ChatHttpError> {
     let request: ConvertRequest = serde_json::from_str(body)
         .map_err(|error| ChatHttpError::bad_request(format!("invalid JSON request: {error}")))?;
+    let source = local_path(&request.source, "source")?;
+    let output = conversion_output(&request.output)?;
+    let tokenizer_out = request
+        .tokenizer_out
+        .as_deref()
+        .map(conversion_tokenizer_output)
+        .transpose()?;
 
     let options = ConvertOptions {
-        model_dir: request.source,
-        output: Some(request.output),
+        model_dir: source,
+        output: Some(output),
         group_size: request.group_size.unwrap_or(128),
         embed_group_size: request.embed_group_size.unwrap_or(64),
         // The conversion API does not expose calibration: it would mean the
@@ -2039,7 +2060,7 @@ fn handle_convert(state: &ServerState, body: &str) -> Result<Value, ChatHttpErro
         max_context: request
             .max_context
             .unwrap_or(crate::convert::FOLLOW_MODEL_CONTEXT),
-        tokenizer_out: request.tokenizer_out,
+        tokenizer_out,
         // The job captures the narration; printing it into the server's
         // terminal too would interleave with request logging.
         quiet: true,
@@ -2057,6 +2078,78 @@ fn handle_convert(state: &ServerState, body: &str) -> Result<Value, ChatHttpErro
         )),
         Err(StartError::Invalid(message)) => Err(ChatHttpError::bad_request(message)),
     }
+}
+
+/// A path from a request, refused if it reaches beyond this machine.
+///
+/// On Windows, opening `\\host\share\…` — or only listing it — makes the
+/// machine authenticate to that host with the user's credentials. A path in a
+/// request is never meant to leave this machine, so network (UNC) and
+/// device-namespace forms are refused outright; anything else is the user's
+/// own filesystem, which the server reads as the command line would.
+fn local_path(raw: &Path, field: &str) -> Result<PathBuf, ChatHttpError> {
+    if names_another_machine(raw) {
+        return Err(ChatHttpError::bad_request(format!(
+            "{field} must be a path on this machine; network (UNC) and device paths are \
+             refused"
+        )));
+    }
+    Ok(raw.to_path_buf())
+}
+
+#[cfg(windows)]
+fn names_another_machine(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
+    match path.components().next() {
+        Some(Component::Prefix(prefix)) => {
+            !matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
+        }
+        _ => false,
+    }
+}
+
+#[cfg(not(windows))]
+fn names_another_machine(_path: &Path) -> bool {
+    false
+}
+
+/// Where a conversion may write its model: a `.raimodel` file and nothing
+/// else. The converter renames its finished output over this path, so an
+/// unconstrained one let any request replace any file the user can write.
+fn conversion_output(raw: &Path) -> Result<PathBuf, ChatHttpError> {
+    let output = local_path(raw, "output")?;
+    let is_model = output
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case(crate::cli::MODEL_EXTENSION));
+    if !is_model {
+        return Err(ChatHttpError::bad_request(format!(
+            "output must name a .{} file",
+            crate::cli::MODEL_EXTENSION
+        )));
+    }
+    if output.is_dir() {
+        return Err(ChatHttpError::bad_request(
+            "output names a directory, not a model file",
+        ));
+    }
+    Ok(output)
+}
+
+/// Where a conversion may copy its tokenizer: a file named `tokenizer.json`,
+/// the only name the runtime looks for beside a model.
+fn conversion_tokenizer_output(raw: &Path) -> Result<PathBuf, ChatHttpError> {
+    let path = local_path(raw, "tokenizer_out")?;
+    let is_tokenizer = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case(crate::cli::TOKENIZER_FILENAME));
+    if !is_tokenizer {
+        return Err(ChatHttpError::bad_request(format!(
+            "tokenizer_out must name a file called {}",
+            crate::cli::TOKENIZER_FILENAME
+        )));
+    }
+    Ok(path)
 }
 
 fn handle_job_poll(state: &ServerState, path: &str, query: &str) -> Result<Value, ChatHttpError> {
@@ -2080,46 +2173,39 @@ fn handle_job_poll(state: &ServerState, path: &str, query: &str) -> Result<Value
 // HTTP plumbing
 // =============================================================================
 
-fn respond_json(request: tiny_http::Request, value: &Value) {
-    let response = Response::from_data(value.to_string().into_bytes())
-        .with_header(Header::from_bytes("Content-Type", "application/json").unwrap())
-        .with_header(Header::from_bytes("X-Content-Type-Options", "nosniff").unwrap());
+fn respond_json(request: Request, value: &Value) {
+    let response = Response::new(200, value.to_string().into_bytes())
+        .with_header("Content-Type", "application/json")
+        .with_header("X-Content-Type-Options", "nosniff");
     let _ = request.respond(response);
 }
 
-fn respond_json_error(request: tiny_http::Request, error: &ChatHttpError) {
+fn respond_json_error(request: Request, error: &ChatHttpError) {
     let body = serde_json::json!({"error": error.to_string()}).to_string();
-    let response = Response::from_data(body.into_bytes())
-        .with_status_code(StatusCode(error.status))
-        .with_header(Header::from_bytes("Content-Type", "application/json").unwrap());
+    let response = Response::new(error.status, body.into_bytes())
+        .with_header("Content-Type", "application/json")
+        .with_header("X-Content-Type-Options", "nosniff");
     let _ = request.respond(response);
 }
 
-/// Listen on loopback, trying both address families.
+/// Listen on loopback.
 ///
-/// `127.0.0.1` is tried first because that is what the printed URL and the
-/// launchers assume. The IPv6 fallback matters on machines where `localhost`
-/// resolves only to `::1` — the IPv4-only bind left Studio unreachable there
-/// with a connection refused, not an error message. Both are loopback, so
-/// neither is reachable from another machine.
-fn bind_loopback(port: u16) -> Result<Server> {
-    let v4 = format!("127.0.0.1:{port}");
-    match Server::http(&v4) {
-        Ok(server) => Ok(server),
-        Err(v4_error) => {
-            let v6 = format!("[::1]:{port}");
-            Server::http(&v6)
-                .map_err(|v6_error| {
-                    anyhow::anyhow!("cannot listen on {v4} ({v4_error}) or {v6} ({v6_error})")
-                })
-                .with_context(|| {
-                    format!(
-                        "another process may already be using port {port}; \
-                         pass --port to pick another"
-                    )
-                })
+/// `127.0.0.1` first, because that is what the printed URL and the launchers
+/// assume; `[::1]` only on a machine with no IPv4 loopback, where `localhost`
+/// resolves to `::1` alone (see [`HttpServer::bind_loopback`] for why a port
+/// in use is an error rather than a reason to try the other family). Both are
+/// loopback, so neither is reachable from another machine.
+fn bind_loopback(port: u16) -> Result<HttpServer> {
+    HttpServer::bind_loopback(port, MAX_CHAT_REQUEST_BYTES).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AddrInUse {
+            anyhow::anyhow!(
+                "port {port} is already in use, probably by another `rai serve`; \
+                 stop it or pass --port to pick another"
+            )
+        } else {
+            anyhow::anyhow!("cannot listen on loopback port {port}: {error}")
         }
-    }
+    })
 }
 
 /// Loopback host forms a browser can produce for our own port.
@@ -2208,7 +2294,7 @@ const CHAT_HTML: &str = include_str!("studio.html");
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::io::Read;
 
     #[test]
     fn empty_prompt_returns_bad_request_instead_of_panicking() {
@@ -2223,11 +2309,69 @@ mod tests {
         assert_eq!(error.status, 400);
     }
 
+    /// Network and device paths never leave this machine's control: opening one
+    /// on Windows authenticates to whatever host it names.
+    #[cfg(windows)]
+    #[test]
+    fn network_and_device_paths_are_refused_on_windows() {
+        for path in [
+            r"\\attacker.example\share",
+            "//attacker.example/share",
+            r"\\?\UNC\attacker.example\share\x",
+            r"\\.\PhysicalDrive0",
+        ] {
+            let error = local_path(Path::new(path), "dir").unwrap_err();
+            assert_eq!(error.status, 400, "{path}");
+            assert!(
+                error.message.contains("network"),
+                "{path}: {}",
+                error.message
+            );
+        }
+        for path in [r"C:\models", "models", r"\\?\C:\models", r".\here"] {
+            assert!(local_path(Path::new(path), "dir").is_ok(), "{path}");
+        }
+    }
+
+    /// A conversion writes a model and its tokenizer and nothing else: the
+    /// converter renames its output over the target, so the target must be
+    /// one of those, whoever sent the request.
+    #[test]
+    fn conversion_targets_are_limited_to_models_and_tokenizers() {
+        assert!(conversion_output(Path::new("out/model.raimodel")).is_ok());
+        assert!(conversion_output(Path::new("out/Model.RAIMODEL")).is_ok());
+        for refused in [".bashrc", "out/notes.txt", "out/model.raimodel.bak", "out/"] {
+            assert_eq!(
+                conversion_output(Path::new(refused)).unwrap_err().status,
+                400,
+                "{refused}"
+            );
+        }
+        assert!(conversion_tokenizer_output(Path::new("out/tokenizer.json")).is_ok());
+        for refused in [
+            "out/startup.cmd",
+            ".ssh/authorized_keys",
+            "out/tokenizer.json.x",
+        ] {
+            assert_eq!(
+                conversion_tokenizer_output(Path::new(refused))
+                    .unwrap_err()
+                    .status,
+                400,
+                "{refused}"
+            );
+        }
+    }
+
     #[test]
     fn oversized_body_returns_payload_too_large() {
-        let mut body = Cursor::new(vec![b'x'; MAX_CHAT_REQUEST_BYTES + 1]);
-        let error = read_request_body(&mut body).unwrap_err();
+        let error = read_request_body(&Body::TooLarge).unwrap_err();
         assert_eq!(error.status, 413);
+        let error = read_request_body(&Body::Complete(vec![0xFF, 0xFE])).unwrap_err();
+        assert_eq!(
+            error.status, 400,
+            "a body that is not UTF-8 is a bad request"
+        );
     }
 
     #[test]
@@ -2302,7 +2446,7 @@ mod tests {
     #[test]
     fn bind_loopback_binds_a_loopback_address() {
         let server = bind_loopback(0).expect("loopback bind");
-        let address = server.server_addr().to_ip().expect("ip socket");
+        let address = server.local_addr();
         assert!(address.ip().is_loopback(), "bound {address}, not loopback");
         assert_ne!(address.port(), 0, "port 0 should resolve to a real port");
     }
@@ -2376,7 +2520,8 @@ mod tests {
     #[test]
     fn invalid_numeric_options_are_rejected() {
         for body in [
-            r#"{"message":"hello","temperature":0}"#,
+            r#"{"message":"hello","temperature":-0.5}"#,
+            r#"{"message":"hello","temperature":2.5}"#,
             r#"{"message":"hello","max_tokens":0}"#,
             r#"{"message":"hello","guidance_scale":5}"#,
             r#"{"message":"hello","ensemble_n":9}"#,
@@ -2385,6 +2530,8 @@ mod tests {
         ] {
             assert_eq!(parse_chat_request(body).unwrap_err().status, 400, "{body}");
         }
+        // Greedy decoding is a legitimate request, not an invalid temperature.
+        assert!(parse_chat_request(r#"{"message":"hello","temperature":0}"#).is_ok());
     }
 
     #[test]
@@ -2702,24 +2849,15 @@ mod tests {
         assert_eq!(StopReason::StopSequence.as_str(), "stop_sequence");
     }
 
-    /// Each record is one chunk: a hex length, the JSON, a newline, a CRLF.
-    /// The newline inside the payload is what makes it ndjson; the CRLF is
-    /// chunked transfer encoding and is not part of the record.
+    /// Each record is one JSON object plus the one newline that separates
+    /// ndjson records (the chunk framing around it is `http`'s, and tested
+    /// there). Key order is serde_json's and is not part of the contract.
     #[test]
-    fn each_ndjson_record_is_one_chunk_ending_in_exactly_one_newline() {
-        let mut out: Vec<u8> = Vec::new();
-        write_ndjson_chunk(&mut out, &json!({"type":"token","text":"hi"})).unwrap();
-        let framed = String::from_utf8(out).unwrap();
-
-        // <hex length>CRLF <payload> CRLF, and the payload is the JSON object
-        // plus the one newline that separates ndjson records. Key order is
-        // serde_json's, not this file's, and is not part of the contract.
-        let (length, rest) = framed.split_once("\r\n").unwrap();
-        let payload = rest.strip_suffix("\r\n").expect("chunk ends with CRLF");
-        assert_eq!(usize::from_str_radix(length, 16).unwrap(), payload.len());
+    fn each_ndjson_record_ends_in_exactly_one_newline() {
+        let payload = ndjson_record(&json!({"type":"token","text":"hi"}));
         assert_eq!(payload.matches('\n').count(), 1, "{payload:?}");
         assert!(payload.ends_with('\n'));
-        let record: Value = serde_json::from_str(payload).unwrap();
+        let record: Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(record["type"], "token");
         assert_eq!(record["text"], "hi");
     }
@@ -2728,12 +2866,7 @@ mod tests {
     /// boundary. `serde_json` escapes them, so the payload stays one line.
     #[test]
     fn a_generated_newline_cannot_split_a_record() {
-        let mut out: Vec<u8> = Vec::new();
-        write_ndjson_chunk(&mut out, &json!({"type":"token","text":"a\nb\r\nc"})).unwrap();
-        let framed = String::from_utf8(out).unwrap();
-        let (length, rest) = framed.split_once("\r\n").unwrap();
-        let payload = rest.strip_suffix("\r\n").unwrap();
-        assert_eq!(usize::from_str_radix(length, 16).unwrap(), payload.len());
+        let payload = ndjson_record(&json!({"type":"token","text":"a\nb\r\nc"}));
         assert_eq!(payload.matches('\n').count(), 1, "{payload:?}");
         assert!(payload.ends_with('\n'));
         assert_eq!(
@@ -2775,23 +2908,33 @@ mod tests {
     // =========================================================================
 
     /// The streaming route is a POST like any other, so it is covered by the
-    /// same three checks — which is the point of screening before routing
-    /// rather than inside each handler.
+    /// same checks — which is the point of screening before routing rather than
+    /// inside each handler.
     #[test]
     fn the_streaming_route_is_screened_like_every_other_post() {
+        let ok = |origin, fetch_site, content_type| Screened {
+            host: Some("localhost:8090"),
+            origin,
+            fetch_site,
+            content_type,
+        };
         let json = Some("application/json");
-        // The happy case.
+        // The happy cases: Studio itself, and a script with no browser headers.
         assert!(screen_headers(
+            Method::Post,
             true,
-            Some("localhost:8090"),
-            Some("http://localhost:8090"),
-            json,
+            ok(Some("http://localhost:8090"), Some("same-origin"), json),
             8090
         )
         .is_ok());
+        assert!(screen_headers(Method::Post, true, ok(None, None, json), 8090).is_ok());
         // A rebound name for our port.
+        let rebound = Screened {
+            host: Some("attacker.example:8090"),
+            ..ok(None, None, json)
+        };
         assert_eq!(
-            screen_headers(true, Some("attacker.example:8090"), None, json, 8090)
+            screen_headers(Method::Post, true, rebound, 8090)
                 .unwrap_err()
                 .status,
             403
@@ -2799,10 +2942,9 @@ mod tests {
         // A page on another origin.
         assert_eq!(
             screen_headers(
+                Method::Post,
                 true,
-                Some("localhost:8090"),
-                Some("https://attacker.example"),
-                json,
+                ok(Some("https://attacker.example"), None, json),
                 8090
             )
             .unwrap_err()
@@ -2812,10 +2954,9 @@ mod tests {
         // The form-post shape that needs no preflight.
         assert_eq!(
             screen_headers(
+                Method::Post,
                 true,
-                Some("localhost:8090"),
-                None,
-                Some("text/plain;charset=UTF-8"),
+                ok(None, None, Some("text/plain;charset=UTF-8")),
                 8090
             )
             .unwrap_err()
@@ -2823,13 +2964,56 @@ mod tests {
             415
         );
         // A GET still has to pass the Host check.
-        assert!(screen_headers(false, Some("127.0.0.1:8090"), None, None, 8090).is_ok());
+        let get = ok(None, None, None);
+        assert!(screen_headers(Method::Get, true, get, 8090).is_ok());
         assert_eq!(
-            screen_headers(false, None, None, None, 8090)
+            screen_headers(Method::Get, true, Screened::default(), 8090)
                 .unwrap_err()
                 .status,
             403
         );
+    }
+
+    /// A cross-site page can make a browser send a GET with no preflight —
+    /// `<img src="http://127.0.0.1:8090/api/models?dir=\\host\share">` —
+    /// and a GET route that reads a directory turned that into a Windows
+    /// machine authenticating to the attacker's host. Every `/api` request is
+    /// held to the origin checks, whatever its method; the page itself is not,
+    /// because following a link to it is harmless.
+    #[test]
+    fn cross_site_gets_to_the_api_are_refused() {
+        let from = |origin, fetch_site| Screened {
+            host: Some("127.0.0.1:8090"),
+            origin,
+            fetch_site,
+            content_type: None,
+        };
+        for site in ["cross-site", "same-site", "CROSS-SITE"] {
+            assert_eq!(
+                screen_headers(Method::Get, true, from(None, Some(site)), 8090)
+                    .unwrap_err()
+                    .status,
+                403,
+                "{site}"
+            );
+        }
+        assert_eq!(
+            screen_headers(
+                Method::Get,
+                true,
+                from(Some("https://attacker.example"), None),
+                8090
+            )
+            .unwrap_err()
+            .status,
+            403
+        );
+        // Studio, the user typing the URL, and a script are all fine.
+        for site in [Some("same-origin"), Some("none"), None] {
+            assert!(screen_headers(Method::Get, true, from(None, site), 8090).is_ok());
+        }
+        // The page: a link to it from anywhere is a harmless navigation.
+        assert!(screen_headers(Method::Get, false, from(None, Some("cross-site")), 8090).is_ok());
     }
 
     // =========================================================================
@@ -2857,7 +3041,7 @@ mod tests {
     /// Run `body` against a real server on a real loopback port.
     fn with_server(body: impl FnOnce(u16)) {
         let server = bind_loopback(0).expect("loopback bind");
-        let port = server.server_addr().to_ip().expect("ip socket").port();
+        let port = server.local_addr().port();
         let state = ServerState {
             loaded: None,
             jobs: Arc::new(Jobs::new()),

@@ -18,6 +18,7 @@
 
 pub mod catalog;
 pub mod convert;
+mod http;
 pub mod jobs;
 pub mod models;
 pub mod perplexity;

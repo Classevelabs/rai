@@ -5,9 +5,12 @@
 //! Optimizations:
 //! 1. **Explicit AVX2+FMA+F16C SIMD** — 32 elements/iter in the inner loop.
 //! 2. **Hardware F16C conversion** — `_mm_cvtph_ps` for scale/zero.
-//! 3. **Fused projections** — QKV and gate+up share input_sums, overlap via rayon::join.
-//! 4. **Factored dequant** — w*x = scale*dot(codes,x) + zero*sum(x_group).
-//! 5. **Rayon par_chunks_mut** for large matrices, single-thread for small.
+//! 3. **Fused projections** — QKV and gate+up quantize their shared input once
+//!    and run as one parallel job list.
+//! 4. **Factored dequant** — w*x = scale*dot(codes,x) + zero*sum(x_group), with
+//!    both terms over the same (quantized, on AVX2) activations.
+//! 5. **Rayon row chunks** for large matrices, single-thread for small, on the
+//!    AVX2 and the scalar kernels alike.
 
 // These kernels deliberately use numeric indexing and fixed, explicit argument lists so the
 // scalar and SIMD implementations stay structurally comparable. Rewriting them as iterators or
@@ -19,12 +22,6 @@
 )]
 
 use half::f16;
-
-// Every rayon dispatch in this file is inside the AVX2 path, so on a target
-// without those kernels the import itself is unused. `-D warnings` is a gate
-// contributors run on their own machine, and an Apple Silicon or ARM-server
-// contributor must be able to pass it.
-#[cfg(target_arch = "x86_64")]
 use rayon::prelude::*;
 
 #[cfg(target_arch = "x86_64")]
@@ -61,74 +58,28 @@ pub fn has_avx2() -> bool {
 // Send-safe pointer wrapper for parallel GEMM dispatch
 // ---------------------------------------------------------------------------
 
-/// Wrappers to allow sending raw pointers across rayon threads.
-/// Safety: caller must ensure no data races (non-overlapping regions per thread).
+/// The batched GEMM's output, shared across rayon workers.
 ///
-/// These exist only to feed the parallel AVX2 chunk kernels. The scalar
-/// fallback walks rows on one thread and never forms a raw pointer, so the
-/// whole group is compiled out on non-x86-64 targets rather than sitting there
-/// as dead code that trips `-D warnings`.
+/// Each worker writes the rows of its own chunk for every token. Those writes
+/// are disjoint but strided by `rows`, so they cannot be handed out as
+/// `&mut` slices the way the single-token paths hand out row chunks; this is
+/// the one place a raw pointer crosses threads.
 #[cfg(target_arch = "x86_64")]
-mod parallel_ptr {
-    #[derive(Copy, Clone)]
-    pub(super) struct SendPtr(pub(super) *mut f32);
-    unsafe impl Send for SendPtr {}
-    unsafe impl Sync for SendPtr {}
-    impl SendPtr {
-        #[inline(always)]
-        pub(super) fn ptr(self) -> *mut f32 {
-            self.0
-        }
-    }
-
-    #[derive(Copy, Clone)]
-    pub(super) struct SyncU8Ptr(pub(super) *const u8);
-    unsafe impl Send for SyncU8Ptr {}
-    unsafe impl Sync for SyncU8Ptr {}
-    impl SyncU8Ptr {
-        #[inline(always)]
-        pub(super) fn ptr(self) -> *const u8 {
-            self.0
-        }
-    }
-
-    #[derive(Copy, Clone)]
-    pub(super) struct SyncF32Ptr(pub(super) *const f32);
-    unsafe impl Send for SyncF32Ptr {}
-    unsafe impl Sync for SyncF32Ptr {}
-    impl SyncF32Ptr {
-        #[inline(always)]
-        pub(super) fn ptr(self) -> *const f32 {
-            self.0
-        }
-    }
-
-    #[derive(Copy, Clone)]
-    pub(super) struct SyncI8Ptr(pub(super) *const i8);
-    unsafe impl Send for SyncI8Ptr {}
-    unsafe impl Sync for SyncI8Ptr {}
-    impl SyncI8Ptr {
-        #[inline(always)]
-        pub(super) fn ptr(self) -> *const i8 {
-            self.0
-        }
-    }
-
-    /// Per-token quantization parameter arrays shared read-only by every worker.
-    #[derive(Copy, Clone)]
-    pub(super) struct SyncGroupPtr(pub(super) *const f32);
-    unsafe impl Send for SyncGroupPtr {}
-    unsafe impl Sync for SyncGroupPtr {}
-    impl SyncGroupPtr {
-        #[inline(always)]
-        pub(super) fn ptr(self) -> *const f32 {
-            self.0
-        }
+#[derive(Copy, Clone)]
+struct SendPtr(*mut f32);
+// SAFETY: every worker writes a disjoint set of elements (see above), and the
+// buffer outlives the parallel loop that uses the pointer.
+#[cfg(target_arch = "x86_64")]
+unsafe impl Send for SendPtr {}
+#[cfg(target_arch = "x86_64")]
+unsafe impl Sync for SendPtr {}
+#[cfg(target_arch = "x86_64")]
+impl SendPtr {
+    #[inline(always)]
+    fn ptr(self) -> *mut f32 {
+        self.0
     }
 }
-
-#[cfg(target_arch = "x86_64")]
-use parallel_ptr::{SendPtr, SyncF32Ptr, SyncGroupPtr, SyncI8Ptr, SyncU8Ptr};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -140,141 +91,64 @@ fn read_f16_le(data: &[u8], offset: usize) -> f32 {
     f16::from_bits(bits).to_f32()
 }
 
-/// Compute per-group input sums for the factored dequant formula.
-#[inline]
-fn compute_input_sums(input: &[f32], cols: usize, group_size: usize) -> [f32; MAX_GROUPS] {
-    let mut sums = [0.0f32; MAX_GROUPS];
-    compute_input_sums_into(input, &mut sums, cols, group_size);
-    sums
-}
-
-/// As [`compute_input_sums`], writing into a caller-owned slice.
+/// Per-group sums of an f32 activation vector, for the scalar kernels'
+/// factored dequantization `w·x = scale·dot(codes, x) + zero·sum(x_group)`.
 ///
-/// The batch path keeps every token's sums in one flat buffer; returning a
-/// `[f32; MAX_GROUPS]` per token would reintroduce both the memset and the
-/// 4 KB stride this refactor removed.
-#[inline]
-fn compute_input_sums_into(input: &[f32], sums: &mut [f32], cols: usize, group_size: usize) {
-    let num_groups = cols.div_ceil(group_size);
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        if has_avx2() {
-            unsafe {
-                compute_input_sums_avx2(input, sums, cols, group_size, num_groups);
-            }
-            return;
-        }
-    }
-
-    for g in 0..num_groups {
+/// The AVX2 kernels never use these: they apply the zero point to the sum of
+/// the *quantized* activations instead (see `quantize_input_split`).
+fn group_sums_into(input: &[f32], sums: &mut [f32], cols: usize, group_size: usize) {
+    for (g, sum) in sums.iter_mut().enumerate().take(cols.div_ceil(group_size)) {
         let start = g * group_size;
         let end = ((g + 1) * group_size).min(cols);
-        let mut s = 0.0f32;
-        for &v in &input[start..end] {
-            s += v;
-        }
-        sums[g] = s;
+        *sum = input[start..end].iter().sum();
     }
 }
 
-/// AVX2 per-group input sums.
+/// Per-group int8 quantization with even/odd column split, for the AVX2
+/// kernels. `input_even[k] = quantize(input[2k])`,
+/// `input_odd[k] = quantize(input[2k+1])`.
 ///
-/// # Safety
-/// - Must only be called after `has_avx2()` returned true (AVX2 is required).
-/// - `input` must hold at least `cols` values.
-/// - `num_groups` must equal `cols.div_ceil(group_size)` and be at most
-///   `MAX_GROUPS` (the `sums` array bound).
+/// Also writes, per group, the sum of the *quantized* activations in their
+/// own units: `input_qsums[g] = scale_g * sum(q_i)`. The kernels apply each
+/// group's zero point to that sum rather than to the exact f32 one. With the
+/// exact sum, the zero term carried no quantization error while the code term
+/// did, so the activation error landed weighted by the raw codes `c_i` (all
+/// positive, mean ~7.5) instead of by the dequantized weights `s*c_i + z`
+/// (centred near zero): about 2.7x larger than it has to be, in every
+/// projection. Both terms from the same quantized activations compute exactly
+/// `sum(w_i * xq_i)`, whose error is the weights' own.
+///
+/// Only the AVX2 kernels consume int8 activations; the scalar kernels work on
+/// the f32 input directly.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn compute_input_sums_avx2(
-    input: &[f32],
-    sums: &mut [f32],
-    cols: usize,
-    group_size: usize,
-    num_groups: usize,
-) {
-    let inp = input.as_ptr();
-    for g in 0..num_groups {
-        let start = g * group_size;
-        let end = ((g + 1) * group_size).min(cols);
-        let len = end - start;
-        let chunks8 = len / 8;
-        let mut acc = _mm256_setzero_ps();
-        for i in 0..chunks8 {
-            acc = _mm256_add_ps(acc, _mm256_loadu_ps(inp.add(start + i * 8)));
-        }
-        // Horizontal sum
-        let hi = _mm256_extractf128_ps(acc, 1);
-        let lo = _mm256_castps256_ps128(acc);
-        let s128 = _mm_add_ps(lo, hi);
-        let shuf = _mm_movehdup_ps(s128);
-        let s2 = _mm_add_ps(s128, shuf);
-        let hi2 = _mm_movehl_ps(s2, s2);
-        let mut total = _mm_cvtss_f32(_mm_add_ss(s2, hi2));
-        for i in (chunks8 * 8)..len {
-            total += *inp.add(start + i);
-        }
-        sums[g] = total;
-    }
-}
-
-/// Per-group int8 quantization with even/odd column split.
-/// Separates input into even-indexed and odd-indexed columns for zero-port5 GEMM.
-/// input_even[k] = quantize(input[2k]), input_odd[k] = quantize(input[2k+1]).
 #[inline]
 fn quantize_input_split(
     input: &[f32],
     input_even: &mut [i8],
     input_odd: &mut [i8],
     input_scales: &mut [f32],
+    input_qsums: &mut [f32],
     cols: usize,
     group_size: usize,
     num_groups: usize,
 ) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if has_avx2() {
-            unsafe {
-                quantize_input_split_avx2(
-                    input,
-                    input_even,
-                    input_odd,
-                    input_scales,
-                    cols,
-                    group_size,
-                    num_groups,
-                );
-            }
-            return;
-        }
-    }
-    for g in 0..num_groups {
-        let start = g * group_size;
-        let end = ((g + 1) * group_size).min(cols);
-        let mut absmax = 0.0f32;
-        for i in start..end {
-            let a = input[i].abs();
-            if a > absmax {
-                absmax = a;
-            }
-        }
-        let scale = if absmax > 1e-10 { absmax / 127.0 } else { 1.0 };
-        let inv_scale = 1.0 / scale;
-        input_scales[g] = scale;
-        let mut col = start;
-        while col + 1 < end {
-            let k = col / 2;
-            input_even[k] = (input[col] * inv_scale)
-                .round_ties_even()
-                .max(-128.0)
-                .min(127.0) as i8;
-            input_odd[k] = (input[col + 1] * inv_scale)
-                .round_ties_even()
-                .max(-128.0)
-                .min(127.0) as i8;
-            col += 2;
-        }
+    debug_assert!(
+        has_avx2(),
+        "int8 activations exist only for the AVX2 kernels"
+    );
+    // SAFETY: the callers only quantize after `has_avx2()` returned true, and
+    // `validate_weight_buffers` established the buffer bounds.
+    unsafe {
+        quantize_input_split_avx2(
+            input,
+            input_even,
+            input_odd,
+            input_scales,
+            input_qsums,
+            cols,
+            group_size,
+            num_groups,
+        );
     }
 }
 
@@ -286,6 +160,7 @@ fn quantize_input_split(
 /// - Must only be called after `has_avx2()` returned true (AVX2 is required).
 /// - `input` must hold at least `cols` values; `input_even` and `input_odd`
 ///   must each hold at least `cols / 2` values (`cols` even).
+/// - `input_scales` and `input_qsums` must each hold `num_groups` values.
 /// - `num_groups` must equal `cols.div_ceil(group_size)` and be at most
 ///   `MAX_GROUPS`, with `group_size` even. The public GEMM entry points
 ///   establish these bounds via `validate_weight_buffers`.
@@ -296,6 +171,7 @@ unsafe fn quantize_input_split_avx2(
     input_even: &mut [i8],
     input_odd: &mut [i8],
     input_scales: &mut [f32],
+    input_qsums: &mut [f32],
     cols: usize,
     group_size: usize,
     num_groups: usize,
@@ -344,6 +220,9 @@ unsafe fn quantize_input_split_avx2(
         let max_v = _mm256_set1_ps(127.0);
         let iters8 = len / 8;
         let even_base = start / 2;
+        // Running sum of the quantized codes; |q| <= 128 and a group holds at
+        // most `cols` values, so an i32 lane cannot overflow.
+        let mut qsum_v = _mm256_setzero_si256();
 
         for i in 0..iters8 {
             let off = i * 8;
@@ -352,6 +231,7 @@ unsafe fn quantize_input_split_avx2(
             let rounded = _mm256_round_ps(scaled, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
             let clamped = _mm256_max_ps(_mm256_min_ps(rounded, max_v), min_v);
             let i32s = _mm256_cvtps_epi32(clamped);
+            qsum_v = _mm256_add_epi32(qsum_v, i32s);
 
             // Split into 128-bit halves and pack within lanes (no cross-lane issues)
             let lo = _mm256_castsi256_si128(i32s); // 4 i32 [0..3]
@@ -369,22 +249,43 @@ unsafe fn quantize_input_split_avx2(
             dst_even.write_unaligned(_mm_cvtsi128_si32(even_bytes) as u32);
             dst_odd.write_unaligned(_mm_cvtsi128_si32(odd_bytes) as u32);
         }
+        let mut qsum = hsum_epi32(qsum_v);
 
         // Scalar tail for remaining pairs
         let mut col = start + iters8 * 8;
         while col + 1 < end {
             let k = col / 2;
-            input_even[k] = (*input.as_ptr().add(col) * inv_scale)
-                .round_ties_even()
-                .max(-128.0)
-                .min(127.0) as i8;
-            input_odd[k] = (*input.as_ptr().add(col + 1) * inv_scale)
-                .round_ties_even()
-                .max(-128.0)
-                .min(127.0) as i8;
+            let even = quantize_i8(*input.as_ptr().add(col), inv_scale);
+            let odd = quantize_i8(*input.as_ptr().add(col + 1), inv_scale);
+            input_even[k] = even;
+            input_odd[k] = odd;
+            qsum += i32::from(even) + i32::from(odd);
             col += 2;
         }
+        input_qsums[g] = scale * qsum as f32;
     }
+}
+
+/// One activation quantized to int8 exactly as the SIMD body does it:
+/// round half to even, clamp to the i8 range.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn quantize_i8(value: f32, inv_scale: f32) -> i8 {
+    (value * inv_scale).round_ties_even().clamp(-128.0, 127.0) as i8
+}
+
+/// Horizontal sum of eight i32 lanes.
+///
+/// # Safety
+/// Must only be called from an AVX2 context.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn hsum_epi32(v: __m256i) -> i32 {
+    let sum128 = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
+    let sum64 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, 0b01_00_11_10));
+    let sum32 = _mm_add_epi32(sum64, _mm_shuffle_epi32(sum64, 0b10_11_00_01));
+    _mm_cvtsi128_si32(sum32)
 }
 
 // ---------------------------------------------------------------------------
@@ -404,9 +305,10 @@ unsafe fn quantize_input_split_avx2(
 /// - `nibble_data` must hold at least `(start_row + chunk_len) * cols / 2`
 ///   bytes and `group_params` at least
 ///   `(start_row + chunk_len) * num_groups * 4` bytes.
-/// - `input_f32` must hold `cols` values; `input_even`/`input_odd` must hold
-///   `cols / 2` int8 values produced by `quantize_input_split` (values within
-///   ±127, so PMADDUBSW pair sums cannot saturate against 4-bit codes).
+/// - `input_even`/`input_odd` must hold `cols / 2` int8 values produced by
+///   `quantize_input_split` (values within ±127, so PMADDUBSW pair sums cannot
+///   saturate against 4-bit codes), and `input_scales`/`input_qsums` its
+///   `num_groups` per-group scales and quantized sums.
 /// - `num_groups == cols.div_ceil(group_size) <= MAX_GROUPS`, `cols` and
 ///   `group_size` even. `validate_weight_buffers` at every public entry point
 ///   establishes exactly these preconditions.
@@ -416,11 +318,10 @@ unsafe fn matvec_chunk_i8(
     output: *mut f32,
     nibble_data: *const u8,
     group_params: &[u8],
-    input_f32: *const f32,
     input_even: *const i8,
     input_odd: *const i8,
     input_scales: &[f32],
-    input_sums: &[f32],
+    input_qsums: &[f32],
     start_row: usize,
     chunk_len: usize,
     cols: usize,
@@ -467,7 +368,7 @@ unsafe fn matvec_chunk_i8(
             let f = _mm_cvtph_ps(v);
             *w_scales.get_unchecked_mut(g) = _mm_cvtss_f32(f);
             let f1 = _mm_shuffle_ps(f, f, 1);
-            zero_corr += _mm_cvtss_f32(f1) * *input_sums.get_unchecked(g);
+            zero_corr += _mm_cvtss_f32(f1) * *input_qsums.get_unchecked(g);
         }
 
         // Phase 2: Integer dot product per group using 256-bit PMADDUBSW.
@@ -527,17 +428,17 @@ unsafe fn matvec_chunk_i8(
                 float_acc = _mm256_add_ps(float_acc, tail_256);
             }
 
-            // Scalar tail for remaining elements
+            // Scalar tail for the remaining pairs, on the same int8 values
+            // the SIMD body used: the zero term counts these quantized
+            // activations too, so the code term must not see the exact ones.
             let simd_done2 = simd_done + if simd_done + 32 <= actual_gs { 32 } else { 0 };
             if simd_done2 < actual_gs {
-                let mut tail_acc = 0.0f32;
-                let mut tc = simd_done2;
-                while tc + 1 < actual_gs {
-                    let b = *nib_row.add(nib_off + tc / 2);
-                    tail_acc += (b & 0x0F) as f32 * *input_f32.add(col_start + tc)
-                        + (b >> 4) as f32 * *input_f32.add(col_start + tc + 1);
-                    tc += 2;
-                }
+                let tail = int8_pair_dot(
+                    nib_row.add(nib_off + simd_done2 / 2),
+                    input_even.add(even_off + simd_done2 / 2),
+                    input_odd.add(even_off + simd_done2 / 2),
+                    (actual_gs - simd_done2) / 2,
+                );
                 let tail_v = _mm256_set_ps(
                     0.0,
                     0.0,
@@ -546,7 +447,7 @@ unsafe fn matvec_chunk_i8(
                     0.0,
                     0.0,
                     0.0,
-                    *w_scales.get_unchecked(g) * tail_acc,
+                    tail as f32 * combined_scale,
                 );
                 float_acc = _mm256_add_ps(float_acc, tail_v);
             }
@@ -565,6 +466,24 @@ unsafe fn matvec_chunk_i8(
     }
 }
 
+/// `sum(lo(b_k) * even_k + hi(b_k) * odd_k)` over `pairs` packed bytes: the
+/// scalar remainder of the int8 kernels, on exactly the values PMADDUBSW
+/// multiplies in their SIMD bodies.
+///
+/// # Safety
+/// `codes`, `even` and `odd` must each be readable for `pairs` values.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn int8_pair_dot(codes: *const u8, even: *const i8, odd: *const i8, pairs: usize) -> i32 {
+    let mut sum = 0i32;
+    for k in 0..pairs {
+        let byte = *codes.add(k);
+        sum += i32::from(byte & 0x0F) * i32::from(*even.add(k))
+            + i32::from(byte >> 4) * i32::from(*odd.add(k));
+    }
+    sum
+}
+
 /// One weight row against `T` tokens, sharing a single unpack of the weights.
 ///
 /// The 4-bit codes are unpacked once per 32-byte block and reused by all `T`
@@ -579,9 +498,10 @@ unsafe fn matvec_chunk_i8(
 /// - Must only be called after `has_avx2()` returned true (AVX2+FMA+F16C).
 /// - `nib_row` must point at `cols / 2` readable bytes for this row.
 /// - `w_scales`/`w_zeros` must hold `num_groups` decoded values for this row.
-/// - `input_even`/`input_odd` must hold `num_tokens * half_cols` int8 values
-///   and `input_f32` `num_tokens * cols` floats, token-major.
-/// - `input_scales`/`input_sums` must point at `num_tokens` arrays.
+/// - `input_even`/`input_odd` must hold `num_tokens * half_cols` int8 values,
+///   token-major.
+/// - `input_scales`/`input_qsums` must point at `num_tokens` arrays of
+///   `num_groups` values.
 /// - `t_base + T <= num_tokens`, and `output` must be valid for the
 ///   `t * rows + row` writes those tokens imply.
 #[cfg(target_arch = "x86_64")]
@@ -591,11 +511,10 @@ unsafe fn matmul_row_tile<const T: usize>(
     nib_row: *const u8,
     w_scales: &[f32],
     w_zeros: &[f32],
-    input_f32: *const f32,
     input_even: *const i8,
     input_odd: *const i8,
     input_scales: *const f32,
-    input_sums: *const f32,
+    input_qsums: *const f32,
     t_base: usize,
     row: usize,
     rows: usize,
@@ -665,15 +584,13 @@ unsafe fn matmul_row_tile<const T: usize>(
             }
 
             if simd_done2 < actual_gs {
-                let tok_f32 = input_f32.add(t * cols);
-                let mut tail_acc = 0.0f32;
-                let mut tc = simd_done2;
-                while tc + 1 < actual_gs {
-                    let b = *nib_row.add(nib_off + tc / 2);
-                    tail_acc += (b & 0x0F) as f32 * *tok_f32.add(col_start + tc)
-                        + (b >> 4) as f32 * *tok_f32.add(col_start + tc + 1);
-                    tc += 2;
-                }
+                let base = t * half_cols + nib_off + simd_done2 / 2;
+                let tail = int8_pair_dot(
+                    nib_row.add(nib_off + simd_done2 / 2),
+                    input_even.add(base),
+                    input_odd.add(base),
+                    (actual_gs - simd_done2) / 2,
+                );
                 let tail_v = _mm256_set_ps(
                     0.0,
                     0.0,
@@ -682,7 +599,7 @@ unsafe fn matmul_row_tile<const T: usize>(
                     0.0,
                     0.0,
                     0.0,
-                    *w_scales.get_unchecked(g) * tail_acc,
+                    tail as f32 * combined_scale,
                 );
                 float_acc[j] = _mm256_add_ps(float_acc[j], tail_v);
             }
@@ -699,7 +616,7 @@ unsafe fn matmul_row_tile<const T: usize>(
         let hi = _mm_movehl_ps(s, s);
         let dot = _mm_cvtss_f32(_mm_add_ss(s, hi));
 
-        let sums = core::slice::from_raw_parts(input_sums.add(t * num_groups), num_groups);
+        let sums = core::slice::from_raw_parts(input_qsums.add(t * num_groups), num_groups);
         let mut zero_corr = 0.0f32;
         for g in 0..num_groups {
             zero_corr += *w_zeros.get_unchecked(g) * *sums.get_unchecked(g);
@@ -725,11 +642,10 @@ unsafe fn matmul_chunk_i8(
     output: *mut f32,
     nibble_data: *const u8,
     group_params: &[u8],
-    input_f32: *const f32,
     input_even: *const i8,
     input_odd: *const i8,
     input_scales: *const f32,
-    input_sums: *const f32,
+    input_qsums: *const f32,
     start_row: usize,
     chunk_len: usize,
     rows: usize,
@@ -780,11 +696,10 @@ unsafe fn matmul_chunk_i8(
                 nib_row,
                 &*w_scales,
                 &*w_zeros,
-                input_f32,
                 input_even,
                 input_odd,
                 input_scales,
-                input_sums,
+                input_qsums,
                 t,
                 row,
                 rows,
@@ -800,11 +715,10 @@ unsafe fn matmul_chunk_i8(
                 nib_row,
                 &*w_scales,
                 &*w_zeros,
-                input_f32,
                 input_even,
                 input_odd,
                 input_scales,
-                input_sums,
+                input_qsums,
                 t,
                 row,
                 rows,
@@ -817,31 +731,81 @@ unsafe fn matmul_chunk_i8(
     }
 }
 
-/// AVX2 LM head using PMADDUBSW for 8-bit codes × i8 hidden.
-/// Hidden is quantized to [-63, 63] to prevent i16 saturation in PMADDUBSW
-/// (max product: 255*63 = 16065, max pair sum: 32130 < 32767).
-/// Processes 32 elements per iteration vs 8 for the FMA path.
+/// Hidden states quantized for the AVX2 LM head, token-major for
+/// `num_tokens` tokens: int8 values in [-63, 63], per-group scales and
+/// quantized sums.
+#[cfg(target_arch = "x86_64")]
+struct Int8Hidden {
+    values: Vec<i8>,
+    scales: Vec<f32>,
+    qsums: Vec<f32>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Int8Hidden {
+    /// Only called after `has_avx2()` returned true and the buffers were
+    /// validated.
+    fn quantize(hidden: &[f32], tokens: usize, hidden_size: usize, group_size: usize) -> Self {
+        let num_groups = hidden_size.div_ceil(group_size);
+        let mut out = Self {
+            values: vec![0; tokens * hidden_size],
+            scales: vec![0.0; tokens * num_groups],
+            qsums: vec![0.0; tokens * num_groups],
+        };
+        for t in 0..tokens {
+            // SAFETY: `has_avx2()` returned true (see above); each slice is
+            // exactly one token's `hidden_size` values or `num_groups` groups.
+            unsafe {
+                quantize_hidden_i8_avx2(
+                    &hidden[t * hidden_size..(t + 1) * hidden_size],
+                    &mut out.values[t * hidden_size..(t + 1) * hidden_size],
+                    &mut out.scales[t * num_groups..(t + 1) * num_groups],
+                    &mut out.qsums[t * num_groups..(t + 1) * num_groups],
+                    hidden_size,
+                    group_size,
+                    num_groups,
+                );
+            }
+        }
+        out
+    }
+}
+
+/// AVX2 LM head using PMADDUBSW for 8-bit codes × int8 hidden.
+///
+/// The hidden state is quantized to [-63, 63] so PMADDUBSW's i16 pair sums
+/// cannot saturate against 8-bit codes (255 · 63 · 2 = 32130 < 32767). A
+/// 16-bit hidden through PMADDWD was measured as an alternative: about 1% less
+/// divergence from the reference model, for 11% less decode speed on a
+/// 152k-token vocabulary, where the head is the largest read of every token.
+///
+/// Each row's scales and zeros are decoded once and the row is then dotted
+/// with every token's hidden state while its bytes are still in L1, so a batch
+/// of tokens reads the table from memory once rather than once per token.
+/// Logit `(t, v)` is written to `logits[t * vocab_stride + v]`.
 ///
 /// # Safety
 /// - Must only be called after `has_avx2()` returned true (AVX2+FMA+F16C).
-/// - `logits` must be valid for `chunk_len` writes.
+/// - `logits` must be valid for writes at `t * vocab_stride + v` for every
+///   token `t < hidden.values.len() / hidden_size` and row
+///   `v in start_row..start_row + chunk_len`, and no other thread may write
+///   those elements.
 /// - `embed_data` must hold at least `(start_row + chunk_len) * hidden_size`
 ///   bytes and `embed_params` at least
 ///   `(start_row + chunk_len) * num_groups * 4` bytes.
-/// - `hidden_i8` must hold `hidden_size` values produced by
-///   `quantize_hidden_i8` (range [-63, 63]; anything wider can saturate the
-///   i16 PMADDUBSW pair sums against 8-bit codes).
+/// - `hidden` must come from [`Int8Hidden::quantize`] with this
+///   `hidden_size` and `group_size`, and `scratch` must hold
+///   `2 * num_groups` values.
 /// - `num_groups == hidden_size.div_ceil(group_size) <= MAX_GROUPS`.
 ///   `tied_lm_head` asserts these bounds before dispatching here.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma,f16c")]
 unsafe fn lm_head_chunk_i8(
     logits: *mut f32,
+    vocab_stride: usize,
     embed_data: *const u8,
     embed_params: &[u8],
-    hidden_i8: *const u8, // quantized hidden, treated as unsigned for PMADDUBSW arg2
-    hidden_sums: &[f32],
-    hidden_scales: &[f32], // per-group quantization scales
+    hidden: &Int8Hidden,
     start_row: usize,
     chunk_len: usize,
     hidden_size: usize,
@@ -849,11 +813,11 @@ unsafe fn lm_head_chunk_i8(
     num_groups: usize,
     scratch: &mut [f32],
 ) {
-    let ones_16 = _mm256_set1_epi16(1);
+    let num_tokens = hidden.values.len() / hidden_size;
     // Reused across every row in the chunk; see `matvec_chunk_i8`. This kernel
     // walks the whole vocabulary, so a per-row memset here is the most
     // expensive place in the engine to leave one.
-    let w_scales = &mut scratch[..num_groups];
+    let (w_scales, w_zeros) = scratch.split_at_mut(num_groups);
 
     for local in 0..chunk_len {
         let v = start_row + local;
@@ -870,158 +834,130 @@ unsafe fn lm_head_chunk_i8(
             }
         }
 
-        // Phase 1: Extract scales and zero corrections (unchecked reads)
-        let mut zero_corr = 0.0f32;
         let ep_ptr = embed_params.as_ptr();
         for g in 0..num_groups {
-            let param_off = row_param_base + g * 4;
-            let bits = (ep_ptr.add(param_off) as *const u32).read_unaligned();
-            let fv = _mm_cvtsi32_si128(bits as i32);
-            let ff = _mm_cvtph_ps(fv);
+            let bits = (ep_ptr.add(row_param_base + g * 4) as *const u32).read_unaligned();
+            let ff = _mm_cvtph_ps(_mm_cvtsi32_si128(bits as i32));
             *w_scales.get_unchecked_mut(g) = _mm_cvtss_f32(ff);
-            let ff1 = _mm_shuffle_ps(ff, ff, 1);
-            zero_corr += _mm_cvtss_f32(ff1) * hidden_sums[g];
+            *w_zeros.get_unchecked_mut(g) = _mm_cvtss_f32(_mm_shuffle_ps(ff, ff, 1));
         }
 
-        // Phase 2: Integer dot products using PMADDUBSW (256-bit AVX2)
-        // codes (u8) × hidden_i8 (i8 stored as u8 with bias 128)
-        // PMADDUBSW treats arg1 as unsigned, arg2 as signed.
-        // We use codes as arg1 (unsigned 0-255) and hidden_i8 as arg2 (signed -63..63).
-        let mut float_acc = _mm256_setzero_ps();
-
-        for g in 0..num_groups {
-            let col_start = g * group_size;
-            let actual_gs = ((g + 1) * group_size).min(hidden_size) - col_start;
-            let codes = row_data.add(col_start);
-            let hidden = hidden_i8.add(col_start);
-            let chunks32 = actual_gs / 32;
-
-            let mut iacc = _mm256_setzero_si256();
-
-            for c in 0..chunks32 {
-                let off = c * 32;
-                // Load 32 code bytes and 32 hidden i8 bytes
-                let code_v = _mm256_loadu_si256(codes.add(off) as *const __m256i);
-                let hid_v = _mm256_loadu_si256(hidden.add(off) as *const __m256i);
-
-                // PMADDUBSW: unsigned codes × signed hidden → i16 pair sums
-                let products = _mm256_maddubs_epi16(code_v, hid_v);
-                // PMADDWD: sum adjacent i16 pairs → i32
-                let sums = _mm256_madd_epi16(products, ones_16);
-                iacc = _mm256_add_epi32(iacc, sums);
-            }
-
-            // Convert to float, multiply by combined scale, accumulate
-            let combined_scale = *w_scales.get_unchecked(g) * *hidden_scales.get_unchecked(g);
-            let dot_f = _mm256_mul_ps(_mm256_cvtepi32_ps(iacc), _mm256_set1_ps(combined_scale));
-            float_acc = _mm256_add_ps(float_acc, dot_f);
-
-            // Scalar tail for remaining elements
-            let simd_done = chunks32 * 32;
-            if simd_done < actual_gs {
-                let mut tail = 0.0f32;
-                for i in simd_done..actual_gs {
-                    tail += *codes.add(i) as f32 * *(hidden as *const i8).add(i) as f32;
-                }
-                float_acc = _mm256_add_ps(
-                    float_acc,
-                    _mm256_set_ps(
-                        0.0,
-                        0.0,
-                        0.0,
-                        0.0,
-                        0.0,
-                        0.0,
-                        0.0,
-                        *w_scales.get_unchecked(g) * *hidden_scales.get_unchecked(g) * tail,
-                    ),
-                );
-            }
+        for t in 0..num_tokens {
+            let dot = lm_head_row_i8(
+                row_data,
+                w_scales,
+                w_zeros,
+                hidden.values.as_ptr().add(t * hidden_size),
+                &hidden.scales[t * num_groups..(t + 1) * num_groups],
+                &hidden.qsums[t * num_groups..(t + 1) * num_groups],
+                hidden_size,
+                group_size,
+                num_groups,
+            );
+            *logits.add(t * vocab_stride + v) = dot;
         }
-
-        // Phase 3: Horizontal sum
-        let hi128 = _mm256_extractf128_ps(float_acc, 1);
-        let lo128 = _mm256_castps256_ps128(float_acc);
-        let s128 = _mm_add_ps(lo128, hi128);
-        let shuf = _mm_movehdup_ps(s128);
-        let s64 = _mm_add_ps(s128, shuf);
-        let hi64 = _mm_movehl_ps(s64, s64);
-        let dot = _mm_cvtss_f32(_mm_add_ss(s64, hi64));
-
-        *logits.add(local) = dot + zero_corr;
     }
 }
 
-/// Quantize f32 hidden state to i8 for use with PMADDUBSW in LM head.
-/// Uses [-63, 63] range to prevent saturation with 8-bit codes (max 255).
-/// Returns per-group scales.
+/// One vocabulary row against one token's int8 hidden state.
 ///
-/// Only the AVX2 `tied_lm_head` path needs an i8 hidden state; the scalar
-/// fallback reads f32 directly, so this is not compiled on other targets.
+/// The zero term is applied to the quantized hidden's own sums, so code and
+/// zero terms see the same activations (see `quantize_input_split`).
+///
+/// # Safety
+/// Must only be called from an AVX2+FMA context, with `row_data` and
+/// `hidden_i8` readable for `hidden_size` values, `hidden_i8` within
+/// [-63, 63], and the four slices holding `num_groups` values each.
 #[cfg(target_arch = "x86_64")]
-fn quantize_hidden_i8(
-    hidden: &[f32],
-    output: &mut [i8],
-    scales: &mut [f32],
+#[target_feature(enable = "avx2,fma,f16c")]
+#[inline]
+unsafe fn lm_head_row_i8(
+    row_data: *const u8,
+    w_scales: &[f32],
+    w_zeros: &[f32],
+    hidden_i8: *const i8,
+    hidden_scales: &[f32],
+    hidden_qsums: &[f32],
     hidden_size: usize,
     group_size: usize,
     num_groups: usize,
-) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if has_avx2() {
-            unsafe {
-                quantize_hidden_i8_avx2(
-                    hidden,
-                    output,
-                    scales,
-                    hidden_size,
-                    group_size,
-                    num_groups,
-                );
-            }
-            return;
-        }
-    }
+) -> f32 {
+    let ones_16 = _mm256_set1_epi16(1);
+    let mut zero_corr = 0.0f32;
+    let mut float_acc = _mm256_setzero_ps();
     for g in 0..num_groups {
-        let start = g * group_size;
-        let end = ((g + 1) * group_size).min(hidden_size);
-        let mut absmax = 0.0f32;
-        for i in start..end {
-            let a = hidden[i].abs();
-            if a > absmax {
-                absmax = a;
+        zero_corr += *w_zeros.get_unchecked(g) * *hidden_qsums.get_unchecked(g);
+
+        let col_start = g * group_size;
+        let actual_gs = ((g + 1) * group_size).min(hidden_size) - col_start;
+        let codes = row_data.add(col_start);
+        let hidden = hidden_i8.add(col_start);
+        let chunks32 = actual_gs / 32;
+
+        // PMADDUBSW: unsigned codes (arg 1) × signed hidden (arg 2) → i16
+        // pair sums; PMADDWD widens them to i32. A lane adds at most
+        // 2 · 32130 per 32 codes, so any group stays far below 2^31.
+        let mut iacc = _mm256_setzero_si256();
+        for c in 0..chunks32 {
+            let off = c * 32;
+            let code_v = _mm256_loadu_si256(codes.add(off) as *const __m256i);
+            let hid_v = _mm256_loadu_si256(hidden.add(off) as *const __m256i);
+            iacc = _mm256_add_epi32(
+                iacc,
+                _mm256_madd_epi16(_mm256_maddubs_epi16(code_v, hid_v), ones_16),
+            );
+        }
+        // Embedding groups are almost always a multiple of 32 wide, so the
+        // remainder is skipped rather than folded in as zeros.
+        if chunks32 * 32 < actual_gs {
+            let mut tail = 0i32;
+            for i in (chunks32 * 32)..actual_gs {
+                tail += i32::from(*codes.add(i)) * i32::from(*hidden.add(i));
             }
+            iacc = _mm256_add_epi32(iacc, _mm256_set_epi32(0, 0, 0, 0, 0, 0, 0, tail));
         }
-        let scale = if absmax > 1e-10 { absmax / 63.0 } else { 1.0 };
-        let inv_scale = 1.0 / scale;
-        scales[g] = scale;
-        for i in start..end {
-            output[i] = (hidden[i] * inv_scale)
-                .round_ties_even()
-                .max(-63.0)
-                .min(63.0) as i8;
-        }
+        let combined = *w_scales.get_unchecked(g) * *hidden_scales.get_unchecked(g);
+        float_acc = _mm256_fmadd_ps(
+            _mm256_cvtepi32_ps(iacc),
+            _mm256_set1_ps(combined),
+            float_acc,
+        );
     }
+
+    let hi128 = _mm256_extractf128_ps(float_acc, 1);
+    let lo128 = _mm256_castps256_ps128(float_acc);
+    let s128 = _mm_add_ps(lo128, hi128);
+    let shuf = _mm_movehdup_ps(s128);
+    let s64 = _mm_add_ps(s128, shuf);
+    let hi64 = _mm_movehl_ps(s64, s64);
+    _mm_cvtss_f32(_mm_add_ss(s64, hi64)) + zero_corr
 }
 
-/// AVX2 hidden quantization: absmax + scale + quantize to i8 (no even/odd split needed).
+/// AVX2 hidden quantization for the LM head: per group, absmax → scale →
+/// round half to even → clamp to [-63, 63] → i8 (no even/odd split needed).
+///
+/// Writes the per-group scales and, as `quantize_input_split` does, the
+/// per-group sums of the quantized values in their own units, which the head
+/// applies its zero points to. Only the AVX2 head quantizes; the scalar head
+/// reads the f32 hidden directly.
 ///
 /// # Safety
 /// - Must only be called after `has_avx2()` returned true (AVX2 is required).
-/// - `hidden` and `output` must each hold at least `hidden_size` values.
-/// - `num_groups` must equal `hidden_size.div_ceil(group_size)` and be at
-///   most `MAX_GROUPS` (the `scales` array bound).
+/// - `hidden` and `output` must each hold at least `hidden_size` values;
+///   `scales` and `qsums` at least `num_groups`.
+/// - `num_groups` must equal `hidden_size.div_ceil(group_size)`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn quantize_hidden_i8_avx2(
     hidden: &[f32],
     output: &mut [i8],
     scales: &mut [f32],
+    qsums: &mut [f32],
     hidden_size: usize,
     group_size: usize,
     num_groups: usize,
 ) {
+    const LIMIT: f32 = 63.0;
     let sign_mask = _mm256_set1_ps(f32::from_bits(0x7FFF_FFFF));
 
     for g in 0..num_groups {
@@ -1045,48 +981,47 @@ unsafe fn quantize_hidden_i8_avx2(
         let hi64 = _mm_movehl_ps(m64, m64);
         let mut absmax = _mm_cvtss_f32(_mm_max_ss(m64, hi64));
         for i in (chunks8 * 8)..len {
-            let a = (*inp.add(i)).abs();
-            if a > absmax {
-                absmax = a;
-            }
+            absmax = absmax.max((*inp.add(i)).abs());
         }
 
-        let scale = if absmax > 1e-10 { absmax / 63.0 } else { 1.0 };
+        let scale = if absmax > 1e-10 { absmax / LIMIT } else { 1.0 };
         let inv_scale = 1.0 / scale;
         scales[g] = scale;
 
-        // AVX2 quantize: float → round → clamp → i32 → pack to i8
         let inv_v = _mm256_set1_ps(inv_scale);
-        let min_v = _mm256_set1_ps(-63.0);
-        let max_v = _mm256_set1_ps(63.0);
+        let min_v = _mm256_set1_ps(-LIMIT);
+        let max_v = _mm256_set1_ps(LIMIT);
         let out_ptr = output.as_mut_ptr().add(start);
+        let mut qsum_v = _mm256_setzero_si256();
 
         for i in 0..chunks8 {
             let off = i * 8;
             let v = _mm256_loadu_ps(inp.add(off));
-            let scaled = _mm256_mul_ps(v, inv_v);
-            let rounded = _mm256_round_ps(scaled, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            let rounded = _mm256_round_ps(
+                _mm256_mul_ps(v, inv_v),
+                _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
+            );
             let clamped = _mm256_max_ps(_mm256_min_ps(rounded, max_v), min_v);
             let i32s = _mm256_cvtps_epi32(clamped);
-
-            // Pack i32 → i16 → i8 (128-bit to avoid cross-lane issues)
-            let lo = _mm256_castsi256_si128(i32s);
-            let hi = _mm256_extracti128_si256(i32s, 1);
-            let packed16 = _mm_packs_epi32(lo, hi); // 8 i16 in order
-            let packed8 = _mm_packs_epi16(packed16, _mm_setzero_si128()); // 8 i8 in lower bytes
-
-            // Store 8 bytes
-            let dst = out_ptr.add(off) as *mut u64;
-            dst.write_unaligned(_mm_cvtsi128_si64(packed8) as u64);
+            qsum_v = _mm256_add_epi32(qsum_v, i32s);
+            // Pack i32 → i16 → i8 within 128-bit halves (no cross-lane issue).
+            let packed16 = _mm_packs_epi32(
+                _mm256_castsi256_si128(i32s),
+                _mm256_extracti128_si256(i32s, 1),
+            );
+            let packed8 = _mm_packs_epi16(packed16, _mm_setzero_si128());
+            (out_ptr.add(off) as *mut u64).write_unaligned(_mm_cvtsi128_si64(packed8) as u64);
         }
+        let mut qsum = hsum_epi32(qsum_v);
 
-        // Scalar tail
         for i in (chunks8 * 8)..len {
-            *(out_ptr.add(i)) = (*inp.add(i) * inv_scale)
+            let q = (*inp.add(i) * inv_scale)
                 .round_ties_even()
-                .max(-63.0)
-                .min(63.0) as i8;
+                .clamp(-LIMIT, LIMIT) as i8;
+            *out_ptr.add(i) = q;
+            qsum += i32::from(q);
         }
+        qsums[g] = scale * qsum as f32;
     }
 }
 
@@ -1160,16 +1095,12 @@ fn lm_head_row_scalar(
 }
 
 // ---------------------------------------------------------------------------
-// Internal dispatch (shared input_sums, no recomputation)
+// Dispatch policy
 // ---------------------------------------------------------------------------
 
-// These describe the parallel AVX2 dispatch policy, which only exists on
-// x86-64; the scalar fallback walks every row on one thread. They stay visible
-// to `cfg(test)` because the reference tests size their inputs relative to
-// `PAR_THRESHOLD` and `LM_CHUNK` to force the parallel branch on AVX2 hosts.
-#[cfg(any(target_arch = "x86_64", test))]
+/// Vocabulary rows per parallel chunk of the LM head.
 const LM_CHUNK: usize = 512;
-#[cfg(any(target_arch = "x86_64", test))]
+/// Fewest rows a decode-time matvec needs before it is worth parallelizing.
 const PAR_THRESHOLD: usize = 256;
 
 /// Smallest weight matrix, in bytes of packed nibbles, worth handing to rayon
@@ -1183,11 +1114,9 @@ const PAR_THRESHOLD: usize = 256;
 ///
 /// Prefill is unaffected: it batches many tokens per weight chunk, so the work
 /// per dispatch is large enough that the overhead disappears into it.
-#[cfg(any(target_arch = "x86_64", test))]
 const PAR_MIN_BYTES: usize = 512 * 1024;
 
 /// Whether a decode-time matvec of this shape is worth parallelizing.
-#[cfg(any(target_arch = "x86_64", test))]
 fn matvec_should_parallelize(rows: usize, cols: usize) -> bool {
     rows >= PAR_THRESHOLD && rows * cols / 2 >= PAR_MIN_BYTES
 }
@@ -1197,11 +1126,11 @@ fn matvec_should_parallelize(rows: usize, cols: usize) -> bool {
 /// SmolLM (cols=256): 24576/(128)=192→clamped to 64 rows.
 /// Mistral hidden (cols=4096): 24576/(2048)=12 rows.
 /// Mistral MLP (cols=14336): 24576/(7168)=3→clamped to 4 rows.
-#[cfg(target_arch = "x86_64")]
 #[inline]
 fn chunk_rows_for(cols: usize) -> usize {
     (24_576 / (cols / 2).max(1)).clamp(4, 64)
 }
+
 /// Maximum number of quantization groups per GEMM call.
 ///
 /// This is a validation bound, not a working size: no buffer in the hot path is
@@ -1279,105 +1208,172 @@ fn validate_projection(output: &[f32], projection: &QuantizedLinear<'_>, input: 
     );
 }
 
-/// Inner dispatch with pre-computed input data. Uses W4A8 integer GEMM when available.
-/// Uses dynamic chunk sizing: exactly num_threads chunks for optimal load balance
-/// and minimal atomic overhead.
-fn w4a8_matvec_inner(
-    output: &mut [f32],
-    nibble_data: &[u8],
-    group_params: &[u8],
-    input: &[f32],
-    input_even: &[i8],
-    input_odd: &[i8],
-    input_scales: &[f32],
-    input_sums: &[f32],
-    rows: usize,
-    cols: usize,
-    group_size: usize,
-    num_groups: usize,
-) {
+// ---------------------------------------------------------------------------
+// Activations, prepared once per call
+// ---------------------------------------------------------------------------
+
+/// Tokens' activations quantized for the AVX2 int8 kernels, token-major: the
+/// even/odd column split, and per group the scale and the quantized sum
+/// `quantize_input_split` describes.
+#[cfg(target_arch = "x86_64")]
+struct Int8Activations {
+    even: Vec<i8>,
+    odd: Vec<i8>,
+    scales: Vec<f32>,
+    qsums: Vec<f32>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Int8Activations {
+    /// Quantize `tokens` rows of `cols` values each. Only called after
+    /// `has_avx2()` returned true and the buffers were validated.
+    fn quantize(input: &[f32], tokens: usize, cols: usize, group_size: usize) -> Self {
+        let num_groups = cols.div_ceil(group_size);
+        let half = cols / 2;
+        let mut act = Self {
+            even: vec![0; tokens * half],
+            odd: vec![0; tokens * half],
+            scales: vec![0.0; tokens * num_groups],
+            qsums: vec![0.0; tokens * num_groups],
+        };
+        for t in 0..tokens {
+            quantize_input_split(
+                &input[t * cols..(t + 1) * cols],
+                &mut act.even[t * half..(t + 1) * half],
+                &mut act.odd[t * half..(t + 1) * half],
+                &mut act.scales[t * num_groups..(t + 1) * num_groups],
+                &mut act.qsums[t * num_groups..(t + 1) * num_groups],
+                cols,
+                group_size,
+                num_groups,
+            );
+        }
+        act
+    }
+}
+
+/// One token through projections that share its activations: an output slice
+/// paired with the projection that fills it.
+type MatvecJobs<'o, 'p, 'w> = Vec<(&'o mut [f32], &'p QuantizedLinear<'w>)>;
+
+/// Run [`MatvecJobs`] on whichever kernel this CPU has.
+///
+/// Serial when the matrices together are under the decode dispatch floor
+/// ([`PAR_MIN_BYTES`]), otherwise one rayon job list over row chunks of all of
+/// them, so small K/V projections ride along with Q instead of each paying a
+/// dispatch of their own.
+fn matvec_dispatch(jobs: MatvecJobs<'_, '_, '_>, input: &[f32], cols: usize, group_size: usize) {
     #[cfg(target_arch = "x86_64")]
     {
         if has_avx2() {
-            if matvec_should_parallelize(rows, cols) {
-                // Adaptive chunk sizing: keeps per-chunk weight data in L1 (32KB).
-                let cr = chunk_rows_for(cols);
-                let num_chunks = rows.div_ceil(cr);
-                let out_ptr = SendPtr(output.as_mut_ptr());
-                let nib_ptr = SyncU8Ptr(nibble_data.as_ptr());
-                let inp_f32_ptr = SyncF32Ptr(input.as_ptr());
-                let inp_even_ptr = SyncI8Ptr(input_even.as_ptr());
-                let inp_odd_ptr = SyncI8Ptr(input_odd.as_ptr());
-                let scales = input_scales;
-                let sums = input_sums;
-                (0..num_chunks).into_par_iter().for_each_init(
-                    || vec![0.0f32; num_groups],
-                    |scratch, ci| {
-                        let start = ci * cr;
-                        let len = cr.min(rows - start);
-                        unsafe {
-                            matvec_chunk_i8(
-                                out_ptr.ptr().add(start),
-                                nib_ptr.ptr(),
-                                group_params,
-                                inp_f32_ptr.ptr(),
-                                inp_even_ptr.ptr(),
-                                inp_odd_ptr.ptr(),
-                                scales,
-                                sums,
-                                start,
-                                len,
-                                cols,
-                                group_size,
-                                num_groups,
-                                scratch,
-                            );
-                        }
-                    },
-                );
-            } else {
-                let mut scratch = vec![0.0f32; num_groups];
-                unsafe {
-                    matvec_chunk_i8(
-                        output.as_mut_ptr(),
-                        nibble_data.as_ptr(),
-                        group_params,
-                        input.as_ptr(),
-                        input_even.as_ptr(),
-                        input_odd.as_ptr(),
-                        input_scales,
-                        input_sums,
-                        0,
-                        rows,
-                        cols,
-                        group_size,
-                        num_groups,
-                        &mut scratch,
-                    );
-                }
-            }
+            let act = Int8Activations::quantize(input, 1, cols, group_size);
+            matvec_avx2(jobs, &act, cols, group_size);
             return;
         }
     }
+    matvec_scalar(jobs, input, cols, group_size);
+}
 
-    // The scalar row kernel dequantizes against the f32 input and the per-group
-    // sums, so the int8 split of the input is only ever consumed by the AVX2
-    // kernels above.
-    #[cfg(not(target_arch = "x86_64"))]
-    let _ = (input_even, input_odd, input_scales);
-
-    for row in 0..rows {
-        output[row] = matvec_row_scalar(
-            nibble_data,
-            group_params,
-            input,
-            input_sums,
-            row,
-            cols,
-            group_size,
-            num_groups,
-        );
+/// Split every job's output into row chunks, remembering each chunk's first
+/// row, so one parallel loop can cover several projections.
+fn row_chunks<'o, 'p, 'w>(
+    jobs: MatvecJobs<'o, 'p, 'w>,
+    rows_per_chunk: usize,
+) -> Vec<(&'o mut [f32], &'p QuantizedLinear<'w>, usize)> {
+    let mut chunks = Vec::new();
+    for (output, projection) in jobs {
+        for (index, chunk) in output[..projection.rows]
+            .chunks_mut(rows_per_chunk)
+            .enumerate()
+        {
+            chunks.push((chunk, projection, index * rows_per_chunk));
+        }
     }
+    chunks
+}
+
+#[cfg(target_arch = "x86_64")]
+fn matvec_avx2(
+    jobs: MatvecJobs<'_, '_, '_>,
+    act: &Int8Activations,
+    cols: usize,
+    group_size: usize,
+) {
+    let num_groups = cols.div_ceil(group_size);
+    let total_rows: usize = jobs.iter().map(|(_, projection)| projection.rows).sum();
+    let run = |output: &mut [f32],
+               projection: &QuantizedLinear<'_>,
+               start: usize,
+               scratch: &mut [f32]| {
+        // SAFETY: `act` exists only after `has_avx2()` returned true;
+        // `validate_projection` proved the projection holds `rows * cols / 2`
+        // code bytes and `rows * num_groups * 4` parameter bytes, `output` is
+        // its rows `start..start + output.len()`, `act` holds one token's
+        // `cols / 2` split activations and `num_groups` scales and sums, and
+        // `scratch` holds `num_groups` values.
+        unsafe {
+            matvec_chunk_i8(
+                output.as_mut_ptr(),
+                projection.nibble_data.as_ptr(),
+                projection.group_params,
+                act.even.as_ptr(),
+                act.odd.as_ptr(),
+                &act.scales,
+                &act.qsums,
+                start,
+                output.len(),
+                cols,
+                group_size,
+                num_groups,
+                scratch,
+            );
+        }
+    };
+    if !matvec_should_parallelize(total_rows, cols) {
+        let mut scratch = vec![0.0f32; num_groups];
+        for (output, projection) in jobs {
+            run(&mut output[..projection.rows], projection, 0, &mut scratch);
+        }
+        return;
+    }
+    row_chunks(jobs, chunk_rows_for(cols))
+        .into_par_iter()
+        .for_each_init(
+            || vec![0.0f32; num_groups],
+            |scratch, (output, projection, start)| run(output, projection, start, scratch),
+        );
+}
+
+/// The scalar kernels read the f32 input directly, so nothing is quantized;
+/// rows are spread across the pool exactly as the AVX2 path spreads them.
+fn matvec_scalar(jobs: MatvecJobs<'_, '_, '_>, input: &[f32], cols: usize, group_size: usize) {
+    let num_groups = cols.div_ceil(group_size);
+    let mut sums = vec![0.0f32; num_groups];
+    group_sums_into(input, &mut sums, cols, group_size);
+    let total_rows: usize = jobs.iter().map(|(_, projection)| projection.rows).sum();
+    let run = |output: &mut [f32], projection: &QuantizedLinear<'_>, start: usize| {
+        for (offset, value) in output.iter_mut().enumerate() {
+            *value = matvec_row_scalar(
+                projection.nibble_data,
+                projection.group_params,
+                input,
+                &sums,
+                start + offset,
+                cols,
+                group_size,
+                num_groups,
+            );
+        }
+    };
+    if !matvec_should_parallelize(total_rows, cols) {
+        for (output, projection) in jobs {
+            run(&mut output[..projection.rows], projection, 0);
+        }
+        return;
+    }
+    row_chunks(jobs, chunk_rows_for(cols))
+        .into_par_iter()
+        .for_each(|(output, projection, start)| run(output, projection, start));
 }
 
 // ---------------------------------------------------------------------------
@@ -1386,8 +1382,9 @@ fn w4a8_matvec_inner(
 
 /// W4A8 matrix–vector product: `output[r] = dot(dequant(weights[r]), input)`.
 ///
-/// The f32 input is quantized to int8 per group internally; weights are 4-bit
-/// codes with per-group f16 scale/zero parameters.
+/// On AVX2 hosts the f32 input is quantized to int8 per group internally; the
+/// scalar kernels use it as f32. Weights are 4-bit codes with per-group f16
+/// scale/zero parameters.
 ///
 /// # Panics
 /// Panics if `rows` is zero, `cols` or `group_size` is zero or odd, the group
@@ -1412,40 +1409,19 @@ pub fn w4a8_matvec(
         1,
         group_size,
     );
-    let num_groups = cols.div_ceil(group_size);
-    let input_sums = compute_input_sums(input, cols, group_size);
-    let half_cols = cols / 2;
-    let mut input_even = vec![0i8; half_cols];
-    let mut input_odd = vec![0i8; half_cols];
-    let mut input_scales = [0.0f32; MAX_GROUPS];
-    quantize_input_split(
-        input,
-        &mut input_even,
-        &mut input_odd,
-        &mut input_scales,
-        cols,
-        group_size,
-        num_groups,
-    );
-    w4a8_matvec_inner(
-        output,
-        nibble_data,
-        group_params,
-        input,
-        &input_even,
-        &input_odd,
-        &input_scales,
-        &input_sums,
+    let projection = QuantizedLinear {
         rows,
         cols,
+        group_params,
+        nibble_data,
         group_size,
-        num_groups,
-    );
+    };
+    matvec_dispatch(vec![(output, &projection)], input, cols, group_size);
 }
 
-/// Fused Q/K/V projections: single parallel dispatch over all Q+K+V rows.
-/// Shared input_sums computed once. K/V rows (below PAR_THRESHOLD individually)
-/// become parallel alongside Q rows via work-stealing.
+/// Fused Q/K/V projections: the input is quantized once and all three
+/// matrices share one parallel dispatch, so the small K/V projections ride
+/// along with Q rather than each paying for a dispatch of their own.
 ///
 /// The decode dispatch floor applies to the combined matrix: when Q+K+V packed
 /// together stay under `PAR_MIN_BYTES`, one thread walks all three projections
@@ -1471,159 +1447,16 @@ pub fn w4a8_fused_qkv(
     assert_eq!(q_proj.cols, v_proj.cols, "Q/V column mismatch");
     assert_eq!(q_proj.group_size, k_proj.group_size, "Q/K group mismatch");
     assert_eq!(q_proj.group_size, v_proj.group_size, "Q/V group mismatch");
-    let cols = q_proj.cols;
-    let group_size = q_proj.group_size;
-    let num_groups = cols.div_ceil(group_size);
-    let input_sums = compute_input_sums(input, cols, group_size);
-    let half_cols = cols / 2;
-    let mut input_even = vec![0i8; half_cols];
-    let mut input_odd = vec![0i8; half_cols];
-    let mut input_scales = [0.0f32; MAX_GROUPS];
-    quantize_input_split(
+    matvec_dispatch(
+        vec![(q_out, q_proj), (k_out, k_proj), (v_out, v_proj)],
         input,
-        &mut input_even,
-        &mut input_odd,
-        &mut input_scales,
-        cols,
-        group_size,
-        num_groups,
+        q_proj.cols,
+        q_proj.group_size,
     );
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        if has_avx2() {
-            let total_rows = q_proj.rows + k_proj.rows + v_proj.rows;
-            if !matvec_should_parallelize(total_rows, cols) {
-                let mut scratch = vec![0.0f32; num_groups];
-                for (out, proj) in [(q_out, q_proj), (k_out, k_proj), (v_out, v_proj)] {
-                    unsafe {
-                        matvec_chunk_i8(
-                            out.as_mut_ptr(),
-                            proj.nibble_data.as_ptr(),
-                            proj.group_params,
-                            input.as_ptr(),
-                            input_even.as_ptr(),
-                            input_odd.as_ptr(),
-                            &input_scales,
-                            &input_sums,
-                            0,
-                            proj.rows,
-                            cols,
-                            group_size,
-                            num_groups,
-                            &mut scratch,
-                        );
-                    }
-                }
-                return;
-            }
-            let cr = chunk_rows_for(cols);
-            let q_chunks = q_proj.rows.div_ceil(cr);
-            let k_chunks = k_proj.rows.div_ceil(cr);
-            let v_chunks = v_proj.rows.div_ceil(cr);
-            let total_chunks = q_chunks + k_chunks + v_chunks;
-
-            let q_ptr = SendPtr(q_out.as_mut_ptr());
-            let k_ptr = SendPtr(k_out.as_mut_ptr());
-            let v_ptr = SendPtr(v_out.as_mut_ptr());
-            let q_nib = SyncU8Ptr(q_proj.nibble_data.as_ptr());
-            let k_nib = SyncU8Ptr(k_proj.nibble_data.as_ptr());
-            let v_nib = SyncU8Ptr(v_proj.nibble_data.as_ptr());
-            let q_par = q_proj.group_params;
-            let k_par = k_proj.group_params;
-            let v_par = v_proj.group_params;
-            let q_rows = q_proj.rows;
-            let k_rows = k_proj.rows;
-            let v_rows = v_proj.rows;
-            let inp_f32_ptr = SyncF32Ptr(input.as_ptr());
-            let inp_even_ptr = SyncI8Ptr(input_even.as_ptr());
-            let inp_odd_ptr = SyncI8Ptr(input_odd.as_ptr());
-            let scales = input_scales;
-            let sums = input_sums;
-
-            (0..total_chunks).into_par_iter().for_each_init(
-                || vec![0.0f32; num_groups],
-                |scratch, chunk_idx| {
-                    let (out_ptr, nibble_data, group_params, rows, start_row) =
-                        if chunk_idx < q_chunks {
-                            let start = chunk_idx * cr;
-                            (q_ptr, q_nib, q_par, q_rows, start)
-                        } else if chunk_idx < q_chunks + k_chunks {
-                            let ki = chunk_idx - q_chunks;
-                            let start = ki * cr;
-                            (k_ptr, k_nib, k_par, k_rows, start)
-                        } else {
-                            let vi = chunk_idx - q_chunks - k_chunks;
-                            let start = vi * cr;
-                            (v_ptr, v_nib, v_par, v_rows, start)
-                        };
-
-                    let chunk_len = cr.min(rows - start_row);
-                    unsafe {
-                        matvec_chunk_i8(
-                            out_ptr.ptr().add(start_row),
-                            nibble_data.ptr(),
-                            group_params,
-                            inp_f32_ptr.ptr(),
-                            inp_even_ptr.ptr(),
-                            inp_odd_ptr.ptr(),
-                            &scales,
-                            &sums,
-                            start_row,
-                            chunk_len,
-                            cols,
-                            group_size,
-                            num_groups,
-                            scratch,
-                        );
-                    }
-                },
-            );
-            return;
-        }
-    }
-
-    // Scalar fallback
-    for row in 0..q_proj.rows {
-        q_out[row] = matvec_row_scalar(
-            q_proj.nibble_data,
-            q_proj.group_params,
-            input,
-            &input_sums,
-            row,
-            cols,
-            group_size,
-            num_groups,
-        );
-    }
-    for row in 0..k_proj.rows {
-        k_out[row] = matvec_row_scalar(
-            k_proj.nibble_data,
-            k_proj.group_params,
-            input,
-            &input_sums,
-            row,
-            cols,
-            group_size,
-            num_groups,
-        );
-    }
-    for row in 0..v_proj.rows {
-        v_out[row] = matvec_row_scalar(
-            v_proj.nibble_data,
-            v_proj.group_params,
-            input,
-            &input_sums,
-            row,
-            cols,
-            group_size,
-            num_groups,
-        );
-    }
 }
 
-/// Fused gate+up projections: single parallel dispatch over all gate+up rows.
-/// Shared input_sums computed once. The combined gate+up matrix is held to the
+/// Fused gate+up projections: one quantization of the input and one parallel
+/// dispatch over both matrices. The combined gate+up matrix is held to the
 /// same `PAR_MIN_BYTES` decode floor as [`w4a8_matvec`]; under it, one thread
 /// walks both projections.
 ///
@@ -1644,134 +1477,12 @@ pub fn w4a8_fused_gate_up(
         gate_proj.group_size, up_proj.group_size,
         "gate/up group mismatch"
     );
-    let cols = gate_proj.cols;
-    let group_size = gate_proj.group_size;
-    let num_groups = cols.div_ceil(group_size);
-    let input_sums = compute_input_sums(input, cols, group_size);
-    let half_cols = cols / 2;
-    let mut input_even = vec![0i8; half_cols];
-    let mut input_odd = vec![0i8; half_cols];
-    let mut input_scales = [0.0f32; MAX_GROUPS];
-    quantize_input_split(
+    matvec_dispatch(
+        vec![(gate_out, gate_proj), (up_out, up_proj)],
         input,
-        &mut input_even,
-        &mut input_odd,
-        &mut input_scales,
-        cols,
-        group_size,
-        num_groups,
+        gate_proj.cols,
+        gate_proj.group_size,
     );
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        if has_avx2() {
-            let total_rows = gate_proj.rows + up_proj.rows;
-            if !matvec_should_parallelize(total_rows, cols) {
-                let mut scratch = vec![0.0f32; num_groups];
-                for (out, proj) in [(gate_out, gate_proj), (up_out, up_proj)] {
-                    unsafe {
-                        matvec_chunk_i8(
-                            out.as_mut_ptr(),
-                            proj.nibble_data.as_ptr(),
-                            proj.group_params,
-                            input.as_ptr(),
-                            input_even.as_ptr(),
-                            input_odd.as_ptr(),
-                            &input_scales,
-                            &input_sums,
-                            0,
-                            proj.rows,
-                            cols,
-                            group_size,
-                            num_groups,
-                            &mut scratch,
-                        );
-                    }
-                }
-                return;
-            }
-            let cr = chunk_rows_for(cols);
-            let g_chunks = gate_proj.rows.div_ceil(cr);
-            let u_chunks = up_proj.rows.div_ceil(cr);
-            let total_chunks = g_chunks + u_chunks;
-
-            let g_ptr = SendPtr(gate_out.as_mut_ptr());
-            let u_ptr = SendPtr(up_out.as_mut_ptr());
-            let g_nib = SyncU8Ptr(gate_proj.nibble_data.as_ptr());
-            let u_nib = SyncU8Ptr(up_proj.nibble_data.as_ptr());
-            let g_par = gate_proj.group_params;
-            let u_par = up_proj.group_params;
-            let g_rows = gate_proj.rows;
-            let u_rows = up_proj.rows;
-            let inp_f32_ptr = SyncF32Ptr(input.as_ptr());
-            let inp_even_ptr = SyncI8Ptr(input_even.as_ptr());
-            let inp_odd_ptr = SyncI8Ptr(input_odd.as_ptr());
-            let scales = input_scales;
-            let sums = input_sums;
-
-            (0..total_chunks).into_par_iter().for_each_init(
-                || vec![0.0f32; num_groups],
-                |scratch, chunk_idx| {
-                    let (out_ptr, nibble_data, group_params, rows, start_row) =
-                        if chunk_idx < g_chunks {
-                            let start = chunk_idx * cr;
-                            (g_ptr, g_nib, g_par, g_rows, start)
-                        } else {
-                            let ui = chunk_idx - g_chunks;
-                            let start = ui * cr;
-                            (u_ptr, u_nib, u_par, u_rows, start)
-                        };
-
-                    let chunk_len = cr.min(rows - start_row);
-                    unsafe {
-                        matvec_chunk_i8(
-                            out_ptr.ptr().add(start_row),
-                            nibble_data.ptr(),
-                            group_params,
-                            inp_f32_ptr.ptr(),
-                            inp_even_ptr.ptr(),
-                            inp_odd_ptr.ptr(),
-                            &scales,
-                            &sums,
-                            start_row,
-                            chunk_len,
-                            cols,
-                            group_size,
-                            num_groups,
-                            scratch,
-                        );
-                    }
-                },
-            );
-            return;
-        }
-    }
-
-    // Scalar fallback
-    for row in 0..gate_proj.rows {
-        gate_out[row] = matvec_row_scalar(
-            gate_proj.nibble_data,
-            gate_proj.group_params,
-            input,
-            &input_sums,
-            row,
-            cols,
-            group_size,
-            num_groups,
-        );
-    }
-    for row in 0..up_proj.rows {
-        up_out[row] = matvec_row_scalar(
-            up_proj.nibble_data,
-            up_proj.group_params,
-            input,
-            &input_sums,
-            row,
-            cols,
-            group_size,
-            num_groups,
-        );
-    }
 }
 
 /// Benchmark-only A/B switch for the batched GEMM restructure.
@@ -1813,20 +1524,15 @@ pub fn serial_decode_attention_enabled() -> bool {
 }
 
 /// Configure the rayon thread pool for optimal inference performance.
-/// Call once at program start. Respects RAYON_NUM_THREADS env var for tuning;
-/// defaults to physical core count + 1.
+/// Call once at program start. Respects the `RAYON_NUM_THREADS` environment
+/// variable; defaults to the machine's performance cores plus one (see
+/// `topology`), capped at the CPUs this process may use.
 pub fn configure_thread_pool() {
     let threads = std::env::var("RAYON_NUM_THREADS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or_else(|| {
-            let cpus = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4);
-            // Physical cores + 1: Best balance for mixed GEMM+attention workloads.
-            // More threads help bandwidth-bound GEMMs but hurt sequential attention.
-            (cpus / 2 + 1).max(2)
-        });
+        .filter(|&threads| threads > 0)
+        .unwrap_or_else(crate::topology::default_threads);
     let _ = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build_global();
@@ -1875,148 +1581,205 @@ pub fn w4a8_matmul(
         );
     }
 
-    let num_groups = cols.div_ceil(group_size);
-    let half_cols = cols / 2;
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2() {
+            // All tokens are quantized up front into flat token-major buffers
+            // (four allocations, not four per token). The group buffers are
+            // strided by the model's real `num_groups`, so one cache line
+            // usually covers the same group across several tokens — exactly
+            // how the weight-stationary kernel reads them.
+            let act = Int8Activations::quantize(input, num_tokens, cols, group_size);
+            return matmul_avx2(
+                output,
+                nibble_data,
+                group_params,
+                &act,
+                rows,
+                cols,
+                num_tokens,
+                group_size,
+            );
+        }
+    }
 
-    // Pre-quantize all token inputs into flat contiguous buffers (4 allocs,
-    // not 4*num_tokens). The group buffers are strided by the model's real
-    // `num_groups`, so one cache line usually covers the same group across
-    // several tokens — which is exactly how the weight-stationary kernel reads
-    // them.
-    let mut all_sums: Vec<f32> = vec![0.0; num_tokens * num_groups];
-    let mut all_even_flat: Vec<i8> = vec![0i8; num_tokens * half_cols];
-    let mut all_odd_flat: Vec<i8> = vec![0i8; num_tokens * half_cols];
-    let mut all_scales: Vec<f32> = vec![0.0; num_tokens * num_groups];
-
-    for t in 0..num_tokens {
-        let inp = &input[t * cols..(t + 1) * cols];
-        compute_input_sums_into(
-            inp,
-            &mut all_sums[t * num_groups..(t + 1) * num_groups],
+    // Scalar: each token's outputs are one contiguous row of `output`, filled
+    // by the same row-parallel matvec a single token uses.
+    let projection = QuantizedLinear {
+        rows,
+        cols,
+        group_params,
+        nibble_data,
+        group_size,
+    };
+    for (t, token_output) in output[..num_tokens * rows].chunks_mut(rows).enumerate() {
+        matvec_scalar(
+            vec![(token_output, &projection)],
+            &input[t * cols..(t + 1) * cols],
             cols,
             group_size,
         );
-        let even = &mut all_even_flat[t * half_cols..(t + 1) * half_cols];
-        let odd = &mut all_odd_flat[t * half_cols..(t + 1) * half_cols];
-        quantize_input_split(
-            inp,
-            even,
-            odd,
-            &mut all_scales[t * num_groups..(t + 1) * num_groups],
-            cols,
-            group_size,
-            num_groups,
+    }
+}
+
+/// Several projections of one batch of activations, which are quantized once
+/// for all of them: the batched forward's Q/K/V and its gate/up. Each output
+/// is laid out as [`w4a8_matmul`]'s, and computed exactly as it would be.
+///
+/// # Panics
+/// Panics if any projection fails the [`w4a8_matmul`] checks for
+/// `num_tokens` tokens, or the projections disagree on `cols` or
+/// `group_size`.
+pub fn w4a8_matmul_shared(
+    jobs: Vec<(&mut [f32], &QuantizedLinear<'_>)>,
+    input: &[f32],
+    num_tokens: usize,
+) {
+    let Some((_, first)) = jobs.first() else {
+        return;
+    };
+    let (cols, group_size) = (first.cols, first.group_size);
+    for (output, projection) in &jobs {
+        assert_eq!(projection.cols, cols, "projections disagree on cols");
+        assert_eq!(
+            projection.group_size, group_size,
+            "projections disagree on group size"
         );
+        validate_weight_buffers(
+            output.len(),
+            projection.nibble_data.len(),
+            projection.group_params.len(),
+            input.len(),
+            projection.rows,
+            cols,
+            num_tokens,
+            group_size,
+        );
+    }
+    if num_tokens == 1 {
+        return matvec_dispatch(jobs, input, cols, group_size);
     }
 
     #[cfg(target_arch = "x86_64")]
     {
         if has_avx2() {
-            let cr = chunk_rows_for(cols);
-            let num_chunks = rows.div_ceil(cr);
-
-            let out_ptr = SendPtr(output.as_mut_ptr());
-            let nib_ptr = SyncU8Ptr(nibble_data.as_ptr());
-            let inp_f32_ptr = SyncF32Ptr(input.as_ptr());
-            let inp_even_ptr = SyncI8Ptr(all_even_flat.as_ptr());
-            let inp_odd_ptr = SyncI8Ptr(all_odd_flat.as_ptr());
-            let scales_ptr = SyncGroupPtr(all_scales.as_ptr());
-            let sums_ptr = SyncGroupPtr(all_sums.as_ptr());
-
-            if legacy_matmul_enabled() {
-                // Benchmark-only: drive the batch through the single-token
-                // kernel once per token, as this function did before the
-                // weight-stationary rewrite.
-                (0..num_chunks).into_par_iter().for_each_init(
-                    || vec![0.0f32; num_groups],
-                    |scratch, ci| {
-                        let start = ci * cr;
-                        let len = cr.min(rows - start);
-                        for t in 0..num_tokens {
-                            unsafe {
-                                matvec_chunk_i8(
-                                    out_ptr.ptr().add(t * rows + start),
-                                    nib_ptr.ptr(),
-                                    group_params,
-                                    inp_f32_ptr.ptr().add(t * cols),
-                                    inp_even_ptr.ptr().add(t * half_cols),
-                                    inp_odd_ptr.ptr().add(t * half_cols),
-                                    core::slice::from_raw_parts(
-                                        scales_ptr.ptr().add(t * num_groups),
-                                        num_groups,
-                                    ),
-                                    core::slice::from_raw_parts(
-                                        sums_ptr.ptr().add(t * num_groups),
-                                        num_groups,
-                                    ),
-                                    start,
-                                    len,
-                                    cols,
-                                    group_size,
-                                    num_groups,
-                                    scratch,
-                                );
-                            }
-                        }
-                    },
+            let act = Int8Activations::quantize(input, num_tokens, cols, group_size);
+            for (output, projection) in jobs {
+                matmul_avx2(
+                    output,
+                    projection.nibble_data,
+                    projection.group_params,
+                    &act,
+                    projection.rows,
+                    cols,
+                    num_tokens,
+                    group_size,
                 );
-                return;
             }
-
-            // Weight-stationary parallel dispatch: each thread takes a chunk of
-            // rows and drives the whole batch through it, so the weight data it
-            // pulls into L1 is unpacked once and reused by every token.
-            (0..num_chunks).into_par_iter().for_each_init(
-                || vec![0.0f32; 2 * num_groups],
-                |scratch, ci| {
-                    let start = ci * cr;
-                    let len = cr.min(rows - start);
-                    unsafe {
-                        matmul_chunk_i8(
-                            out_ptr.ptr(),
-                            nib_ptr.ptr(),
-                            group_params,
-                            inp_f32_ptr.ptr(),
-                            inp_even_ptr.ptr(),
-                            inp_odd_ptr.ptr(),
-                            scales_ptr.ptr(),
-                            sums_ptr.ptr(),
-                            start,
-                            len,
-                            rows,
-                            cols,
-                            group_size,
-                            num_groups,
-                            num_tokens,
-                            scratch,
-                        );
-                    }
-                },
-            );
             return;
         }
     }
+    for (output, projection) in jobs {
+        w4a8_matmul(
+            output,
+            projection.nibble_data,
+            projection.group_params,
+            input,
+            projection.rows,
+            cols,
+            num_tokens,
+            group_size,
+        );
+    }
+}
 
-    // Scalar fallback
-    for v in output[..num_tokens * rows].iter_mut() {
-        *v = 0.0;
+/// The AVX2 half of [`w4a8_matmul`], on already-quantized activations.
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+fn matmul_avx2(
+    output: &mut [f32],
+    nibble_data: &[u8],
+    group_params: &[u8],
+    act: &Int8Activations,
+    rows: usize,
+    cols: usize,
+    num_tokens: usize,
+    group_size: usize,
+) {
+    let num_groups = cols.div_ceil(group_size);
+    let half_cols = cols / 2;
+    let cr = chunk_rows_for(cols);
+    let num_chunks = rows.div_ceil(cr);
+    // Every chunk writes its own rows for every token: disjoint, but strided
+    // by `rows`, so the output travels as a raw pointer rather than as slices.
+    let out_ptr = SendPtr(output.as_mut_ptr());
+
+    if legacy_matmul_enabled() {
+        // Benchmark-only: drive the batch through the single-token kernel once
+        // per token, as this function did before the weight-stationary rewrite.
+        (0..num_chunks).into_par_iter().for_each_init(
+            || vec![0.0f32; num_groups],
+            |scratch, ci| {
+                let start = ci * cr;
+                let len = cr.min(rows - start);
+                for t in 0..num_tokens {
+                    // SAFETY: as in `matvec_avx2`, for token `t`'s slice of
+                    // the activations and output row `t`.
+                    unsafe {
+                        matvec_chunk_i8(
+                            out_ptr.ptr().add(t * rows + start),
+                            nibble_data.as_ptr(),
+                            group_params,
+                            act.even.as_ptr().add(t * half_cols),
+                            act.odd.as_ptr().add(t * half_cols),
+                            &act.scales[t * num_groups..(t + 1) * num_groups],
+                            &act.qsums[t * num_groups..(t + 1) * num_groups],
+                            start,
+                            len,
+                            cols,
+                            group_size,
+                            num_groups,
+                            scratch,
+                        );
+                    }
+                }
+            },
+        );
+        return;
     }
-    for row in 0..rows {
-        for t in 0..num_tokens {
-            let inp = &input[t * cols..(t + 1) * cols];
-            let sums = &all_sums[t * num_groups..(t + 1) * num_groups];
-            output[t * rows + row] = matvec_row_scalar(
-                nibble_data,
-                group_params,
-                inp,
-                sums,
-                row,
-                cols,
-                group_size,
-                num_groups,
-            );
-        }
-    }
+
+    // Weight-stationary parallel dispatch: each thread takes a chunk of rows
+    // and drives the whole batch through it, so the weight data it pulls into
+    // L1 is unpacked once and reused by every token.
+    (0..num_chunks).into_par_iter().for_each_init(
+        || vec![0.0f32; 2 * num_groups],
+        |scratch, ci| {
+            let start = ci * cr;
+            let len = cr.min(rows - start);
+            // SAFETY: `validate_weight_buffers` proved the weights, the
+            // `num_tokens * rows` output and the `num_tokens * cols` input
+            // (quantized into `act`) all fit; chunks cover disjoint rows.
+            unsafe {
+                matmul_chunk_i8(
+                    out_ptr.ptr(),
+                    nibble_data.as_ptr(),
+                    group_params,
+                    act.even.as_ptr(),
+                    act.odd.as_ptr(),
+                    act.scales.as_ptr(),
+                    act.qsums.as_ptr(),
+                    start,
+                    len,
+                    rows,
+                    cols,
+                    group_size,
+                    num_groups,
+                    num_tokens,
+                    scratch,
+                );
+            }
+        },
+    );
 }
 
 /// Dequantize one embedding row (8-bit codes, per-group f16 scale/zero) into `output`.
@@ -2072,8 +1835,10 @@ pub fn embed_lookup(
 
 /// Project a hidden state through the (tied) 8-bit embedding matrix to logits.
 ///
-/// On AVX2 hosts the hidden state is quantized to int8 (range ±63) for the
-/// integer PMADDUBSW path; the scalar fallback uses the f32 hidden directly.
+/// On AVX2 hosts the hidden state is quantized to int8 (range ±63) per group
+/// for the integer PMADDUBSW path; the scalar fallback uses the f32 hidden
+/// directly. Both spread the vocabulary across the pool in [`LM_CHUNK`]-row
+/// chunks.
 ///
 /// # Panics
 /// Panics if `group_size` is zero, `hidden_size` is zero or odd, the group
@@ -2088,13 +1853,77 @@ pub fn tied_lm_head(
     hidden_size: usize,
     group_size: usize,
 ) {
+    lm_head_dispatch(
+        logits,
+        hidden,
+        embed_data,
+        embed_params,
+        vocab_size,
+        hidden_size,
+        group_size,
+        1,
+    );
+}
+
+/// [`tied_lm_head`] for `num_tokens` hidden states at once, token-major:
+/// `hidden[t * hidden_size..]` in, `logits[t * vocab_size..]` out.
+///
+/// The table is the largest single read in a small model (a 151,936-token
+/// vocabulary at hidden size 896 is 136 MB), and verifying several drafted
+/// tokens, or scoring a chunk of text, used to stream it once per token. Here
+/// each row is read once per batch and dotted with every token while it is in
+/// L1. Every logit is computed exactly as [`tied_lm_head`] computes it.
+///
+/// # Panics
+/// The [`tied_lm_head`] conditions, for `num_tokens` tokens, or if
+/// `num_tokens` is zero.
+pub fn tied_lm_head_batch(
+    logits: &mut [f32],
+    hidden: &[f32],
+    embed_data: &[u8],
+    embed_params: &[u8],
+    vocab_size: usize,
+    hidden_size: usize,
+    group_size: usize,
+    num_tokens: usize,
+) {
+    lm_head_dispatch(
+        logits,
+        hidden,
+        embed_data,
+        embed_params,
+        vocab_size,
+        hidden_size,
+        group_size,
+        num_tokens,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lm_head_dispatch(
+    logits: &mut [f32],
+    hidden: &[f32],
+    embed_data: &[u8],
+    embed_params: &[u8],
+    vocab_size: usize,
+    hidden_size: usize,
+    group_size: usize,
+    num_tokens: usize,
+) {
     assert!(group_size > 0, "group_size must be non-zero");
+    assert!(num_tokens > 0, "num_tokens must be non-zero");
     assert!(
         hidden_size > 0 && hidden_size.is_multiple_of(2),
         "hidden_size must be non-zero and even"
     );
-    assert!(hidden.len() >= hidden_size, "hidden buffer is too small");
-    assert!(logits.len() >= vocab_size, "logit buffer is too small");
+    let hidden_len = num_tokens
+        .checked_mul(hidden_size)
+        .expect("hidden dimensions overflow");
+    let logits_len = num_tokens
+        .checked_mul(vocab_size)
+        .expect("logit dimensions overflow");
+    assert!(hidden.len() >= hidden_len, "hidden buffer is too small");
+    assert!(logits.len() >= logits_len, "logit buffer is too small");
     let num_groups = hidden_size.div_ceil(group_size);
     assert!(
         num_groups <= MAX_GROUPS,
@@ -2115,71 +1944,70 @@ pub fn tied_lm_head(
                 .expect("embedding parameter dimensions overflow"),
         "embedding parameters are truncated"
     );
-
-    let hidden_sums = compute_input_sums(hidden, hidden_size, group_size);
+    let logits = &mut logits[..logits_len];
+    let hidden = &hidden[..hidden_len];
 
     #[cfg(target_arch = "x86_64")]
     {
         if has_avx2() {
-            // Quantize hidden state to i8 for integer PMADDUBSW path
-            let mut hidden_i8 = vec![0i8; hidden_size];
-            let mut hidden_scales = [0.0f32; MAX_GROUPS];
-            quantize_hidden_i8(
-                hidden,
-                &mut hidden_i8,
-                &mut hidden_scales,
-                hidden_size,
-                group_size,
-                num_groups,
-            );
-
-            let num_chunks = vocab_size.div_ceil(LM_CHUNK);
-            let out_ptr = SendPtr(logits.as_mut_ptr());
-            let emb_ptr = SyncU8Ptr(embed_data.as_ptr());
-            let hid_i8_ptr = SyncU8Ptr(hidden_i8.as_ptr() as *const u8);
-            let sums = &hidden_sums[..num_groups];
-            // Slice to the model's real group count: the kernel reads
-            // [0, num_groups) and a longer slice would only invite a caller to
-            // pass one that disagrees with num_groups.
-            let hscales = &hidden_scales[..num_groups];
-            (0..num_chunks).into_par_iter().for_each_init(
-                || vec![0.0f32; num_groups],
-                |scratch, ci| {
-                    let start = ci * LM_CHUNK;
-                    let len = LM_CHUNK.min(vocab_size - start);
-                    unsafe {
-                        lm_head_chunk_i8(
-                            out_ptr.ptr().add(start),
-                            emb_ptr.ptr(),
-                            embed_params,
-                            hid_i8_ptr.ptr(),
-                            sums,
-                            hscales,
-                            start,
-                            len,
-                            hidden_size,
-                            group_size,
-                            num_groups,
-                            scratch,
-                        );
-                    }
-                },
-            );
+            let quantized = Int8Hidden::quantize(hidden, num_tokens, hidden_size, group_size);
+            // Each chunk writes its own vocabulary rows for every token:
+            // disjoint, but strided by `vocab_size` across tokens.
+            let out = SendPtr(logits.as_mut_ptr());
+            (0..vocab_size.div_ceil(LM_CHUNK))
+                .into_par_iter()
+                .for_each_init(
+                    || vec![0.0f32; 2 * num_groups],
+                    |scratch, ci| {
+                        let start = ci * LM_CHUNK;
+                        // SAFETY: `has_avx2()` returned true; the asserts above
+                        // proved the table holds `vocab_size` rows of codes and
+                        // parameters and the logits `num_tokens * vocab_size`
+                        // values; chunks cover disjoint vocabulary rows.
+                        unsafe {
+                            lm_head_chunk_i8(
+                                out.ptr(),
+                                vocab_size,
+                                embed_data.as_ptr(),
+                                embed_params,
+                                &quantized,
+                                start,
+                                LM_CHUNK.min(vocab_size - start),
+                                hidden_size,
+                                group_size,
+                                num_groups,
+                                scratch,
+                            );
+                        }
+                    },
+                );
             return;
         }
     }
 
-    for v in 0..vocab_size {
-        logits[v] = lm_head_row_scalar(
-            embed_data,
-            embed_params,
-            hidden,
-            &hidden_sums,
-            v,
-            hidden_size,
-            group_size,
-            num_groups,
-        );
+    for (token_logits, token_hidden) in logits
+        .chunks_exact_mut(vocab_size)
+        .zip(hidden.chunks_exact(hidden_size))
+    {
+        let mut sums = vec![0.0f32; num_groups];
+        group_sums_into(token_hidden, &mut sums, hidden_size, group_size);
+        token_logits
+            .par_chunks_mut(LM_CHUNK)
+            .enumerate()
+            .for_each(|(ci, chunk)| {
+                for (offset, logit) in chunk.iter_mut().enumerate() {
+                    *logit = lm_head_row_scalar(
+                        embed_data,
+                        embed_params,
+                        token_hidden,
+                        &sums,
+                        ci * LM_CHUNK + offset,
+                        hidden_size,
+                        group_size,
+                        num_groups,
+                    );
+                }
+            });
     }
 }
 
@@ -3003,5 +2831,353 @@ mod tests {
             })
             .collect();
         assert_close(&logits, &expected, 5e-3, "tied_lm_head vs reference");
+    }
+
+    // -----------------------------------------------------------------------
+    // Activation quantization must not inflate the error
+    // -----------------------------------------------------------------------
+
+    /// A deterministic, non-repeating sequence in [-1, 1): activations that do
+    /// NOT quantize exactly, unlike `exact_quant_input`, so the quantization
+    /// error is real and its treatment is what the tests below measure.
+    fn messy_values(count: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (0..count)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 40) as f64 / (1u64 << 24) as f64 * 2.0 - 1.0) as f32
+            })
+            .collect()
+    }
+
+    /// Weights quantized like the converter does it: per-group min/max codes,
+    /// so each group's zero point is its (negative) minimum — the layout under
+    /// which an inconsistent zero term costs the most.
+    fn min_max_weights(
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        seed: u64,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let num_groups = cols.div_ceil(group_size);
+        let mut nibbles = vec![0u8; rows * cols / 2];
+        let mut params = vec![0u8; rows * num_groups * 4];
+        let codes = messy_values(rows * cols, seed);
+        for r in 0..rows {
+            for g in 0..num_groups {
+                let scale = f16::from_f32(0.02 + 0.001 * ((r + g) % 5) as f32);
+                let zero = f16::from_f32(-0.15 - 0.01 * ((r * 3 + g) % 4) as f32);
+                let off = (r * num_groups + g) * 4;
+                params[off..off + 2].copy_from_slice(&scale.to_le_bytes());
+                params[off + 2..off + 4].copy_from_slice(&zero.to_le_bytes());
+            }
+            for c in 0..cols {
+                let code = ((codes[r * cols + c] + 1.0) * 7.999) as u8 & 0x0F;
+                let byte = &mut nibbles[(r * cols + c) / 2];
+                if c % 2 == 0 {
+                    *byte |= code;
+                } else {
+                    *byte |= code << 4;
+                }
+            }
+        }
+        (nibbles, params)
+    }
+
+    /// `dequant(weights) · activations` in f64, with the activations first put
+    /// through exactly the int8 rounding the AVX2 kernels apply.
+    fn reference_over_quantized_input(
+        nibbles: &[u8],
+        params: &[u8],
+        input: &[f32],
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+    ) -> Vec<f32> {
+        let num_groups = cols.div_ceil(group_size);
+        let mut quantized = vec![0.0f64; cols];
+        for g in 0..num_groups {
+            let (start, end) = (g * group_size, ((g + 1) * group_size).min(cols));
+            let absmax = input[start..end].iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let scale = if absmax > 1e-10 { absmax / 127.0 } else { 1.0 };
+            let inv = 1.0 / scale;
+            for i in start..end {
+                let q = (input[i] * inv).round_ties_even().clamp(-128.0, 127.0);
+                quantized[i] = q as f64 * scale as f64;
+            }
+        }
+        (0..rows)
+            .map(|r| {
+                let mut acc = 0.0f64;
+                for c in 0..cols {
+                    let off = (r * num_groups + c / group_size) * 4;
+                    let scale = read_f16_le(params, off) as f64;
+                    let zero = read_f16_le(params, off + 2) as f64;
+                    let byte = nibbles[(r * cols + c) / 2];
+                    let code = if c % 2 == 0 { byte & 0x0F } else { byte >> 4 } as f64;
+                    acc += (scale * code + zero) * quantized[c];
+                }
+                acc as f32
+            })
+            .collect()
+    }
+
+    /// The AVX2 kernels compute exactly `Σ w·x̂`: the zero term must see the
+    /// same quantized activations as the code term. With the exact f32 sum in
+    /// the zero term instead, the result is off by `zero · Σ(x − x̂)` per
+    /// group, two orders of magnitude outside this tolerance.
+    #[test]
+    fn int8_kernels_compute_the_product_of_the_quantized_activations() {
+        if !has_avx2() {
+            return;
+        }
+        let (rows, cols, group_size, tokens) = (96, 384, 64, 5);
+        let (nibbles, params) = min_max_weights(rows, cols, group_size, 7);
+        let input = messy_values(tokens * cols, 11);
+
+        let mut single = vec![0.0f32; rows];
+        w4a8_matvec(
+            &mut single,
+            &nibbles,
+            &params,
+            &input[..cols],
+            rows,
+            cols,
+            group_size,
+        );
+        let expected = reference_over_quantized_input(
+            &nibbles,
+            &params,
+            &input[..cols],
+            rows,
+            cols,
+            group_size,
+        );
+        assert_close(&single, &expected, 2e-4, "matvec over quantized input");
+
+        let mut batched = vec![0.0f32; tokens * rows];
+        w4a8_matmul(
+            &mut batched,
+            &nibbles,
+            &params,
+            &input,
+            rows,
+            cols,
+            tokens,
+            group_size,
+        );
+        for t in 0..tokens {
+            let expected = reference_over_quantized_input(
+                &nibbles,
+                &params,
+                &input[t * cols..(t + 1) * cols],
+                rows,
+                cols,
+                group_size,
+            );
+            assert_close(
+                &batched[t * rows..(t + 1) * rows],
+                &expected,
+                2e-4,
+                "matmul over quantized input",
+            );
+        }
+    }
+
+    /// The AVX2 head computes exactly `Σ w·ĥ` over its ±63-quantized hidden
+    /// state: the zero term sees the quantized hidden too. With the exact f32
+    /// sum in the zero term, the logits are off by `zero · Σ(h − ĥ)` per
+    /// group, far outside this tolerance.
+    #[test]
+    fn tied_lm_head_computes_the_product_of_the_quantized_hidden() {
+        if !has_avx2() {
+            return;
+        }
+        let (vocab, hidden_size, group_size) = (700, 256, 64);
+        let num_groups = hidden_size / group_size;
+        let codes: Vec<u8> = messy_values(vocab * hidden_size, 5)
+            .iter()
+            .map(|v| ((v + 1.0) * 127.99) as u8)
+            .collect();
+        let mut params = vec![0u8; vocab * num_groups * 4];
+        for (i, chunk) in params.chunks_exact_mut(4).enumerate() {
+            chunk[..2]
+                .copy_from_slice(&f16::from_f32(0.004 + 0.0001 * (i % 7) as f32).to_le_bytes());
+            chunk[2..].copy_from_slice(&f16::from_f32(-0.5 - 0.01 * (i % 3) as f32).to_le_bytes());
+        }
+        let hidden = messy_values(hidden_size, 9);
+        let mut logits = vec![0.0f32; vocab];
+        tied_lm_head(
+            &mut logits,
+            &hidden,
+            &codes,
+            &params,
+            vocab,
+            hidden_size,
+            group_size,
+        );
+        // The hidden state as the head sees it: per-group absmax/63, rounded
+        // half to even.
+        let mut quantized = vec![0.0f64; hidden_size];
+        for g in 0..num_groups {
+            let group = &hidden[g * group_size..(g + 1) * group_size];
+            let absmax = group.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let scale = if absmax > 1e-10 { absmax / 63.0 } else { 1.0 };
+            let inv = 1.0 / scale;
+            for (i, value) in group.iter().enumerate() {
+                let q = (value * inv).round_ties_even().clamp(-63.0, 63.0);
+                quantized[g * group_size + i] = q as f64 * scale as f64;
+            }
+        }
+        let expected: Vec<f32> = (0..vocab)
+            .map(|v| {
+                let mut acc = 0.0f64;
+                for c in 0..hidden_size {
+                    let off = (v * num_groups + c / group_size) * 4;
+                    let w = read_f16_le(&params, off) as f64 * codes[v * hidden_size + c] as f64
+                        + read_f16_le(&params, off + 2) as f64;
+                    acc += w * quantized[c];
+                }
+                acc as f32
+            })
+            .collect();
+        assert_close(&logits, &expected, 2e-4, "tied head over quantized hidden");
+    }
+
+    /// The scalar kernels (aarch64, x86 without AVX2) spread rows across the
+    /// pool like the AVX2 ones, and stay exact against the f32 input.
+    #[test]
+    fn scalar_matvec_is_parallel_and_exact() {
+        let (rows, cols, group_size) = (2048, 1024, 128);
+        assert!(matvec_should_parallelize(rows, cols));
+        let (nibbles, params) = min_max_weights(rows, cols, group_size, 3);
+        let input = messy_values(cols, 4);
+        let projection = QuantizedLinear {
+            rows,
+            cols,
+            group_params: &params,
+            nibble_data: &nibbles,
+            group_size,
+        };
+        let mut output = vec![0.0f32; rows];
+        matvec_scalar(vec![(&mut output, &projection)], &input, cols, group_size);
+        let num_groups = cols / group_size;
+        let expected: Vec<f32> = (0..rows)
+            .map(|r| {
+                let mut acc = 0.0f64;
+                for c in 0..cols {
+                    let off = (r * num_groups + c / group_size) * 4;
+                    let byte = nibbles[(r * cols + c) / 2];
+                    let code = if c % 2 == 0 { byte & 0x0F } else { byte >> 4 } as f64;
+                    let w = read_f16_le(&params, off) as f64 * code
+                        + read_f16_le(&params, off + 2) as f64;
+                    acc += w * input[c] as f64;
+                }
+                acc as f32
+            })
+            .collect();
+        assert_close(&output, &expected, 1e-4, "parallel scalar matvec");
+    }
+
+    /// The batched head is a scheduling change only: every logit equals the
+    /// single-token head's, bit for bit, across more than one vocabulary chunk.
+    #[test]
+    fn batched_tied_head_matches_the_single_token_head_exactly() {
+        let (vocab, hidden_size, group_size, tokens) = (2 * LM_CHUNK + 77, 192, 64, 5);
+        let num_groups = hidden_size / group_size;
+        let codes: Vec<u8> = messy_values(vocab * hidden_size, 21)
+            .iter()
+            .map(|v| ((v + 1.0) * 127.99) as u8)
+            .collect();
+        let mut params = vec![0u8; vocab * num_groups * 4];
+        for (i, chunk) in params.chunks_exact_mut(4).enumerate() {
+            chunk[..2]
+                .copy_from_slice(&f16::from_f32(0.003 + 0.0002 * (i % 5) as f32).to_le_bytes());
+            chunk[2..].copy_from_slice(&f16::from_f32(-0.4 - 0.02 * (i % 3) as f32).to_le_bytes());
+        }
+        let hidden = messy_values(tokens * hidden_size, 22);
+        let mut batched = vec![0.0f32; tokens * vocab];
+        tied_lm_head_batch(
+            &mut batched,
+            &hidden,
+            &codes,
+            &params,
+            vocab,
+            hidden_size,
+            group_size,
+            tokens,
+        );
+        for t in 0..tokens {
+            let mut single = vec![0.0f32; vocab];
+            tied_lm_head(
+                &mut single,
+                &hidden[t * hidden_size..(t + 1) * hidden_size],
+                &codes,
+                &params,
+                vocab,
+                hidden_size,
+                group_size,
+            );
+            assert_eq!(
+                &batched[t * vocab..(t + 1) * vocab],
+                &single[..],
+                "token {t}"
+            );
+        }
+    }
+
+    /// Quantizing a shared input once for several projections changes nothing
+    /// about any of them.
+    #[test]
+    fn shared_projections_match_separate_matmuls_exactly() {
+        let (cols, group_size, tokens) = (256, 64, 6);
+        let input = messy_values(tokens * cols, 31);
+        let shapes = [(96usize, 1u64), (32, 2), (32, 3)];
+        let weights: Vec<(Vec<u8>, Vec<u8>)> = shapes
+            .iter()
+            .map(|&(rows, seed)| min_max_weights(rows, cols, group_size, seed))
+            .collect();
+        let projections: Vec<QuantizedLinear<'_>> = shapes
+            .iter()
+            .zip(&weights)
+            .map(|(&(rows, _), (nibbles, params))| QuantizedLinear {
+                rows,
+                cols,
+                group_params: params,
+                nibble_data: nibbles,
+                group_size,
+            })
+            .collect();
+        let mut shared: Vec<Vec<f32>> = shapes
+            .iter()
+            .map(|&(rows, _)| vec![0.0f32; rows * tokens])
+            .collect();
+        w4a8_matmul_shared(
+            shared
+                .iter_mut()
+                .zip(&projections)
+                .map(|(output, projection)| (&mut output[..], projection))
+                .collect(),
+            &input,
+            tokens,
+        );
+        for (output, projection) in shared.iter().zip(&projections) {
+            let mut separate = vec![0.0f32; projection.rows * tokens];
+            w4a8_matmul(
+                &mut separate,
+                projection.nibble_data,
+                projection.group_params,
+                &input,
+                projection.rows,
+                cols,
+                tokens,
+                group_size,
+            );
+            assert_eq!(output, &separate);
+        }
     }
 }

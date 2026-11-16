@@ -86,7 +86,10 @@ impl LayerKVCache {
             .checked_mul(positions)
             .and_then(|value| value.checked_mul(head_dim))
             .ok_or_else(|| anyhow!("KV cache dimensions overflow"))?;
-        let mib = (total * 2 * std::mem::size_of::<f32>()) >> 20;
+        let mib = total
+            .checked_mul(2 * std::mem::size_of::<f32>())
+            .ok_or_else(|| anyhow!("KV cache byte size overflows"))?
+            >> 20;
         let mut k = Vec::new();
         let mut v = Vec::new();
         k.try_reserve_exact(total)
@@ -131,6 +134,29 @@ impl LayerKVCache {
         self.capacity
     }
 
+    /// Make positions `0..positions` addressable, growing if needed.
+    ///
+    /// The fallible half of growth: the cache only allocates its first
+    /// [`INITIAL_POSITIONS`] up front, so a long conversation reaches new
+    /// allocations long after the window was weighed against free memory at
+    /// load. Reserving before a forward pass stores anything turns running out
+    /// then into an error the caller can report, rather than a panic in the
+    /// middle of a layer.
+    ///
+    /// # Errors
+    /// Fails if `positions` exceeds the window or the memory cannot be had.
+    pub fn reserve(&mut self, positions: usize) -> Result<()> {
+        ensure!(
+            positions <= self.max_ctx,
+            "{positions} positions exceed the {}-position KV cache",
+            self.max_ctx
+        );
+        match positions.checked_sub(1) {
+            Some(last) => self.grow_to_hold(last),
+            None => Ok(()),
+        }
+    }
+
     /// Store K and V vectors at the given position.
     ///
     /// `k_vec` is `[num_kv_heads * head_dim]`, `v_vec` is `[num_kv_heads * head_dim]`.
@@ -139,15 +165,13 @@ impl LayerKVCache {
     ///
     /// # Panics
     /// Panics if `pos` is out of range, if storing at `pos` would leave a gap
-    /// of unwritten positions below it, or on a vector length mismatch.
+    /// of unwritten positions below it, on a vector length mismatch, or if
+    /// growing to `pos` fails — which [`Self::reserve`] beforehand rules out;
+    /// every forward pass in this crate reserves before it stores.
     pub fn store(&mut self, pos: usize, k_vec: &[f32], v_vec: &[f32]) {
         assert!(pos < self.max_ctx, "KV cache position is out of range");
-        // Growth is fallible, but `store` is on the hot path and every caller
-        // has already had the window checked against memory at load time. A
-        // failure here means the machine lost memory mid-conversation, which
-        // is not a recoverable state for a half-written layer.
         self.grow_to_hold(pos)
-            .expect("KV cache growth failed mid-generation");
+            .expect("KV cache growth failed: reserve the positions before storing them");
         assert!(
             pos <= self.filled,
             "KV store at position {pos} would leave a gap (filled {})",
@@ -203,6 +227,43 @@ impl LayerKVCache {
         &self.v[start..start + self.head_dim]
     }
 
+    /// The cached keys of `head` at positions `0..len`, as one contiguous
+    /// slab of `len * head_dim` values, position-major.
+    ///
+    /// A head's positions are stored back to back (the layout is
+    /// `[head][position][head_dim]`), so the whole history attention reads is a
+    /// single slice. Borrowing it once moves the range and watermark checks out
+    /// of the per-position loop.
+    ///
+    /// # Panics
+    /// Panics if `head` is out of range or `len` exceeds the filled positions.
+    #[inline]
+    pub fn head_keys(&self, head: usize, len: usize) -> &[f32] {
+        let start = self.head_slab_start(head, len);
+        &self.k[start..start + len * self.head_dim]
+    }
+
+    /// The cached values of `head` at positions `0..len`; see
+    /// [`Self::head_keys`].
+    ///
+    /// # Panics
+    /// Panics if `head` is out of range or `len` exceeds the filled positions.
+    #[inline]
+    pub fn head_values(&self, head: usize, len: usize) -> &[f32] {
+        let start = self.head_slab_start(head, len);
+        &self.v[start..start + len * self.head_dim]
+    }
+
+    fn head_slab_start(&self, head: usize, len: usize) -> usize {
+        assert!(head < self.num_kv_heads, "KV cache head is out of range");
+        assert!(
+            len <= self.filled,
+            "KV read of {len} positions exceeds the filled {}",
+            self.filled
+        );
+        head * self.capacity * self.head_dim
+    }
+
     /// Number of leading positions that contain stored data.
     #[inline]
     pub fn filled(&self) -> usize {
@@ -220,6 +281,21 @@ impl LayerKVCache {
         self.k.iter_mut().for_each(|v| *v = 0.0);
         self.v.iter_mut().for_each(|v| *v = 0.0);
         self.filled = 0;
+    }
+
+    /// Empty the cache and give back what it grew to, keeping only the first
+    /// [`INITIAL_POSITIONS`]. A failed allocation leaves it emptied but
+    /// unshrunk, which is still correct.
+    pub fn release(&mut self) {
+        self.filled = 0;
+        let initial = self.max_ctx.min(INITIAL_POSITIONS);
+        if self.capacity > initial {
+            if let Ok((k, v)) = Self::allocate(self.num_kv_heads, initial, self.head_dim) {
+                self.k = k;
+                self.v = v;
+                self.capacity = initial;
+            }
+        }
     }
 
     /// Memory usage in bytes.
@@ -286,12 +362,69 @@ impl KVCache {
         self.layers[layer].get_v(head, pos)
     }
 
+    /// A head's cached keys for positions `0..len` in one layer, as one
+    /// contiguous position-major slab; see [`LayerKVCache::head_keys`].
+    ///
+    /// # Panics
+    /// Panics if `layer` or `head` is out of range, `head_dim` does not match
+    /// the cache, or `len` exceeds the filled positions.
+    pub fn head_keys(&self, layer: usize, head: usize, len: usize, head_dim: usize) -> &[f32] {
+        assert_eq!(
+            self.layers[layer].head_dim, head_dim,
+            "KV cache head_dim mismatch"
+        );
+        self.layers[layer].head_keys(head, len)
+    }
+
+    /// A head's cached values for positions `0..len` in one layer; see
+    /// [`Self::head_keys`].
+    ///
+    /// # Panics
+    /// Same conditions as [`Self::head_keys`].
+    pub fn head_values(&self, layer: usize, head: usize, len: usize, head_dim: usize) -> &[f32] {
+        assert_eq!(
+            self.layers[layer].head_dim, head_dim,
+            "KV cache head_dim mismatch"
+        );
+        self.layers[layer].head_values(head, len)
+    }
+
     /// Number of leading positions with stored data in a layer.
     ///
     /// # Panics
     /// Panics if `layer` is out of range.
     pub fn filled(&self, layer: usize) -> usize {
         self.layers[layer].filled()
+    }
+
+    /// Make positions `0..positions` addressable in every layer; see
+    /// [`LayerKVCache::reserve`].
+    ///
+    /// # Errors
+    /// Fails if `positions` exceeds the window or the memory cannot be had.
+    pub fn reserve(&mut self, positions: usize) -> Result<()> {
+        for layer in &mut self.layers {
+            layer.reserve(positions)?;
+        }
+        Ok(())
+    }
+
+    /// Positions every layer holds: the smallest per-layer watermark.
+    ///
+    /// The layers fill in lockstep, so this equals each layer's own count
+    /// except mid-way through a forward pass; a prefill that resumes from a
+    /// position must not start above it.
+    pub fn filled_min(&self) -> usize {
+        self.layers
+            .iter()
+            .map(LayerKVCache::filled)
+            .min()
+            .unwrap_or(0)
+    }
+
+    /// The window this cache may grow to, in positions.
+    pub fn max_context(&self) -> usize {
+        self.layers.first().map_or(0, |layer| layer.max_ctx)
     }
 
     /// Truncate every layer to at most `len` filled positions.
@@ -320,6 +453,14 @@ impl KVCache {
     pub fn clear(&mut self) {
         for layer in &mut self.layers {
             layer.clear();
+        }
+    }
+
+    /// Empty every layer and return its grown memory; see
+    /// [`LayerKVCache::release`].
+    pub fn release(&mut self) {
+        for layer in &mut self.layers {
+            layer.release();
         }
     }
 

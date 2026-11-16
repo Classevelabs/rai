@@ -123,25 +123,64 @@ pub fn add_bias(output: &mut [f32], bias: Option<&[f32]>) {
         if has_avx2() {
             // SAFETY: `has_avx2()` gates AVX2, and the assert above proves both
             // slices hold `output.len()` values.
-            unsafe {
-                let n = output.len();
-                let mut i = 0usize;
-                for _ in 0..(n / 8) {
-                    let o = _mm256_loadu_ps(output.as_ptr().add(i));
-                    let b = _mm256_loadu_ps(bias.as_ptr().add(i));
-                    _mm256_storeu_ps(output.as_mut_ptr().add(i), _mm256_add_ps(o, b));
-                    i += 8;
-                }
-                while i < n {
-                    *output.as_mut_ptr().add(i) += *bias.as_ptr().add(i);
-                    i += 1;
-                }
-            }
+            unsafe { add_assign_avx2(output, bias) };
             return;
         }
     }
     for (value, &b) in output.iter_mut().zip(bias) {
         *value += b;
+    }
+}
+
+/// `dst[i] += src[i]` over `dst.len()` values.
+///
+/// The AVX2 bodies of the element-wise adds live in `#[target_feature]`
+/// functions so the intrinsics inline. Written inside an ordinary function, as
+/// they once were, each `_mm256_*` call compiles to an out-of-line call with
+/// its vectors passed through memory, because that caller is built for the
+/// x86-64-v2 baseline and cannot inline AVX code.
+///
+/// # Safety
+/// Must only be called after `has_avx2()` returned true, with `src` at least
+/// as long as `dst`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn add_assign_avx2(dst: &mut [f32], src: &[f32]) {
+    let n = dst.len();
+    let full = n - n % 8;
+    let mut i = 0usize;
+    while i < full {
+        let d = _mm256_loadu_ps(dst.as_ptr().add(i));
+        let s = _mm256_loadu_ps(src.as_ptr().add(i));
+        _mm256_storeu_ps(dst.as_mut_ptr().add(i), _mm256_add_ps(d, s));
+        i += 8;
+    }
+    while i < n {
+        *dst.as_mut_ptr().add(i) += *src.as_ptr().add(i);
+        i += 1;
+    }
+}
+
+/// `out[i] = a[i] + b[i]` over `out.len()` values; see [`add_assign_avx2`].
+///
+/// # Safety
+/// Must only be called after `has_avx2()` returned true, with `a` and `b` at
+/// least as long as `out`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn add_avx2(out: &mut [f32], a: &[f32], b: &[f32]) {
+    let n = out.len();
+    let full = n - n % 8;
+    let mut i = 0usize;
+    while i < full {
+        let x = _mm256_loadu_ps(a.as_ptr().add(i));
+        let y = _mm256_loadu_ps(b.as_ptr().add(i));
+        _mm256_storeu_ps(out.as_mut_ptr().add(i), _mm256_add_ps(x, y));
+        i += 8;
+    }
+    while i < n {
+        *out.as_mut_ptr().add(i) = *a.as_ptr().add(i) + *b.as_ptr().add(i);
+        i += 1;
     }
 }
 
@@ -510,21 +549,9 @@ pub fn vec_add(hidden: &mut [f32], residual: &[f32], addition: &[f32]) {
     #[cfg(target_arch = "x86_64")]
     {
         if has_avx2() {
-            unsafe {
-                let mut i = 0usize;
-                let chunks8 = n / 8;
-                for _ in 0..chunks8 {
-                    let r = _mm256_loadu_ps(residual.as_ptr().add(i));
-                    let a = _mm256_loadu_ps(addition.as_ptr().add(i));
-                    _mm256_storeu_ps(hidden.as_mut_ptr().add(i), _mm256_add_ps(r, a));
-                    i += 8;
-                }
-                while i < n {
-                    *hidden.as_mut_ptr().add(i) =
-                        *residual.as_ptr().add(i) + *addition.as_ptr().add(i);
-                    i += 1;
-                }
-            }
+            // SAFETY: `has_avx2()` gates AVX2, and the asserts above prove all
+            // three slices hold `n` values.
+            unsafe { add_avx2(hidden, residual, addition) };
             return;
         }
     }
@@ -846,25 +873,89 @@ pub fn silu_mul_inplace(gate: &mut [f32], up: &[f32], n: usize) {
     }
 }
 
-/// Scalar twin of the AVX2 Schraudolph fast-`exp` used in the softmax and SiLU
-/// SIMD bodies (`exp_a * x + exp_b`, clamp to `[0, 2139095040]`, `cvtps_epi32`
-/// round-to-nearest-even, then reinterpret the integer bits as f32). Evaluated
-/// identically so a buffer's SIMD body and its scalar tail cannot use two
-/// different exp curves — the same body/tail doctrine `tanh_poly` upholds for
-/// `tanh_avx2`. `x` is the exponent argument (already <= 0 at both call sites).
-// Gated to x86_64: the only callers are the AVX2 SiLU and softmax tails, which
-// are #[cfg(target_arch = "x86_64")], so on other arches this is otherwise dead.
+/// `ln(f32::MAX)`: the largest argument whose `exp` is finite.
+const EXP_MAX_ARG: f32 = 88.722_84;
+/// `ln(f32::MIN_POSITIVE)`: below it `exp` is subnormal and [`exp_avx2`]
+/// returns exactly 0. A softmax weight or sigmoid tail under 1.2e-38 is zero
+/// for every purpose here, and an exact zero keeps the sums exact.
+const EXP_MIN_ARG: f32 = -87.336_55;
+
+/// Eight-lane `exp`, within 2 ulp of the true value over the whole f32 range.
+///
+/// Cody-Waite range reduction `x = n ln2 + r`, `|r| <= ln2/2`, then the Cephes
+/// `expf` polynomial for `exp(r)`, scaled by `2^n`. The scale is applied as
+/// two halves so that `n = 128` (arguments just under [`EXP_MAX_ARG`]) still
+/// builds two normal powers of two rather than an infinite one.
+///
+/// This replaced Schraudolph's bit-trick `exp`, whose error measured 3.9% on
+/// `exp` itself and 4.2% on individual attention weights: every softmax and
+/// every SiLU in the model was a few percent off the arithmetic the model was
+/// trained with, and off the scalar path that no-AVX2 machines run. NaN
+/// propagates; `-inf` and anything below [`EXP_MIN_ARG`] give 0; anything
+/// above [`EXP_MAX_ARG`] gives `+inf`.
+///
+/// # Safety
+/// Must only be called from an AVX2+FMA context.
 #[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
 #[inline]
-fn schraudolph_exp(x: f32) -> f32 {
-    const EXP_A: f32 = 12102203.0; // 2^23 / ln(2)
-    const EXP_B: f32 = 1065353216.0 - 486411.0; // 2^23 * 127 - correction
-    let t = (EXP_A * x + EXP_B).clamp(0.0, 2139095040.0);
-    f32::from_bits(t.round_ties_even() as i32 as u32)
+unsafe fn exp_avx2(x: __m256) -> __m256 {
+    const LOG2E: f32 = std::f32::consts::LOG2_E;
+    // ln 2 split so that `n * LN2_HI` is exact for every |n| <= 128.
+    const LN2_HI: f32 = 0.693_359_4;
+    const LN2_LO: f32 = -2.121_944_4e-4;
+    // Cephes `expf` coefficients; the last, 0.50000001201, rounds to exactly
+    // 0.5 in f32.
+    const P: [f32; 6] = [
+        1.987_569_1e-4,
+        1.398_199_9e-3,
+        8.333_452e-3,
+        4.166_579_6e-2,
+        0.166_666_65,
+        0.5,
+    ];
+
+    let lo = _mm256_set1_ps(EXP_MIN_ARG);
+    let hi = _mm256_set1_ps(EXP_MAX_ARG);
+    // `max_ps`/`min_ps` return their second operand when either is NaN, so a
+    // NaN argument survives the clamp and propagates through the arithmetic.
+    let xc = _mm256_min_ps(hi, _mm256_max_ps(lo, x));
+
+    let n = _mm256_round_ps(
+        _mm256_mul_ps(xc, _mm256_set1_ps(LOG2E)),
+        _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
+    );
+    let r = _mm256_fnmadd_ps(n, _mm256_set1_ps(LN2_HI), xc);
+    let r = _mm256_fnmadd_ps(n, _mm256_set1_ps(LN2_LO), r);
+
+    let mut p = _mm256_set1_ps(P[0]);
+    for &coefficient in &P[1..] {
+        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(coefficient));
+    }
+    // exp(r) = 1 + r + r^2 * P(r)
+    let r2 = _mm256_mul_ps(r, r);
+    let y = _mm256_add_ps(_mm256_fmadd_ps(p, r2, r), _mm256_set1_ps(1.0));
+
+    // 2^n as 2^(n >> 1) * 2^(n - (n >> 1)): each half lies in [-63, 64], so
+    // both are normal and their product is exactly 2^n.
+    let ni = _mm256_cvtps_epi32(n);
+    let n1 = _mm256_srai_epi32(ni, 1);
+    let n2 = _mm256_sub_epi32(ni, n1);
+    let bias = _mm256_set1_epi32(127);
+    let pow1 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_add_epi32(n1, bias), 23));
+    let pow2 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_add_epi32(n2, bias), 23));
+    let result = _mm256_mul_ps(_mm256_mul_ps(y, pow1), pow2);
+
+    let underflow = _mm256_cmp_ps(x, lo, _CMP_LT_OQ);
+    let overflow = _mm256_cmp_ps(x, hi, _CMP_GT_OQ);
+    let result = _mm256_andnot_ps(underflow, result);
+    _mm256_blendv_ps(result, _mm256_set1_ps(f32::INFINITY), overflow)
 }
 
-/// AVX2 fast SiLU(x) * y using Schraudolph exp approximation.
-/// SiLU(x) = x / (1 + exp(-x)). Approximation error < 2% for |x| < 10.
+/// AVX2 `silu(x) * y`, with `exp` from [`exp_avx2`].
+///
+/// The trailing `n % 8` values go through the same eight-lane body on a padded
+/// copy, so one buffer never mixes two `exp` implementations.
 ///
 /// # Safety
 /// - Must only be called after `has_avx2()` returned true (AVX2+FMA).
@@ -873,40 +964,39 @@ fn schraudolph_exp(x: f32) -> f32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn silu_mul_avx2(gate: &mut [f32], up: &[f32], n: usize) {
-    let chunks8 = n / 8;
-    let neg_one = _mm256_set1_ps(-1.0);
-    let one = _mm256_set1_ps(1.0);
-    // Schraudolph constants for exp(): float_bits = a * x + b
-    let exp_a = _mm256_set1_ps(12102203.0); // 2^23 / ln(2)
-    let exp_b = _mm256_set1_ps(1065353216.0 - 486411.0); // 2^23 * 127 - correction
-    let exp_lo = _mm256_set1_ps(0.0);
-    let exp_hi = _mm256_set1_ps(2139095040.0);
-
-    for i in 0..chunks8 {
-        let off = i * 8;
+    let full = n - n % 8;
+    let mut off = 0;
+    while off < full {
         let x = _mm256_loadu_ps(gate.as_ptr().add(off));
         let u = _mm256_loadu_ps(up.as_ptr().add(off));
-
-        // exp(-x) via Schraudolph trick
-        let neg_x = _mm256_mul_ps(x, neg_one);
-        let t = _mm256_add_ps(_mm256_mul_ps(exp_a, neg_x), exp_b);
-        let t = _mm256_max_ps(_mm256_min_ps(t, exp_hi), exp_lo);
-        let exp_neg_x = _mm256_castsi256_ps(_mm256_cvtps_epi32(t));
-
-        // silu(x) = x / (1 + exp(-x))
-        let denom = _mm256_add_ps(one, exp_neg_x);
-        let silu_x = _mm256_div_ps(x, denom);
-
-        // result = silu(x) * up
-        _mm256_storeu_ps(gate.as_mut_ptr().add(off), _mm256_mul_ps(silu_x, u));
+        _mm256_storeu_ps(gate.as_mut_ptr().add(off), silu_times(x, u));
+        off += 8;
     }
-
-    // Scalar tail — mirror the SIMD body's Schraudolph exp so the body and the
-    // trailing <8 lanes of one buffer cannot use two different exp curves.
-    for i in (chunks8 * 8)..n {
-        let exp_neg_x = schraudolph_exp(-gate[i]);
-        gate[i] = (gate[i] / (1.0 + exp_neg_x)) * up[i];
+    if full < n {
+        let rest = n - full;
+        let mut x = [0.0f32; 8];
+        let mut u = [0.0f32; 8];
+        x[..rest].copy_from_slice(&gate[full..n]);
+        u[..rest].copy_from_slice(&up[full..n]);
+        let out = silu_times(_mm256_loadu_ps(x.as_ptr()), _mm256_loadu_ps(u.as_ptr()));
+        _mm256_storeu_ps(x.as_mut_ptr(), out);
+        gate[full..n].copy_from_slice(&x[..rest]);
     }
+}
+
+/// `silu(x) * u` over eight lanes.
+///
+/// # Safety
+/// Must only be called from an AVX2+FMA context.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn silu_times(x: __m256, u: __m256) -> __m256 {
+    let exp_neg_x = exp_avx2(_mm256_sub_ps(_mm256_setzero_ps(), x));
+    _mm256_mul_ps(
+        _mm256_div_ps(x, _mm256_add_ps(_mm256_set1_ps(1.0), exp_neg_x)),
+        u,
+    )
 }
 
 /// GeLU, tanh approximation — the one Gemma trains against
@@ -946,12 +1036,8 @@ pub fn gelu_tanh_mul_inplace(gate: &mut [f32], up: &[f32], n: usize) {
 
 /// AVX2 `gelu_tanh(x) * y`.
 ///
-/// The SiLU path next door uses Schraudolph's bit-trick `exp`, whose ~2%
-/// relative error is tolerable there because `silu` is a *bounded* rescaling of
-/// its input. It is not tolerable here: `gelu_tanh` multiplies the saturating
-/// factor by `x` itself, so a 2% error on the factor is a 2% error on an
-/// unbounded output. This uses the accurate rational `tanh` in [`tanh_avx2`]
-/// instead — same eight-lanes-per-iteration structure, no accuracy give-away
+/// Uses the accurate rational `tanh` in [`tanh_avx2`] — same
+/// eight-lanes-per-iteration structure as SiLU, no accuracy give-away
 /// (measured max absolute error against `f64` `gelu_tanh`: 1.9e-6 over
 /// [-30, 30], which is f32 rounding at that magnitude).
 ///
@@ -1285,18 +1371,17 @@ pub fn gqa_attention_decode(
 ///   `head_dim` a multiple of 8.
 /// - `scores.len() >= pos + 1` (the kernel writes every index `0..=pos`
 ///   unchecked).
-/// - `layer_idx`/`kvh` must be in range for `kv_cache` and every position
-///   `0..=pos` must already be stored (`supports_attention` plus the filled
-///   watermark, asserted by the callers, establish this).
+/// - `keys` and `values` must each hold `(pos + 1) * head_dim` values: the
+///   head's cached K and V for positions `0..=pos`, position-major, as
+///   [`KVCache::head_keys`] and [`KVCache::head_values`] return them.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn attention_head_avx2(
     q_head: &[f32],
     out_head: &mut [f32],
     scores: &mut [f32],
-    kv_cache: &KVCache,
-    layer_idx: usize,
-    kvh: usize,
+    keys: &[f32],
+    values: &[f32],
     pos: usize,
     head_dim: usize,
     shaping: ScoreShaping,
@@ -1304,17 +1389,19 @@ unsafe fn attention_head_avx2(
     let scale = shaping.scale;
     let softcap = shaping.softcap;
     let chunks8 = head_dim / 8;
+    let kp = keys.as_ptr();
+    let vp = values.as_ptr();
 
     // Compute dot(Q, K_cached) for all positions using AVX2
     let mut max_score = f32::NEG_INFINITY;
     for t in 0..=pos {
-        let k_cached = kv_cache.get_k(layer_idx, kvh, t, head_dim);
+        let k_cached = kp.add(t * head_dim);
         let mut acc = _mm256_setzero_ps();
         for c in 0..chunks8 {
             let off = c * 8;
             acc = _mm256_fmadd_ps(
                 _mm256_loadu_ps(q_head.as_ptr().add(off)),
-                _mm256_loadu_ps(k_cached.as_ptr().add(off)),
+                _mm256_loadu_ps(k_cached.add(off)),
                 acc,
             );
         }
@@ -1339,28 +1426,31 @@ unsafe fn attention_head_avx2(
         }
     }
 
-    // Softmax with Schraudolph fast-exp AVX2
+    // Softmax. The trailing `n_pos % 8` scores go through the same eight-lane
+    // `exp` on a copy padded with -inf, whose `exp` is exactly 0, so one
+    // softmax never mixes two exp curves and the padding adds nothing.
     let max_v = _mm256_set1_ps(max_score);
-    let exp_a = _mm256_set1_ps(12102203.0); // 2^23 / ln(2)
-    let exp_b = _mm256_set1_ps(1065353216.0 - 486411.0); // 2^23 * 127 - correction
-    let exp_lo = _mm256_set1_ps(0.0);
-    let exp_hi = _mm256_set1_ps(2139095040.0);
     let mut sum_acc = _mm256_setzero_ps();
     let sp = scores.as_mut_ptr();
     let n_pos = pos + 1;
-    let chunks8_s = n_pos / 8;
-    for i in 0..chunks8_s {
-        let off = i * 8;
-        let sv = _mm256_loadu_ps(sp.add(off));
-        let shifted = _mm256_sub_ps(sv, max_v);
-        let t = _mm256_add_ps(_mm256_mul_ps(exp_a, shifted), exp_b);
-        let t = _mm256_max_ps(_mm256_min_ps(t, exp_hi), exp_lo);
-        let ev = _mm256_castsi256_ps(_mm256_cvtps_epi32(t));
+    let full = n_pos - n_pos % 8;
+    let mut off = 0;
+    while off < full {
+        let ev = exp_avx2(_mm256_sub_ps(_mm256_loadu_ps(sp.add(off)), max_v));
         _mm256_storeu_ps(sp.add(off), ev);
         sum_acc = _mm256_add_ps(sum_acc, ev);
+        off += 8;
     }
-    // Scalar tail for exp
-    let mut sum_exp = {
+    if full < n_pos {
+        let rest = n_pos - full;
+        let mut tail = [f32::NEG_INFINITY; 8];
+        std::ptr::copy_nonoverlapping(sp.add(full), tail.as_mut_ptr(), rest);
+        let ev = exp_avx2(_mm256_sub_ps(_mm256_loadu_ps(tail.as_ptr()), max_v));
+        _mm256_storeu_ps(tail.as_mut_ptr(), ev);
+        std::ptr::copy_nonoverlapping(tail.as_ptr(), sp.add(full), rest);
+        sum_acc = _mm256_add_ps(sum_acc, ev);
+    }
+    let sum_exp = {
         let hi = _mm256_extractf128_ps(sum_acc, 1);
         let lo = _mm256_castps256_ps128(sum_acc);
         let s = _mm_add_ps(lo, hi);
@@ -1369,23 +1459,16 @@ unsafe fn attention_head_avx2(
         let hi2 = _mm_movehl_ps(s2, s2);
         _mm_cvtss_f32(_mm_add_ss(s2, hi2))
     };
-    for t in (chunks8_s * 8)..n_pos {
-        // Same Schraudolph exp as the SIMD body above, so every position in one
-        // softmax uses one exp curve (was accurate .exp() here, which biased the
-        // trailing <8 keys relative to the body).
-        let v = schraudolph_exp(*sp.add(t) - max_score);
-        *sp.add(t) = v;
-        sum_exp += v;
-    }
     // Normalize
     let inv_sum = 1.0 / sum_exp;
     let inv_v = _mm256_set1_ps(inv_sum);
-    for i in 0..chunks8_s {
-        let off = i * 8;
+    let mut off = 0;
+    while off < full {
         let sv = _mm256_loadu_ps(sp.add(off));
         _mm256_storeu_ps(sp.add(off), _mm256_mul_ps(sv, inv_v));
+        off += 8;
     }
-    for t in (chunks8_s * 8)..n_pos {
+    for t in full..n_pos {
         *sp.add(t) *= inv_sum;
     }
 
@@ -1395,12 +1478,12 @@ unsafe fn attention_head_avx2(
         _mm256_storeu_ps(out_head.as_mut_ptr().add(c * 8), _mm256_setzero_ps());
     }
     for t in 0..=pos {
-        let v_cached = kv_cache.get_v(layer_idx, kvh, t, head_dim);
+        let v_cached = vp.add(t * head_dim);
         let score_v = _mm256_set1_ps(*scores.get_unchecked(t));
         for c in 0..chunks8 {
             let off = c * 8;
             let cur = _mm256_loadu_ps(out_head.as_ptr().add(off));
-            let val = _mm256_loadu_ps(v_cached.as_ptr().add(off));
+            let val = _mm256_loadu_ps(v_cached.add(off));
             _mm256_storeu_ps(
                 out_head.as_mut_ptr().add(off),
                 _mm256_fmadd_ps(score_v, val, cur),
@@ -1416,6 +1499,15 @@ unsafe fn attention_head_avx2(
 /// scalar fallback are defined once instead of once per caller.
 ///
 /// `scores` is scratch for `pos + 1` values and is fully overwritten.
+///
+/// The head's cached keys and values for `0..=pos` are borrowed once, as two
+/// contiguous slabs, so the cache's bounds and watermark checks run once per
+/// head instead of once per cached position inside the hottest loop of a long
+/// context.
+///
+/// # Panics
+/// Panics if a buffer is shorter than `head_dim` (or `pos + 1` for `scores`),
+/// or the cache does not hold `0..=pos` for this layer and head.
 #[inline]
 fn attention_head(
     q_head: &[f32],
@@ -1428,20 +1520,22 @@ fn attention_head(
     head_dim: usize,
     shaping: ScoreShaping,
 ) {
-    debug_assert_eq!(q_head.len(), head_dim, "query head length mismatch");
-    debug_assert_eq!(out_head.len(), head_dim, "attention head output mismatch");
-    debug_assert!(scores.len() > pos, "score scratch is too small");
+    assert_eq!(q_head.len(), head_dim, "query head length mismatch");
+    assert_eq!(out_head.len(), head_dim, "attention head output mismatch");
+    assert!(scores.len() > pos, "score scratch is too small");
+    let keys = kv_cache.head_keys(layer_idx, kvh, pos + 1, head_dim);
+    let values = kv_cache.head_values(layer_idx, kvh, pos + 1, head_dim);
 
     #[cfg(target_arch = "x86_64")]
     {
         if has_avx2() && head_dim.is_multiple_of(8) {
             // SAFETY: `has_avx2()` gates AVX2+FMA, `head_dim` is a multiple of
             // 8, the head buffers hold `head_dim` values, `scores` holds more
-            // than `pos` values, and the callers assert the cache dimensions
-            // and the filled watermark covering `0..=pos`.
+            // than `pos` values, and `head_keys`/`head_values` returned exactly
+            // `(pos + 1) * head_dim` values each.
             unsafe {
                 attention_head_avx2(
-                    q_head, out_head, scores, kv_cache, layer_idx, kvh, pos, head_dim, shaping,
+                    q_head, out_head, scores, keys, values, pos, head_dim, shaping,
                 );
             }
             return;
@@ -1449,8 +1543,7 @@ fn attention_head(
     }
 
     let mut max_score = f32::NEG_INFINITY;
-    for t in 0..=pos {
-        let k_cached = kv_cache.get_k(layer_idx, kvh, t, head_dim);
+    for (t, k_cached) in keys.chunks_exact(head_dim).enumerate() {
         let mut dot = 0.0f32;
         for d in 0..head_dim {
             dot += q_head[d] * k_cached[d];
@@ -1472,8 +1565,7 @@ fn attention_head(
     for d in 0..head_dim {
         out_head[d] = 0.0;
     }
-    for t in 0..=pos {
-        let v_cached = kv_cache.get_v(layer_idx, kvh, t, head_dim);
+    for (t, v_cached) in values.chunks_exact(head_dim).enumerate() {
         let score = scores[t];
         for d in 0..head_dim {
             out_head[d] += score * v_cached[d];
@@ -1701,7 +1793,8 @@ pub fn compute_attention(
 ///
 /// # Panics
 /// Panics if any dimension is zero, `num_heads` is not divisible by
-/// `num_kv_heads`, or the buffers do not match `positions.len()` tokens.
+/// `num_kv_heads`, the buffers do not match `positions.len()` tokens, or any
+/// position is not already stored in the cache for this layer.
 pub fn attend_batch(
     attn_out: &mut [f32], // [batch * num_heads * head_dim]
     q: &[f32],            // [batch * num_heads * head_dim], RoPE applied
@@ -1734,6 +1827,14 @@ pub fn attend_batch(
     assert!(
         kv_cache.supports_attention(layer_idx, num_kv_heads, 0, head_dim),
         "KV cache dimensions do not match attention"
+    );
+    // Every position must already be stored: the score scratch below is sized
+    // from it, so a position past the watermark (or near `usize::MAX`) has to
+    // be refused here, before anything is allocated or read.
+    let filled = kv_cache.filled(layer_idx);
+    assert!(
+        positions.iter().all(|&pos| pos < filled),
+        "batched attention reads a position at or past the {filled} stored in layer {layer_idx}"
     );
 
     let heads_per_kv = num_heads / num_kv_heads;
@@ -2371,5 +2472,195 @@ mod tests {
     fn add_bias_rejects_a_mismatched_vector() {
         let mut output = [0.0f32; 4];
         add_bias(&mut output, Some(&[1.0, 2.0]));
+    }
+
+    #[test]
+    fn vec_add_covers_simd_body_and_scalar_tail() {
+        let n = 8 * 4 + 3;
+        let residual: Vec<f32> = (0..n).map(|i| i as f32 * 1.5 - 7.0).collect();
+        let addition: Vec<f32> = (0..n).map(|i| 3.0 - i as f32 * 0.125).collect();
+        let mut hidden = vec![f32::NAN; n];
+        vec_add(&mut hidden, &residual, &addition);
+        for i in 0..n {
+            assert_eq!(hidden[i], residual[i] + addition[i], "index {i}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // exp, SiLU and the attention softmax
+    // -----------------------------------------------------------------------
+
+    /// Distance in units in the last place between two finite f32 values.
+    fn ulp_distance(a: f32, b: f32) -> u32 {
+        // Map the sign-magnitude bit patterns onto one monotonic integer line.
+        fn ordered(x: f32) -> i64 {
+            let bits = x.to_bits() as i32 as i64;
+            if bits < 0 {
+                i64::from(i32::MIN) - bits
+            } else {
+                bits
+            }
+        }
+        (ordered(a) - ordered(b)).unsigned_abs() as u32
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn exp_lanes(values: [f32; 8]) -> [f32; 8] {
+        let mut out = [0.0f32; 8];
+        // SAFETY: only called after the caller checked `has_avx2()`.
+        unsafe {
+            let result = exp_avx2(_mm256_loadu_ps(values.as_ptr()));
+            _mm256_storeu_ps(out.as_mut_ptr(), result);
+        }
+        out
+    }
+
+    /// The SIMD `exp` is within 2 ulp of the correctly rounded value over the
+    /// whole normal range. Its predecessor, Schraudolph's bit trick, was off
+    /// by up to 3.9% here, which is about 300,000 ulp.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn exp_avx2_is_within_two_ulp_everywhere_it_is_normal() {
+        if !has_avx2() {
+            return;
+        }
+        let mut worst = 0u32;
+        let mut worst_at = 0.0f32;
+        let mut x = EXP_MIN_ARG;
+        while x <= EXP_MAX_ARG {
+            let mut lanes = [0.0f32; 8];
+            for (lane, value) in lanes.iter_mut().enumerate() {
+                *value = (x + lane as f32 * 0.001).min(EXP_MAX_ARG);
+            }
+            let got = exp_lanes(lanes);
+            for lane in 0..8 {
+                let expected = (lanes[lane] as f64).exp() as f32;
+                if !expected.is_finite() {
+                    continue;
+                }
+                let distance = ulp_distance(got[lane], expected);
+                if distance > worst {
+                    worst = distance;
+                    worst_at = lanes[lane];
+                }
+            }
+            x += 0.0137;
+        }
+        assert!(worst <= 2, "exp_avx2 is {worst} ulp off at x = {worst_at}");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn exp_avx2_handles_the_edges_of_the_range() {
+        if !has_avx2() {
+            return;
+        }
+        let got = exp_lanes([
+            f32::NEG_INFINITY,
+            -1000.0,
+            EXP_MIN_ARG - 0.01,
+            0.0,
+            89.0,
+            f32::INFINITY,
+            f32::NAN,
+            EXP_MAX_ARG - 0.001,
+        ]);
+        assert_eq!(got[0], 0.0, "exp(-inf)");
+        assert_eq!(got[1], 0.0, "exp(-1000)");
+        assert_eq!(got[2], 0.0, "below the normal range flushes to zero");
+        assert_eq!(got[3], 1.0, "exp(0)");
+        assert_eq!(got[4], f32::INFINITY, "exp(89) overflows");
+        assert_eq!(got[5], f32::INFINITY, "exp(+inf)");
+        assert!(got[6].is_nan(), "NaN propagates, got {}", got[6]);
+        assert!(
+            got[7].is_finite() && got[7] > 3.0e38,
+            "just under ln(f32::MAX) stays finite, got {}",
+            got[7]
+        );
+    }
+
+    /// `silu(gate) * up` agrees with the f64 definition at f32 precision, on a
+    /// length whose tail does not fill a vector, on every target.
+    #[test]
+    fn silu_mul_matches_the_high_precision_reference() {
+        let n = 8 * 9 + 5;
+        let gate: Vec<f32> = (0..n).map(|i| (i as f32 - n as f32 / 2.0) * 0.41).collect();
+        let up: Vec<f32> = (0..n).map(|i| 0.5 + (i as f32) * 0.03).collect();
+        let mut got = gate.clone();
+        silu_mul_inplace(&mut got, &up, n);
+        for i in 0..n {
+            let x = gate[i] as f64;
+            let reference = x / (1.0 + (-x).exp()) * up[i] as f64;
+            let tolerance = 4.0 * f32::EPSILON as f64 * reference.abs().max(1e-30);
+            assert!(
+                (got[i] as f64 - reference).abs() <= tolerance,
+                "index {i} (x = {x}): got {} expected {reference}",
+                got[i]
+            );
+        }
+    }
+
+    /// One attention head against an f64 softmax, for history lengths that
+    /// leave every possible remainder modulo the vector width.
+    #[test]
+    fn attention_head_matches_an_f64_softmax_at_every_tail_length() {
+        let head_dim = 16;
+        for len in 1..=19usize {
+            let mut cache = KVCache::new(1, 1, len, head_dim).unwrap();
+            let mut keys = Vec::new();
+            let mut values = Vec::new();
+            for t in 0..len {
+                let k: Vec<f32> = (0..head_dim)
+                    .map(|d| ((t * 7 + d * 3) % 11) as f32 * 0.37 - 1.8)
+                    .collect();
+                let v: Vec<f32> = (0..head_dim)
+                    .map(|d| ((t * 5 + d) % 13) as f32 * 0.21 - 1.1)
+                    .collect();
+                cache.store(0, t, &k, &v);
+                keys.push(k);
+                values.push(v);
+            }
+            let q: Vec<f32> = (0..head_dim).map(|d| (d % 5) as f32 * 0.6 - 1.0).collect();
+            let shaping = ScoreShaping::plain(head_dim);
+            let mut out = vec![0.0f32; head_dim];
+            let mut scores = vec![0.0f32; len];
+            attention_head(
+                &q,
+                &mut out,
+                &mut scores,
+                &cache,
+                0,
+                0,
+                len - 1,
+                head_dim,
+                shaping,
+            );
+
+            let logits: Vec<f64> = keys
+                .iter()
+                .map(|k| {
+                    k.iter()
+                        .zip(&q)
+                        .map(|(a, b)| *a as f64 * *b as f64)
+                        .sum::<f64>()
+                        * shaping.scale as f64
+                })
+                .collect();
+            let max = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let weights: Vec<f64> = logits.iter().map(|l| (l - max).exp()).collect();
+            let total: f64 = weights.iter().sum();
+            for d in 0..head_dim {
+                let expected: f64 = weights
+                    .iter()
+                    .zip(&values)
+                    .map(|(w, v)| w / total * v[d] as f64)
+                    .sum();
+                assert!(
+                    (out[d] as f64 - expected).abs() < 2e-6,
+                    "len {len}, dim {d}: got {} expected {expected}",
+                    out[d]
+                );
+            }
+        }
     }
 }
