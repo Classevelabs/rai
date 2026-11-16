@@ -162,8 +162,57 @@ versioning for its pre-1.0 releases.
   shorter than two tokens up front. Converter messages no longer carry runs of
   spaces from a broken line continuation, or name a `--calibrate` flag that
   does not exist.
+- A decoder given a second, shorter prompt failed its first step, or kept
+  the first prompt's tail counted as context: prefill now discards what the
+  cache held from where it starts.
+- Stop strings that are control tokens (`</s>`, `<|im_end|>`) were also
+  matched as text, so a reply that quoted one was cut there. They end a reply
+  by token id only, as in transformers.
+- Chat templates read the date from `strftime_now` in UTC; it is local time
+  now, as in transformers, so Llama 3.1 and 3.2 see the same date there.
+- The chat record reads the end ids from `config.json` when a checkpoint has
+  no `generation_config.json`, and an older tokenizer config's tokens from
+  `special_tokens_map.json`, as transformers does. Both used to be left out.
+- `rai serve` started without a model checks `--chat-template` before it
+  starts; a typo used to fail every later load. A `--max-context` past the
+  model's own is clamped for a later load as for a model named at startup,
+  instead of refusing every load.
+- Studio's system panel stops polling while a reply is generating, when the
+  server cannot answer it, and reads again as the reply ends.
+- Gemma3 4B, 12B and 27B and Phi-3.5 were listed as converting; neither does
+  (one is multimodal, the other uses `longrope` RoPE scaling), and the docs
+  say so now. A multimodal checkpoint is refused as one, and a config from
+  another family for its family, instead of for a missing `hidden_size`.
+- Studio's check runs every check the conversion makes before writing, once
+  the weights are on disk: every tensor's shape, every expert, `tokenizer.json`
+  and the chat files, and a sandwich-normed family with post-norm layers. It
+  used to call such checkpoints convertible.
+- The Python exporters copy the checkpoint's own `tokenizer.json`, as
+  `rai convert` does; the copy they re-saved differed in bytes and was refused
+  as another model's by the other tool. Their default output name resolves `.`
+  and keeps spaces, as `rai convert`'s does.
+- The Docker conversion examples run as your user, so on Linux they can write
+  into your folder, and `.dockerignore` keeps weights out of the build context
+  at any depth, not only at the root.
+- On Windows, CI's Python suite step failed only when its last command did;
+  it runs under bash on every runner. The release's `RUNNING.txt` lost the
+  indentation of its command list. A re-run release resumes its draft instead
+  of opening a second one beside it, and the CI gate counts only runs of the
+  tagged commit itself, not pull-request runs of a merge.
+- The API documentation had 33 broken links and markup errors (bracketed math
+  read as links, links to private items, diagrams read as HTML); CI now builds
+  it with warnings as errors.
+- Kernel entry points that run AVX2 code check for it in release builds too,
+  not only in debug builds.
 
 ### Security
+- `rai serve` gives a client 15 seconds from connecting to send its whole
+  request; the limit used to restart with every byte, so one byte every 14
+  seconds held a reader slot for hours, and 32 such clients refused everyone.
+  A refusal is drained before closing so the reset cannot destroy it, and a
+  client that sent bytes after its request is still noticed when it leaves.
+  A client that shuts its sending side after the request is taken to have
+  left, which the server cannot tell apart.
 - `rai serve` runs on its own small HTTP/1.1 layer instead of tiny_http.
   Bodies are capped before they are read (a declared `Content-Length` of
   10^18 used to abort the server), connections have deadlines, a bounded

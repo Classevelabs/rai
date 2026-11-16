@@ -56,6 +56,22 @@ and the real Qwen2.5 and SmolLM2 tokenizers.
 **If regressed.** Replies stop mid-sentence on HTML or markup, or run on to
 `--max-tokens` after the model has finished.
 
+## 2026-11-16 — A stop that is a control token ends a reply by id only
+
+**Decision.** A template's stop marker that the tokenizer holds as an added
+token (`</s>`, `<|im_end|>`, `[INST]` where it is one) joins the end ids and is
+dropped from the text stops; markers the tokenizer spells as plain text, such
+as TinyLlama's `<|user|>`, stay text stops (`chat_format.rs`, `ChatFormat::new`).
+
+**Symptom.** The control token already ended the reply by id, so its text match
+could only fire on ordinary tokens spelling it: "Use `<s>old</s>`" was cut at
+`</s>`, where transformers stops on ids alone.
+
+**Verified against.** `control_token_stops_end_by_id_not_by_text`.
+
+**If regressed.** Replies that quote markup or a template's own markers stop
+at the quote.
+
 ## 2026-11-16 — The checkpoint's own chat template, recorded at conversion
 
 **Decision.** Conversion writes `<name>.chat.json` beside the model with the
@@ -74,6 +90,11 @@ without the start token they were trained with.
 `apply_chat_template` on Qwen2.5-0.5B and SmolLM2-135M over four conversations
 (multi-turn, whitespace, Unicode, literal `{{ }}` in user text); the
 `chat_format` and `convert_matches_python` tests.
+
+The record's fields come from the files transformers 5.8 reads them from
+(checked in its source): end ids from `config.json` when there is no
+`generation_config.json`, a pre-`added_tokens_decoder` tokenizer config's
+tokens from `special_tokens_map.json`, and `strftime_now` in local time.
 
 **If regressed.** Chat models answer in the wrong format, ignore instructions,
 or print nothing because they end the turn at once.
@@ -112,7 +133,7 @@ template error once it outgrows the window.
 
 ## 2026-11-16 — A client that leaves stops its generation
 
-**Decision.** Between prefill chunks and between tokens the server peeks the
+**Decision.** Between prefill chunks and between tokens the server checks the
 connection (`cli/http.rs` `client_gone`) and stops when the client has closed
 it.
 
@@ -122,8 +143,30 @@ request thread until the reply finished, up to the whole window.
 **Verified against.** A client that leaves mid-stream frees the server in
 0.25 s, and one that leaves during prefill in 0.88 s (SmolLM2, release build).
 
+Bytes still arriving after the request are read and discarded, not peeked: one
+stray byte hid the end of stream behind it for good
+(`surplus_bytes_do_not_hide_a_departed_client`). A client that shuts only its
+sending side after the request looks the same as one that left, and is
+treated as gone.
+
 **If regressed.** After pressing Stop, the next message waits for the
 abandoned reply to finish.
+
+## 2026-11-16 — A request has 15 seconds from connecting, not 15 per byte
+
+**Decision.** `READ_TIMEOUT` is a deadline set when the connection is
+accepted; each read waits only for what is left of it (`cli/http.rs`
+`read_by`). Refusals drain what the client is still sending, within `LINGER`,
+before closing.
+
+**Symptom.** The timeout restarted with every byte, so a local process sending
+one byte every 14 seconds held a reader slot for hours, and 32 of them made the
+server answer 503 to everyone, Studio included.
+
+**Verified against.** `a_dribbling_client_is_cut_off_at_the_deadline`, which
+hangs on the old timeout; `a_refusal_arrives_whole_with_the_request_still_in_flight`.
+
+**If regressed.** Any local process can lock Studio out of its own server.
 
 ## 2026-11-16 — Only verified families convert
 
@@ -137,6 +180,11 @@ names, and both would convert into a model that computes something else.
 
 **Verified against.** `only_verified_families_convert` and the Python suite's
 `test_preflight_converts_only_verified_families`.
+
+The family is settled before any other field is read, and a config that nests
+its language model under `text_config` is refused as multimodal. `gemma3` is
+not on the list: it is the multimodal Gemma3 (4B and larger), never verified;
+the verified Gemma3 is `gemma3_text` (`the_family_is_the_reason_a_foreign_config_is_refused`).
 
 **If regressed.** A new family converts cleanly, loads, and generates fluent
 nonsense.
@@ -159,6 +207,13 @@ naming `\\host\share` made Windows authenticate to that host.
 **If regressed.** A model sits beside the wrong tokenizer and produces nonsense,
 or an interrupted conversion leaves a truncated file under the real name.
 
+Studio's Check runs these same checks once the weights are on disk
+(`check_checkpoint_tensors`, `read_companion_files`), so it cannot call a
+checkpoint convertible that the conversion then refuses
+(`check_refuses_what_the_conversion_refuses`). The Python exporters copy the
+checkpoint's own `tokenizer.json`, as `rai convert` does, so the clash check
+compares the same bytes whichever tool wrote first.
+
 ## 2026-11-16 — A shorter draft window hands decoding to the target
 
 **Decision.** `SpeculativeDecoder` keeps the target's window and drafts only
@@ -175,8 +230,10 @@ draft's window.
 ## 2026-11-16 — A release builds only what CI passed, and is never rebuilt
 
 **Decision.** `release.yml` resolves the tag to one commit through the tag
-namespace, waits for green CI on that commit, resumes drafts only, and attests
-each archive's provenance; `publish.yml` publishes the tag's commit from the
+namespace, waits for green CI on that commit (a push or dispatched run of the
+commit itself; a pull-request run tests a merge), looks for the tag's draft
+before opening one, resumes drafts only, and attests each archive's
+provenance; `publish.yml` publishes the tag's commit from the
 `crates-io` environment and skips crates already published.
 
 **Symptom.** v0.2.5 was tagged on a tree that failed clippy and the Python
