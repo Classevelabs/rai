@@ -1499,14 +1499,16 @@ async function readSystem(){
   }
   paintSystem();
 }
+/* The server answers one request at a time, so a poll sent during a reply
+   only waits behind it; the panel is read again the moment the reply ends. */
 function syncSysPolling(){
   clearTimeout(SYS_TIMER);SYS_TIMER=0;
   const onChat=$("#s-run").classList.contains("on");
-  if(!SYS_OPEN||!onChat)return;
+  if(!SYS_OPEN||!onChat||GENERATING)return;
   const tick=async()=>{
     await readSystem();
-    if(!SYS_OPEN)return;
-    SYS_TIMER=setTimeout(tick,GENERATING?800:2500);
+    if(!SYS_OPEN||GENERATING)return;
+    SYS_TIMER=setTimeout(tick,2500);
   };
   tick();
 }

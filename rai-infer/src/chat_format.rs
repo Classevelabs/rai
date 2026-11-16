@@ -2,9 +2,11 @@
 //!
 //! A conversion records the checkpoint's own chat template, its special
 //! tokens and its end-of-sequence ids beside the model, as
-//! `<name>.chat.json` ([`ChatRecord`]). [`ChatFormat`] renders that template
-//! the way transformers' `apply_chat_template` does, or a built-in
-//! [`ChatTemplate`] when one is asked for by name or no record exists.
+//! `<name>.chat.json` ([`ChatRecord`](crate::chat_format::ChatRecord)).
+//! [`ChatFormat`](crate::chat_format::ChatFormat) renders that template the
+//! way transformers' `apply_chat_template` does, or a built-in
+//! [`ChatTemplate`](crate::chat_template::ChatTemplate) when one is asked
+//! for by name or no record exists.
 //!
 //! Probing the vocabulary for sentinel tokens, the only option before a
 //! record existed, cannot tell most families apart: TinyLlama-Chat, Zephyr
@@ -41,10 +43,13 @@ const END_MARKERS: [&str; 9] = [
 
 /// What a conversion records about how its model is prompted.
 ///
-/// Every field is the checkpoint's own: `chat_template` from
-/// `chat_template.jinja` or `tokenizer_config.json`, the two token strings
-/// from `tokenizer_config.json`, and the ids from `generation_config.json`.
-/// A field the checkpoint does not provide is `None` or empty.
+/// Every field is the checkpoint's own, read from the files transformers
+/// reads it from: `chat_template` from `chat_template.jinja` or
+/// `tokenizer_config.json`, the two token strings from `tokenizer_config.json`
+/// (or `special_tokens_map.json` for a config saved before transformers wrote
+/// `added_tokens_decoder`), and the ids from `generation_config.json` (or
+/// `config.json` when there is none). A field the checkpoint does not provide
+/// is `None` or empty.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatRecord {
     /// The Jinja chat template, as transformers renders it.
@@ -102,16 +107,54 @@ impl ChatRecord {
             }
         };
 
+        // transformers reads special_tokens_map.json only for a tokenizer
+        // config saved before it wrote `added_tokens_decoder`, and then lets
+        // the map's entries override the config's.
+        let legacy = tokenizer_config
+            .as_ref()
+            .is_none_or(|config| config.get("added_tokens_decoder").is_none());
+        let special_tokens_map = if legacy {
+            read_json_if_present(&dir.join("special_tokens_map.json"))?
+        } else {
+            None
+        };
         let token = |name: &str| -> Option<String> {
-            let field = tokenizer_config.as_ref()?.get(name)?;
-            // A plain string, or the serialized AddedToken transformers writes.
-            field
-                .as_str()
-                .or_else(|| field.get("content").and_then(|content| content.as_str()))
-                .map(str::to_owned)
+            // `None` when the file has no such entry; `Some(None)` when it
+            // has one that spells no token.
+            let entry = |config: &serde_json::Value| -> Option<Option<String>> {
+                let field = config.get(name)?;
+                // A plain string, or the serialized AddedToken transformers
+                // writes.
+                Some(
+                    field
+                        .as_str()
+                        .or_else(|| field.get("content").and_then(|content| content.as_str()))
+                        .map(str::to_owned),
+                )
+            };
+            special_tokens_map
+                .as_ref()
+                .and_then(entry)
+                .or_else(|| tokenizer_config.as_ref().and_then(entry))
+                .flatten()
         };
 
-        let eos_token_ids = match generation_config
+        // Without a generation_config.json, transformers builds the generation
+        // settings from config.json, end ids included.
+        let (end_source, end_file) = match generation_config {
+            Some(config) => (Some(config), "generation_config.json"),
+            None => (
+                read_json_if_present(&dir.join("config.json"))?,
+                "config.json",
+            ),
+        };
+        let token_id = |value: &serde_json::Value| -> Result<u32> {
+            value
+                .as_u64()
+                .and_then(|id| u32::try_from(id).ok())
+                .with_context(|| format!("{end_file} has the eos_token_id {value}, not a token id"))
+        };
+        let eos_token_ids = match end_source
             .as_ref()
             .and_then(|config| config.get("eos_token_id"))
         {
@@ -175,15 +218,6 @@ fn template_field(field: &serde_json::Value, file: &str) -> Result<Option<String
             .map(str::to_owned)),
         other => bail!("{file} has a chat_template that is neither text nor a list: {other}"),
     }
-}
-
-fn token_id(value: &serde_json::Value) -> Result<u32> {
-    value
-        .as_u64()
-        .and_then(|id| u32::try_from(id).ok())
-        .with_context(|| {
-            format!("generation_config.json has the eos_token_id {value}, not a token id")
-        })
 }
 
 /// How a loaded model is prompted, and where its replies end.
@@ -286,7 +320,17 @@ impl ChatFormat {
                 stops.push(eos.to_owned());
             }
         }
-        let end_ids = end_ids(tokenizer, record, &stops);
+        let added: HashMap<String, u32> = tokenizer
+            .get_added_tokens_decoder()
+            .into_iter()
+            .map(|(id, token)| (token.content, id))
+            .collect();
+        let end_ids = end_ids(tokenizer, &added, record, &stops);
+        // A stop that is a control token ends the reply by its id. Matched as
+        // text too, it could only fire on ordinary tokens that happen to spell
+        // it, cutting a reply that quotes `</s>`, where transformers stops on
+        // ids alone. Text stops stay for markers the tokenizer spells as text.
+        stops.retain(|stop| !added.contains_key(stop));
         Ok(Self {
             style,
             end_ids,
@@ -422,14 +466,10 @@ fn family_of(source: &str) -> Option<ChatTemplate> {
 /// that are tokens of their own.
 fn end_ids(
     tokenizer: &tokenizers::Tokenizer,
+    added: &HashMap<String, u32>,
     record: Option<&ChatRecord>,
     stops: &[String],
 ) -> Vec<usize> {
-    let added: HashMap<String, u32> = tokenizer
-        .get_added_tokens_decoder()
-        .into_iter()
-        .map(|(id, token)| (token.content, id))
-        .collect();
     let vocab = tokenizer.get_vocab_size(true);
     let mut ids: Vec<u32> = END_MARKERS
         .iter()
@@ -463,13 +503,63 @@ fn raise_exception(message: String) -> Result<String, minijinja::Error> {
     ))
 }
 
-/// transformers' `strftime_now`, in UTC. Llama 3.1 and 3.2 put today's date in
-/// their system header with it; without it they fall back to a fixed date.
+/// transformers' `strftime_now`, which is `datetime.now().strftime(format)`:
+/// local time. Llama 3.1 and 3.2 put today's date in their system header with
+/// it; without it they fall back to a fixed date.
 fn strftime_now(format: String) -> Result<String, minijinja::Error> {
     let seconds = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs());
-    strftime(&format, seconds)
+    strftime(
+        &format,
+        seconds.saturating_add_signed(local_offset_seconds(seconds)),
+    )
+}
+
+/// How far local time is ahead of UTC at `unix_seconds`, by the system's own
+/// zone rules; 0, which is UTC, where the system cannot say.
+// `tm_gmtoff` is a C `long`: already 64 bits on 64-bit targets, 32 on others.
+#[allow(clippy::useless_conversion)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn local_offset_seconds(unix_seconds: u64) -> i64 {
+    let Ok(time) = libc::time_t::try_from(unix_seconds) else {
+        return 0;
+    };
+    // SAFETY: an all-zero `tm` is a valid value, which `localtime_r` overwrites.
+    let mut local: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: both pointers are to live locals, and `localtime_r` writes only
+    // through the second.
+    if unsafe { libc::localtime_r(&time, &mut local) }.is_null() {
+        return 0;
+    }
+    i64::from(local.tm_gmtoff)
+}
+
+/// How far local time is ahead of UTC now, by the system's own zone rules; 0,
+/// which is UTC, where the system cannot say.
+#[cfg(windows)]
+fn local_offset_seconds(_unix_seconds: u64) -> i64 {
+    use windows_sys::Win32::System::SystemServices::{
+        TIME_ZONE_ID_DAYLIGHT, TIME_ZONE_ID_STANDARD, TIME_ZONE_ID_UNKNOWN,
+    };
+    use windows_sys::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
+    // SAFETY: an all-zero TIME_ZONE_INFORMATION is a valid value, which the
+    // call overwrites.
+    let mut zone: TIME_ZONE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: `zone` is a live, writable TIME_ZONE_INFORMATION.
+    let bias = match unsafe { GetTimeZoneInformation(&mut zone) } {
+        TIME_ZONE_ID_DAYLIGHT => zone.Bias + zone.DaylightBias,
+        TIME_ZONE_ID_STANDARD => zone.Bias + zone.StandardBias,
+        TIME_ZONE_ID_UNKNOWN => zone.Bias,
+        _ => return 0,
+    };
+    // The bias is the minutes added to local time to reach UTC.
+    -i64::from(bias) * 60
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn local_offset_seconds(_unix_seconds: u64) -> i64 {
+    0
 }
 
 fn strftime(format: &str, unix_seconds: u64) -> Result<String, minijinja::Error> {
@@ -652,6 +742,19 @@ mod tests {
         assert_eq!(unrecorded.end_ids(), &[2, 3]);
     }
 
+    /// A stop marker that is a control token ends the reply by id, and is not
+    /// also a text stop: matched as text it could only cut a reply that
+    /// quotes it. A marker spelled as plain text stays a text stop.
+    #[test]
+    fn control_token_stops_end_by_id_not_by_text() {
+        let chatml = ChatFormat::new("chatml", Some(&record(None)), &tokenizer()).unwrap();
+        assert!(chatml.end_ids().contains(&3));
+        assert_eq!(chatml.stop_sequences(), &["<|im_start|>".to_string()]);
+        let zephyr = ChatFormat::new("auto", Some(&record(Some(ZEPHYR))), &tokenizer()).unwrap();
+        assert!(zephyr.end_ids().contains(&2));
+        assert_eq!(zephyr.stop_sequences(), &["<|user|>".to_string()]);
+    }
+
     #[test]
     fn choices_resolve_or_are_refused_by_name() {
         let tokenizer = tokenizer();
@@ -734,6 +837,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The record reads each field where transformers 5 does: a legacy
+    /// tokenizer config's tokens give way to special_tokens_map.json, and a
+    /// checkpoint without generation_config.json ends where config.json says.
+    #[test]
+    fn the_record_reads_each_field_where_transformers_does() {
+        let dir = std::env::temp_dir().join(format!("rai-chat-sources-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, value: serde_json::Value| {
+            std::fs::write(dir.join(name), value.to_string()).unwrap();
+        };
+        write(
+            "tokenizer_config.json",
+            serde_json::json!({ "bos_token": "<s>", "eos_token": "</s>" }),
+        );
+        write(
+            "special_tokens_map.json",
+            serde_json::json!({ "bos_token": { "content": "<|begin|>" } }),
+        );
+        write("config.json", serde_json::json!({ "eos_token_id": 5 }));
+        let read = ChatRecord::from_checkpoint(&dir).unwrap();
+        assert_eq!(read.bos_token.as_deref(), Some("<|begin|>"));
+        assert_eq!(read.eos_token.as_deref(), Some("</s>"));
+        assert_eq!(read.eos_token_ids, vec![5]);
+
+        // A config that lists its added tokens is read as it stands, and a
+        // generation config, once there, is the only source of end ids.
+        write(
+            "tokenizer_config.json",
+            serde_json::json!({ "bos_token": "<s>", "added_tokens_decoder": {} }),
+        );
+        write("generation_config.json", serde_json::json!({}));
+        let read = ChatRecord::from_checkpoint(&dir).unwrap();
+        assert_eq!(read.bos_token.as_deref(), Some("<s>"));
+        assert!(read.eos_token_ids.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn dates_are_formatted_as_python_formats_them() {
         assert_eq!(strftime("%d %b %Y", 0).unwrap(), "01 Jan 1970");
@@ -745,5 +886,22 @@ mod tests {
         // 2024-02-29, a leap day.
         assert_eq!(strftime("%Y-%m-%d", 1_709_164_800).unwrap(), "2024-02-29");
         assert!(strftime("%Q", 0).is_err());
+    }
+
+    /// The clock the template sees is the system's local one: every zone in
+    /// use is within 14 hours of UTC and a whole number of minutes from it.
+    #[test]
+    fn the_template_clock_is_local_time() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let offset = local_offset_seconds(now);
+        assert!(offset.abs() <= 14 * 3600, "{offset} s from UTC");
+        assert_eq!(offset % 60, 0, "{offset} s from UTC");
+        let today = strftime_now("%Y-%m-%d".to_string()).unwrap();
+        let expected = strftime("%Y-%m-%d", now.saturating_add_signed(offset)).unwrap();
+        let next_second = strftime("%Y-%m-%d", (now + 1).saturating_add_signed(offset)).unwrap();
+        assert!(today == expected || today == next_second, "{today}");
     }
 }

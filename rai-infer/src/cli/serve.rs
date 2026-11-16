@@ -33,6 +33,10 @@
 //! `connect-src 'self'` allows it, because it is a same-origin `fetch` to the
 //! very origin that served the page.
 //!
+//! A client keeps its connection open until the reply ends. One that closes
+//! it, or only shuts its sending side after the request (`nc -N`), stops the
+//! generation: from the socket, the two look the same as a client that left.
+//!
 //! Paths in requests are the user's own filesystem paths and are not confined
 //! to a root: this server is the local application's own back end, reachable
 //! only from the machine it runs on, and it can do exactly what the `rai`
@@ -169,14 +173,27 @@ pub struct ServeOptions {
     #[arg(long, default_value = "8090")]
     pub port: u16,
     /// Context window to allocate the KV cache for, in tokens. Defaults to the
-    /// context window the model itself was stored with; a smaller value trades
-    /// history for memory, a larger one is clamped to what the model supports.
+    /// context the model was stored with, reduced to fit free memory when it
+    /// would not (a note says so); a smaller value trades history for memory,
+    /// a larger one is clamped to what the model supports.
     #[arg(long)]
     pub max_context: Option<usize>,
     /// Chat template: auto (the model's own, recorded at conversion), model,
     /// none, few-shot, mistral, llama3, chatml, zephyr, phi3, gemma
     #[arg(long, default_value = "auto")]
     pub chat_template: String,
+}
+
+/// Refuse a `--chat-template` that names no template, before anything reads
+/// a model with it.
+fn check_template_name(chat_template: &str) -> Result<()> {
+    anyhow::ensure!(
+        matches!(chat_template, "auto" | "model")
+            || ChatTemplate::from_name(chat_template).is_some(),
+        "unknown chat template '{chat_template}'; expected auto, model, or one of {}",
+        ChatTemplate::NAMES.join(", ")
+    );
+    Ok(())
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -257,12 +274,7 @@ impl Loaded {
             model_path.display()
         );
         // Refused before the weights are read, not after.
-        anyhow::ensure!(
-            matches!(chat_template, "auto" | "model")
-                || ChatTemplate::from_name(chat_template).is_some(),
-            "unknown chat template '{chat_template}'; expected auto, model, or one of {}",
-            ChatTemplate::NAMES.join(", ")
-        );
+        check_template_name(chat_template)?;
         let started = Instant::now();
         let tokenizer_path = resolve_tokenizer(model_path, tokenizer_arg)?;
         let model = RaiModel::load(model_path)?;
@@ -1179,6 +1191,9 @@ pub fn run(args: &ServeArgs) -> Result<()> {
     if matches!(args.options.max_context, Some(0)) {
         anyhow::bail!("--max-context must be greater than zero");
     }
+    // Checked here as well as at every load: started with no model, a typo
+    // would otherwise only surface as every later `/api/load` failing.
+    check_template_name(&args.options.chat_template)?;
 
     // Starting with no model is now legitimate: the UI picks one over
     // `POST /api/load`. A model named on the command line still has to load
@@ -1616,13 +1631,18 @@ fn handle_load(state: &mut ServerState, body: &str) -> Result<Value, ChatHttpErr
         .map_err(|error| ChatHttpError::bad_request(format!("invalid JSON request: {error}")))?;
 
     // Neither the request nor the command line naming a context means "use the
-    // model's own", which `Loaded::open` resolves once the header is read.
-    let max_context = request.max_context.or(state.options.max_context);
-    if max_context.is_some_and(|value| value == 0 || value > MAX_LOAD_CONTEXT) {
+    // model's own", which `Loaded::open` resolves once the header is read. The
+    // request's number is checked here; `--max-context` was checked at
+    // startup and is clamped to the model, as it is for a model named there.
+    if request
+        .max_context
+        .is_some_and(|value| value == 0 || value > MAX_LOAD_CONTEXT)
+    {
         return Err(ChatHttpError::bad_request(format!(
             "max_context must be between 1 and {MAX_LOAD_CONTEXT}"
         )));
     }
+    let max_context = request.max_context.or(state.options.max_context);
     let template = request
         .chat_template
         .clone()
@@ -1722,6 +1742,18 @@ pub(crate) fn choose_context_window(
     model_max: usize,
     kv_bytes_for: impl Fn(usize) -> usize,
 ) -> Result<ContextChoice> {
+    fit_context_window(requested, model_max, kv_bytes_for, available_memory_bytes)
+}
+
+/// [`choose_context_window`] with the free memory as an input, so the rule is
+/// tested against machines of every size rather than whatever the one running
+/// the tests has free at that moment.
+fn fit_context_window(
+    requested: Option<usize>,
+    model_max: usize,
+    kv_bytes_for: impl Fn(usize) -> usize,
+    available_memory: impl FnOnce() -> Option<u64>,
+) -> Result<ContextChoice> {
     let ceiling = resolve_context_window(requested, model_max);
     // An explicit number is the user's call: honour it, and let the caller's
     // fit check refuse it by name if the machine cannot hold it.
@@ -1732,7 +1764,7 @@ pub(crate) fn choose_context_window(
             reduced_to_fit: false,
         });
     }
-    let Some(available) = available_memory_bytes() else {
+    let Some(available) = available_memory() else {
         // Nothing measurable to fit to; the fallible allocation still guards it.
         return Ok(ContextChoice {
             context: ceiling,
@@ -2172,10 +2204,25 @@ fn local_path(raw: &Path, field: &str) -> Result<PathBuf, ChatHttpError> {
 #[cfg(windows)]
 fn names_another_machine(path: &Path) -> bool {
     use std::path::{Component, Prefix};
+    let local_disk = |component: Option<Component<'_>>| {
+        matches!(component, Some(Component::Prefix(prefix))
+            if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)))
+    };
+    // The raw text decides first, because the parser does not see every form
+    // Windows opens: `\\server` with no share and the NT path `\??\UNC\…` both
+    // parse as a plain rooted path, and both reach the network when opened.
+    let raw = path.as_os_str().to_string_lossy();
+    let separator = |c: Option<char>| matches!(c, Some('\\' | '/'));
+    let mut chars = raw.chars();
+    let (first, second) = (chars.next(), chars.next());
+    if separator(first) && separator(second) {
+        return !local_disk(path.components().next());
+    }
+    if separator(first) && raw[1..].starts_with("??") && separator(raw[3..].chars().next()) {
+        return true;
+    }
     match path.components().next() {
-        Some(Component::Prefix(prefix)) => {
-            !matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
-        }
+        Some(Component::Prefix(_)) => !local_disk(path.components().next()),
         _ => false,
     }
 }
@@ -2390,8 +2437,16 @@ mod tests {
         for path in [
             r"\\attacker.example\share",
             "//attacker.example/share",
+            r"\/attacker.example/share",
             r"\\?\UNC\attacker.example\share\x",
             r"\\.\PhysicalDrive0",
+            r"\\?\GLOBALROOT\Device\Mup\attacker.example\share",
+            // Not parsed as prefixes at all, and still opened over the network.
+            r"\\attacker.example",
+            r"\\attacker.example\",
+            r"\??\UNC\attacker.example\share\x",
+            "/??/UNC/attacker.example/share",
+            r"\??\C:\models",
         ] {
             let error = local_path(Path::new(path), "dir").unwrap_err();
             assert_eq!(error.status, 400, "{path}");
@@ -2401,7 +2456,15 @@ mod tests {
                 error.message
             );
         }
-        for path in [r"C:\models", "models", r"\\?\C:\models", r".\here"] {
+        for path in [
+            r"C:\models",
+            "C:models",
+            "models",
+            r"\\?\C:\models",
+            r".\here",
+            r"\models",
+            r"\?models",
+        ] {
             assert!(local_path(Path::new(path), "dir").is_ok(), "{path}");
         }
     }
@@ -2455,35 +2518,43 @@ mod tests {
         assert!(!is_allowed_origin("https://attacker.example", 8090));
     }
 
-    /// A window nobody asked for must never stop the server starting. This is
-    /// the regression that made a model with a 40,960-token stored context
-    /// refuse to launch at all, where before it had served happily at 512.
+    /// A window nobody asked for fits the machine instead of stopping the
+    /// server starting. This is the regression that made a model with a
+    /// 40,960-token stored context refuse to launch at all, where before it
+    /// had served happily at 512. The free memory is given, not measured: read
+    /// live, the test failed whenever the machine running it was busy.
     #[test]
     fn an_unrequested_window_fits_itself_to_the_machine() {
-        // 1 MB per token: the model's own 40,960 would want 40 GB.
+        // 1 MiB per token: the model's own 40,960 would want 40 GiB.
         let per_token = 1024 * 1024;
         let kv = |ctx: usize| ctx * per_token;
-        let choice = choose_context_window(None, 40_960, kv).expect("must not refuse to start");
-        assert!(
-            choice.context <= 40_960,
-            "never above the model's own window"
+        let gib = 1u64 << 30;
+
+        let roomy = fit_context_window(None, 40_960, kv, || Some(64 * gib)).unwrap();
+        assert_eq!((roomy.context, roomy.reduced_to_fit), (40_960, false));
+        let unmeasured = fit_context_window(None, 40_960, kv, || None).unwrap();
+        assert_eq!(
+            (unmeasured.context, unmeasured.reduced_to_fit),
+            (40_960, false)
         );
-        assert!(choice.context >= MIN_AUTOFIT_CONTEXT);
+
+        // 4 GiB free: 80% of it holds 3,276 tokens, reported at a round 3,072.
+        let tight = fit_context_window(None, 40_960, kv, || Some(4 * gib)).unwrap();
+        assert_eq!((tight.context, tight.reduced_to_fit), (3_072, true));
+        assert!(tight.context.is_multiple_of(AUTOFIT_GRANULARITY));
+        // A window that had to shrink says so rather than shrinking in silence.
+        let note = context_choice_note(tight, kv).expect("a reduced window must explain");
+        assert!(note.contains("--max-context"), "{note}");
         assert!(
-            choice.context.is_multiple_of(AUTOFIT_GRANULARITY),
-            "auto-chosen windows are reported at a round size, got {}",
-            choice.context
+            note.contains("40960"),
+            "the note names the model's own window: {note}"
         );
-        // Whether it had to shrink depends on this machine's free memory, but
-        // if it did, it must say so rather than shrink in silence.
-        if choice.reduced_to_fit {
-            let note = context_choice_note(choice, kv).expect("a reduced window must explain");
-            assert!(note.contains("--max-context"), "{note}");
-            assert!(
-                note.contains("40960"),
-                "the note names the model's own window: {note}"
-            );
-        }
+
+        // Not room for even the smallest window: refused, with the numbers.
+        let error = fit_context_window(None, 40_960, kv, || Some(256 << 20))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("512-token"), "{error}");
     }
 
     /// An explicitly requested window is the user's decision. It is honoured,
@@ -2787,6 +2858,50 @@ again"
             handle_load(&mut state, r#"{"path":"x.raimodel","max_context":0}"#).unwrap_err();
         assert_eq!(error.status, 400);
         assert!(error.message.contains("max_context"), "{error}");
+    }
+
+    /// `--max-context` means the same whether the model is named at startup
+    /// or loaded later: a number past the model's own is clamped to it. A
+    /// server started empty with one used to refuse every load instead.
+    #[test]
+    fn the_command_line_context_is_clamped_for_a_later_load_too() {
+        let dir = std::env::temp_dir().join(format!("rai-serve-clamp-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-tied.raimodel");
+        let model_path = dir.join("tiny.raimodel");
+        std::fs::copy(&fixture, &model_path).unwrap();
+        let stored = RaiModel::load(&model_path).unwrap().config;
+        let vocab: serde_json::Map<String, Value> = (0..stored.vocab_size)
+            .map(|id| (format!("t{id}"), json!(id)))
+            .collect();
+        let tokenizer = json!({
+            "version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+            "normalizer": null, "pre_tokenizer": { "type": "Whitespace" },
+            "post_processor": null, "decoder": null,
+            "model": { "type": "WordLevel", "unk_token": "t0", "vocab": vocab }
+        });
+        std::fs::write(dir.join("tokenizer.json"), tokenizer.to_string()).unwrap();
+
+        let mut state = ServerState {
+            loaded: None,
+            jobs: Arc::new(Jobs::new()),
+            options: ServeOptions {
+                port: 8090,
+                max_context: Some(2 * MAX_LOAD_CONTEXT),
+                chat_template: "chatml".to_string(),
+            },
+        };
+        let body = json!({ "path": model_path }).to_string();
+        let result = handle_load(&mut state, &body);
+        std::fs::remove_dir_all(&dir).ok();
+        result.unwrap();
+        assert_eq!(
+            state.loaded.as_ref().unwrap().max_context,
+            stored.max_context as usize
+        );
+        assert!(check_template_name("chatlm").is_err());
     }
 
     #[test]

@@ -36,18 +36,25 @@ cli = [
     "dep:minijinja-contrib",
 ]
 
-# Unix-only, and only for the free-space preflight before a conversion writes.
-# libc is already in the lock file transitively, so this adds no new code to the
-# dependency tree; the alternative was hand-declaring statvfs, whose struct
-# layout differs between glibc, musl and macOS and would be a guess per target.
+# Unix-only: for the free-space preflight before a conversion writes, and for
+# the local time zone chat templates' `strftime_now` reads. libc is already in
+# the lock file transitively, so this adds no new code to the dependency tree;
+# the alternative was hand-declaring statvfs and tm, whose struct layouts differ
+# between glibc, musl and macOS and would be a guess per target.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# Windows only, and only to count performance cores for the default thread
-# pool (`src/topology.rs`). Already in the lock file through the workspace, so
-# no new crate enters the dependency tree.
+# Windows only: to count performance cores for the default thread pool
+# (`src/topology.rs`), and to read the local time zone for chat templates'
+# `strftime_now` (`src/chat_format.rs`). Already in the lock file through the
+# workspace, so no new crate enters the dependency tree.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_Time",
+] }
 
 [dependencies]
 half = "2.4"

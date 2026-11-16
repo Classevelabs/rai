@@ -72,8 +72,9 @@ pub struct GenerationArgs {
     #[arg(long, default_value = "3.0")]
     pub entropy_threshold: f32,
     /// Context window to allocate the KV cache for, in tokens. Defaults to the
-    /// context window the model itself was stored with; a smaller value trades
-    /// history for memory, a larger one is clamped to what the model supports.
+    /// context the model was stored with, reduced to fit free memory when it
+    /// would not (a note says so); a smaller value trades history for memory,
+    /// a larger one is clamped to what the model supports.
     #[arg(long)]
     pub max_context: Option<usize>,
     /// Random seed; the same seed and settings reproduce the same text

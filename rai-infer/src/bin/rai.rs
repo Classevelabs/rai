@@ -58,7 +58,8 @@ enum Command {
 
     /// Serve a .raimodel over a local web chat UI
     #[command(
-        after_help = "EXAMPLE:\n  rai serve tinyllama.raimodel --port 8090\n\nBinds 127.0.0.1 only and rejects requests from other hosts."
+        after_help = "EXAMPLE:\n  rai serve tinyllama.raimodel --port 8090\n\nBinds loopback only (127.0.0.1, or [::1] on a machine without IPv4
+loopback) and rejects requests from other hosts."
     )]
     Serve(cli::serve::ServeArgs),
 

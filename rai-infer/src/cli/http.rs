@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Largest request head (request line and headers) accepted, in bytes.
 const MAX_HEAD_BYTES: usize = 16 * 1024;
@@ -31,13 +31,15 @@ const MAX_HEADERS: usize = 64;
 const MAX_READING: usize = 32;
 /// Requests parsed and waiting for the handler.
 const QUEUE_DEPTH: usize = 64;
-/// How long a client has to deliver its whole request.
+/// How long a client has to deliver its whole request, counted from the
+/// moment it connects: a deadline, not an idle timeout, so dribbling a byte at
+/// a time cannot hold one of the [`MAX_READING`] slots past it.
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long one write may block before the client is taken to be gone.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
-/// After a response to a request whose body was refused unread, how long and
-/// how much of it is drained so closing does not reset the connection before
-/// the client has read the refusal.
+/// After a response to a request that was not read to its end, how long and
+/// how much of the rest is drained so closing does not reset the connection
+/// before the client has read the response.
 const LINGER: Duration = Duration::from_millis(500);
 const LINGER_BYTES: usize = 256 * 1024;
 
@@ -93,8 +95,7 @@ impl Request {
             .map(|(_, value)| value.as_str())
     }
 
-    /// Whether the client has closed the connection. Its whole body has been
-    /// read, so end of stream here means nobody is waiting for the response.
+    /// Whether the client has closed the connection; see [`peer_closed`].
     pub fn client_gone(&self) -> bool {
         peer_closed(&self.stream)
     }
@@ -150,15 +151,7 @@ impl Request {
     fn close(&mut self) {
         let _ = self.stream.shutdown(Shutdown::Write);
         if matches!(self.body, Body::TooLarge) {
-            let _ = self.stream.set_read_timeout(Some(LINGER));
-            let mut sink = [0u8; 8192];
-            let mut drained = 0usize;
-            while drained < LINGER_BYTES {
-                match self.stream.read(&mut sink) {
-                    Ok(0) | Err(_) => break,
-                    Ok(read) => drained += read,
-                }
-            }
+            linger(&self.stream);
         }
     }
 }
@@ -191,23 +184,64 @@ pub struct ChunkedWriter {
 }
 
 /// Whether the client has closed its side of the connection, so that work
-/// done for it can stop. A non-blocking peek: end of stream or a reset means
-/// gone; data waiting, or nothing yet, means still there.
-fn peer_closed(stream: &TcpStream) -> bool {
+/// done for it can stop.
+///
+/// Its request has been read to the end, so whatever still arrives is surplus
+/// (a stray line ending, a pipelined request this server never answers). That
+/// is read and discarded without blocking, up to [`LINGER_BYTES`] a check:
+/// peeked instead, one surplus byte hid the end of stream behind it for good,
+/// and a client that had left was generated for to the last token. End of
+/// stream or a reset means gone, and so does a client that half-closes after
+/// its request, which the socket cannot tell from one that left. Nothing yet
+/// means still there.
+fn peer_closed(mut stream: &TcpStream) -> bool {
     if stream.set_nonblocking(true).is_err() {
         return false;
     }
-    let mut byte = [0u8; 1];
-    let gone = match stream.peek(&mut byte) {
-        Ok(0) => true,
-        Ok(_) => false,
-        Err(error) => !matches!(
-            error.kind(),
-            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-        ),
+    let mut sink = [0u8; 4096];
+    let mut drained = 0usize;
+    let gone = loop {
+        match stream.read(&mut sink) {
+            Ok(0) => break true,
+            Ok(read) => {
+                drained += read;
+                if drained >= LINGER_BYTES {
+                    break false;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => break error.kind() != io::ErrorKind::WouldBlock,
+        }
     };
     let _ = stream.set_nonblocking(false);
     gone
+}
+
+/// After a response is written and the write side shut, read and discard what
+/// the client is still sending, for at most [`LINGER`] in all and
+/// [`LINGER_BYTES`]. Closing on unread data makes the operating system reset
+/// the connection, which can destroy the response before the client reads it.
+fn linger(mut stream: &TcpStream) {
+    let deadline = Instant::now() + LINGER;
+    let mut sink = [0u8; 8192];
+    let mut drained = 0usize;
+    while drained < LINGER_BYTES {
+        match read_by(&mut stream, &mut sink, deadline) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => drained += read,
+        }
+    }
+}
+
+/// One read that waits no later than `deadline`.
+fn read_by(stream: &mut &TcpStream, buffer: &mut [u8], deadline: Instant) -> io::Result<usize> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    // A zero timeout is refused by the socket rather than meaning "now".
+    if remaining.is_zero() {
+        return Err(io::ErrorKind::TimedOut.into());
+    }
+    stream.set_read_timeout(Some(remaining))?;
+    stream.read(buffer)
 }
 
 impl ChunkedWriter {
@@ -333,11 +367,7 @@ fn accept_loop(
         };
         if reading.fetch_add(1, Ordering::SeqCst) >= MAX_READING {
             reading.fetch_sub(1, Ordering::SeqCst);
-            let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
-            let _ = stream.write_all(
-                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\
-                  Connection: close\r\n\r\n",
-            );
+            refuse_busy(&mut stream);
             continue;
         }
         let sender = sender.clone();
@@ -345,7 +375,7 @@ fn accept_loop(
         let spawned = thread::Builder::new()
             .name("rai-http-read".into())
             .spawn(move || {
-                if let Some(request) = read_request(stream, max_body) {
+                if let Some(request) = read_request(stream, max_body, READ_TIMEOUT) {
                     let _ = sender.send(request);
                 }
                 slot.fetch_sub(1, Ordering::SeqCst);
@@ -357,9 +387,32 @@ fn accept_loop(
     }
 }
 
-/// Read and parse one request, answering protocol errors itself.
-fn read_request(mut stream: TcpStream, max_body: usize) -> Option<Request> {
-    stream.set_read_timeout(Some(READ_TIMEOUT)).ok()?;
+/// Answer `503` from the accept thread, which must never wait on one client:
+/// what has already arrived of the request is discarded without blocking, so
+/// that closing is less likely to reset the connection under the answer.
+fn refuse_busy(stream: &mut TcpStream) {
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+    let _ = stream.write_all(
+        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\
+          Connection: close\r\n\r\n",
+    );
+    let _ = stream.shutdown(Shutdown::Write);
+    if stream.set_nonblocking(true).is_ok() {
+        let mut sink = [0u8; 8192];
+        let mut drained = 0usize;
+        while drained < LINGER_BYTES {
+            match stream.read(&mut sink) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => drained += read,
+            }
+        }
+    }
+}
+
+/// Read and parse one request, answering protocol errors itself. The client
+/// has `timeout` from now to deliver all of it.
+fn read_request(mut stream: TcpStream, max_body: usize, timeout: Duration) -> Option<Request> {
+    let deadline = Instant::now() + timeout;
     stream.set_write_timeout(Some(WRITE_TIMEOUT)).ok()?;
     let _ = stream.set_nodelay(true);
 
@@ -403,7 +456,7 @@ fn read_request(mut stream: TcpStream, max_body: usize) -> Option<Request> {
             reject(&mut stream, 431, "request head is too large");
             return None;
         }
-        match stream.read(&mut chunk) {
+        match read_by(&mut &stream, &mut chunk, deadline) {
             Ok(0) | Err(_) => return None,
             Ok(read) => buffer.extend_from_slice(&chunk[..read]),
         }
@@ -457,7 +510,7 @@ fn read_request(mut stream: TcpStream, max_body: usize) -> Option<Request> {
         body.truncate(declared);
         while body.len() < declared {
             let want = (declared - body.len()).min(chunk.len());
-            match stream.read(&mut chunk[..want]) {
+            match read_by(&mut &stream, &mut chunk[..want], deadline) {
                 Ok(0) | Err(_) => return None,
                 Ok(read) => body.extend_from_slice(&chunk[..read]),
             }
@@ -475,7 +528,8 @@ fn read_request(mut stream: TcpStream, max_body: usize) -> Option<Request> {
     })
 }
 
-/// Answer a request the server could not parse, and close.
+/// Answer a request the server could not parse, and close; the rest of it is
+/// drained first, as for any response to a request not read to its end.
 fn reject(stream: &mut TcpStream, status: u16, message: &str) {
     let body = format!("{message}\n");
     let response = format!(
@@ -487,6 +541,7 @@ fn reject(stream: &mut TcpStream, status: u16, message: &str) {
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
     let _ = stream.shutdown(Shutdown::Write);
+    linger(stream);
 }
 
 fn status_line(status: u16) -> String {
@@ -635,6 +690,98 @@ mod tests {
         server.unblock();
         let seen = handle.join().unwrap();
         assert_eq!(seen, vec![("/next".to_string(), 0)]);
+    }
+
+    /// The time a client has is for its whole request: one that keeps
+    /// sending a byte at a time is cut off at the deadline, where a timeout
+    /// that restarted on every byte would have held its slot for hours.
+    #[test]
+    fn a_dribbling_client_is_cut_off_at_the_deadline() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+        let address = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let dribbler = {
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                let mut client = TcpStream::connect(address).expect("connect");
+                let _ = client.write_all(b"GET / HTTP/1.1\r\nX-Slow: ");
+                while !stop.load(Ordering::SeqCst) {
+                    if client.write_all(b"a").is_err() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+            })
+        };
+        let (stream, _) = listener.accept().expect("accept");
+        let started = Instant::now();
+        let request = read_request(stream, 1024, Duration::from_millis(300));
+        let took = started.elapsed();
+        stop.store(true, Ordering::SeqCst);
+        dribbler.join().unwrap();
+        assert!(request.is_none());
+        assert!(took < Duration::from_secs(2), "held for {took:?}");
+    }
+
+    /// A refusal sent before the request was read to its end still reaches
+    /// the client whole: the rest of the request is drained, so closing does
+    /// not reset the connection under the answer.
+    #[test]
+    fn a_refusal_arrives_whole_with_the_request_still_in_flight() {
+        let (server, handle) = echo_server(1024);
+        let mut socket = TcpStream::connect(server.local_addr()).expect("connect");
+        let mut raw = b"POST /c HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        raw.extend(std::iter::repeat_n(b'x', 128 * 1024));
+        let _ = socket.write_all(&raw);
+        let _ = socket.shutdown(Shutdown::Write);
+        let mut response = String::new();
+        socket
+            .read_to_string(&mut response)
+            .expect("the refusal is read, not reset");
+        assert!(response.starts_with("HTTP/1.1 411"), "{response}");
+        assert!(response.ends_with("Content-Length\n"), "{response:?}");
+        server.unblock();
+        assert!(handle.join().unwrap().is_empty());
+    }
+
+    /// Bytes a client sends after its request do not hide that it has gone,
+    /// and do not make a client that is still there look gone.
+    #[test]
+    fn surplus_bytes_do_not_hide_a_departed_client() {
+        let server = Arc::new(HttpServer::bind_loopback(0, 16).expect("bind"));
+        let (arrived, wait_arrived) = std::sync::mpsc::channel();
+        let (left, wait_left) = std::sync::mpsc::channel::<()>();
+        let handle = {
+            let server = Arc::clone(&server);
+            thread::spawn(move || {
+                let request = server.incoming_requests().next().expect("a request");
+                arrived.send(()).unwrap();
+                // Still connected, with a stray line ending sent after the
+                // request: still there.
+                thread::sleep(Duration::from_millis(100));
+                let present = !request.client_gone();
+                wait_left.recv().unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut gone = request.client_gone();
+                while !gone && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(20));
+                    gone = request.client_gone();
+                }
+                (present, gone)
+            })
+        };
+        let mut socket = TcpStream::connect(server.local_addr()).expect("connect");
+        socket
+            .write_all(b"GET /g HTTP/1.1\r\nHost: a\r\n\r\n")
+            .unwrap();
+        wait_arrived.recv().unwrap();
+        socket.write_all(b"\r\n").unwrap();
+        thread::sleep(Duration::from_millis(300));
+        drop(socket);
+        left.send(()).unwrap();
+        let (present, gone) = handle.join().unwrap();
+        assert!(present, "a connected client was taken to be gone");
+        assert!(gone, "a client that left was never noticed");
     }
 
     #[test]
