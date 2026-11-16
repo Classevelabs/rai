@@ -132,7 +132,7 @@ pub struct Job {
     pub elapsed_ms: u64,
     /// Every narration line, in order. Poll with a cursor to read the tail.
     pub log: Vec<String>,
-    /// Lines dropped once [`MAX_LOG_LINES`] was reached, so a client can tell
+    /// Lines dropped once `MAX_LOG_LINES` was reached, so a client can tell
     /// its cursor is no longer exact.
     pub log_dropped: usize,
     pub result: Option<JobResult>,

@@ -137,7 +137,7 @@ impl LayerKVCache {
     /// Make positions `0..positions` addressable, growing if needed.
     ///
     /// The fallible half of growth: the cache only allocates its first
-    /// [`INITIAL_POSITIONS`] up front, so a long conversation reaches new
+    /// `INITIAL_POSITIONS` up front, so a long conversation reaches new
     /// allocations long after the window was weighed against free memory at
     /// load. Reserving before a forward pass stores anything turns running out
     /// then into an error the caller can report, rather than a panic in the
@@ -284,7 +284,7 @@ impl LayerKVCache {
     }
 
     /// Empty the cache and give back what it grew to, keeping only the first
-    /// [`INITIAL_POSITIONS`]. A failed allocation leaves it emptied but
+    /// `INITIAL_POSITIONS`. A failed allocation leaves it emptied but
     /// unshrunk, which is still correct.
     pub fn release(&mut self) {
         self.filled = 0;

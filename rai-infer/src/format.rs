@@ -1,12 +1,15 @@
 //! `.raimodel` binary format: validated in-memory reader for GPTQ-4bit models.
 //!
 //! File layout:
-//!   [64 or 128 bytes]     Header (magic, version, model config)
-//!   [num_sections * 16]   Section index table (offset, size per section)
-//!   [variable]            Section 0: Embedding (8-bit quantized)
-//!   [variable]            Sections 1..N: Transformer layers (4-bit quantized linears + f32 norms)
-//!   [variable]            Section N+1: Final RMSNorm (f32 weights)
-//!   [variable]            Section N+2 (untied only): lm_head (4-bit quantized)
+//!
+//! ```text
+//! [64 or 128 bytes]     Header (magic, version, model config)
+//! [num_sections * 16]   Section index table (offset, size per section)
+//! [variable]            Section 0: Embedding (8-bit quantized)
+//! [variable]            Sections 1..N: Transformer layers (4-bit quantized linears + f32 norms)
+//! [variable]            Section N+1: Final RMSNorm (f32 weights)
+//! [variable]            Section N+2 (untied only): lm_head (4-bit quantized)
+//! ```
 //!
 //! # Versions
 //!
@@ -47,7 +50,7 @@
 //!
 //! A layer section is, in order:
 //!
-//! 1. the seven quantized linears, in [`PROJECTION_NAMES`] order;
+//! 1. the seven quantized linears, in [`PROJECTION_NAMES`](crate::format::PROJECTION_NAMES) order;
 //! 2. the **bias block** — present when `flags` bit 0 is set: one `rows * 4`-byte
 //!    f32 vector per set `bias_mask` bit, in the same order. Biases are stored
 //!    as f32 rather than quantized: they are `rows` values against a matrix of

@@ -17,8 +17,8 @@
 //!
 //! # Layout
 //!
-//! The reading path runs [`format`] → [`model`] → [`layers`] + [`gemm`]:
-//! [`format`] validates a file and hands out borrowed views into one heap
+//! The reading path runs [`format`](mod@format) → [`model`] → [`layers`] + [`gemm`]:
+//! [`format`](mod@format) validates a file and hands out borrowed views into one heap
 //! buffer, [`model`] drives the forward pass over those views, and [`layers`]
 //! and [`gemm`] are the kernels underneath. [`kv_cache`] holds attention state
 //! across steps and [`sampler`] turns logits into a token.

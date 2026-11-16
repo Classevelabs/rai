@@ -5,12 +5,13 @@
 //! Round-to-nearest fits each group's scale and zero point to the weights
 //! alone. A calibrated conversion first runs the checkpoint, unquantized, over
 //! some representative text and measures how much energy each input channel of
-//! every projection carries ([`accumulate_channel_energy`]: the diagonal of the
-//! activation Hessian `H = XᵀX`). It then fits each group's scale and zero
-//! point to minimize the rounding error weighted by that energy
-//! ([`group_params_weighted`]), so a weight on a channel the model actually
-//! drives is rounded more carefully. The file is byte-for-byte the same shape
-//! either way.
+//! every projection carries
+//! ([`accumulate_channel_energy`](crate::calibrate::accumulate_channel_energy):
+//! the diagonal of the activation Hessian `H = XᵀX`). It then fits each
+//! group's scale and zero point to minimize the rounding error weighted by
+//! that energy ([`group_params_weighted`](crate::calibrate::group_params_weighted)),
+//! so a weight on a channel the model actually drives is rounded more
+//! carefully. The file is byte-for-byte the same shape either way.
 //!
 //! It is not GPTQ. GPTQ also carries each column's rounding error into the
 //! columns not yet quantized, which needs the full `cols × cols` Hessian and
@@ -34,9 +35,10 @@
 //! calibration tokens: 462 s against 20 s for round-to-nearest on
 //! SmolLM2-1.7B, paid once at conversion.
 //!
-//! [`accumulate_gram`] builds the full Hessian, the input the GPTQ step needs.
-//! The converter does not call it; `benches/gemm.rs` measures what it would
-//! cost, since `H` for a 7B MLP is 14336², 1.6 GB in f64.
+//! [`accumulate_gram`](crate::calibrate::accumulate_gram) builds the full
+//! Hessian, the input the GPTQ step needs. The converter does not call it;
+//! `benches/gemm.rs` measures what it would cost, since `H` for a 7B MLP is
+//! 14336², 1.6 GB in f64.
 
 use anyhow::{ensure, Result};
 use rayon::prelude::*;

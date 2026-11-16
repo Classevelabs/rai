@@ -16,7 +16,7 @@
 //! `max(0, p_target - p_draft)`. The draft distribution here is a point mass
 //! on the copied token (`p_draft = 1`), so acceptance reduces to
 //! `p_target(draft_token)` — but it is computed through the same
-//! [`softmax_prob_of`] / [`sample_correction`] core as the model-drafted path
+//! `softmax_prob_of` / `sample_correction` core as the model-drafted path
 //! so there is exactly one acceptance rule in the crate.
 //!
 //! When no n-gram matches at all, no draft is produced and the step degenerates

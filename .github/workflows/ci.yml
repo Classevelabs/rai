@@ -99,6 +99,15 @@ jobs:
       - name: Documentation tests
         run: cargo test --workspace --doc --locked
 
+      # The published crates' API docs, as docs.rs builds them: a broken link
+      # there renders as stray brackets or a dead reference, and 33 of them
+      # had built up while nothing checked.
+      - name: API documentation builds without warnings
+        if: matrix.os == 'ubuntu-24.04'
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps -p classeve-rai-infer -p classeve-rai-compress --locked
+
       - name: Release build
         run: cargo build --workspace --release --locked
 
@@ -106,6 +115,10 @@ jobs:
         run: python3 -m compileall -q rai-infer/scripts
 
       - name: Run exporter conformance suite (numpy-only)
+        # bash on every runner: Windows' default pwsh fails a step only on its
+        # last command, so a failing suite there passed whenever the
+        # fixtures happened to match.
+        shell: bash
         env:
           # macOS runner pythons are PEP 668 externally-managed; CI machines
           # are ephemeral, so installing into the system environment is fine.

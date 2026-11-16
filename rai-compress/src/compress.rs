@@ -38,6 +38,8 @@ pub enum CompressionError {
 /// Compressed weight matrix using Resonance Compression.
 ///
 /// Layout:
+///
+/// ```text
 /// ┌──────────────────────────────┐
 /// │ Prior (low-rank: U, S, V)    │  ← captures structure (FP16-equivalent)
 /// ├──────────────────────────────┤
@@ -45,6 +47,7 @@ pub enum CompressionError {
 /// │  [block_0] [block_1] ...     │
 /// │  each block: scale + bits[]  │
 /// └──────────────────────────────┘
+/// ```
 ///
 /// Decompression: W ≈ Prior.predict() + dequant(residual_blocks)
 /// Prior can be cached → hot path is just residual dequant.
