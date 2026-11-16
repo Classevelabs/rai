@@ -164,6 +164,8 @@ struct Spec {
     /// what lets a fused checkpoint be compared byte-for-byte against the
     /// separate one built from the same seed.
     fused_projections: bool,
+    /// Give every layer norm a bias, as StableLM's LayerNorm carries.
+    norm_bias: bool,
     /// Extra keys merged into `config.json` verbatim.
     extra_config: serde_json::Value,
     shards: usize,
@@ -183,6 +185,7 @@ impl Default for Spec {
             experts: 0,
             post_norm: false,
             fused_projections: false,
+            norm_bias: false,
             extra_config: serde_json::Value::Null,
             shards: 1,
         }
@@ -366,6 +369,10 @@ fn write_checkpoint(dir: &Path, spec: &Spec) -> Checkpoint {
             let tensor = format!("model.layers.{layer}.{suffix}.weight");
             tensors.push((tensor.clone(), vec![HIDDEN], values.clone()));
             norms.push((tensor, values));
+            if spec.norm_bias {
+                let bias = format!("model.layers.{layer}.{suffix}.bias");
+                tensors.push((bias, vec![HIDDEN], rng.norm(HIDDEN)));
+            }
         }
     }
     let final_norm = rng.norm(HIDDEN);
@@ -1018,6 +1025,54 @@ fn a_llama3_rope_checkpoint_records_its_scaling() {
 }
 
 #[test]
+fn a_transformers_5_config_stores_the_checkpoints_own_rope() {
+    // transformers 5 writes the RoPE block into `rope_parameters` and drops the
+    // top-level `rope_theta`; reading only the old key stored the 10000 fallback.
+    let root = scratch_dir("rope-parameters");
+    let model_dir = root.join("checkpoint");
+    let output = root.join("out").join("x.raimodel");
+    write_checkpoint(&model_dir, &Spec::default());
+    let config_path = model_dir.join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    let object = config.as_object_mut().unwrap();
+    object.remove("rope_theta");
+    object.remove("rope_scaling");
+    config["rope_parameters"] = serde_json::json!({
+        "rope_type": "llama3", "rope_theta": 500000.0, "factor": 32.0,
+        "low_freq_factor": 1.0, "high_freq_factor": 4.0,
+        "original_max_position_embeddings": 256
+    });
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+    convert(&options(&model_dir, &output)).expect("a transformers 5 config must convert");
+    let file = RaiModelFile::open(&output).unwrap();
+    assert_eq!(file.config.rope_theta, 500_000.0);
+    assert_eq!(
+        file.config.rope_scaling,
+        RopeScaling::Llama3 {
+            factor: 32.0,
+            low_freq_factor: 1.0,
+            high_freq_factor: 4.0,
+            original_max_position: 256,
+        }
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_biased_layer_norm_is_refused() {
+    // StableLM's LayerNorm carries a bias; run as RMSNorm it would lose the
+    // bias and the mean subtraction.
+    let spec = Spec {
+        norm_bias: true,
+        ..Spec::default()
+    };
+    let error = convert_error("norm-bias", &spec);
+    assert!(error.contains("input_layernorm.bias"), "{error}");
+}
+
+#[test]
 fn an_unknown_rope_scheme_is_still_refused() {
     let spec = Spec {
         rope_scaling: serde_json::json!({ "rope_type": "yarn", "factor": 4.0 }),
@@ -1133,6 +1188,39 @@ fn architectures_the_container_cannot_express_are_still_refused() {
                 config["sliding_window"] = serde_json::json!(128);
             }),
             "sliding_window",
+        ),
+        (
+            // Granite: Llama tensor names, and a residual scale with no slot.
+            "unstored-scale",
+            Box::new(|config: &mut serde_json::Value| {
+                config["residual_multiplier"] = serde_json::json!(0.22);
+            }),
+            "residual_multiplier=0.22",
+        ),
+        (
+            "no-rope-layers",
+            Box::new(|config: &mut serde_json::Value| {
+                config["no_rope_layers"] = serde_json::json!([1, 0]);
+            }),
+            "no_rope_layers",
+        ),
+        (
+            "partial-rotary",
+            Box::new(|config: &mut serde_json::Value| {
+                config["partial_rotary_factor"] = serde_json::json!(0.5);
+            }),
+            "partial_rotary_factor=0.5",
+        ),
+        (
+            // transformers 5 names the scheme in `rope_parameters`.
+            "rope-parameters-yarn",
+            Box::new(|config: &mut serde_json::Value| {
+                let object = config.as_object_mut().unwrap();
+                object.remove("rope_theta");
+                object.remove("rope_scaling");
+                config["rope_parameters"] = serde_json::json!({ "rope_type": "yarn", "rope_theta": 10000.0, "factor": 4.0 });
+            }),
+            "rope_parameters type 'yarn'",
         ),
     ] {
         let root = scratch_dir(&format!("refuse-{label}"));
@@ -1520,6 +1608,43 @@ fn a_sparse_checkpoint_stores_its_router_and_every_expert() {
         layer.expert(4, &file.config).is_err(),
         "an expert past the end must be an error, not a wrong slice"
     );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Qwen3-MoE declares a dense `intermediate_size` it never uses and stores
+/// every expert at `moe_intermediate_size`. Reading the dense width sized the
+/// experts wrong and refused the checkpoint; the expert width is the MLP width.
+#[test]
+fn a_qwen3_moe_checkpoint_sizes_its_experts_by_moe_intermediate_size() {
+    let spec = Spec {
+        model_type: "qwen3_moe",
+        experts: 4,
+        qk_norm: QkNorm::EveryLayer,
+        extra_config: serde_json::json!({
+            "intermediate_size": 4 * INTERMEDIATE,
+            "moe_intermediate_size": INTERMEDIATE,
+            "decoder_sparse_step": 1,
+            "mlp_only_layers": [],
+            "num_experts": 4,
+            "num_experts_per_tok": 2,
+            "norm_topk_prob": true,
+        }),
+        ..Spec::default()
+    };
+    let (root, output, _) = convert_spec("qwen3-moe", &spec);
+
+    let file = RaiModelFile::open(&output).expect("the produced model must load");
+    assert_eq!(file.config.intermediate_size as usize, INTERMEDIATE);
+    assert_eq!(file.config.num_experts, 4);
+    let layer = file.layer(LAYERS - 1).expect("last layer");
+    for expert in 0..4 {
+        let mlp = layer.expert(expert, &file.config).expect("expert");
+        assert_eq!((mlp.gate.rows, mlp.gate.cols), (INTERMEDIATE, HIDDEN));
+        assert_eq!((mlp.down.rows, mlp.down.cols), (HIDDEN, INTERMEDIATE));
+    }
+    let logits = run_forward(&RaiModel::load(&output).unwrap(), &[1, 5, 9, 13]);
+    assert!(logits.iter().all(|value| value.is_finite()));
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -1991,6 +2116,109 @@ fn a_conversion_reports_the_shards_it_read_and_what_they_became() {
         "bits_per_parameter {} does not match the file",
         summary.bits_per_parameter()
     );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Another model's tokenizer already in the output folder is refused before
+/// a byte of the model is written, so no model is left beside a tokenizer it
+/// cannot use; the same tokenizer is not a clash.
+#[test]
+fn a_tokenizer_clash_is_refused_before_the_model_is_written() {
+    let root = scratch_dir("tokenizer-clash");
+    let model_dir = root.join("checkpoint");
+    let out_dir = root.join("out");
+    let output = out_dir.join("clash.raimodel");
+    write_checkpoint(&model_dir, &Spec::default());
+    std::fs::create_dir_all(&out_dir).expect("creating the output dir");
+    let foreign = b"{\"another\":\"model\"}";
+    std::fs::write(out_dir.join("tokenizer.json"), foreign).expect("writing a foreign tokenizer");
+
+    let error = format!(
+        "{:#}",
+        convert(&options(&model_dir, &output)).expect_err("a clash must be refused")
+    );
+    assert!(error.contains("refusing to overwrite"), "{error}");
+    let left: Vec<String> = std::fs::read_dir(&out_dir)
+        .expect("reading the output dir")
+        .map(|entry| {
+            entry
+                .expect("directory entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert_eq!(
+        left,
+        ["tokenizer.json"],
+        "nothing but the foreign tokenizer may remain"
+    );
+    assert_eq!(
+        std::fs::read(out_dir.join("tokenizer.json")).unwrap(),
+        foreign
+    );
+
+    std::fs::copy(
+        model_dir.join("tokenizer.json"),
+        out_dir.join("tokenizer.json"),
+    )
+    .expect("placing this model's own tokenizer");
+    convert(&options(&model_dir, &output))
+        .unwrap_or_else(|error| panic!("its own tokenizer is no clash: {error:#}"));
+    assert!(output.is_file());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Calibrated conversion end to end: it runs, writes a model the reader
+/// loads, and rounds differently from round-to-nearest, or the calibration
+/// pass would be decorative.
+#[test]
+fn a_calibrated_conversion_runs_and_changes_the_rounding() {
+    let root = scratch_dir("calibrated");
+    let model_dir = root.join("checkpoint");
+    write_checkpoint(&model_dir, &Spec::default());
+    // A word-level tokenizer over the synthetic vocabulary, so the corpus maps
+    // onto ids the model has.
+    let vocab: serde_json::Map<String, serde_json::Value> = (0..VOCAB)
+        .map(|id| (format!("w{id}"), serde_json::json!(id)))
+        .collect();
+    let tokenizer = serde_json::json!({
+        "version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+        "normalizer": null, "pre_tokenizer": { "type": "Whitespace" },
+        "post_processor": null, "decoder": null,
+        "model": { "type": "WordLevel", "vocab": vocab, "unk_token": "w0" }
+    });
+    std::fs::write(
+        model_dir.join("tokenizer.json"),
+        serde_json::to_vec(&tokenizer).unwrap(),
+    )
+    .expect("writing the tokenizer");
+    let mut rng = Lcg(7);
+    let corpus: Vec<String> = (0..4 * 32)
+        .map(|_| format!("w{}", rng.next_u32() as usize % VOCAB))
+        .collect();
+    let text_path = root.join("calibration.txt");
+    std::fs::write(&text_path, corpus.join(" ")).expect("writing the corpus");
+
+    let rounded = root.join("rounded").join("model.raimodel");
+    convert(&options(&model_dir, &rounded)).unwrap_or_else(|error| panic!("{error:#}"));
+    let calibrated = root.join("calibrated").join("model.raimodel");
+    convert(&ConvertOptions {
+        calibration_text: Some(text_path),
+        calibration_sequences: 4,
+        calibration_seq_len: 32,
+        ..options(&model_dir, &calibrated)
+    })
+    .unwrap_or_else(|error| panic!("calibrated conversion failed: {error:#}"));
+
+    let a = std::fs::read(&rounded).unwrap();
+    let b = std::fs::read(&calibrated).unwrap();
+    assert_eq!(a.len(), b.len(), "calibration changes rounding, not layout");
+    assert_ne!(a, b, "calibrated codes must differ from round-to-nearest");
+    let logits = run_forward(&RaiModel::load(&calibrated).unwrap(), &[1, 5, 9, 13]);
+    assert!(logits.iter().all(|value| value.is_finite()));
 
     let _ = std::fs::remove_dir_all(&root);
 }

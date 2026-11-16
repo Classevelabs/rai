@@ -39,8 +39,8 @@ use std::time::{Duration, Instant};
 // `layers.rs`). The writer imports them so a converted file is, by
 // construction, a file this build can load.
 use crate::format::{
-    MAX_CONTEXT, MAX_HEADS, MAX_HIDDEN_SIZE, MAX_INTERMEDIATE_SIZE, MAX_LAYERS, MAX_VOCAB_SIZE,
-    PROJECTION_NAMES,
+    MAX_CONTEXT, MAX_HEADS, MAX_HIDDEN_SIZE, MAX_INTERMEDIATE_SIZE, MAX_LAYERS,
+    MAX_MODEL_FILE_BYTES, MAX_VOCAB_SIZE, PROJECTION_NAMES,
 };
 use crate::gemm::MAX_GROUPS as MAX_GEMM_GROUPS;
 use crate::layers::{Activation, RopeScaling, MAX_ROPE_TABLE_BYTES};
@@ -72,21 +72,31 @@ const BLOCK_ELEMENTS: usize = 2 << 20;
 /// parses — this is also the bit order of the v2 header's `bias_mask`.
 const LAYER_LINEAR_NAMES: [&str; 7] = PROJECTION_NAMES;
 
-/// Architectures whose maths this container cannot express even though their
-/// tensor names look Llama-shaped.
+/// The `model_type`s whose forward pass the runtime implements and which have
+/// been converted and checked against the reference (`docs/MODELS.md`).
 ///
-/// `gemma` came off this list in container v2: GeGLU is a stored activation
-/// code, and Gemma's other differences are folded at conversion time (see
-/// `GemmaFolds`). `gemma2` came off it once the header gained the two softcaps
-/// and the layer section gained the sandwich norms.
-///
-/// `gemma3` was the last entry off: its blocker was the two rotary bases
-/// (`rope_local_base_freq` for the sliding layers, `rope_theta` for the global
-/// ones), and the header now carries `rope_local_theta` plus
-/// `global_layer_stride` so the runtime builds both tables. The list is empty
-/// today; it stays here because the refusal machinery and its message are the
-/// contract for whatever architecture shows up next.
-const UNSUPPORTED_MODEL_TYPES: [(&str, &str); 0] = [];
+/// An allowlist, not a denylist of known-bad families, because matching tensor
+/// names prove nothing about the arithmetic: ERNIE-4.5 rotates interleaved
+/// pairs and EXAONE-4 skips RoPE on its global layers, both under Llama tensor
+/// names and with no config key that says so. Either would convert cleanly
+/// into a model that computes something else. A family joins this list when it
+/// has been verified, not before. `scripts/raimodel.py` holds the same list,
+/// held equal by `tests/limits_are_single_sourced.rs`.
+pub const VERIFIED_MODEL_TYPES: &[&str] = &[
+    "llama",
+    "mistral",
+    "mixtral",
+    "qwen2",
+    "qwen3",
+    "qwen3_moe",
+    "gemma",
+    "gemma2",
+    "gemma3",
+    "gemma3_text",
+    "phi3",
+    "olmo2",
+    "olmoe",
+];
 
 /// Model families that need the container's Gemma-specific conversion folds:
 /// the `1 + w` RMSNorm and the `sqrt(hidden_size)` embedding scale. Gemma2 uses
@@ -422,6 +432,30 @@ struct GemmaFolds {
     norm_plus_one: bool,
 }
 
+/// The sibling temp file an output is written through before it is renamed
+/// over the target.
+///
+/// The name is this process's own and is created exclusively: with one fixed
+/// `<output>.partial`, two conversions to the same target (the command line
+/// and Studio, say) truncated each other's bytes and could rename a corrupted
+/// file into place.
+fn partial_path(target: &Path) -> PathBuf {
+    let mut name = target.as_os_str().to_owned();
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    name.push(format!(".{}-{stamp}.partial", std::process::id()));
+    PathBuf::from(name)
+}
+
+fn create_partial(path: &Path) -> Result<File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))
+}
+
 /// Deletes the `.partial` conversion output on drop unless the write finished
 /// and the file was renamed into place (`keep` flipped to true). Covers early
 /// `?` returns and panics on the conversion thread alike.
@@ -467,13 +501,23 @@ pub fn convert_with_progress(
     let head_dim = resolve_head_dim(optional_u32(&hf, "head_dim")?, hidden_size, num_heads)?;
     let intermediate_size = required_u32(&hf, "intermediate_size")?;
     let vocab_size = required_u32(&hf, "vocab_size")?;
-    let rope_theta = optional_f64(&hf, "rope_theta")?.unwrap_or(10_000.0) as f32;
+    validate_dimension_bounds(
+        hidden_size,
+        num_layers,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        intermediate_size,
+        vocab_size,
+    )?;
+    let rope_theta = resolve_rope_theta(&hf)?;
     let norm_eps = optional_f64(&hf, "rms_norm_eps")?.unwrap_or(1e-5) as f32;
-    let tied = hf
-        .get("tie_word_embeddings")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
     let model_type = hf.get("model_type").and_then(|v| v.as_str()).unwrap_or("?");
+    let mut store = SafeTensorsSet::open(&options.model_dir)?;
+    let tied = resolve_tied(&hf, Some(&store));
+    let experts = resolve_experts(&hf, intermediate_size)?;
+    // The width every stored MLP has: the experts' own for a sparse model.
+    let intermediate_size = experts.mlp_width;
 
     // Settled before anything is planned: the stored context sizes the RoPE
     // table, is echoed in the header, and is the ceiling every later run is
@@ -488,6 +532,7 @@ pub fn convert_with_progress(
         intermediate_size,
         vocab_size,
         tied_embeddings: tied,
+        num_experts: experts.count,
     };
 
     let is_gemma = GEMMA_MODEL_TYPES.contains(&model_type);
@@ -498,7 +543,6 @@ pub fn convert_with_progress(
     let final_logit_softcap = resolve_softcap(&hf, "final_logit_softcapping")?;
     let attn_scale = resolve_attn_scale(&hf, head_dim)?;
     let per_layer_rope = resolve_per_layer_rope(&hf, num_layers)?;
-    let experts = resolve_experts(&hf, intermediate_size)?;
     let folds = GemmaFolds {
         norm_plus_one: is_gemma,
     };
@@ -536,9 +580,9 @@ pub fn convert_with_progress(
         post_norm: false,
         rope_local_theta: per_layer_rope.0,
         global_layer_stride: per_layer_rope.1,
-        num_experts: experts.0,
-        experts_per_token: experts.1,
-        norm_topk_prob: experts.2,
+        num_experts: experts.count,
+        experts_per_token: experts.per_token,
+        norm_topk_prob: experts.norm_topk_prob,
         attn_logit_softcap,
         final_logit_softcap,
         attn_scale,
@@ -563,6 +607,11 @@ pub fn convert_with_progress(
             .unwrap_or_else(|| Path::new("."))
             .join("tokenizer.json"),
     };
+    // Settled before a byte of the model is written. Checked only after the
+    // rename, a clash left the finished model in place beside another
+    // model's tokenizer — a pair that loads and produces fluent nonsense. The
+    // copy at the end checks again, for a file that appears meanwhile.
+    check_tokenizer_destination(&tokenizer_src, &tokenizer_dst)?;
 
     // Progress accounting: one unit per section (the embedding, each layer,
     // the final norm, and `lm_head` when untied), so `percent` advances once
@@ -592,7 +641,6 @@ pub fn convert_with_progress(
 
     log(&format!("Output: {}", output_path.display()));
     log(&format!("Reading {}...", options.model_dir.display()));
-    let mut store = SafeTensorsSet::open(&options.model_dir)?;
     assert_exportable_architecture(&hf, Some(&store), context.tokens, num_layers)?;
     let (source_bytes, source_files) = checkpoint_source_bytes(&store)?;
     let parameters = shape.parameter_count();
@@ -632,7 +680,7 @@ pub fn convert_with_progress(
         let experts = ExpertLayout::detect(&store)?;
         if config.bias_mask != 0 {
             bail!(
-                "checkpoint declares experts and projection biases; the bias mask addresses the                  seven dense projections and has no slot for a per-expert bias."
+                "checkpoint declares experts and projection biases; the bias mask addresses the seven dense projections and has no slot for a per-expert bias."
             );
         }
         // Every expert of every layer, checked before a byte is written: a
@@ -784,18 +832,14 @@ pub fn convert_with_progress(
     // part-way leaves the old model untouched, and the guard removes the
     // partial so it cannot be mistaken for a model later. (A hard kill —
     // Ctrl+C included, which does not unwind on Windows — can still leave a
-    // stale .partial behind; the next conversion truncates it.)
-    let tmp_path = {
-        let mut name = output_path.clone().into_os_string();
-        name.push(".partial");
-        PathBuf::from(name)
-    };
+    // stale .partial behind.)
+    //
+    let tmp_path = partial_path(&output_path);
+    let mut file = create_partial(&tmp_path)?;
     let mut tmp_guard = PartialOutput {
         path: &tmp_path,
         keep: false,
     };
-    let mut file =
-        File::create(&tmp_path).with_context(|| format!("creating {}", tmp_path.display()))?;
     write_header(&mut file, &config, num_sections as u32)?;
     for (offset, size) in offsets.iter().zip(&section_sizes) {
         file.write_all(&offset.to_le_bytes())?;
@@ -833,6 +877,7 @@ pub fn convert_with_progress(
                 &layout,
                 &linear_dims,
                 expert_layout.as_ref(),
+                folds,
                 &tokens,
                 options.calibration_seq_len,
                 &log,
@@ -1125,13 +1170,64 @@ pub fn convert_with_progress(
 // Validation
 // =============================================================================
 
-fn validate_options(options: &ConvertOptions) -> Result<()> {
-    for (flag, value) in [
-        ("--group-size", options.group_size),
-        ("--embed-group-size", options.embed_group_size),
+/// The one rule for a quantization group size, shared by the converter and
+/// [`preflight`]: the header stores it in a `u8`, and the packed kernels need
+/// it even.
+fn validate_group_size(flag: &str, value: u32) -> Result<u8> {
+    if !(2..=254).contains(&value) || !value.is_multiple_of(2) {
+        bail!("{flag} must be an even integer in 2..=254, got {value}");
+    }
+    Ok(value as u8)
+}
+
+/// Bound every dimension a config declares before anything loops over or
+/// multiplies them: a config claiming four billion layers would otherwise
+/// spin through billions of tensor-name lookups (or overflow an index) before
+/// the full validation got to refuse it.
+fn validate_dimension_bounds(
+    hidden_size: u32,
+    num_layers: u32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    intermediate_size: u32,
+    vocab_size: u32,
+) -> Result<()> {
+    for (name, value, maximum) in [
+        ("hidden_size", hidden_size, MAX_HIDDEN_SIZE),
+        ("num_hidden_layers", num_layers, MAX_LAYERS),
+        ("num_attention_heads", num_heads, MAX_HEADS),
+        ("num_key_value_heads", num_kv_heads, MAX_HEADS),
+        ("head_dim", head_dim, MAX_HIDDEN_SIZE),
+        (
+            "intermediate_size",
+            intermediate_size,
+            MAX_INTERMEDIATE_SIZE,
+        ),
+        ("vocab_size", vocab_size, MAX_VOCAB_SIZE),
     ] {
-        if !(2..=254).contains(&value) || !value.is_multiple_of(2) {
-            bail!("{flag} must be an even integer in 2..=254, got {value}");
+        if value == 0 || value > maximum {
+            bail!("config declares {name}={value}; the .raimodel reader requires 1..={maximum}");
+        }
+    }
+    Ok(())
+}
+
+fn validate_options(options: &ConvertOptions) -> Result<()> {
+    validate_group_size("--group-size", options.group_size)?;
+    validate_group_size("--embed-group-size", options.embed_group_size)?;
+    if options.calibration_text.is_some() {
+        // Zero sequences would leave every channel's energy at 0/0 and quietly
+        // produce a round-to-nearest model under a calibrated name; a
+        // one-token sequence has nothing to predict from.
+        if options.calibration_sequences == 0 {
+            bail!("--calibration-sequences must be at least 1");
+        }
+        if options.calibration_seq_len < 2 {
+            bail!(
+                "--calibration-seq-len must be at least 2 tokens, got {}",
+                options.calibration_seq_len
+            );
         }
     }
     // Zero is `FOLLOW_MODEL_CONTEXT`, not a context: `resolve_max_context`
@@ -1310,6 +1406,8 @@ struct ModelShape {
     intermediate_size: u32,
     vocab_size: u32,
     tied_embeddings: bool,
+    /// Routed experts per layer; 0 for a dense model.
+    num_experts: u16,
 }
 
 impl ModelShape {
@@ -1320,21 +1418,38 @@ impl ModelShape {
     /// [`convert_with_progress`] (which divides the output size by it): two
     /// counts that disagreed would make the bits-per-parameter figure a
     /// different number depending on which screen the user read it from.
+    ///
+    /// Saturating throughout: [`preflight`] reports this for any config it is
+    /// handed, including ones whose dimensions it is about to refuse, and an
+    /// overflow there would be a panic rather than a refusal.
     fn parameter_count(self) -> u64 {
-        let attention_dim = self.num_heads as u64 * self.head_dim as u64;
-        let kv_dim = self.num_kv_heads as u64 * self.head_dim as u64;
-        let hidden = self.hidden_size as u64;
-        let inter = self.intermediate_size as u64;
-        let per_layer =
-            hidden * attention_dim * 2 + hidden * kv_dim * 2 + hidden * inter * 3 + hidden * 2;
-        self.vocab_size as u64 * hidden
-            + self.num_layers as u64 * per_layer
-            + hidden
-            + if self.tied_embeddings {
-                0
+        let attention_dim = u64::from(self.num_heads).saturating_mul(u64::from(self.head_dim));
+        let kv_dim = u64::from(self.num_kv_heads).saturating_mul(u64::from(self.head_dim));
+        let hidden = u64::from(self.hidden_size);
+        let inter = u64::from(self.intermediate_size);
+        // A sparse layer stores every expert's MLP and a router; a dense one
+        // is the one-expert case.
+        let experts = u64::from(self.num_experts.max(1));
+        let mlp = hidden
+            .saturating_mul(inter)
+            .saturating_mul(3)
+            .saturating_mul(experts)
+            .saturating_add(if self.num_experts > 0 {
+                hidden.saturating_mul(experts)
             } else {
-                self.vocab_size as u64 * hidden
-            }
+                0
+            });
+        let per_layer = hidden
+            .saturating_mul(attention_dim)
+            .saturating_mul(2)
+            .saturating_add(hidden.saturating_mul(kv_dim).saturating_mul(2))
+            .saturating_add(mlp)
+            .saturating_add(hidden.saturating_mul(2));
+        let embedding = u64::from(self.vocab_size).saturating_mul(hidden);
+        embedding
+            .saturating_add(u64::from(self.num_layers).saturating_mul(per_layer))
+            .saturating_add(hidden)
+            .saturating_add(if self.tied_embeddings { 0 } else { embedding })
     }
 }
 
@@ -1475,22 +1590,149 @@ fn resolve_activation(hf: &serde_json::Value, is_gemma: bool) -> Result<Activati
     }
 }
 
+/// The RoPE block a transformers >= 5 config carries instead of `rope_theta`,
+/// `rope_scaling` and `rope_local_base_freq`.
+///
+/// It is one flat object, or one object per attention kind when the layers
+/// rotate differently (Gemma3). A config written by transformers 5 has no
+/// top-level `rope_theta` at all, so reading only the old keys stored the
+/// fallback base instead of the model's own.
+#[derive(Debug, Default, Clone, Copy)]
+struct RopeParameters<'a> {
+    /// The full-attention layers' parameters, or every layer's when flat.
+    global: Option<&'a serde_json::Map<String, serde_json::Value>>,
+    /// The sliding-window layers' parameters; per-kind layout only.
+    sliding: Option<&'a serde_json::Map<String, serde_json::Value>>,
+}
+
+impl RopeParameters<'_> {
+    fn is_present(&self) -> bool {
+        self.global.is_some() || self.sliding.is_some()
+    }
+}
+
+fn rope_parameters(hf: &serde_json::Value) -> Result<RopeParameters<'_>> {
+    let object = match hf.get("rope_parameters") {
+        None | Some(serde_json::Value::Null) => return Ok(RopeParameters::default()),
+        Some(serde_json::Value::Object(object)) => object,
+        Some(other) => bail!("config field rope_parameters is not an object: {other}"),
+    };
+    if !object.values().any(serde_json::Value::is_object) {
+        return Ok(RopeParameters {
+            global: Some(object),
+            sliding: None,
+        });
+    }
+    let mut parameters = RopeParameters::default();
+    for (kind, entry) in object {
+        let Some(entry) = entry.as_object() else {
+            bail!(
+                "config field rope_parameters mixes per-attention-kind entries with a plain \
+                 value under '{kind}'"
+            );
+        };
+        match kind.as_str() {
+            "full_attention" => parameters.global = Some(entry),
+            "sliding_attention" => parameters.sliding = Some(entry),
+            other => bail!(
+                "config field rope_parameters has an entry for attention kind '{other}'; the \
+                 container stores full and sliding attention only."
+            ),
+        }
+    }
+    Ok(parameters)
+}
+
+/// `rope_theta` inside one `rope_parameters` entry, if it carries one.
+fn nested_rope_theta(
+    entry: Option<&serde_json::Map<String, serde_json::Value>>,
+    field: &str,
+) -> Result<Option<f64>> {
+    match entry.and_then(|entry| entry.get("rope_theta")) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => Ok(Some(value.as_f64().with_context(|| {
+            format!("config field {field}.rope_theta is not a number: {value}")
+        })?)),
+    }
+}
+
+/// The RoPE base of the full-attention layers, from either config layout.
+///
+/// A wrong base loads, runs, and generates with the wrong positions, so two
+/// values that disagree, or a `rope_parameters` without one, are refused; the
+/// Llama default is kept only for configs that predate the field entirely.
+fn resolve_rope_theta(hf: &serde_json::Value) -> Result<f32> {
+    let parameters = rope_parameters(hf)?;
+    let nested = nested_rope_theta(parameters.global, "rope_parameters")?;
+    let legacy = optional_f64(hf, "rope_theta")?;
+    let theta = match (nested, legacy) {
+        (Some(nested), Some(legacy)) if nested != legacy => bail!(
+            "config declares rope_theta {legacy} and rope_parameters.rope_theta {nested}; \
+             storing either one would be a guess at the model's RoPE base."
+        ),
+        (Some(theta), _) | (None, Some(theta)) => theta,
+        (None, None) if parameters.is_present() => bail!(
+            "config declares rope_parameters but no rope_theta for the full-attention layers; \
+             converting with a guessed RoPE base would produce a model that loads cleanly and \
+             generates with the wrong positions."
+        ),
+        (None, None) => 10_000.0,
+    };
+    Ok(theta as f32)
+}
+
 /// Read `rope_scaling` into the container's representation.
 ///
 /// transformers >= 5 normalizes plain RoPE into `{"rope_type": "default"}`, so
 /// the field's presence means nothing on its own. Anything other than absent,
 /// null, "default" or "llama3" is refused: the reader would otherwise build a
-/// table for the wrong positions.
+/// table for the wrong positions. A transformers 5 config names the scheme in
+/// `rope_parameters` instead, which is read the same way.
 fn resolve_rope_scaling(hf: &serde_json::Value) -> Result<RopeScaling> {
-    let Some(scaling) = hf.get("rope_scaling") else {
-        return Ok(RopeScaling::None);
-    };
-    if scaling.is_null() {
-        return Ok(RopeScaling::None);
+    let parameters = rope_parameters(hf)?;
+    if let Some(sliding) = parameters.sliding {
+        // The stored scheme applies to the full-attention layers, as in Gemma3.
+        let rope_type = sliding
+            .get("rope_type")
+            .or_else(|| sliding.get("type"))
+            .and_then(|v| v.as_str());
+        if let Some(other) = rope_type.filter(|name| *name != "default") {
+            bail!(
+                "config declares rope_parameters.sliding_attention type '{other}'; the \
+                 container scales the full-attention layers only, so positions would be wrong."
+            );
+        }
     }
-    let Some(object) = scaling.as_object() else {
-        bail!("config field rope_scaling is not an object: {scaling}");
+    let legacy = match hf.get("rope_scaling") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(scaling) => match scaling.as_object() {
+            Some(object) => Some(parse_rope_scheme(hf, "rope_scaling", object)?),
+            None => bail!("config field rope_scaling is not an object: {scaling}"),
+        },
     };
+    let nested = parameters
+        .global
+        .map(|object| parse_rope_scheme(hf, "rope_parameters", object))
+        .transpose()?;
+    // A config that carries both layouts must say the same thing in both;
+    // preferring either one would be a guess at the model's positions.
+    match (legacy, nested) {
+        (Some(legacy), Some(nested)) if legacy != nested => bail!(
+            "config declares rope_scaling {legacy:?} and rope_parameters {nested:?}; storing \
+             either one would be a guess at how the model rotates positions."
+        ),
+        (Some(scheme), _) | (None, Some(scheme)) => Ok(scheme),
+        (None, None) => Ok(RopeScaling::None),
+    }
+}
+
+/// One RoPE scaling object (`rope_scaling`, or a transformers 5
+/// `rope_parameters` entry) in the container's representation.
+fn parse_rope_scheme(
+    hf: &serde_json::Value,
+    field: &str,
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<RopeScaling> {
     let rope_type = object
         .get("rope_type")
         .or_else(|| object.get("type"))
@@ -1503,7 +1745,7 @@ fn resolve_rope_scaling(hf: &serde_json::Value) -> Result<RopeScaling> {
                     .get(key)
                     .and_then(serde_json::Value::as_f64)
                     .with_context(|| {
-                        format!("rope_scaling declares rope_type 'llama3' but has no numeric {key}")
+                        format!("{field} declares rope_type 'llama3' but has no numeric {key}")
                     })
             };
             let factor = number("factor")?;
@@ -1513,27 +1755,30 @@ fn resolve_rope_scaling(hf: &serde_json::Value) -> Result<RopeScaling> {
                 .get("original_max_position_embeddings")
                 .and_then(serde_json::Value::as_u64)
                 .or_else(|| hf.get("max_position_embeddings").and_then(|v| v.as_u64()))
-                .context(
-                    "rope_scaling declares rope_type 'llama3' but neither it nor the config \
-                     provides original_max_position_embeddings",
-                )?;
+                .with_context(|| {
+                    format!(
+                        "{field} declares rope_type 'llama3' but neither it nor the config \
+                         provides original_max_position_embeddings"
+                    )
+                })?;
             for (name, value) in [
                 ("factor", factor),
                 ("low_freq_factor", low_freq_factor),
                 ("high_freq_factor", high_freq_factor),
             ] {
                 if !value.is_finite() || value <= 0.0 {
-                    bail!("rope_scaling {name} must be finite and positive, got {value}");
+                    bail!("{field} {name} must be finite and positive, got {value}");
                 }
             }
             if (high_freq_factor - low_freq_factor).abs() == 0.0 {
-                bail!("rope_scaling high_freq_factor must differ from low_freq_factor");
+                bail!("{field} high_freq_factor must differ from low_freq_factor");
             }
-            let original = u32::try_from(original)
-                .context("rope_scaling original_max_position_embeddings does not fit in a u32")?;
+            let original = u32::try_from(original).with_context(|| {
+                format!("{field} original_max_position_embeddings does not fit in a u32")
+            })?;
             if original == 0 || original > MAX_CONTEXT {
                 bail!(
-                    "rope_scaling original_max_position_embeddings must be in 1..={MAX_CONTEXT}, \
+                    "{field} original_max_position_embeddings must be in 1..={MAX_CONTEXT}, \
                      got {original}"
                 );
             }
@@ -1545,7 +1790,7 @@ fn resolve_rope_scaling(hf: &serde_json::Value) -> Result<RopeScaling> {
             })
         }
         Some(other) => bail!(
-            "config declares rope_scaling type '{other}'; the container stores plain RoPE and \
+            "config declares {field} type '{other}'; the container stores plain RoPE and \
              the llama3 scheme only, so positions would be wrong."
         ),
     }
@@ -1597,7 +1842,19 @@ fn qk_norm_names(layer: u32) -> [String; 2] {
 /// Returns `(0, 0, false)` for a dense model. The expert *tensors* are found
 /// by name in [`ExpertLayout`]; this reads only the config, so a config-only
 /// inspection reports the same verdict a conversion would.
-fn resolve_experts(hf: &serde_json::Value, intermediate_size: u32) -> Result<(u16, u8, bool)> {
+/// What a config says about routed experts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Experts {
+    /// Experts per layer; 0 for a dense model.
+    count: u16,
+    per_token: u8,
+    norm_topk_prob: bool,
+    /// The width of every MLP the file stores, which for a sparse model is
+    /// each expert's.
+    mlp_width: u32,
+}
+
+fn resolve_experts(hf: &serde_json::Value, intermediate_size: u32) -> Result<Experts> {
     let count = ["num_experts", "num_local_experts"]
         .iter()
         .filter_map(|key| optional_u32(hf, key).transpose())
@@ -1605,7 +1862,12 @@ fn resolve_experts(hf: &serde_json::Value, intermediate_size: u32) -> Result<(u1
         .transpose()?
         .unwrap_or(0);
     if count == 0 {
-        return Ok((0, 0, false));
+        return Ok(Experts {
+            count: 0,
+            per_token: 0,
+            norm_topk_prob: false,
+            mlp_width: intermediate_size,
+        });
     }
     let count = u16::try_from(count)
         .map_err(|_| anyhow::anyhow!("num_experts {count} does not fit in the header's u16"))?;
@@ -1625,23 +1887,43 @@ fn resolve_experts(hf: &serde_json::Value, intermediate_size: u32) -> Result<(u1
         if let Some(value) = optional_u32(hf, key)? {
             if value > 0 {
                 bail!(
-                    "config declares {key}={value}; this model runs a shared expert for every                      token alongside the routed ones, and the container stores routed experts                      only. Use a model without a shared expert."
+                    "config declares {key}={value}; this model runs a shared expert for every token alongside the routed ones, and the container stores routed experts only. Use a model without a shared expert."
                 );
             }
         }
     }
-    if let Some(moe_intermediate) = optional_u32(hf, "moe_intermediate_size")? {
-        if moe_intermediate != intermediate_size {
-            bail!(
-                "config declares moe_intermediate_size={moe_intermediate} but                  intermediate_size={intermediate_size}; the container stores one MLP width."
-            );
+    // Qwen-style configs give the routed experts their own width and keep
+    // `intermediate_size` for dense layers. The container stores one MLP shape
+    // per file, so the expert width is the file's MLP width exactly when no
+    // layer is dense — which is Qwen3-MoE's own configuration.
+    let mlp_width = match optional_u32(hf, "moe_intermediate_size")? {
+        Some(expert_width) if expert_width != intermediate_size => {
+            let sparse_step = optional_u32(hf, "decoder_sparse_step")?.unwrap_or(1);
+            let dense_layers = hf
+                .get("mlp_only_layers")
+                .and_then(|value| value.as_array())
+                .is_some_and(|layers| !layers.is_empty());
+            if sparse_step != 1 || dense_layers {
+                bail!(
+                    "config mixes dense and sparse layers (decoder_sparse_step={sparse_step}, \
+                     mlp_only_layers non-empty: {dense_layers}); the container stores one MLP \
+                     shape for every layer."
+                );
+            }
+            expert_width
         }
-    }
-    let norm_topk = hf
+        _ => intermediate_size,
+    };
+    let norm_topk_prob = hf
         .get("norm_topk_prob")
         .and_then(|value| value.as_bool())
         .unwrap_or(true);
-    Ok((count, per_token, norm_topk))
+    Ok(Experts {
+        count,
+        per_token,
+        norm_topk_prob,
+        mlp_width,
+    })
 }
 
 /// Where a sparse checkpoint keeps its router and expert tensors.
@@ -1670,7 +1952,7 @@ impl ExpertLayout {
             return Ok(Self::BlockSparseMoe);
         }
         bail!(
-            "config declares experts but the checkpoint has neither              model.layers.0.mlp.gate.weight nor model.layers.0.block_sparse_moe.gate.weight,              so the router cannot be located."
+            "config declares experts but the checkpoint has neither model.layers.0.mlp.gate.weight nor model.layers.0.block_sparse_moe.gate.weight, so the router cannot be located."
         )
     }
 
@@ -1709,14 +1991,44 @@ impl ExpertLayout {
 /// the nearest stride would rotate some layers at the wrong base — a model
 /// that loads, runs, and is quietly worse.
 fn resolve_per_layer_rope(hf: &serde_json::Value, num_layers: u32) -> Result<(f32, u8)> {
-    let local = resolve_softcap(hf, "rope_local_base_freq").unwrap_or(0.0);
+    let legacy = resolve_softcap(hf, "rope_local_base_freq").unwrap_or(0.0);
+    // transformers 5 keeps the sliding layers' base in `rope_parameters`
+    // instead; one base shared by both kinds is a single-base model.
+    let sliding_entry = rope_parameters(hf)?.sliding;
+    let local = match nested_rope_theta(sliding_entry, "rope_parameters.sliding_attention")? {
+        None if sliding_entry.is_some() && legacy <= 0.0 => bail!(
+            "config declares rope_parameters.sliding_attention but no rope_theta for it; \
+             converting with a guessed RoPE base would rotate the sliding layers wrongly."
+        ),
+        Some(sliding) => {
+            if !sliding.is_finite() || sliding <= 0.0 {
+                bail!(
+                    "config field rope_parameters.sliding_attention.rope_theta must be finite \
+                     and positive, got {sliding}"
+                );
+            }
+            let sliding = sliding as f32;
+            if legacy > 0.0 && legacy != sliding {
+                bail!(
+                    "config declares rope_local_base_freq {legacy} and \
+                     rope_parameters.sliding_attention.rope_theta {sliding}; storing either one \
+                     would be a guess at the sliding layers' RoPE base."
+                );
+            }
+            if sliding == resolve_rope_theta(hf)? {
+                return Ok((0.0, 0));
+            }
+            sliding
+        }
+        None => legacy,
+    };
     if local <= 0.0 {
         return Ok((0.0, 0));
     }
     let stride = optional_u32(hf, "sliding_window_pattern")?.unwrap_or(6);
     if stride < 2 {
         bail!(
-            "sliding_window_pattern is {stride}; the container stores a stride of 2 or more,              and a stride below that describes no alternation at all."
+            "sliding_window_pattern is {stride}; the container stores a stride of 2 or more, and a stride below that describes no alternation at all."
         );
     }
     let stride = u8::try_from(stride).map_err(|_| {
@@ -1740,7 +2052,7 @@ fn resolve_per_layer_rope(hf: &serde_json::Value, num_layers: u32) -> Result<(f3
             };
             if name != expected {
                 bail!(
-                    "layer_types[{index}] is '{name}' but a stride of {stride} implies                      '{expected}'. The container stores the stride, not a per-layer list, so an                      irregular pattern cannot be represented and would rotate some layers at the                      wrong RoPE base."
+                    "layer_types[{index}] is '{name}' but a stride of {stride} implies '{expected}'. The container stores the stride, not a per-layer list, so an irregular pattern cannot be represented and would rotate some layers at the wrong RoPE base."
                 );
             }
         }
@@ -1984,17 +2296,19 @@ fn assert_exportable_architecture(
 ) -> Result<()> {
     let mut problems: Vec<String> = Vec::new();
 
-    let model_type = hf.get("model_type").and_then(|v| v.as_str());
-    if let Some(model_type) = model_type {
-        if let Some((_, reason)) = UNSUPPORTED_MODEL_TYPES
-            .iter()
-            .find(|(name, _)| *name == model_type)
-        {
-            problems.push(format!(
-                "model_type '{model_type}' is not supported: {reason}, which this format does \
-                 not store."
-            ));
-        }
+    match hf.get("model_type").and_then(|v| v.as_str()) {
+        Some(model_type) if VERIFIED_MODEL_TYPES.contains(&model_type) => {}
+        Some(model_type) => problems.push(format!(
+            "model_type '{model_type}' has no verified forward pass in this runtime (verified: \
+             {}). A family with the same tensor names can still rotate, scale or normalize \
+             differently, and would convert into a model that computes something else.",
+            VERIFIED_MODEL_TYPES.join(", ")
+        )),
+        None => problems.push(
+            "config.json declares no model_type, so the architecture cannot be checked against \
+             the ones this runtime implements."
+                .to_string(),
+        ),
     }
 
     if let Some(store) = store {
@@ -2027,6 +2341,22 @@ fn assert_exportable_architecture(
             );
         }
 
+        // A norm with a bias is a LayerNorm (StableLM): run as RMSNorm it would
+        // lose both the bias and the mean subtraction.
+        if let Some(name) = [
+            "model.layers.0.input_layernorm.bias",
+            "model.layers.0.post_attention_layernorm.bias",
+            "model.norm.bias",
+        ]
+        .into_iter()
+        .find(|name| store.info(name).is_some())
+        {
+            problems.push(format!(
+                "checkpoint carries {name}; the container stores RMSNorm weights only, so a \
+                 biased LayerNorm would be computed as a different operation."
+            ));
+        }
+
         // Per-head QK norms (Qwen3, Gemma3) are a v2 capability now; see
         // `resolve_qk_norm`, which is where an inconsistent or wrongly-shaped
         // set is caught by name.
@@ -2034,6 +2364,78 @@ fn assert_exportable_architecture(
 
     // `rope_scaling` is handled by `resolve_rope_scaling`, which accepts
     // default and llama3 and refuses every other scheme by name.
+
+    // The runtime rotates every dimension of every head, so a family that
+    // rotates only part of each one would convert cleanly and attend wrongly.
+    let parameters = rope_parameters(hf)?;
+    for (field, value) in [
+        ("partial_rotary_factor", hf.get("partial_rotary_factor")),
+        (
+            "rope_parameters.partial_rotary_factor",
+            parameters
+                .global
+                .and_then(|entry| entry.get("partial_rotary_factor")),
+        ),
+        (
+            "rope_parameters.sliding_attention.partial_rotary_factor",
+            parameters
+                .sliding
+                .and_then(|entry| entry.get("partial_rotary_factor")),
+        ),
+    ] {
+        let Some(value) = value.filter(|value| !value.is_null()) else {
+            continue;
+        };
+        if value.as_f64() != Some(1.0) {
+            problems.push(format!(
+                "config declares {field}={value}; the container rotates the full head, so \
+                 positions would be wrong."
+            ));
+        }
+    }
+
+    // Scales applied outside any stored tensor (Granite's multipliers, MiniCPM's
+    // depth and width scaling) have no header slot; `None` means no value of
+    // the field is neutral.
+    for (field, neutral) in [
+        ("embedding_multiplier", Some(1.0)),
+        ("residual_multiplier", Some(1.0)),
+        ("logits_scaling", Some(1.0)),
+        ("attention_multiplier", None),
+        ("scale_emb", Some(1.0)),
+        ("scale_depth", None),
+        ("dim_model_base", None),
+    ] {
+        let Some(value) = hf.get(field).filter(|value| !value.is_null()) else {
+            continue;
+        };
+        if neutral.is_none() || value.as_f64() != neutral {
+            problems.push(format!(
+                "config declares {field}={value}; the container has no slot for that scale, \
+                 so the model would convert cleanly and compute something else."
+            ));
+        }
+    }
+
+    // The runtime rotates every layer; SmolLM3-style layers that skip RoPE
+    // would attend with positions the model never saw.
+    let skips_rope = match hf.get("no_rope_layers") {
+        // `0` and `false` both mean "this layer does not rotate".
+        Some(serde_json::Value::Array(flags)) => flags
+            .iter()
+            .any(|flag| flag.as_u64() == Some(0) || flag.as_bool() == Some(false)),
+        _ => hf
+            .get("no_rope_layer_interval")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|interval| interval > 0 && interval <= num_layers as u64),
+    };
+    if skips_rope {
+        problems.push(
+            "config declares layers without rotary embeddings (no_rope_layers); the runtime \
+             rotates every layer, so positions would be wrong on those layers."
+                .to_string(),
+        );
+    }
 
     // Mixture-of-experts is a v2 capability now; `resolve_experts` reads the
     // counts and refuses a routing scheme the container cannot express.
@@ -2175,12 +2577,11 @@ pub fn preflight(
     let head_dim = resolve_head_dim(optional_u32(hf, "head_dim")?, hidden_size, num_heads)?;
     let intermediate_size = required_u32(hf, "intermediate_size")?;
     let vocab_size = required_u32(hf, "vocab_size")?;
-    let rope_theta = optional_f64(hf, "rope_theta")?.unwrap_or(10_000.0) as f32;
+    // Reported for any config, so an unreadable base shows as 0 here and the
+    // verdict below refuses it with the reason, instead of the whole report
+    // failing and taking the shape it could still show with it.
+    let rope_theta = resolve_rope_theta(hf).unwrap_or(0.0);
     let norm_eps = optional_f64(hf, "rms_norm_eps")?.unwrap_or(1e-5) as f32;
-    let tied = hf
-        .get("tie_word_embeddings")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
     let model_type = hf
         .get("model_type")
         .and_then(|v| v.as_str())
@@ -2196,6 +2597,16 @@ pub fn preflight(
         })
         .unwrap_or_default();
 
+    let store = match model_dir {
+        Some(dir) => Some(SafeTensorsSet::open(dir)?),
+        None => None,
+    };
+    let tied = resolve_tied(hf, store.as_ref());
+    // As for the RoPE base: a config the verdict will refuse is still shown,
+    // so the shape uses the dense reading when the expert one is refused.
+    let raw_intermediate_size = intermediate_size;
+    let experts = resolve_experts(hf, intermediate_size).ok();
+    let intermediate_size = experts.map_or(intermediate_size, |experts| experts.mlp_width);
     let shape = ModelShape {
         hidden_size,
         num_layers,
@@ -2205,6 +2616,7 @@ pub fn preflight(
         intermediate_size,
         vocab_size,
         tied_embeddings: tied,
+        num_experts: experts.map_or(0, |experts| experts.count),
     };
     let parameters = shape.parameter_count();
 
@@ -2242,10 +2654,6 @@ pub fn preflight(
     };
 
     let is_gemma = GEMMA_MODEL_TYPES.contains(&model_type.as_str());
-    let store = match model_dir {
-        Some(dir) => Some(SafeTensorsSet::open(dir)?),
-        None => None,
-    };
     report.weights_checked = store.is_some();
 
     let verdict = (|| -> Result<PreflightContainer> {
@@ -2255,6 +2663,20 @@ pub fn preflight(
         let context = *context
             .as_ref()
             .map_err(|error| anyhow::anyhow!("{error:#}"))?;
+        // The same order the converter checks in: dimensions before anything
+        // loops over them, then every option and field it would refuse.
+        validate_dimension_bounds(
+            hidden_size,
+            num_layers,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            intermediate_size,
+            vocab_size,
+        )?;
+        let group_size = validate_group_size("--group-size", group_size)?;
+        let embed_group_size = validate_group_size("--embed-group-size", embed_group_size)?;
+        let rope_theta = resolve_rope_theta(hf)?;
         let activation = resolve_activation(hf, is_gemma)?;
         let rope_scaling = resolve_rope_scaling(hf)?;
         assert_exportable_architecture(hf, store.as_ref(), context.tokens, num_layers)?;
@@ -2277,7 +2699,7 @@ pub fn preflight(
         let has_sandwich_norm =
             SANDWICH_NORM_MODEL_TYPES.contains(&model_type.as_str()) && !post_norm;
         let per_layer_rope = resolve_per_layer_rope(hf, num_layers)?;
-        let experts = resolve_experts(hf, intermediate_size)?;
+        let experts = resolve_experts(hf, raw_intermediate_size)?;
         if has_sandwich_norm {
             if let Some(store) = store.as_ref() {
                 check_sandwich_norms(store, num_layers, hidden_size as usize)?;
@@ -2295,13 +2717,9 @@ pub fn preflight(
             rope_theta,
             norm_eps,
             bits: 4,
-            group_size: u8::try_from(group_size).map_err(|_| {
-                anyhow::anyhow!("--group-size must be in 2..=254, got {group_size}")
-            })?,
+            group_size,
             embed_bits: 8,
-            embed_group_size: u8::try_from(embed_group_size).map_err(|_| {
-                anyhow::anyhow!("--embed-group-size must be in 2..=254, got {embed_group_size}")
-            })?,
+            embed_group_size,
             activation,
             rope_scaling,
             bias_mask,
@@ -2316,9 +2734,9 @@ pub fn preflight(
             post_norm,
             rope_local_theta: per_layer_rope.0,
             global_layer_stride: per_layer_rope.1,
-            num_experts: experts.0,
-            experts_per_token: experts.1,
-            norm_topk_prob: experts.2,
+            num_experts: experts.count,
+            experts_per_token: experts.per_token,
+            norm_topk_prob: experts.norm_topk_prob,
             attn_logit_softcap: resolve_softcap(hf, "attn_logit_softcapping")?,
             final_logit_softcap: resolve_softcap(hf, "final_logit_softcapping")?,
             attn_scale: resolve_attn_scale(hf, head_dim)?,
@@ -2348,8 +2766,8 @@ pub fn preflight(
             post_norm,
             rope_local_theta: per_layer_rope.0,
             global_layer_stride: per_layer_rope.1,
-            num_experts: experts.0,
-            experts_per_token: experts.1,
+            num_experts: experts.count,
+            experts_per_token: experts.per_token,
             attn_logit_softcap: config.attn_logit_softcap,
             final_logit_softcap: config.final_logit_softcap,
             attn_scale: config.attn_scale,
@@ -2408,7 +2826,7 @@ fn check_output_space(output: &Path, needed: u64) -> Result<()> {
     let margin = 64 * 1024 * 1024;
     if free < needed.saturating_add(margin) {
         bail!(
-            "this conversion writes {} but {} has only {} free. Free up space or pass              --output to a different drive.",
+            "this conversion writes {} but {} has only {} free. Free up space or pass --output to a different drive.",
             crate::cli::format_bytes(needed),
             directory.unwrap_or_else(|| Path::new(".")).display(),
             crate::cli::format_bytes(free),
@@ -2643,7 +3061,7 @@ fn calibration_tokens(
         .context("calibration size overflows")?;
     ensure!(
         ids.len() >= wanted,
-        "the calibration text tokenizes to {} tokens but {sequences} sequences of {seq_len}          need {wanted}. Use a longer text, or lower --calibration-sequences.",
+        "the calibration text tokenizes to {} tokens but {sequences} sequences of {seq_len} need {wanted}. Use a longer text, or lower --calibration-sequences.",
         ids.len()
     );
     Ok(ids[..wanted].to_vec())
@@ -2662,19 +3080,32 @@ fn collect_calibration_energy(
     layout: &ProjectionLayout,
     linear_dims: &[(usize, usize); 7],
     expert_layout: Option<&ExpertLayout>,
+    folds: GemmaFolds,
     tokens: &[u32],
     seq_len: usize,
     log: &dyn Fn(&str),
 ) -> Result<CalibrationEnergy> {
     use crate::calibrate::{accumulate_channel_energy, apply_rope, causal_attention, matmul_t};
 
+    // The checkpoint's raw norm weights, as the model applies them: Gemma's
+    // `1 + w` is folded at write time, so this pass must fold it too.
+    let read_norm = |store: &mut SafeTensorsSet, name: &str| -> Result<Vec<f32>> {
+        let mut weights = store.read_all(name, config.hidden_size as usize)?;
+        if folds.norm_plus_one {
+            for value in weights.iter_mut() {
+                *value += 1.0;
+            }
+        }
+        Ok(weights)
+    };
+
     ensure!(
         expert_layout.is_none(),
-        "calibrated conversion does not support mixture-of-experts checkpoints yet: which          expert sees which token is a routing decision this pass would have to reproduce          exactly, and approximating it would quantize the model against activations it never          sees. Convert without --calibrate."
+        "calibrated conversion does not support mixture-of-experts checkpoints yet: which expert sees which token is a routing decision this pass would have to reproduce exactly, and approximating it would quantize the model against activations it never sees. Convert without --calibration-text."
     );
     ensure!(
         !config.has_sandwich_norm && !config.post_norm,
-        "calibrated conversion does not support sandwich-normed or post-norm checkpoints yet.          Convert without --calibrate."
+        "calibrated conversion does not support sandwich-normed or post-norm checkpoints yet. Convert without --calibration-text."
     );
 
     let hidden = config.hidden_size as usize;
@@ -2736,7 +3167,7 @@ fn collect_calibration_energy(
             tail_norm_names(layer as u32, config.has_sandwich_norm, config.post_norm);
         // Norms are 1-D vectors, so they need `read_all`; `read_rows` demands a
         // 2-D matrix and refuses a `[hidden]` tensor outright.
-        let attn_norm = store.read_all(&attn_norm_name, hidden)?;
+        let attn_norm = read_norm(store, &attn_norm_name)?;
         for t in 0..tokens.len() {
             crate::layers::rms_norm(
                 &mut normed[t * hidden..(t + 1) * hidden],
@@ -2766,7 +3197,7 @@ fn collect_calibration_energy(
 
         if config.has_qk_norm || config.has_full_qk_norm {
             bail!(
-                "calibrated conversion does not support per-head QK norms yet (Qwen3, Gemma3).                  Convert without --calibrate."
+                "calibrated conversion does not support per-head QK norms yet (Qwen3, Gemma3). Convert without --calibration-text."
             );
         }
 
@@ -2827,7 +3258,7 @@ fn collect_calibration_energy(
         }
 
         // ---- MLP input ------------------------------------------------------
-        let mlp_norm = store.read_all(&mlp_norm_name, hidden)?;
+        let mlp_norm = read_norm(store, &mlp_norm_name)?;
         for t in 0..tokens.len() {
             crate::layers::rms_norm(
                 &mut normed[t * hidden..(t + 1) * hidden],
@@ -3179,6 +3610,14 @@ fn plan_sections(config: &RaiConfig, tied: bool) -> Result<(Vec<u64>, u64)> {
     let total = config.header_size()
         + section_sizes.len() as u64 * SECTION_ENTRY_SIZE
         + section_sizes.iter().sum::<u64>();
+    // The reader refuses a larger file outright, so writing one would spend the
+    // whole download and conversion on a model `rai run` cannot open.
+    if total > MAX_MODEL_FILE_BYTES {
+        bail!(
+            "the converted file would be {total} bytes; the reader's maximum is \
+             {MAX_MODEL_FILE_BYTES}, so it could never be loaded."
+        );
+    }
     Ok((section_sizes, total))
 }
 
@@ -3461,22 +3900,15 @@ fn default_output_name(model_dir: &Path) -> Result<String> {
     Ok(format!("{name}-q4.raimodel"))
 }
 
-/// Mirror of `raimodel.copy_tokenizer_json`: never clobber a *different*
+/// Mirror of `raimodel.place_tokenizer_json`: never clobber a *different*
 /// tokenizer, because a model silently paired with the wrong one produces
-/// fluent nonsense.
+/// fluent nonsense. Written through a partial file like the model, so an
+/// interrupted copy leaves no truncated tokenizer that the next conversion
+/// would refuse as "different".
 fn copy_tokenizer_json(src: &Path, dst: &Path) -> Result<bool> {
     let source = std::fs::read(src).with_context(|| format!("reading {}", src.display()))?;
-    if dst.exists() {
-        let existing = std::fs::read(dst).with_context(|| format!("reading {}", dst.display()))?;
-        if existing == source {
-            return Ok(false);
-        }
-        bail!(
-            "refusing to overwrite {}: it differs from this model's tokenizer.json. Another \
-             model's tokenizer already lives there — export into a separate output directory \
-             (--output <dir>/<name>.raimodel).",
-            dst.display()
-        );
+    if destination_holds_this_tokenizer(&source, dst)? {
+        return Ok(false);
     }
     if let Some(parent) = dst.parent() {
         if !parent.as_os_str().is_empty() {
@@ -3484,8 +3916,63 @@ fn copy_tokenizer_json(src: &Path, dst: &Path) -> Result<bool> {
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
     }
-    std::fs::write(dst, &source).with_context(|| format!("writing {}", dst.display()))?;
+    let tmp_path = partial_path(dst);
+    let mut file = create_partial(&tmp_path)?;
+    let mut guard = PartialOutput {
+        path: &tmp_path,
+        keep: false,
+    };
+    file.write_all(&source)
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("writing {}", tmp_path.display()))?;
+    drop(file);
+    std::fs::rename(&tmp_path, dst).with_context(|| format!("writing {}", dst.display()))?;
+    guard.keep = true;
     Ok(true)
+}
+
+/// Refuse up front a tokenizer destination that already holds a different
+/// tokenizer; see `copy_tokenizer_json`, which applies the same rule again
+/// when it actually copies.
+fn check_tokenizer_destination(src: &Path, dst: &Path) -> Result<()> {
+    let source = std::fs::read(src).with_context(|| format!("reading {}", src.display()))?;
+    destination_holds_this_tokenizer(&source, dst).map(|_| ())
+}
+
+/// `Ok(true)` when `dst` already holds exactly `source`, `Ok(false)` when it
+/// does not exist, and an error naming the clash when it holds another file.
+fn destination_holds_this_tokenizer(source: &[u8], dst: &Path) -> Result<bool> {
+    if !dst.exists() {
+        return Ok(false);
+    }
+    let existing = std::fs::read(dst).with_context(|| format!("reading {}", dst.display()))?;
+    if existing == source {
+        return Ok(true);
+    }
+    bail!(
+        "refusing to overwrite {}: it differs from this model's tokenizer.json. Another \
+         model's tokenizer already lives there — export into a separate output directory \
+         (--output <dir>/<name>.raimodel).",
+        dst.display()
+    )
+}
+
+/// Whether the output head is the embedding table.
+///
+/// An explicit `tie_word_embeddings` is the model's own word, read as
+/// transformers reads it. Absent, the right default depends on the model
+/// class — Llama's is untied, Gemma's tied — so the checkpoint settles it: a
+/// separate `lm_head.weight` means a separate head. A blanket "tied" default
+/// silently made a hand-written Llama config's output projection the
+/// embedding table.
+fn resolve_tied(hf: &serde_json::Value, store: Option<&SafeTensorsSet>) -> bool {
+    match hf
+        .get("tie_word_embeddings")
+        .and_then(|value| value.as_bool())
+    {
+        Some(tied) => tied,
+        None => store.is_none_or(|store| store.info("lm_head.weight").is_none()),
+    }
 }
 
 fn required_u32(config: &serde_json::Value, key: &str) -> Result<u32> {
@@ -3631,6 +4118,304 @@ mod tests {
         let yarn = serde_json::json!({ "rope_scaling": { "rope_type": "yarn", "factor": 4.0 } });
         let error = resolve_rope_scaling(&yarn).unwrap_err().to_string();
         assert!(error.contains("rope_scaling type 'yarn'"), "{error}");
+    }
+
+    #[test]
+    fn rope_theta_is_read_from_either_transformers_layout() {
+        let theta = |hf: serde_json::Value| resolve_rope_theta(&hf);
+        assert_eq!(theta(serde_json::json!({})).unwrap(), 10_000.0);
+        assert_eq!(
+            theta(serde_json::json!({ "rope_theta": 500000.0 })).unwrap(),
+            500_000.0
+        );
+        // A transformers 5 config has no top-level rope_theta at all.
+        assert_eq!(
+            theta(serde_json::json!({
+                "rope_parameters": { "rope_type": "default", "rope_theta": 130000.0 }
+            }))
+            .unwrap(),
+            130_000.0
+        );
+        assert_eq!(
+            theta(serde_json::json!({
+                "rope_theta": 1000000,
+                "rope_parameters": { "rope_type": "default", "rope_theta": 1000000.0 }
+            }))
+            .unwrap(),
+            1_000_000.0
+        );
+        assert_eq!(
+            theta(serde_json::json!({ "rope_parameters": {
+                "full_attention": { "rope_type": "default", "rope_theta": 1000000.0 },
+                "sliding_attention": { "rope_type": "default", "rope_theta": 10000.0 }
+            }}))
+            .unwrap(),
+            1_000_000.0
+        );
+
+        let disagree = theta(serde_json::json!({
+            "rope_theta": 10000.0,
+            "rope_parameters": { "rope_type": "default", "rope_theta": 500000.0 }
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            disagree.contains("rope_parameters.rope_theta 500000"),
+            "{disagree}"
+        );
+        let missing = theta(serde_json::json!({ "rope_parameters": { "rope_type": "default" } }))
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("no rope_theta"), "{missing}");
+        let kind = theta(serde_json::json!({ "rope_parameters": {
+            "chunked_attention": { "rope_theta": 500000.0 }
+        }}))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            kind.contains("attention kind 'chunked_attention'"),
+            "{kind}"
+        );
+    }
+
+    #[test]
+    fn rope_scaling_is_read_from_rope_parameters() {
+        let llama3 = serde_json::json!({ "rope_parameters": {
+            "rope_type": "llama3", "rope_theta": 500000.0, "factor": 32.0,
+            "low_freq_factor": 1.0, "high_freq_factor": 4.0,
+            "original_max_position_embeddings": 8192
+        }});
+        assert_eq!(
+            resolve_rope_scaling(&llama3).unwrap(),
+            RopeScaling::Llama3 {
+                factor: 32.0,
+                low_freq_factor: 1.0,
+                high_freq_factor: 4.0,
+                original_max_position: 8_192,
+            }
+        );
+        let yarn = serde_json::json!({ "rope_parameters": {
+            "rope_type": "yarn", "rope_theta": 1000000.0, "factor": 16.0,
+            "original_max_position_embeddings": 16384
+        }});
+        let error = resolve_rope_scaling(&yarn).unwrap_err().to_string();
+        assert!(error.contains("rope_parameters type 'yarn'"), "{error}");
+        let linear_global = serde_json::json!({ "rope_parameters": {
+            "full_attention": { "rope_type": "linear", "factor": 8.0, "rope_theta": 1000000.0 },
+            "sliding_attention": { "rope_type": "default", "rope_theta": 10000.0 }
+        }});
+        let error = resolve_rope_scaling(&linear_global)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("rope_parameters type 'linear'"), "{error}");
+        let scaled_sliding = serde_json::json!({ "rope_parameters": {
+            "full_attention": { "rope_type": "default", "rope_theta": 1000000.0 },
+            "sliding_attention": { "rope_type": "yarn", "rope_theta": 10000.0 }
+        }});
+        let error = resolve_rope_scaling(&scaled_sliding)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("sliding_attention type 'yarn'"), "{error}");
+    }
+
+    #[test]
+    fn per_layer_rope_is_read_from_rope_parameters() {
+        let layer_types: Vec<&str> = (0..12)
+            .map(|i| {
+                if (i + 1) % 6 == 0 {
+                    "full_attention"
+                } else {
+                    "sliding_attention"
+                }
+            })
+            .collect();
+        let gemma3 = serde_json::json!({
+            "layer_types": layer_types,
+            "rope_parameters": {
+                "full_attention": { "rope_type": "default", "rope_theta": 1000000.0 },
+                "sliding_attention": { "rope_type": "default", "rope_theta": 10000.0 }
+            }
+        });
+        assert_eq!(resolve_per_layer_rope(&gemma3, 12).unwrap(), (10_000.0, 6));
+        assert_eq!(resolve_rope_theta(&gemma3).unwrap(), 1_000_000.0);
+
+        let one_base = serde_json::json!({ "rope_parameters": {
+            "full_attention": { "rope_type": "default", "rope_theta": 10000.0 },
+            "sliding_attention": { "rope_type": "default", "rope_theta": 10000.0 }
+        }});
+        assert_eq!(resolve_per_layer_rope(&one_base, 26).unwrap(), (0.0, 0));
+
+        let no_base = serde_json::json!({ "rope_parameters": {
+            "full_attention": { "rope_type": "default", "rope_theta": 1000000.0 },
+            "sliding_attention": { "rope_type": "default" }
+        }});
+        let error = resolve_per_layer_rope(&no_base, 12)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no rope_theta"), "{error}");
+    }
+
+    #[test]
+    fn scales_the_header_cannot_store_are_refused() {
+        // granite-4.1-8b's values: Llama tensor names, different arithmetic.
+        let granite = serde_json::json!({
+            "model_type": "granite", "embedding_multiplier": 12.0,
+            "residual_multiplier": 0.22, "attention_multiplier": 0.0078125,
+            "logits_scaling": 16.0
+        });
+        let error = assert_exportable_architecture(&granite, None, 2048, 40)
+            .unwrap_err()
+            .to_string();
+        for field in [
+            "embedding_multiplier=12.0",
+            "residual_multiplier=0.22",
+            "attention_multiplier=0.0078125",
+            "logits_scaling=16.0",
+        ] {
+            assert!(error.contains(field), "{field}: {error}");
+        }
+        let minicpm = serde_json::json!({
+            "model_type": "minicpm", "scale_emb": 12, "scale_depth": 1.4, "dim_model_base": 256
+        });
+        let error = assert_exportable_architecture(&minicpm, None, 2048, 40)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("scale_depth=1.4"), "{error}");
+
+        let neutral = serde_json::json!({
+            "model_type": "llama", "embedding_multiplier": 1.0, "logits_scaling": 1,
+            "residual_multiplier": null
+        });
+        assert_exportable_architecture(&neutral, None, 2048, 2).unwrap();
+    }
+
+    #[test]
+    fn layers_that_skip_rope_are_refused() {
+        let smollm3 = serde_json::json!({
+            "model_type": "smollm3", "no_rope_layers": [1, 1, 1, 0, 1, 1, 1, 0],
+            "no_rope_layer_interval": 4
+        });
+        let error = assert_exportable_architecture(&smollm3, None, 2048, 8)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no_rope_layers"), "{error}");
+        let derived = serde_json::json!({
+            "model_type": "llama", "no_rope_layers": null, "no_rope_layer_interval": 4
+        });
+        let error = assert_exportable_architecture(&derived, None, 2048, 8)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no_rope_layers"), "{error}");
+        let switched_off = serde_json::json!({
+            "model_type": "llama", "no_rope_layers": [true, false, true, true]
+        });
+        let error = assert_exportable_architecture(&switched_off, None, 2048, 4)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no_rope_layers"), "{error}");
+
+        let every_layer_rotates =
+            serde_json::json!({ "model_type": "llama", "no_rope_layers": [1, 1, 1, 1] });
+        assert_exportable_architecture(&every_layer_rotates, None, 2048, 4).unwrap();
+        let interval_past_the_end = serde_json::json!({
+            "model_type": "llama", "no_rope_layers": null, "no_rope_layer_interval": 8
+        });
+        assert_exportable_architecture(&interval_past_the_end, None, 2048, 4).unwrap();
+    }
+
+    #[test]
+    fn partial_rotary_is_refused_in_either_config_layout() {
+        for hf in [
+            serde_json::json!({ "model_type": "llama", "partial_rotary_factor": 0.25 }),
+            serde_json::json!({ "model_type": "llama", "rope_parameters": {
+                "rope_type": "default", "rope_theta": 10000000, "partial_rotary_factor": 0.25
+            }}),
+            serde_json::json!({ "model_type": "gemma3_text", "rope_parameters": {
+                "full_attention": { "rope_theta": 1000000.0, "partial_rotary_factor": 0.25 },
+                "sliding_attention": { "rope_theta": 10000.0 }
+            }}),
+        ] {
+            let error = assert_exportable_architecture(&hf, None, 2048, 2)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("partial_rotary_factor=0.25"), "{error}");
+        }
+        for hf in [
+            serde_json::json!({ "model_type": "llama", "partial_rotary_factor": 1.0 }),
+            serde_json::json!({ "model_type": "llama", "partial_rotary_factor": null }),
+            serde_json::json!({ "model_type": "llama", "rope_parameters": { "rope_theta": 10000.0 } }),
+        ] {
+            assert_exportable_architecture(&hf, None, 2048, 2).unwrap();
+        }
+    }
+
+    /// Matching tensor names prove nothing about the arithmetic, so a family
+    /// is converted only once its forward pass has been verified here.
+    #[test]
+    fn only_verified_families_convert() {
+        for model_type in VERIFIED_MODEL_TYPES {
+            let hf = serde_json::json!({ "model_type": model_type });
+            assert_exportable_architecture(&hf, None, 2048, 2)
+                .unwrap_or_else(|error| panic!("{model_type}: {error}"));
+        }
+        // ERNIE-4.5 rotates interleaved pairs under Llama tensor names.
+        let ernie = serde_json::json!({ "model_type": "ernie4_5" });
+        let error = assert_exportable_architecture(&ernie, None, 2048, 2)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("model_type 'ernie4_5'"), "{error}");
+        let unnamed = serde_json::json!({ "max_position_embeddings": 2048 });
+        let error = assert_exportable_architecture(&unnamed, None, 2048, 2)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("declares no model_type"), "{error}");
+    }
+
+    #[test]
+    fn a_file_the_reader_would_refuse_is_never_planned() {
+        // Mixtral-8x22B's shape: every expert stored is ~70 GiB at 4 bits.
+        let mut config = RaiConfig {
+            hidden_size: 6144,
+            num_layers: 56,
+            num_heads: 48,
+            num_kv_heads: 8,
+            head_dim: 128,
+            intermediate_size: 16384,
+            vocab_size: 32768,
+            max_context: 4096,
+            rope_theta: 1_000_000.0,
+            norm_eps: 1e-5,
+            bits: 4,
+            group_size: 128,
+            embed_bits: 8,
+            embed_group_size: 128,
+            activation: Activation::Silu,
+            rope_scaling: RopeScaling::None,
+            bias_mask: 0,
+            embed_scale: 1.0,
+            has_qk_norm: false,
+            has_sandwich_norm: false,
+            has_full_qk_norm: false,
+            post_norm: false,
+            rope_local_theta: 0.0,
+            global_layer_stride: 0,
+            num_experts: 8,
+            experts_per_token: 2,
+            norm_topk_prob: false,
+            attn_logit_softcap: 0.0,
+            final_logit_softcap: 0.0,
+            attn_scale: 0.0,
+        };
+        let error = plan_sections(&config, false).unwrap_err().to_string();
+        assert!(error.contains("could never be loaded"), "{error}");
+
+        // Mixtral-8x7B's shape (~24 GB) is well inside the limit.
+        config.hidden_size = 4096;
+        config.num_layers = 32;
+        config.num_heads = 32;
+        config.intermediate_size = 14336;
+        let (_, total) = plan_sections(&config, false).unwrap();
+        assert!(total < MAX_MODEL_FILE_BYTES, "{total}");
     }
 
     #[test]
@@ -3895,6 +4680,7 @@ mod tests {
     #[test]
     fn a_followed_context_stops_at_the_sliding_window() {
         let windowed = serde_json::json!({
+            "model_type": "mistral",
             "max_position_embeddings": 32_768,
             "sliding_window": 4_096,
         });
@@ -3972,6 +4758,135 @@ mod tests {
         );
     }
 
+    /// Qwen3-MoE gives its experts their own width and keeps
+    /// `intermediate_size` for dense layers it does not have; the file stores
+    /// the experts' width. A stack that mixes the two shapes is refused.
+    #[test]
+    fn expert_width_comes_from_moe_intermediate_size_when_every_layer_is_sparse() {
+        let qwen3_moe = serde_json::json!({
+            "num_experts": 128, "num_experts_per_tok": 8, "norm_topk_prob": true,
+            "intermediate_size": 6144, "moe_intermediate_size": 768,
+            "decoder_sparse_step": 1, "mlp_only_layers": []
+        });
+        let experts = resolve_experts(&qwen3_moe, 6144).unwrap();
+        assert_eq!(experts.count, 128);
+        assert_eq!(experts.per_token, 8);
+        assert_eq!(experts.mlp_width, 768);
+
+        for (label, patch) in [
+            ("sparse step", serde_json::json!({"decoder_sparse_step": 2})),
+            (
+                "dense layers",
+                serde_json::json!({"mlp_only_layers": [0, 1]}),
+            ),
+        ] {
+            let mut mixed = qwen3_moe.clone();
+            for (key, value) in patch.as_object().unwrap() {
+                mixed[key] = value.clone();
+            }
+            let error = resolve_experts(&mixed, 6144).unwrap_err().to_string();
+            assert!(error.contains("mixes dense and sparse"), "{label}: {error}");
+        }
+
+        // A dense config, and a sparse one with one width, are unchanged.
+        let dense = serde_json::json!({"intermediate_size": 1024});
+        assert_eq!(resolve_experts(&dense, 1024).unwrap().mlp_width, 1024);
+        let olmoe = serde_json::json!({"num_experts": 64, "num_experts_per_tok": 8});
+        assert_eq!(resolve_experts(&olmoe, 1024).unwrap().mlp_width, 1024);
+    }
+
+    /// An explicit `tie_word_embeddings` is the model's own word; without
+    /// one (and without weights to look at) a tied head is the reading.
+    #[test]
+    fn an_explicit_tie_setting_is_taken_as_given() {
+        assert!(resolve_tied(
+            &serde_json::json!({"tie_word_embeddings": true}),
+            None
+        ));
+        assert!(!resolve_tied(
+            &serde_json::json!({"tie_word_embeddings": false}),
+            None
+        ));
+        assert!(resolve_tied(&serde_json::json!({}), None));
+    }
+
+    /// Group sizes and calibration options are refused before anything is
+    /// read; zero sequences used to produce NaN energies, a zero-length
+    /// sequence a division by zero.
+    #[test]
+    fn invalid_options_are_refused_up_front() {
+        for value in [0, 1, 3, 255, 256] {
+            assert!(
+                validate_group_size("--group-size", value).is_err(),
+                "{value}"
+            );
+        }
+        assert_eq!(validate_group_size("--group-size", 128).unwrap(), 128);
+
+        let dir = std::env::temp_dir();
+        let base = ConvertOptions {
+            model_dir: dir.clone(),
+            output: None,
+            calibration_text: Some(dir.join("calibration.txt")),
+            calibration_sequences: 16,
+            calibration_seq_len: 512,
+            group_size: 128,
+            embed_group_size: 64,
+            max_context: FOLLOW_MODEL_CONTEXT,
+            tokenizer_out: None,
+            quiet: true,
+        };
+        assert!(validate_options(&base).is_ok());
+        let none = ConvertOptions {
+            calibration_sequences: 0,
+            ..base.clone()
+        };
+        assert!(validate_options(&none)
+            .unwrap_err()
+            .to_string()
+            .contains("--calibration-sequences"));
+        let short = ConvertOptions {
+            calibration_seq_len: 1,
+            ..base
+        };
+        assert!(validate_options(&short)
+            .unwrap_err()
+            .to_string()
+            .contains("--calibration-seq-len"));
+    }
+
+    /// The preflight behind Studio's Check is a report, not a crash: a group
+    /// size of zero used to divide by zero, and an unreadable RoPE base used
+    /// to fail the whole report instead of becoming its verdict.
+    #[test]
+    fn preflight_reports_refusals_instead_of_failing() {
+        let hf = serde_json::json!({
+            "model_type": "llama", "hidden_size": 64, "num_hidden_layers": 2,
+            "num_attention_heads": 4, "intermediate_size": 128, "vocab_size": 96,
+            "max_position_embeddings": 512,
+        });
+        let report = preflight(&hf, None, 0, 64, FOLLOW_MODEL_CONTEXT).unwrap();
+        assert!(!report.supported);
+        assert!(report.reason.contains("--group-size"), "{}", report.reason);
+
+        let mut no_base = hf.clone();
+        no_base["rope_parameters"] = serde_json::json!({"rope_type": "default"});
+        let report = preflight(&no_base, None, 64, 64, FOLLOW_MODEL_CONTEXT).unwrap();
+        assert!(!report.supported);
+        assert!(report.reason.contains("rope_theta"), "{}", report.reason);
+        assert_eq!(report.hidden_size, 64, "the shape is still reported");
+
+        let mut huge = hf;
+        huge["num_hidden_layers"] = serde_json::json!(u32::MAX);
+        let report = preflight(&huge, None, 64, 64, FOLLOW_MODEL_CONTEXT).unwrap();
+        assert!(!report.supported);
+        assert!(
+            report.reason.contains("num_hidden_layers"),
+            "{}",
+            report.reason
+        );
+    }
+
     /// One parameter count, so the preflight report and the bits-per-parameter
     /// figure printed after a conversion can never disagree.
     #[test]
@@ -3986,6 +4901,7 @@ mod tests {
             intermediate_size: 128,
             vocab_size: 96,
             tied_embeddings: true,
+            num_experts: 0,
         };
         // 96*64 embedding + 2 * (64*64*2 + 64*32*2 + 64*128*3 + 64*2) + 64.
         assert_eq!(shape.parameter_count(), 80_192);
@@ -3995,6 +4911,23 @@ mod tests {
             ..shape
         };
         assert_eq!(untied.parameter_count(), 80_192 + 96 * 64);
+        // A sparse layer stores every expert's MLP and a router.
+        let sparse = ModelShape {
+            num_experts: 4,
+            ..shape
+        };
+        assert_eq!(
+            sparse.parameter_count(),
+            80_192 + 2 * (3 * 64 * 128 * 3 + 4 * 64)
+        );
+        // Hostile dimensions saturate instead of overflowing.
+        let absurd = ModelShape {
+            num_heads: u32::MAX,
+            head_dim: u32::MAX,
+            num_layers: u32::MAX,
+            ..shape
+        };
+        assert_eq!(absurd.parameter_count(), u64::MAX);
 
         // And it is the number `preflight` reports, from the same config.
         let hf = serde_json::json!({

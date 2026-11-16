@@ -508,27 +508,47 @@ def test_require_calibration_chunks():
         raise AssertionError("empty calibration set was accepted")
 
 
-def test_copy_tokenizer_json():
+def test_place_tokenizer_json():
     with tempfile.TemporaryDirectory() as td:
-        src = Path(td) / "src" / "tokenizer.json"
-        src.parent.mkdir()
-        src.write_bytes(b'{"model": "a"}')
-        dst = Path(td) / "out" / "tokenizer.json"
-        dst.parent.mkdir()
+        dst = Path(td) / "tokenizer.json"
+        ours = b'{"model": "a"}'
 
-        assert raimodel.copy_tokenizer_json(src, dst) is True
-        assert dst.read_bytes() == b'{"model": "a"}'
+        raimodel.check_tokenizer_destination(ours, dst)  # nothing there yet
+        assert raimodel.place_tokenizer_json(ours, dst) is True
+        assert dst.read_bytes() == ours
         # identical file already present -> skip
-        assert raimodel.copy_tokenizer_json(src, dst) is False
-        # different file already present -> refuse
+        raimodel.check_tokenizer_destination(ours, dst)
+        assert raimodel.place_tokenizer_json(ours, dst) is False
+        # different file already present -> refused by both, before and after export
         dst.write_bytes(b'{"model": "b"}')
-        try:
-            raimodel.copy_tokenizer_json(src, dst)
-        except RuntimeError as exc:
-            assert "separate" in str(exc)
-        else:
-            raise AssertionError("differing tokenizer.json was overwritten")
+        for refuse in (raimodel.check_tokenizer_destination, raimodel.place_tokenizer_json):
+            try:
+                refuse(ours, dst)
+            except RuntimeError as exc:
+                assert "separate" in str(exc)
+            else:
+                raise AssertionError(f"{refuse.__name__} let a differing tokenizer.json through")
         assert dst.read_bytes() == b'{"model": "b"}'  # untouched
+        assert sorted(p.name for p in Path(td).iterdir()) == ["tokenizer.json"]
+
+
+def test_a_failed_write_leaves_nothing_behind():
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "model.raimodel"
+        path.write_bytes(b"earlier export")
+
+        def dies_halfway(f):
+            f.write(b"half a model")
+            raise OSError("disk full")
+
+        try:
+            raimodel._write_atomically(path, dies_halfway)
+        except OSError:
+            pass
+        else:
+            raise AssertionError("the failing writer did not propagate")
+        assert path.read_bytes() == b"earlier export"
+        assert sorted(p.name for p in Path(td).iterdir()) == ["model.raimodel"]
 
 
 # =============================================================================
@@ -731,7 +751,8 @@ def test_generate_golden_fixtures():
             "expected": expected,
         }
         sidecar_path = FIXTURE_DIR / f"{name}.expected.json"
-        sidecar_path.write_text(json.dumps(sidecar, indent=2) + "\n", encoding="ascii")
+        # Bytes, not text mode: Windows text mode writes CRLF and dirties the fixture.
+        sidecar_path.write_bytes((json.dumps(sidecar, indent=2) + "\n").encode("ascii"))
 
         # The JSON floats must round-trip to the exact same f32 values.
         loaded = json.loads(sidecar_path.read_text(encoding="ascii"))
@@ -757,7 +778,7 @@ class _Stub:
         self.__dict__.update(kwargs)
 
 
-def _fake_model(bias=False, qk_norm=False, layers=2):
+def _fake_model(bias=False, qk_norm=False, layers=2, norm_bias=False):
     def linear():
         return _Stub(bias=object() if bias else None)
 
@@ -768,7 +789,10 @@ def _fake_model(bias=False, qk_norm=False, layers=2):
             attn.q_norm = object()
             attn.k_norm = object()
         mlp = _Stub(gate_proj=linear(), up_proj=linear(), down_proj=linear())
-        built.append(_Stub(self_attn=attn, mlp=mlp))
+        layer = _Stub(self_attn=attn, mlp=mlp)
+        if norm_bias:
+            layer.input_layernorm = _Stub(bias=object())
+        built.append(layer)
     return _Stub(model=_Stub(layers=built))
 
 
@@ -816,10 +840,91 @@ def test_preflight_rejects_a_non_llama_module_tree():
                      "does not expose model.model.layers")
 
 
+def test_preflight_rejects_llama_shaped_families_no_container_stores():
+    # Their module tree is Llama-shaped, so without these checks they export
+    # cleanly and generate nonsense; `rai convert` must not be named as the way out.
+    granite = _Stub(model_type="granite", embedding_multiplier=12.0, residual_multiplier=0.22,
+                    attention_multiplier=0.0078125, logits_scaling=16.0)
+    _expect_rejected(_fake_model(), granite, 2048, "residual_multiplier=0.22")
+    _expect_rejected(_fake_model(), granite, 2048, "refuses it too")
+    minicpm = _Stub(model_type="minicpm", scale_emb=12, scale_depth=1.4, dim_model_base=256)
+    _expect_rejected(_fake_model(), minicpm, 2048, "scale_depth=1.4")
+    smollm3 = _Stub(model_type="smollm3", no_rope_layers=[1, 1, 1, 0], num_hidden_layers=4)
+    _expect_rejected(_fake_model(), smollm3, 2048, "no_rope_layers")
+    _expect_rejected(_fake_model(norm_bias=True), _Stub(model_type="stablelm"), 2048,
+                     "layer 0.input_layernorm")
+    for config in (
+        _Stub(model_type="llama", partial_rotary_factor=0.25),
+        _Stub(model_type="llama", rope_parameters={"rope_theta": 1e7, "partial_rotary_factor": 0.25}),
+        _Stub(model_type="llama", rope_parameters={
+            "full_attention": {"rope_theta": 1e6, "partial_rotary_factor": 0.25},
+            "sliding_attention": {"rope_theta": 1e4},
+        }),
+    ):
+        _expect_rejected(_fake_model(), config, 2048, "partial_rotary_factor=0.25")
+    raimodel.assert_exportable_architecture(
+        _fake_model(), _Stub(model_type="llama", partial_rotary_factor=1.0), 2048
+    )
+    neutral = _Stub(model_type="llama", embedding_multiplier=1.0, no_rope_layers=[1, 1])
+    raimodel.assert_exportable_architecture(_fake_model(), neutral, 2048)
+
+
+def test_preflight_reads_rope_schemes_in_both_layouts():
+    # transformers 5 moved the scheme into rope_parameters, flat or per layer
+    # type; reading rope_scaling alone missed every scheme kept per layer.
+    for config, needle in (
+        (_Stub(model_type="llama", rope_parameters={"rope_type": "yarn", "rope_theta": 1e6}),
+         "rope_parameters type 'yarn'"),
+        (_Stub(model_type="llama", rope_parameters={
+            "full_attention": {"rope_type": "linear", "rope_theta": 1e6},
+            "sliding_attention": {"rope_type": "default", "rope_theta": 1e4},
+        }), "rope_parameters.full_attention type 'linear'"),
+        (_Stub(model_type="llama", rope_parameters={
+            "full_attention": {"rope_type": "llama3", "rope_theta": 5e5},
+            "sliding_attention": {"rope_type": "llama3", "rope_theta": 1e4},
+        }), "rope_parameters.sliding_attention type 'llama3'"),
+    ):
+        _expect_rejected(_fake_model(), config, 2048, needle)
+        _expect_rejected(_fake_model(), config, 2048, "refuses it too")
+    # llama3 is a v2 scheme: refused here, with `rai convert` named as the way out.
+    nested_llama3 = _Stub(model_type="llama", rope_parameters={
+        "full_attention": {"rope_type": "llama3", "rope_theta": 5e5},
+        "sliding_attention": {"rope_type": "default", "rope_theta": 1e4},
+    })
+    _expect_rejected(_fake_model(), nested_llama3, 2048, "full_attention type 'llama3'")
+    _expect_rejected(_fake_model(), nested_llama3, 2048, "`rai convert` writes container v2")
+    # On transformers 5 rope_scaling is the same dict, read once.
+    plain = {"rope_type": "default", "rope_theta": 1e4}
+    raimodel.assert_exportable_architecture(
+        _fake_model(), _Stub(model_type="llama", rope_parameters=plain, rope_scaling=plain), 2048
+    )
+    raimodel.assert_exportable_architecture(
+        _fake_model(),
+        _Stub(model_type="llama", rope_parameters={
+            "full_attention": {"rope_type": "default", "rope_theta": 1e6},
+            "sliding_attention": {"rope_theta": 1e4},
+        }),
+        2048,
+    )
+
+
+def test_preflight_converts_only_verified_families():
+    # ERNIE-4.5 rotates interleaved pairs under Llama tensor names and no
+    # config key says so; only a verified family may export.
+    _expect_rejected(_fake_model(), _Stub(model_type="ernie4_5"), 2048, "model_type 'ernie4_5'")
+    _expect_rejected(_fake_model(), _Stub(model_type="ernie4_5"), 2048, "refuses it too")
+    _expect_rejected(_fake_model(), _Stub(), 2048, "declares no model_type")
+    for model_type in ("llama", "mistral"):
+        raimodel.assert_exportable_architecture(_fake_model(), _Stub(model_type=model_type), 2048)
+
+
 TESTS = [
     test_preflight_accepts_a_plain_llama_style_model,
     test_preflight_rejects_unrepresentable_architectures,
     test_preflight_rejects_a_non_llama_module_tree,
+    test_preflight_rejects_llama_shaped_families_no_container_stores,
+    test_preflight_reads_rope_schemes_in_both_layouts,
+    test_preflight_converts_only_verified_families,
     test_pack_nibbles_roundtrip,
     test_pack_nibbles_rejects_odd_columns,
     test_group_param_byte_layout,
@@ -835,7 +940,8 @@ TESTS = [
     test_read_rope_theta_across_transformers_versions,
     test_validate_export_options,
     test_require_calibration_chunks,
-    test_copy_tokenizer_json,
+    test_place_tokenizer_json,
+    test_a_failed_write_leaves_nothing_behind,
     test_write_minimal_model,
     test_write_minimal_model_untied,
     test_generate_golden_fixtures,

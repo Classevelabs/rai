@@ -12,7 +12,7 @@ Usage:
   PYTHONUNBUFFERED=1 python3 export_rtn.py --model mistralai/Mistral-7B-Instruct-v0.3
 """
 
-import argparse, time, sys, tempfile
+import argparse, time, sys
 from pathlib import Path
 import numpy as np
 import torch
@@ -32,7 +32,7 @@ def main():
     raimodel.validate_export_options(parser, args)
 
     if args.output is None:
-        args.output = f"{args.model.split('/')[-1].lower()}-q{args.bits}.raimodel"
+        args.output = raimodel.default_output_name(args.model, args.bits)
 
     print(f"Output: {args.output}"); sys.stdout.flush()
     print(f"Loading {args.model}..."); sys.stdout.flush()
@@ -45,6 +45,12 @@ def main():
         )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    # Refused now rather than after quantizing: a different model's tokenizer
+    # already beside the output would otherwise cost the whole export.
+    tokenizer_json = raimodel.saved_tokenizer_json(tokenizer)
+    outpath = Path(args.output)
+    td = outpath.parent / "tokenizer.json"
+    raimodel.check_tokenizer_destination(tokenizer_json, td)
     model.eval()
     print(f"Loaded in {time.time()-t0:.1f}s"); sys.stdout.flush()
 
@@ -146,7 +152,6 @@ def main():
 
     # Write
     print(f"\n=== WRITING ==="); sys.stdout.flush()
-    outpath = Path(args.output)
 
     # Sections: embed + layers + norm [+ lm_head if untied]
     sections = []
@@ -163,16 +168,10 @@ def main():
     print(f"\nWrote: {outpath} ({sz/1e6:.1f} MB, {len(sections)} sections)"); sys.stdout.flush()
 
     # Tokenizer
-    td = outpath.parent / "tokenizer.json"
-    with tempfile.TemporaryDirectory(prefix="rai_tokenizer_") as tmp_dir:
-        tokenizer.save_pretrained(tmp_dir)
-        ts = Path(tmp_dir) / "tokenizer.json"
-        if not ts.exists():
-            raise RuntimeError("tokenizer export did not produce the required tokenizer.json")
-        if raimodel.copy_tokenizer_json(ts, td):
-            print(f"Tokenizer: {td}")
-        else:
-            print(f"Tokenizer already present (identical): {td}")
+    if raimodel.place_tokenizer_json(tokenizer_json, td):
+        print(f"Tokenizer: {td}")
+    else:
+        print(f"Tokenizer already present (identical): {td}")
 
     total = time.time() - t_start
     print(f"\n=== DONE in {total:.1f}s ({total/60:.1f} min) ===")

@@ -199,6 +199,20 @@ impl SafeTensorsSet {
             if names.is_empty() {
                 bail!("{} lists no shards", index.display());
             }
+            // Shards sit beside the index. A name with a path in it would be
+            // joined onto, or replace, the folder: an index from a model hub
+            // could then read any file, and on Windows a `\\host\share` name
+            // makes the machine authenticate to that host.
+            if let Some(name) = names
+                .iter()
+                .find(|name| *name == ".." || name.contains(['/', '\\', ':']))
+            {
+                bail!(
+                    "{} names the shard '{name}', which is not a file in the checkpoint \
+                     folder; shards must sit beside the index",
+                    index.display()
+                );
+            }
             names.into_iter().map(|n| dir.join(n)).collect()
         } else if single.is_file() {
             vec![single]
@@ -390,8 +404,8 @@ fn read_shard_header(
             .iter()
             .map(|v| {
                 v.as_u64()
-                    .map(|n| n as usize)
-                    .with_context(|| format!("tensor '{name}' has a non-integer shape entry"))
+                    .and_then(|n| usize::try_from(n).ok())
+                    .with_context(|| format!("tensor '{name}' has the shape entry {v}, not a size"))
             })
             .collect::<Result<_>>()?;
         let offsets = value
@@ -415,10 +429,17 @@ fn read_shard_header(
                 "tensor '{name}' claims bytes {begin}..{end}, outside the {data_len}-byte payload"
             );
         }
-        let numel: usize = shape.iter().product();
-        let expected = (numel as u64)
-            .checked_mul(dtype.size() as u64)
-            .context("tensor byte length overflows")?;
+        // Checked: a wrapped product could match the byte span by accident,
+        // and every later size computed from this shape trusts it.
+        let expected = shape
+            .iter()
+            .try_fold(dtype.size() as u64, |bytes, &dim| {
+                bytes.checked_mul(dim as u64)
+            })
+            .filter(|bytes| usize::try_from(*bytes).is_ok())
+            .with_context(|| {
+                format!("tensor '{name}' has shape {shape:?}, too large to address")
+            })?;
         if end - begin != expected {
             bail!(
                 "tensor '{name}' spans {} bytes but its shape {shape:?} and dtype need {expected}",
@@ -524,6 +545,55 @@ mod tests {
         std::fs::write(inner.join("config.json"), b"{}").unwrap();
         let message = explain_missing_checkpoint(&dir);
         assert!(message.contains("snapshot-abc123"), "{message}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn write_safetensors(path: &Path, header: &str, payload: &[u8]) {
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(payload);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// 2^32 x 2^32 f16 elements wrap a 64-bit byte count to zero, which an
+    /// unchecked product accepted as matching an empty span.
+    #[test]
+    fn a_shape_too_large_to_address_is_refused() {
+        let dir = scratch("huge-shape");
+        write_safetensors(
+            &dir.join("model.safetensors"),
+            r#"{"w":{"dtype":"F16","shape":[4294967296,4294967296],"data_offsets":[0,0]}}"#,
+            &[],
+        );
+        let error = format!("{:#}", SafeTensorsSet::open(&dir).err().expect("refused"));
+        assert!(error.contains("too large to address"), "{error}");
+        write_safetensors(
+            &dir.join("model.safetensors"),
+            r#"{"w":{"dtype":"F16","shape":[2,3],"data_offsets":[0,12]}}"#,
+            &[0; 12],
+        );
+        let store = SafeTensorsSet::open(&dir).unwrap();
+        assert_eq!(store.info("w").unwrap().numel(), 6);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_index_naming_a_shard_outside_the_folder_is_refused() {
+        let dir = scratch("index-escape");
+        for shard in [
+            "../model-00001-of-00001.safetensors",
+            "C:model.safetensors",
+            r"\\\\host\\share\\model.safetensors",
+            "..",
+        ] {
+            let index = format!(r#"{{"weight_map":{{"w":"{shard}"}}}}"#);
+            std::fs::write(dir.join("model.safetensors.index.json"), index).unwrap();
+            let error = format!("{:#}", SafeTensorsSet::open(&dir).err().expect("refused"));
+            assert!(
+                error.contains("must sit beside the index"),
+                "{shard}: {error}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

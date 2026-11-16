@@ -22,7 +22,6 @@ export_fast.py and export_rtn.py); see its docstring for the binary layout.
 
 import argparse
 import time
-import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -75,6 +74,12 @@ def main():
         )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    # Refused now rather than after quantizing: a different model's tokenizer
+    # already beside the output would otherwise cost the whole export.
+    tokenizer_json = raimodel.saved_tokenizer_json(tokenizer)
+    output_path = Path(args.output)
+    tokenizer_dst = output_path.parent / "tokenizer.json"
+    raimodel.check_tokenizer_destination(tokenizer_json, tokenizer_dst)
     model.eval()
 
     cfg = model.config
@@ -281,8 +286,6 @@ def main():
     print("STEP 4: WRITING .raimodel FILE")
     print(f"{'='*60}")
 
-    output_path = Path(args.output)
-
     # Build section data: embed + layers + final norm [+ lm_head if untied]
     sections_data = []
     sections_data.append(raimodel.build_embedding_section(embed_codes, embed_scales, embed_zeros))
@@ -314,16 +317,10 @@ def main():
     # =========================================================================
     # Step 5: Copy tokenizer
     # =========================================================================
-    tokenizer_dst = output_path.parent / "tokenizer.json"
-    with tempfile.TemporaryDirectory(prefix="rai_tokenizer_") as tmp_dir:
-        tokenizer.save_pretrained(tmp_dir)
-        src_json = Path(tmp_dir) / "tokenizer.json"
-        if not src_json.exists():
-            raise RuntimeError("tokenizer export did not produce the required tokenizer.json")
-        if raimodel.copy_tokenizer_json(src_json, tokenizer_dst):
-            print(f"Tokenizer copied to: {tokenizer_dst}")
-        else:
-            print(f"Tokenizer already present (identical): {tokenizer_dst}")
+    if raimodel.place_tokenizer_json(tokenizer_json, tokenizer_dst):
+        print(f"Tokenizer written to: {tokenizer_dst}")
+    else:
+        print(f"Tokenizer already present (identical): {tokenizer_dst}")
 
     # =========================================================================
     # Summary

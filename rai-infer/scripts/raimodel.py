@@ -53,9 +53,11 @@ Section encodings:
 """
 
 import math
+import os
 import re
-import shutil
 import struct
+import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -647,39 +649,88 @@ def write_raimodel(path, config, sections_data):
         offsets.append(current_offset)
         current_offset += len(data)
 
-    with open(path, "wb") as f:
+    def write(f):
         write_header(f, config, num_sections)
         for offset, data in zip(offsets, sections_data):
             f.write(struct.pack("<QQ", offset, len(data)))
         for data in sections_data:
             f.write(data)
 
+    _write_atomically(path, write)
     return current_offset
+
+
+def _write_atomically(path, write):
+    """Write through a sibling `.partial` file and rename it into place.
+
+    An export that dies mid-write (killed, disk full) then leaves no truncated
+    file under the real name, and never a half-overwritten earlier export. The
+    name is this process's own and created exclusively, as in convert.rs, so
+    two exports to one target cannot write into each other's bytes.
+    """
+    path = Path(path)
+    partial = path.with_name(f"{path.name}.{os.getpid()}-{time.time_ns()}.partial")
+    f = open(partial, "xb")
+    try:
+        with f:
+            write(f)
+            f.flush()
+            os.fsync(f.fileno())
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+    # A finished file is kept when only the rename fails (the target held open
+    # by a scanner, say): deleting hours of export would be worse.
+    try:
+        os.replace(partial, path)
+    except OSError as error:
+        raise RuntimeError(
+            f"moving {partial} into place as {path} failed ({error}); the finished file "
+            f"is intact at the first path — move or rename it by hand"
+        ) from error
 
 
 # =============================================================================
 # Tokenizer copy
 # =============================================================================
 
-def copy_tokenizer_json(src_path, dst_path):
-    """Copy tokenizer.json next to the model, refusing to clobber a different one.
+def saved_tokenizer_json(tokenizer):
+    """The tokenizer.json bytes a fast tokenizer saves: the file the runtime reads."""
+    with tempfile.TemporaryDirectory(prefix="rai_tokenizer_") as tmp_dir:
+        tokenizer.save_pretrained(tmp_dir)
+        saved = Path(tmp_dir) / "tokenizer.json"
+        if not saved.exists():
+            raise RuntimeError("tokenizer export did not produce the required tokenizer.json")
+        return saved.read_bytes()
 
-    Returns True if the file was copied, False if an identical file already
-    existed (skip).  Raises RuntimeError if a DIFFERENT tokenizer.json is
-    already at the destination.
+
+def check_tokenizer_destination(tokenizer_json, dst_path):
+    """Refuse when a DIFFERENT tokenizer.json already sits where this one goes.
+
+    Exporters call this before quantizing, so a clash is refused in seconds
+    instead of after the whole export, with no model written beside another
+    model's tokenizer.
     """
-    src_path = Path(src_path)
     dst_path = Path(dst_path)
-    src_bytes = src_path.read_bytes()
-    if dst_path.exists():
-        if dst_path.read_bytes() == src_bytes:
-            return False
+    if dst_path.exists() and dst_path.read_bytes() != tokenizer_json:
         raise RuntimeError(
             f"refusing to overwrite {dst_path}: it differs from this model's tokenizer.json. "
             f"Another model's tokenizer already lives there — export into a separate "
             f"output directory (--output <dir>/<name>.raimodel)."
         )
-    shutil.copy2(src_path, dst_path)
+
+
+def place_tokenizer_json(tokenizer_json, dst_path):
+    """Write tokenizer.json next to the model, never clobbering a different one.
+
+    Returns True if the file was written, False if an identical one was
+    already there. Raises RuntimeError if a DIFFERENT one is.
+    """
+    dst_path = Path(dst_path)
+    check_tokenizer_destination(tokenizer_json, dst_path)
+    if dst_path.exists():
+        return False
+    _write_atomically(dst_path, lambda f: f.write(tokenizer_json))
     return True
 
 
@@ -690,14 +741,148 @@ def copy_tokenizer_json(src_path, dst_path):
 # keeps its numpy-only import contract (test_raimodel.py runs without them).
 # ---------------------------------------------------------------------------
 
-# Architectures whose maths this container cannot express even though their
-# module tree looks Llama-shaped.
+# The model_types whose forward pass the runtime implements and has checked
+# against the reference: tensor names alone prove nothing about the arithmetic.
+# Same list as VERIFIED_MODEL_TYPES in src/convert.rs, held equal by
+# tests/limits_are_single_sourced.rs.
+VERIFIED_MODEL_TYPES = (
+    "llama",
+    "mistral",
+    "mixtral",
+    "qwen2",
+    "qwen3",
+    "qwen3_moe",
+    "gemma",
+    "gemma2",
+    "gemma3",
+    "gemma3_text",
+    "phi3",
+    "olmo2",
+    "olmoe",
+)
+
+# Verified families whose maths container v1 cannot express even though their
+# module tree looks Llama-shaped; `rai convert` writes v2 and stores them.
 _UNSUPPORTED_MODEL_TYPES = {
     "gemma": "Gemma scales embeddings by sqrt(hidden) and its RMSNorm applies (1 + weight)",
     "gemma2": "Gemma2 adds logit softcapping and (1 + weight) RMSNorm",
     "gemma3": "Gemma3 adds per-head QK norm and (1 + weight) RMSNorm",
     "gemma3_text": "Gemma3 adds per-head QK norm and (1 + weight) RMSNorm",
 }
+
+# Scales applied outside any stored tensor (Granite's multipliers, MiniCPM's
+# depth and width scaling); None means no value of the field is neutral.
+_UNSTORED_SCALES = (
+    ("embedding_multiplier", 1.0),
+    ("residual_multiplier", 1.0),
+    ("logits_scaling", 1.0),
+    ("attention_multiplier", None),
+    ("scale_emb", 1.0),
+    ("scale_depth", None),
+    ("dim_model_base", None),
+)
+
+
+def _unrepresentable_anywhere(config):
+    """Config-level maths no container version stores, so `rai convert` refuses it too."""
+    found = []
+    model_type = getattr(config, "model_type", None)
+    if not model_type:
+        found.append(
+            "config.json declares no model_type, so the architecture cannot be checked "
+            "against the ones this runtime implements."
+        )
+    elif model_type not in VERIFIED_MODEL_TYPES:
+        found.append(
+            f"model_type '{model_type}' has no verified forward pass in this runtime "
+            f"(verified: {', '.join(VERIFIED_MODEL_TYPES)}). A family with the same tensor "
+            f"names can still rotate, scale or normalize differently, and would convert "
+            f"into a model that computes something else."
+        )
+    for field, neutral in _UNSTORED_SCALES:
+        value = getattr(config, field, None)
+        if value is not None and (neutral is None or value != neutral):
+            found.append(
+                f"config declares {field}={value}; the container has no slot for that "
+                f"scale, so the model would export cleanly and compute something else."
+            )
+    no_rope = getattr(config, "no_rope_layers", None)
+    if no_rope is not None:
+        skips_rope = any(flag == 0 for flag in no_rope)
+    else:
+        interval = getattr(config, "no_rope_layer_interval", None)
+        layers = getattr(config, "num_hidden_layers", None)
+        skips_rope = bool(interval) and (layers is None or interval <= layers)
+    if skips_rope:
+        found.append(
+            "config declares layers without rotary embeddings (no_rope_layers); the reader "
+            "rotates every layer, so positions would be wrong on those layers."
+        )
+    for field, factor in _partial_rotary_factors(config):
+        if factor != 1.0:
+            found.append(
+                f"config declares {field}={factor}; the reader rotates the full head, so "
+                f"positions would be wrong."
+            )
+    for field, rope_type in _rope_schemes(config):
+        # The stored scheme applies to the full-attention layers, as in Gemma3.
+        sliding = field.endswith(".sliding_attention")
+        if rope_type == "default" or (rope_type == "llama3" and not sliding):
+            continue
+        found.append(
+            f"config declares {field} type '{rope_type}'; the container stores plain RoPE "
+            f"and the llama3 scheme of the full-attention layers only, so positions would "
+            f"be wrong."
+        )
+    return found
+
+
+def _rope_parameter_entries(parameters):
+    """(layer kind or None, entry) for a flat or a per-layer-type rope_parameters dict."""
+    if any(isinstance(value, dict) for value in parameters.values()):
+        return list(parameters.items())
+    return [(None, parameters)]
+
+
+def _partial_rotary_factors(config):
+    """Every partial_rotary_factor the config declares, in either transformers layout."""
+    found = []
+    legacy = getattr(config, "partial_rotary_factor", None)
+    if legacy is not None:
+        found.append(("partial_rotary_factor", legacy))
+    parameters = getattr(config, "rope_parameters", None)
+    if isinstance(parameters, dict):
+        for kind, entry in _rope_parameter_entries(parameters):
+            if isinstance(entry, dict) and entry.get("partial_rotary_factor") is not None:
+                field = "rope_parameters" + (f".{kind}" if kind else "")
+                found.append((f"{field}.partial_rotary_factor", entry["partial_rotary_factor"]))
+    return found
+
+
+def _rope_schemes(config):
+    """Every RoPE scheme the config names, as (field, rope_type), on any transformers version.
+
+    transformers 5 keeps them in `rope_parameters`, flat or one entry per layer
+    type, and serves `rope_scaling` as an alias of the same dict; 4.x has
+    `rope_scaling` alone. A scheme that names no type is plain RoPE.
+    """
+    parameters = getattr(config, "rope_parameters", None)
+    legacy = getattr(config, "rope_scaling", None)
+    sources = [("rope_parameters", parameters)]
+    if legacy is not parameters:
+        sources.append(("rope_scaling", legacy))
+    found = []
+    for name, value in sources:
+        if not value:
+            continue
+        if not isinstance(value, dict):
+            found.append((name, str(value)))
+            continue
+        for kind, entry in _rope_parameter_entries(value):
+            if isinstance(entry, dict):
+                field = name + (f".{kind}" if kind else "")
+                found.append((field, entry.get("rope_type") or entry.get("type") or "default"))
+    return found
 
 
 def load_hf_causal_lm(model_path, dtype_name="float16"):
@@ -769,6 +954,7 @@ def assert_exportable_architecture(model, config, max_context):
 
     biased = []
     qk_normed = []
+    norm_biased = []
     for index, layer in enumerate(layers):
         try:
             linears = _iter_export_linears(layer)
@@ -783,6 +969,24 @@ def assert_exportable_architecture(model, config, max_context):
         for norm_attr in ("q_norm", "k_norm"):
             if getattr(layer.self_attn, norm_attr, None) is not None:
                 qk_normed.append(f"layer {index}.self_attn.{norm_attr}")
+        for norm_attr in ("input_layernorm", "post_attention_layernorm"):
+            if getattr(getattr(layer, norm_attr, None), "bias", None) is not None:
+                norm_biased.append(f"layer {index}.{norm_attr}")
+
+    # Checked before the v1-only problems below, whose message sends the user
+    # to `rai convert`: that path refuses these as well.
+    unrepresentable = _unrepresentable_anywhere(config)
+    if norm_biased:
+        unrepresentable.append(
+            f"{len(norm_biased)} layer norm(s) carry a bias (e.g. {norm_biased[0]}); the "
+            f"container stores RMSNorm weights only, so a biased LayerNorm would be computed "
+            f"as a different operation."
+        )
+    if unrepresentable:
+        raise RuntimeError(
+            "this checkpoint cannot be represented by any .raimodel container version, so "
+            "`rai convert` refuses it too:\n  - " + "\n  - ".join(unrepresentable)
+        )
 
     if biased:
         problems.append(
@@ -797,20 +1001,16 @@ def assert_exportable_architecture(model, config, max_context):
         )
 
     # transformers >= 5 normalizes plain RoPE into {"rope_type": "default"},
-    # so the presence of the field means nothing on its own — only a scaling
-    # type the reader cannot reproduce is a blocker.
-    rope_scaling = getattr(config, "rope_scaling", None)
-    if rope_scaling:
-        if isinstance(rope_scaling, dict):
-            rope_type = rope_scaling.get("rope_type") or rope_scaling.get("type")
-        else:
-            rope_type = str(rope_scaling)
-        if rope_type not in (None, "default"):
+    # so the presence of the field means nothing on its own. Types no container
+    # stores were refused above; llama3 is stored by v2 only.
+    for field, rope_type in _rope_schemes(config):
+        if rope_type == "llama3":
             problems.append(
-                f"config declares rope_scaling type '{rope_type}'; the reader builds a plain "
-                f"RoPE table from rope_theta alone, so positions would be wrong. "
-                f"Llama-3.1/3.2 (rope_type 'llama3') are the common case here."
+                f"config declares {field} type 'llama3'; container v1 builds a plain RoPE "
+                f"table from rope_theta alone, so positions would be wrong. "
+                f"Llama-3.1/3.2 are the common case here."
             )
+            break
 
     for attr in ("num_experts", "num_local_experts"):
         if getattr(config, attr, None):

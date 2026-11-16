@@ -16,7 +16,6 @@ Usage (any recent CUDA GPU):
 import argparse
 import time
 import sys
-import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -65,6 +64,12 @@ def main():
         )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    # Refused now rather than after quantizing: a different model's tokenizer
+    # already beside the output would otherwise cost the whole export.
+    tokenizer_json = raimodel.saved_tokenizer_json(tokenizer)
+    output_path = Path(args.output)
+    tok_dst = output_path.parent / "tokenizer.json"
+    raimodel.check_tokenizer_destination(tokenizer_json, tok_dst)
     model.eval()
     print(f"Model loaded in {time.time()-t0:.1f}s")
     sys.stdout.flush()
@@ -239,8 +244,6 @@ def main():
     print(f"\n=== STEP 4: WRITING .raimodel ===")
     sys.stdout.flush()
 
-    output_path = Path(args.output)
-
     sections_data = []
     sections_data.append(raimodel.build_embedding_section(embed_codes, embed_scales, embed_zeros))
     for li in range(n_layers):
@@ -258,17 +261,11 @@ def main():
     print(f"\n  Wrote: {output_path} ({total_size / 1e6:.1f} MB, {len(sections_data)} sections)")
     sys.stdout.flush()
 
-    # Copy tokenizer
-    tok_dst = output_path.parent / "tokenizer.json"
-    with tempfile.TemporaryDirectory(prefix="rai_tokenizer_") as tmp_dir:
-        tokenizer.save_pretrained(tmp_dir)
-        tok_src = Path(tmp_dir) / "tokenizer.json"
-        if not tok_src.exists():
-            raise RuntimeError("tokenizer export did not produce the required tokenizer.json")
-        if raimodel.copy_tokenizer_json(tok_src, tok_dst):
-            print(f"  Tokenizer: {tok_dst}")
-        else:
-            print(f"  Tokenizer already present (identical): {tok_dst}")
+    # Tokenizer
+    if raimodel.place_tokenizer_json(tokenizer_json, tok_dst):
+        print(f"  Tokenizer: {tok_dst}")
+    else:
+        print(f"  Tokenizer already present (identical): {tok_dst}")
 
     print(f"\n=== DONE ===")
     print(f"  Model: {args.output} ({total_size / 1e6:.1f} MB)")

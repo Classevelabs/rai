@@ -74,8 +74,9 @@ that this format does store.
 | Gemma2 (2B, 9B, 27B) | **Converts** | — | Logit softcapping and the two block-output norms are stored. Convert with `--max-context 4096` or lower (see sliding windows). Verified: gemma-2-2b-it converts to 1.70 GB and generates. |
 | OLMo2 | **Converts** | — | Projection-wide QK norms and post-norm placement are both stored. Verified: OLMo-2-1B-Instruct converts in 47.2 s to 898 MB and generates. |
 | Gemma3, Gemma3-text | **Converts** | — | Both RoPE bases and the layer stride are stored. Convert with `--max-context 512` or lower (its sliding window), and run with `--chat-template gemma`. Verified: gemma-3-1b-it converts in 41.5 s to 660 MB and generates. |
-| Mixtral-8x7B, Mixtral-8x22B | **Converts** | — | Router and every expert are stored. A 4-bit Mixtral-8x7B is ~24 GB on disk and needs that much RAM to run — check before you start. |
-| Qwen3-MoE (30B-A3B, 235B-A22B) | **Converts** | — | Routed experts are stored. Verified on OLMoE-1B-7B (64 experts, 8 per token): converts in 121.3 s to 3.5 GB and generates. |
+| Mixtral-8x7B | **Converts** | — | Router and every expert are stored. A 4-bit Mixtral-8x7B is ~24 GB on disk and needs that much RAM to run — check before you start. |
+| Qwen3-MoE (30B-A3B) | **Converts** | — | Routed experts are stored. Verified on OLMoE-1B-7B (64 experts, 8 per token): converts in 121.3 s to 3.5 GB and generates. |
+| Mixtral-8x22B, Qwen3-MoE 235B-A22B | **Refused** | Mixtral-8x7B, Qwen3-30B-A3B | At 4 bits every stored expert comes to more than the reader's 64 GiB file limit, so the conversion is refused before it starts rather than producing a file that cannot be loaded. |
 | Any config with `shared_expert_intermediate_size` or `n_shared_experts` | **Refused** | The same family without a shared expert | A shared expert runs for *every* token alongside the routed ones; the container stores routed experts only, so dropping it would remove a pathway rather than degrade one. |
 | Phi-3, Phi-3.5 | **Converts** | — | Its fused `qkv_proj` and `gate_up_proj` are split at conversion. Convert with `--max-context 2047` or lower (see sliding windows), and run with `--chat-template phi3`. Verified: Phi-3-mini-4k-instruct converts to 2,083 MB in 22.8 s and generates. |
 | Phi-2 | **Refused** | `meta-llama/Llama-3.2-3B-Instruct` | Not a Llama-shaped module tree; unlike Phi-3 it is not a fused variant of one. |
@@ -85,14 +86,21 @@ that this format does store.
 | GPT-2 | **Refused** | `HuggingFaceTB/SmolLM2-360M-Instruct` | Learned position embeddings, fused attention, no `model.layers`. |
 | Anything with `rope_scaling` other than `default` or `llama3` (`linear`, `dynamic`, `yarn`) | **Refused** | The unscaled base checkpoint, or a Llama-3.1 model | Positions would be computed wrong; the container stores two schemes. |
 | Anything carrying `lm_head.bias` | **Refused** | The base checkpoint it was tuned from | Biases are stored for the seven layer projections only, so it would be dropped in silence. |
+| Granite (dense), MiniCPM | **Refused** | A Llama, Mistral or Qwen3 checkpoint of the same size | Llama tensor names, but scales applied outside any tensor (`residual_multiplier`, `scale_depth`, …) that the header has no slot for. |
+| SmolLM3 | **Refused** | `HuggingFaceTB/SmolLM2-1.7B-Instruct` | Every fourth layer skips RoPE (`no_rope_layers`); the runtime rotates every layer. |
+| StableLM, StableLM-2 | **Refused** | `HuggingFaceTB/SmolLM2-1.7B-Instruct` | Biased LayerNorm and partial rotary (`partial_rotary_factor`); the container stores RMSNorm and rotates the full head. |
 
 A refusal is a hard error at export, never a warning, and never a file that
 loads cleanly and generates nonsense.
 
 ### Where the line falls now
 
-Nothing is refused for its `model_type` any more. What is refused is refused
-for something a checkpoint *contains*:
+A family converts once its forward pass has been verified: the `model_type`
+list in the table further down. Matching tensor names prove nothing about the
+arithmetic — ERNIE-4.5 rotates interleaved pairs and EXAONE-4 skips RoPE on its
+global layers, both under Llama tensor names — so any other `model_type` is
+refused. Within those families, what is refused is refused for something a
+checkpoint *contains*:
 
 - **A shared expert.** A routed mixture-of-experts model converts; one that
   also runs a shared expert for every token does not. That expert has no slot,
@@ -102,11 +110,20 @@ for something a checkpoint *contains*:
   shows up as quality loss at long context, not as a failure, so it is refused.
 - **An `lm_head` bias.** Biases are stored for the seven layer projections
   only, so it would be dropped in silence.
+- **A scale with no slot.** Granite multiplies its embeddings, residual
+  branches, attention scores and logits by configured factors, and MiniCPM
+  scales by depth and width; none of those live in a tensor, so a file that
+  left them out would load and compute something else.
+- **Rotary on part of the head, or on some layers only.** A
+  `partial_rotary_factor` below 1 or a `no_rope_layers` entry of 0 changes
+  where positions enter; the runtime rotates every dimension of every layer.
+- **A norm with a bias.** That is a LayerNorm, not an RMSNorm, and running it
+  as one would drop both the bias and the mean subtraction.
 - **A module tree that is not Llama-shaped.** Falcon, GPT-NeoX, MPT, GPT-2 and
   Phi-2 do not expose the tensors a layer stores. Phi-3 *is* a fused Llama tree,
   which is why it converts and Phi-2 does not.
 
-Two families illustrate why the family name never settles it. OLMo2 carries
+Two families illustrate why the family name alone never settles it. OLMo2 carries
 `q_norm`/`k_norm` — the same tensor names Qwen3 uses — but sized over the whole
 projection and applied before the split into heads: different arithmetic, not a
 longer vector. Both are stored, under different flags, and which one a
@@ -146,6 +163,7 @@ c = json.load(open("config.json"))
 print("model_type       ", c.get("model_type"))
 print("architectures    ", c.get("architectures"))
 print("rope_scaling     ", c.get("rope_scaling"))
+print("rope_parameters  ", c.get("rope_parameters"))
 print("experts          ", c.get("num_experts"), c.get("num_local_experts"))
 print("sliding_window   ", c.get("sliding_window"))
 print("softcapping      ", c.get("attn_logit_softcapping"), c.get("final_logit_softcapping"))
@@ -158,10 +176,14 @@ The three fields that decide it most often are `model_type`, `num_experts`, and
 
 | Field | Convert it | Do not download |
 | --- | --- | --- |
-| `model_type` | `llama`, `mistral`, `qwen2`, `qwen3`, `qwen3_moe`, `gemma`, `gemma2`, `gemma3`, `gemma3_text`, `phi3`, `olmo2`, `olmoe`, `mixtral` | `phi`, `falcon`, `mpt`, `gpt_neox`, `gpt2` |
+| `model_type` | `llama`, `mistral`, `qwen2`, `qwen3`, `qwen3_moe`, `gemma`, `gemma2`, `gemma3`, `gemma3_text`, `phi3`, `olmo2`, `olmoe`, `mixtral` | Any other, such as `phi`, `falcon`, `mpt`, `gpt_neox`, `gpt2`, `granite`, `smollm3` |
 | `num_experts` / `num_local_experts` | Any value — routed experts convert | — |
 | `shared_expert_intermediate_size` | Absent or zero | Any positive value: a shared expert has no slot |
-| `rope_scaling` | `null`, absent, `{"rope_type": "default"}`, or `{"rope_type": "llama3", ...}` | Any other `rope_type`, including `linear`, `dynamic`, `yarn` |
+| `rope_scaling`, or `rope_parameters` in a config written by transformers 5 | `null`, absent, `{"rope_type": "default"}`, or `{"rope_type": "llama3", ...}` | Any other `rope_type`, including `linear`, `dynamic`, `yarn` |
+| `partial_rotary_factor` (top level or inside `rope_parameters`) | Absent or `1.0` | Anything below 1 |
+| `no_rope_layers` | Absent, or every entry `1` | Any entry `0` |
+| `embedding_multiplier`, `residual_multiplier`, `logits_scaling`, `scale_emb` | Absent or `1.0` | Any other value |
+| `attention_multiplier`, `scale_depth`, `dim_model_base` | Absent | Present |
 | `sliding_window` | Absent, or at least your `--max-context` | Present and below your `--max-context` — lower the context rather than dropping the model |
 | `hidden_act` / `hidden_activation` | `silu`, `swish`, `gelu_pytorch_tanh`, or absent | Any other named activation |
 

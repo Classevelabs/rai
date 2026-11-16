@@ -121,6 +121,42 @@ fn the_python_exporter_agrees_with_the_rust_limits() {
     );
 }
 
+/// The families both converters accept. A name only Python knows exports a
+/// file nothing verified; a name only Rust knows is refused by the exporter
+/// the docs send GPTQ users to.
+#[cfg(feature = "cli")]
+#[test]
+fn the_python_exporter_verifies_the_same_families() {
+    let source = exporter_source();
+    let start = source
+        .find("\nVERIFIED_MODEL_TYPES = (")
+        .expect("scripts/raimodel.py does not define VERIFIED_MODEL_TYPES as a tuple");
+    // From the declaration line itself, which `skip(1)` below steps over.
+    let body = &source[start + 1..];
+    let end = body
+        .find("\n)")
+        .expect("VERIFIED_MODEL_TYPES is not closed by a `)` line");
+    let python: Vec<&str> = body[..end]
+        .lines()
+        .skip(1)
+        .map(|line| {
+            let entry = line.trim();
+            entry
+                .strip_prefix('"')
+                .and_then(|entry| entry.strip_suffix("\","))
+                .unwrap_or_else(|| {
+                    panic!("VERIFIED_MODEL_TYPES entry `{entry}` is not one `\"name\",` per line")
+                })
+        })
+        .collect();
+    assert_eq!(
+        python,
+        rai_infer::convert::VERIFIED_MODEL_TYPES,
+        "scripts/raimodel.py and src/convert.rs verify different model families; \
+         convert.rs is authoritative, update the Python tuple to match"
+    );
+}
+
 /// The parser itself has to be trustworthy: a silent mis-read would make the
 /// test above pass while the values disagreed.
 #[test]

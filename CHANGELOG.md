@@ -6,6 +6,75 @@ versioning for its pre-1.0 releases.
 
 ## [Unreleased]
 
+### Fixed
+- **`rai convert` read the wrong RoPE settings from transformers 5 configs.**
+  transformers 5 writes `rope_theta`, the scaling scheme and Gemma3's
+  sliding-layer base into `rope_parameters` and drops the top-level keys, so a
+  checkpoint it saved converted with the 10000 fallback base and plain RoPE: a
+  file that passes validation, loads, and generates with the wrong positions.
+  Both layouts are read now, and a scheme named in `rope_parameters` is
+  accepted or refused exactly as one in `rope_scaling`. Two bases that
+  disagree, or a `rope_parameters` without one, are refused rather than guessed.
+- Calibrated conversion of first-generation Gemma computed its activation
+  statistics with the checkpoint's raw RMSNorm weights instead of Gemma's
+  `(1 + w)`, so the quantization was fitted to a different model than the one
+  written. The calibration pass now applies the same fold as the file.
+- `rai convert` and the Python exporters refuse Llama-shaped checkpoints whose
+  arithmetic the container does not store, instead of converting them into a
+  model that generates nonsense: scales applied outside any tensor (Granite's
+  `embedding_multiplier`, `residual_multiplier`, `attention_multiplier` and
+  `logits_scaling`; MiniCPM's `scale_emb`, `scale_depth` and `dim_model_base`),
+  layers that skip RoPE (SmolLM3's `no_rope_layers`), partial rotary
+  (`partial_rotary_factor`), and biased LayerNorms (StableLM). Each is refused
+  for what the checkpoint contains, whatever its `model_type`.
+- Only families whose forward pass has been verified convert. Matching tensor
+  names prove nothing about the arithmetic (ERNIE-4.5 rotates interleaved
+  pairs, EXAONE-4 skips RoPE on its global layers, both under Llama names), so
+  a `model_type` outside the list in docs/MODELS.md, or none at all, is
+  refused by `rai convert` and the Python exporters alike; a test keeps the two
+  lists equal.
+- `rai convert` and Studio's check refuse a model whose `.raimodel` would
+  exceed the reader's 64 GiB file limit. The writer imported every other reader
+  limit but not that one, so Mixtral-8x22B and Qwen3-MoE 235B-A22B converted
+  into files `rai run` refuses to open; the docs listed both as converting.
+- Qwen3-MoE converts, as the docs said it did. Its config declares a dense
+  `intermediate_size` no layer uses and stores every expert at
+  `moe_intermediate_size`; the converter refused the two widths. When every
+  layer is sparse the expert width is the MLP width now, and a config that
+  mixes dense and sparse layers is still refused.
+- A config without `tie_word_embeddings` was read as tied, so a checkpoint
+  with its own `lm_head.weight` converted with the embedding table as its
+  output head. The checkpoint settles it now: a separate `lm_head.weight`
+  means a separate head.
+- Studio's pre-conversion check reports every refusal the conversion would
+  make (dimension limits, group sizes, the RoPE base, expert widths) instead
+  of passing checkpoints the conversion then refused.
+- A different model's `tokenizer.json` in the output folder is refused before
+  quantizing, by `rai convert` and the Python exporters, instead of after the
+  model was written beside it. The tokenizer and the Python exporters' model
+  are written through a temporary file and renamed into place, like
+  `rai convert`'s model, so an interrupted export leaves no truncated file.
+- Two conversions to the same output (the command line and Studio, say)
+  shared one `.partial` file and could rename a corrupted model into place;
+  each now writes its own.
+- The Python exporters read the RoPE scheme from `rope_parameters` too, flat
+  or per layer type, as transformers 5 stores it; a scheme kept per layer type
+  went unchecked. `export_rtn.py` names its default output as `rai convert`
+  does, keeping the case and splitting Windows paths.
+- Calibrated conversion refuses zero calibration sequences or sequences
+  shorter than two tokens up front. Converter messages no longer carry runs of
+  spaces from a broken line continuation, or name a `--calibrate` flag that
+  does not exist.
+
+### Security
+- The checkpoint reader refuses a shard index that names a file outside the
+  checkpoint folder. A downloaded index could otherwise point the converter at
+  any file, and on Windows a `\\host\share` shard name makes the machine
+  authenticate to that host.
+- Tensor sizes in a safetensors header are computed with checked arithmetic;
+  a shape whose element count wrapped could pass the length check and drive
+  later reads and allocations.
+
 ## [0.2.5] - 2026-09-08
 
 ### Fixed

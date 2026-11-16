@@ -475,7 +475,8 @@ impl Drop for TerminalPhaseGuard<'_> {
         job.phase = JobPhase::Error;
         job.stage = "error".to_string();
         job.elapsed_ms = job.started.elapsed().as_millis() as u64;
-        let text = "the conversion worker ended without recording a result;                     the conversion did not finish";
+        let text =
+            "the conversion worker ended without recording a result; the conversion did not finish";
         job.push_line(text);
         if job.error.is_none() {
             job.error = Some(text.to_string());

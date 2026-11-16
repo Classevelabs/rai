@@ -1383,7 +1383,7 @@ fn read_v2_capabilities(data: &[u8], config: &mut ModelConfig) -> Result<()> {
     // guessing which layers use which base, so neither is allowed alone.
     if (config.rope_local_theta > 0.0) != (config.global_layer_stride > 0) {
         bail!(
-            "header is inconsistent: rope_local_theta is {} and global_layer_stride is {};              per-layer RoPE needs both or neither",
+            "header is inconsistent: rope_local_theta is {} and global_layer_stride is {}; per-layer RoPE needs both or neither",
             config.rope_local_theta,
             config.global_layer_stride
         );
