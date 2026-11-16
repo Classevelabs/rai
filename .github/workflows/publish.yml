@@ -7,50 +7,144 @@ name: Publish
 # secret. Dispatched by hand after a release, never on its own — publication
 # is deliberate, and a published version cannot be taken back.
 #
+# It publishes the tag it is given, never the branch it was dispatched from:
+# the crates must be the same tree the release binaries came from. The job
+# runs in the `crates-io` environment, so publishing can require a reviewer's
+# approval (Settings → Environments), and crates.io's trusted publisher can be
+# bound to that environment as well.
+#
 # `rem-nra`, `rai-core`, and `rai-server` are publish = false and stay out on
 # purpose; see the note at the top of their manifests.
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v0.2.6)"
+        required: true
+        type: string
+
+concurrency:
+  group: publish-${{ inputs.tag }}
+  cancel-in-progress: false
 
 permissions: {}
 
 jobs:
   publish:
-    name: Publish to crates.io
+    name: Publish ${{ inputs.tag }} to crates.io
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: crates-io
     permissions:
       id-token: write
       contents: read
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
+      actions: read
 
-      - name: Refuse to republish an existing version
+    steps:
+      - name: Resolve the tag to the commit it names
+        id: tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          # Through the environment, never interpolated into the script.
+          RAW_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
-          echo "workspace version: $version"
+          tag="$RAW_TAG"
+          if ! printf '%s' "$tag" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
+            echo "::error::'$tag' is not a version tag of the form vMAJOR.MINOR.PATCH"
+            exit 1
+          fi
+          ref=$(gh api "repos/$REPO/git/ref/tags/$tag") \
+            || { echo "::error::$tag is not a tag in $REPO"; exit 1; }
+          sha=$(jq -r '.object.sha' <<<"$ref")
+          if [ "$(jq -r '.object.type' <<<"$ref")" = "tag" ]; then
+            sha=$(gh api "repos/$REPO/git/tags/$sha" --jq '.object.sha')
+          fi
+          if ! printf '%s' "$sha" | grep -qE '^[0-9a-f]{40}$'; then
+            echo "::error::$tag does not resolve to a commit"
+            exit 1
+          fi
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "$tag is $sha"
+
+      - name: Require green CI on this exact commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ steps.tag.outputs.sha }}
+        run: |
+          set -euo pipefail
+          passed=$(gh api "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&status=success&per_page=1" \
+                     --jq '.total_count')
+          if [ "$passed" -eq 0 ]; then
+            echo "::error::CI has no successful run on $SHA; publish only a commit CI passed"
+            exit 1
+          fi
+
+      - name: Checkout the tagged commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.tag.outputs.sha }}
+          persist-credentials: false
+
+      - name: Verify the commit and the workspace version
+        shell: bash
+        env:
+          SHA: ${{ steps.tag.outputs.sha }}
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SHA"
+          declared=$(cargo metadata --locked --format-version 1 --no-deps \
+            | jq -r '[.packages[].version] | unique | if length == 1 then .[0] else "MIXED" end')
+          if [ "$declared" != "$VERSION" ]; then
+            echo "::error::the tag says $VERSION but the workspace declares $declared"
+            exit 1
+          fi
+
+      # Per crate, so a run that published one crate and then failed on the
+      # other can simply be re-run: the published one is skipped, the other is
+      # published. Aborting on the first existing version made that failure
+      # unrecoverable without a version bump.
+      - name: Find which crates still need publishing
+        id: pending
+        shell: bash
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
           for crate in classeve-rai-compress classeve-rai-infer; do
             prefix="${crate:0:2}/${crate:2:2}"
-            if curl -fsS "https://index.crates.io/$prefix/$crate" | grep -q "\"vers\":\"$version\""; then
-              echo "::error::$crate $version is already on crates.io; bump the workspace version instead"
-              exit 1
+            index=$(curl -fsS "https://index.crates.io/$prefix/$crate" || true)
+            if printf '%s' "$index" | grep -q "\"vers\":\"$VERSION\""; then
+              echo "$crate $VERSION is already on crates.io; skipping it"
+              echo "$crate=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "$crate=true" >> "$GITHUB_OUTPUT"
             fi
           done
 
+      - name: Package both crates before publishing either
+        run: cargo package --locked -p classeve-rai-compress -p classeve-rai-infer
+
       - name: Authenticate with crates.io
         id: auth
+        if: steps.pending.outputs.classeve-rai-compress == 'true' || steps.pending.outputs.classeve-rai-infer == 'true'
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
 
       - name: Publish classeve-rai-compress
+        if: steps.pending.outputs.classeve-rai-compress == 'true'
         run: cargo publish --locked -p classeve-rai-compress
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
       - name: Publish classeve-rai-infer
+        if: steps.pending.outputs.classeve-rai-infer == 'true'
         run: cargo publish --locked -p classeve-rai-infer
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

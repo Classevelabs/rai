@@ -192,14 +192,15 @@ jobs:
           done
           cat /tmp/notices.warn
 
-          # With every lookup failed the regenerated file is incomplete, so a diff would be
-          # a false alarm; a stale file still fails the next run that reaches the lookup.
+          # With every lookup failed the regenerated file is incomplete, so a diff
+          # proves nothing either way. That is a failure, not a pass: skipping it
+          # once let a release ship notices naming the previous version, and the
+          # release now requires this run to be green. Re-run the job.
           if grep -q 'failed to request license information' /tmp/notices.warn; then
-            echo "::warning::cargo-about could not reach api.clearlydefined.io after"
-            echo "::warning::five attempts; the regenerated notices are incomplete, so the"
-            echo "::warning::staleness check is skipped for this run. Transient network"
-            echo "::warning::failure, not a stale THIRD-PARTY-NOTICES.md."
-            exit 0
+            echo "::error::cargo-about could not reach api.clearlydefined.io after five"
+            echo "::error::attempts, so THIRD-PARTY-NOTICES.md could not be checked. This is a"
+            echo "::error::network failure, not a stale file: re-run this job."
+            exit 1
           fi
 
           if ! diff -u THIRD-PARTY-NOTICES.md /tmp/notices.md; then

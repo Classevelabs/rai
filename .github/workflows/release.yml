@@ -28,8 +28,11 @@ on:
         required: true
         type: string
 
+# One group per release whichever way it was started: `github.ref` is
+# `refs/tags/vX` for a tag push but the input is `vX` for a dispatch, and
+# keying on both let two runs for one tag overlap.
 concurrency:
-  group: release-${{ github.workflow }}-${{ inputs.tag || github.ref }}
+  group: release-${{ github.workflow }}-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 permissions:
@@ -44,27 +47,26 @@ env:
 
 jobs:
   prepare:
-    name: Resolve tag and open draft release
+    name: Resolve tag, require green CI, open draft release
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # Most of this is waiting for CI on the tagged commit to finish.
+    timeout-minutes: 100
     permissions:
       contents: write
+      actions: read
     outputs:
-      tag: ${{ steps.resolve.outputs.tag }}
-      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+      sha: ${{ steps.tag.outputs.sha }}
       release_id: ${{ steps.draft.outputs.release_id }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ inputs.tag || github.ref }}
-          persist-credentials: false
-
-      - name: Resolve tag and verify it matches the workspace version
-        id: resolve
+      - name: Resolve the tag to the commit it names
+        id: tag
         shell: bash
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
           # Via the environment, never interpolated into the script body:
           # workflow_dispatch input is attacker-shaped text, and `${{ }}` inside
           # a run block is textual substitution, not a shell argument.
@@ -81,7 +83,44 @@ jobs:
             exit 1
           fi
 
-          version="${tag#v}"
+          # Resolved once, here, from the tag namespace only (a branch of the
+          # same name does not count), and handed to every job as a commit:
+          # a tag moved between a failed job and its re-run would otherwise
+          # build some platforms from one commit and the rest from another.
+          ref=$(gh api "repos/$REPO/git/ref/tags/$tag") \
+            || { echo "::error::$tag is not a tag in $REPO"; exit 1; }
+          sha=$(jq -r '.object.sha' <<<"$ref")
+          if [ "$(jq -r '.object.type' <<<"$ref")" = "tag" ]; then
+            sha=$(gh api "repos/$REPO/git/tags/$sha" --jq '.object.sha')
+          fi
+          if ! printf '%s' "$sha" | grep -qE '^[0-9a-f]{40}$'; then
+            echo "::error::$tag does not resolve to a commit"
+            exit 1
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "$tag is $sha"
+
+      - name: Checkout the tagged commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.tag.outputs.sha }}
+          persist-credentials: false
+
+      - name: Verify the tag matches the workspace version
+        shell: bash
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          VERSION: ${{ steps.tag.outputs.version }}
+          SHA: ${{ steps.tag.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          tag="$TAG"
+          version="$VERSION"
+          test "$(git rev-parse HEAD)" = "$SHA"
 
           # A tag that disagrees with Cargo.toml ships archives whose names lie
           # about what is inside them. Catch it before anything is built. Every
@@ -104,15 +143,48 @@ jobs:
             exit 1
           fi
 
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+      # The release consumes CI instead of running beside it: docs/RELEASE.md
+      # has always required green CI on the exact commit, and nothing enforced
+      # it, so v0.2.5 was tagged on a tree that failed clippy and the Python
+      # suite. A tag pushed with its commit waits here for that commit's run.
+      - name: Require green CI on this exact commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ steps.tag.outputs.sha }}
+        run: |
+          set -euo pipefail
+          deadline=$(( $(date +%s) + 90 * 60 ))
+          while :; do
+            runs=$(gh api "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&per_page=100" \
+                     --jq '.workflow_runs')
+            passed=$(jq '[.[] | select(.status == "completed" and .conclusion == "success")] | length' <<<"$runs")
+            running=$(jq '[.[] | select(.status != "completed")] | length' <<<"$runs")
+            if [ "$passed" -gt 0 ]; then
+              echo "CI passed on $SHA"
+              break
+            fi
+            if [ "$running" -eq 0 ]; then
+              echo "::error::CI has no successful run on $SHA. Release only a commit CI passed;"
+              echo "::error::if its run was cancelled by a later push, start CI on the tag"
+              echo "::error::(gh workflow run ci.yml --ref <tag>) and re-run this workflow."
+              exit 1
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::CI on $SHA did not finish within 90 minutes"
+              exit 1
+            fi
+            echo "CI is still running on $SHA; waiting"
+            sleep 60
+          done
 
       - name: Open the draft release
         id: draft
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          TAG: ${{ steps.resolve.outputs.tag }}
+          TAG: ${{ steps.tag.outputs.tag }}
         shell: bash
         run: |
           set -euo pipefail
@@ -162,6 +234,14 @@ jobs:
           sha256sum --ignore-missing -c SHA256SUMS
           ```
 
+          Each archive also carries a signed build-provenance attestation, which
+          ties it to this repository's release workflow and the tagged commit.
+          With the GitHub CLI:
+
+          ```
+          gh attestation verify <archive> --repo Classevelabs/rai
+          ```
+
           The x86-64 archives are built with `-C target-cpu=x86-64-v2`, so they
           start on any x86-64 CPU from roughly 2009 onward, and their
           AVX2/FMA/F16C kernels are selected at runtime on CPUs that report
@@ -200,8 +280,16 @@ jobs:
             cat create.err >&2
 
             if grep -q 'already_exists\|HTTP 422' create.err; then
-              echo "Release $TAG already exists — reusing it."
               id=$(list_id)
+              # Only a draft is resumed. A published release is immutable: a
+              # re-run used to rebuild and replace its archives and rewrite
+              # SHA256SUMS weeks later, under hashes people had already pinned.
+              if [ "$(gh api "repos/$REPO/releases/$id" --jq '.draft')" != "true" ]; then
+                echo "::error::$TAG is already published. Published artifacts are never"
+                echo "::error::replaced; fix forward with a new version."
+                exit 1
+              fi
+              echo "Release $TAG exists as a draft — resuming it."
               break
             fi
 
@@ -226,6 +314,10 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: write
+      # Build provenance: a signed statement that this workflow, at this
+      # commit, produced the archive.
+      id-token: write
+      attestations: write
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
     strategy:
@@ -256,11 +348,17 @@ jobs:
             rustflags: ""
 
     steps:
-      - name: Checkout
+      - name: Checkout the commit prepare resolved
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.prepare.outputs.tag }}
+          ref: ${{ needs.prepare.outputs.sha }}
           persist-credentials: false
+
+      - name: Confirm the commit
+        shell: bash
+        env:
+          SHA: ${{ needs.prepare.outputs.sha }}
+        run: test "$(git rev-parse HEAD)" = "$SHA"
 
       - name: Show pinned Rust toolchain and release flags
         shell: bash
@@ -543,6 +641,11 @@ jobs:
           Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip" -Force
           Get-Item "dist/$name.zip"
 
+      - name: Attest the archive's build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/rai-${{ needs.prepare.outputs.version }}-${{ matrix.target }}.${{ matrix.archive }}
+
       - name: Upload the archive to the draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -566,9 +669,9 @@ jobs:
           # reliably — it failed on two of four runners while the builds
           # themselves were green.
           #
-          # An asset of the same name already present is a rerun; the upload
-          # API rejects the duplicate rather than replacing it, so clear it
-          # first. That is what --clobber was doing.
+          # An asset of the same name already present is a re-run of this
+          # draft (prepare refuses a published release); the upload API rejects
+          # the duplicate rather than replacing it, so clear it first.
           existing=$(gh api --paginate "repos/$REPO/releases/$RELEASE_ID/assets" \
                        --jq ".[] | select(.name == \"$name\") | .id" || true)
           for old in $existing; do

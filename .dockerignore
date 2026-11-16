@@ -1,13 +1,37 @@
+# Mirrors .gitignore: nothing the repository does not track belongs in the
+# build context, and secrets least of all, since `COPY . .` bakes whatever is
+# here into a layer that a cache export can carry off the machine.
 .git
 .github
 target
 **/target
+
+# Environment files and secrets
+**/.env
+**/.env.*
+
+# Python caches and the virtualenv docs/INSTALL.md tells you to create
 **/__pycache__
-*.pyc
+**/*.pyc
+**/.venv
+**/venv
+
+# Model weights, calibration data and other large local assets
 *.raimodel
 *.safetensors
+*.bin
 *.gguf
 *.npy
 test_weights
+rai-infer/scripts/tokenizer.json
+rai-infer/scripts/mistral-tokenizer.json
 rai-infer/scripts/teacher_data
 rai-infer/scripts/train.log
+
+# Editors and the OS
+.vscode
+.idea
+**/*.swp
+**/*.swo
+**/.DS_Store
+**/Thumbs.db

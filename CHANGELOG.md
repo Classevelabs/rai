@@ -126,6 +126,31 @@ versioning for its pre-1.0 releases.
 - Tensor sizes in a safetensors header are computed with checked arithmetic;
   a shape whose element count wrapped could pass the length check and drive
   later reads and allocations.
+- The memory service's dependencies (`rai-core`, `rai-server`; nothing in the
+  release archives links them) are updated past fourteen RustSec advisories
+  in quinn-proto, quinn-udp, rustls, rustls-webpki and webpki-roots, tokio past
+  the `AsyncFd` unsoundness advisory, and hyper to a release without the
+  unmaintained pin-utils. `cargo audit --deny warnings` passes, and every
+  update builds on Rust 1.87.
+- `.dockerignore` keeps `.env` files and virtualenvs out of the image build
+  context; `COPY . .` baked them into a layer.
+
+### Changed
+- A release builds only a commit CI passed: it waits for CI on the tagged
+  commit and refuses one with no successful run. v0.2.5 was tagged on a tree
+  that failed clippy and the Python suite, because nothing enforced the rule.
+- The tag is resolved to one commit, from the tag namespace only, and every
+  release job builds and checks that commit.
+- A published release is never rebuilt or replaced; only a draft is resumed.
+  A re-run used to replace every archive and rewrite `SHA256SUMS` under
+  hashes people had already pinned.
+- Every archive carries a signed build-provenance attestation, verifiable
+  with `gh attestation verify <archive> --repo Classevelabs/rai`.
+- Crates publish from the release tag's commit, never the dispatching branch,
+  after green CI and packaging, in the `crates-io` environment; a run that
+  published one crate and failed on the other is finished by re-running it.
+- CI's third-party-notices check fails when it cannot reach its licence
+  source, instead of passing unchecked.
 
 ## [0.2.5] - 2026-09-08
 

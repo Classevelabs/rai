@@ -40,8 +40,10 @@ the *same* machine, ideally alternating between the two builds.
 `cargo about` reaches `api.clearlydefined.io` for crates whose own files do not
 settle their license, and that request is flaky. If it warns
 `failed to request license information`, the file it wrote is missing license
-sections and the `diff` above means nothing — retry until it does not, exactly
-as `.github/workflows/ci.yml` does. Do not reach for `--offline` to make it
+sections and the `diff` above means nothing — retry until it does not.
+`.github/workflows/ci.yml` retries five times and then fails the job rather
+than skipping the check: a skipped check once let a release ship notices naming
+the previous version. Do not reach for `--offline` to make it
 quiet: it substitutes a default license file and drops copyright lines that only
 the upstream repository carries, which is the information this file exists to
 reproduce.
@@ -58,7 +60,11 @@ recovery, malformed model files, and the container. Also require:
   compatibility breaks;
 - green CI on Linux, Windows, Apple Silicon macOS, and Intel macOS for the
   exact commit — the Apple Silicon job is also the only one that executes the
-  scalar fallback kernels, since it is the only runner without AVX2;
+  scalar fallback kernels, since it is the only runner without AVX2. The
+  release workflow enforces this one: it waits for CI on the tagged commit and
+  refuses to build a commit CI has not passed. A run cancelled by a later push
+  counts as not passed; start CI on the tag itself
+  (`gh workflow run ci.yml --ref v0.2.0`) and run the release again;
 - pinned model/dataset revisions, Python dependencies, hardware identity,
   commands, commit SHA, and retained raw output behind any new benchmark claim;
 - crate archive checksums, RustSec output, CI URL, and smoke evidence recorded
@@ -87,7 +93,12 @@ git push origin v0.2.0
 Pushing a `v*` tag runs [`.github/workflows/release.yml`](../.github/workflows/release.yml),
 which needs no manual step:
 
-1. Verifies the tag against the workspace version and opens a **draft** release.
+1. Resolves the tag to one commit (from the tag namespace only, so a branch
+   of the same name cannot stand in for it), verifies it against the
+   workspace version, waits for green CI on that commit, and opens a
+   **draft** release. Every later job builds that commit and checks that it
+   did, so a tag moved between a failed job and its re-run cannot mix two
+   trees in one release.
 2. Builds `rai` plus the deprecated `rai-convert`,
    `rai-generate`, and `rai-chat` wrappers — `--package classeve-rai-infer`
    only, so no non-product crate can reach an archive — on `ubuntu-24.04`, `windows-2025`,
@@ -103,7 +114,16 @@ which needs no manual step:
 
 `workflow_dispatch` accepts an existing tag and re-runs the same path,
 addressing the draft by release id rather than by tag so a draft re-run can
-find it.
+find it. It resumes a **draft** only: a published release is refused, never
+rebuilt, because a rebuild replaced every archive and rewrote `SHA256SUMS`
+under hashes people had already pinned. A bad published release is fixed
+forward with a new version.
+
+Each archive also gets a signed build-provenance attestation
+(`actions/attest-build-provenance`), which ties it to this workflow and the
+tagged commit. Users verify one with
+`gh attestation verify <archive> --repo Classevelabs/rai`; the release notes
+say so.
 
 **Never let this workflow build with `target-cpu=native`.** Such binaries die
 with SIGILL on any CPU older than the runner that built them, after download,
@@ -115,9 +135,10 @@ being changed back and a published release is the wrong place to discover it.
 kernels are selected at runtime by `has_avx2()` in `rai-infer/src/gemm.rs`, not
 by the compile-time baseline.
 
-Releasing an unsigned binary is deliberate: macOS users clear the quarantine
-attribute themselves and Windows shows a SmartScreen warning. `SHA256SUMS` is
-the integrity story, so it must never be missing from a published release.
+Releasing a binary without platform code signing is deliberate: macOS users
+clear the quarantine attribute themselves and Windows shows a SmartScreen
+warning. `SHA256SUMS` and the provenance attestations are the integrity story,
+so neither may be missing from a published release.
 
 ## Release notes
 
@@ -133,10 +154,18 @@ dependencies on each other, so there is no ordering. The other three crates
 are `publish = false` and stay that way; their 0.1.0 releases are yanked.
 
 Publication is separate from the GitHub release: dispatch the `Publish`
-workflow by hand. It authenticates through crates.io trusted publishing (an
-OIDC exchange scoped to this repository and workflow file — no long-lived
-token exists anywhere), refuses to republish a version the index already
-carries, and publishes with `--locked`.
+workflow by hand with the release tag. It publishes that tag's commit, never
+the branch it was dispatched from, requires green CI on that commit, packages
+both crates before publishing either, and authenticates through crates.io
+trusted publishing (an OIDC exchange scoped to this repository and workflow
+file — no long-lived token exists anywhere). A crate already at that version
+is skipped rather than failing the run, so a run that published one crate and
+then failed on the other is finished by running it again.
+
+The job runs in the `crates-io` environment. Give that environment required
+reviewers (Settings → Environments) so that publishing needs a second person's
+approval, and name the environment in each crate's trusted-publisher entry on
+crates.io so that no other workflow job can mint the token.
 
 ## Rollback
 
