@@ -209,6 +209,11 @@ versioning for its pre-1.0 releases.
   `rai convert` does.
 
 ### Security
+- The Python exporters' `requirements-lock.txt` moves aiohttp, yarl,
+  multidict, filelock, urllib3 and certifi to releases that fix the 34
+  advisories open against them, each at least two weeks old. A clean Python
+  3.11 environment built from it still exports a model that generates
+  correct text.
 - `rai serve` gives a client 15 seconds from connecting to send its whole
   request; the limit used to restart with every byte, so one byte every 14
   seconds held a reader slot for hours, and 32 such clients refused everyone.

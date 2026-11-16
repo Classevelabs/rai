@@ -212,11 +212,13 @@ python -m venv .venv
 .venv/bin/pip install -r rai-infer/scripts/requirements-lock.txt
 ```
 
-`requirements-lock.txt` pins the exact versions the benchmark ran on.
-`requirements.txt` carries lower bounds and will resolve to whatever is newest,
-which is not the combination those numbers were measured on. Neither file
-installs `accelerate`: the exporters read weights on CPU and do not use
-`device_map`. No GPU is required.
+`requirements-lock.txt` pins the versions the benchmark ran on, and needs
+Python 3.11 or newer; the only packages it has moved since are ones that never
+touch the numbers (HTTP, file locking, certificates), to releases that fix
+security advisories. `requirements.txt` carries lower bounds and will resolve
+to whatever is newest, which is not the combination those numbers were
+measured on. Neither file installs `accelerate`: the exporters read weights on
+CPU and do not use `device_map`. No GPU is required.
 
 ```bash
 # Round-to-nearest, the Python equivalent of `rai convert`
