@@ -189,18 +189,14 @@ mod tests {
         assert!(threads <= available.max(2), "{threads} > {available}");
     }
 
+    /// The platform answers on every OS the runtime ships for. No upper bound
+    /// is asserted here: a CI runner's CPU quota can sit below its core count.
+    /// The counting itself is pinned on synthetic input by the tests below.
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
     fn this_machine_reports_its_cores() {
         let cores = performance_cores().expect("the platform reports a core count");
-        let available = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(cores);
         assert!(cores >= 1);
-        assert!(
-            cores <= available.max(cores),
-            "{cores} cores reported, {available} CPUs available"
-        );
     }
 
     /// Core records are 48 bytes; every one of them is read, the last

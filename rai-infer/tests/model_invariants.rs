@@ -80,15 +80,6 @@ fn batched_logits(model: &RaiModel, tokens: &[usize], max_ctx: usize) -> Vec<Vec
         .collect()
 }
 
-fn argmax(values: &[f32]) -> usize {
-    values
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(i, _)| i)
-        .unwrap()
-}
-
 fn check_batch_matches_sequential(fixture_name: &str) {
     let model = RaiModel::load(&fixture(fixture_name)).expect("load fixture model");
     let vocab = model.config.vocab_size as usize;
@@ -99,28 +90,19 @@ fn check_batch_matches_sequential(fixture_name: &str) {
     let batched = batched_logits(&model, &tokens, max_ctx);
 
     assert_eq!(sequential.len(), batched.len());
-    let mut max_diff = 0.0f32;
     for (pos, (s, b)) in sequential.iter().zip(&batched).enumerate() {
         assert!(
             s.iter().all(|v| v.is_finite()) && b.iter().all(|v| v.is_finite()),
             "non-finite logits at position {pos}"
         );
-        // The token-level invariant speculative verification relies on.
+        // Exact, not close: both paths quantize each activation the same way
+        // and sum in the same order, on the AVX2 kernels and the scalar ones,
+        // so any difference at all is a kernel that drifted.
         assert_eq!(
-            argmax(s),
-            argmax(b),
-            "argmax diverged at position {pos} ({fixture_name})"
+            s, b,
+            "batched logits differ from sequential at position {pos} ({fixture_name})"
         );
-        for (i, (x, y)) in s.iter().zip(b).enumerate() {
-            let diff = (x - y).abs();
-            max_diff = max_diff.max(diff);
-            assert!(
-                diff <= 2e-3,
-                "logit mismatch at pos {pos} token {i}: sequential {x} vs batched {y} ({fixture_name})"
-            );
-        }
     }
-    eprintln!("{fixture_name}: max |sequential - batched| logit diff = {max_diff:e}");
 }
 
 #[test]
@@ -228,18 +210,60 @@ fn chunked_and_resumed_prefill_match_the_sequential_path() {
 
     for split in [0, 1, 100, PREFILL_CHUNK, n - 1] {
         let got = logits_after_prefill(&model, &tokens, split);
-        assert_eq!(
-            argmax(&got),
-            argmax(expected),
-            "argmax diverged (split {split})"
-        );
-        let worst = got
-            .iter()
-            .zip(expected)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        assert!(worst <= 2e-3, "split {split}: max logit diff {worst:e}");
+        assert_eq!(&got, expected, "logits differ (split {split})");
     }
+}
+
+/// A cache reused for a shorter sequence holds exactly that sequence: what a
+/// longer, earlier one left past it no longer counts as context, and the next
+/// position decodes as it does on a fresh cache.
+#[test]
+fn prefill_into_a_used_cache_discards_the_old_tail() {
+    let model = RaiModel::load(&fixture("tiny-tied.raimodel")).expect("load fixture model");
+    let vocab = model.config.vocab_size as usize;
+    let long = token_sequence(vocab, 20);
+    let short: Vec<usize> = token_sequence(vocab, 7)
+        .into_iter()
+        .map(|token| (token + 3) % vocab)
+        .collect();
+    let hs = model.config.hidden_size as usize;
+    let mut kv = model.create_kv_cache(32).unwrap();
+    let mut batch = BatchScratch::new();
+
+    model.prefill(&long, 0, &mut kv, &mut batch).unwrap();
+    assert_eq!(kv.filled_min(), long.len());
+    model
+        .prefill(&short[..short.len() - 1], 0, &mut kv, &mut batch)
+        .unwrap();
+    assert_eq!(
+        kv.filled_min(),
+        short.len() - 1,
+        "the earlier sequence's tail still counts as context"
+    );
+
+    let mut hidden = vec![0.0f32; hs];
+    model
+        .embed_token(short[short.len() - 1], &mut hidden)
+        .unwrap();
+    model
+        .forward_from_hidden(
+            &mut hidden,
+            short.len() - 1,
+            &mut kv,
+            true,
+            &mut Scratch::new(),
+        )
+        .unwrap();
+    let mut normed = vec![0.0f32; hs];
+    let mut reused = vec![0.0f32; vocab];
+    model
+        .hidden_to_logits_into(&hidden, &mut normed, &mut reused)
+        .unwrap();
+    assert_eq!(reused, logits_after_prefill(&model, &short, 0));
+
+    // An empty prefill still settles the cache at its start.
+    model.prefill(&[], 2, &mut kv, &mut batch).unwrap();
+    assert_eq!(kv.filled_min(), 2);
 }
 
 /// A prefill that would leave a gap below its start, or run past the cache,

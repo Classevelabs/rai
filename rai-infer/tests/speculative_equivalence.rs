@@ -168,6 +168,45 @@ fn speculative_runs_complete_and_first_token_distribution_matches_target() {
     assert_eq!(direct_first_counts.iter().sum::<usize>(), RUNS);
 }
 
+/// A decoder used for one prompt and then given a shorter one decodes the
+/// second exactly as a fresh decoder does: nothing of the first prompt stays
+/// counted in either model's cache.
+#[test]
+fn a_reused_decoder_decodes_its_new_prompt_as_a_fresh_one_does() {
+    let draft = RaiModel::load(&fixture("tiny-tied.raimodel")).expect("load draft fixture");
+    let target = RaiModel::load(&fixture("tiny-untied.raimodel")).expect("load target fixture");
+    let vocab = target.config.vocab_size as usize;
+    let config = SpeculativeConfig {
+        draft_k: 3,
+        sampler: exact_sampler(),
+    };
+    let decode = |decoder: &mut SpeculativeDecoder, prompt: &[usize]| -> Vec<usize> {
+        let mut rng = StdRng::seed_from_u64(11);
+        let mut pos = decoder.prefill(prompt).expect("prefill");
+        let mut last = *prompt.last().unwrap();
+        let mut produced = Vec::new();
+        while produced.len() < TOKENS_PER_RUN {
+            let (tokens, metrics) = decoder
+                .step(pos, last, &config, &mut rng)
+                .expect("step after prefill");
+            pos += metrics.produced;
+            last = *tokens.last().unwrap();
+            produced.extend_from_slice(&tokens);
+        }
+        produced
+    };
+
+    let long_prompt: Vec<usize> = (0..14).map(|i| (i * 5 + 2) % vocab).collect();
+    let short_prompt = prompt_for_run(3, vocab);
+    let mut reused = SpeculativeDecoder::new(&draft, &target, MAX_CTX).expect("decoder");
+    decode(&mut reused, &long_prompt);
+    let mut fresh = SpeculativeDecoder::new(&draft, &target, MAX_CTX).expect("decoder");
+    assert_eq!(
+        decode(&mut reused, &short_prompt),
+        decode(&mut fresh, &short_prompt)
+    );
+}
+
 /// A draft whose window is shorter than the target's hands decoding to the
 /// target past it, instead of ending generation or refusing the prompt.
 #[test]

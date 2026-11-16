@@ -538,7 +538,7 @@ unsafe fn rms_norm_with_residual_avx2(
     }
 }
 
-/// SIMD vector add: hidden[i] = residual[i] + addition[i]
+/// SIMD vector add: `hidden[i] = residual[i] + addition[i]`
 ///
 /// # Panics
 /// Panics if the three buffer lengths differ.
@@ -874,10 +874,12 @@ pub fn silu_mul_inplace(gate: &mut [f32], up: &[f32], n: usize) {
 }
 
 /// `ln(f32::MAX)`: the largest argument whose `exp` is finite.
+#[cfg(target_arch = "x86_64")]
 const EXP_MAX_ARG: f32 = 88.722_84;
 /// `ln(f32::MIN_POSITIVE)`: below it `exp` is subnormal and [`exp_avx2`]
 /// returns exactly 0. A softmax weight or sigmoid tail under 1.2e-38 is zero
 /// for every purpose here, and an exact zero keeps the sums exact.
+#[cfg(target_arch = "x86_64")]
 const EXP_MIN_ARG: f32 = -87.336_55;
 
 /// Eight-lane `exp`, within 2 ulp of the true value over the whole f32 range.
@@ -1004,7 +1006,7 @@ unsafe fn silu_times(x: __m256, u: __m256) -> __m256 {
 ///
 /// `0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3)))`
 ///
-/// Uses [`tanh_poly`], not `f32::tanh`, so this is bit-identical to the scalar
+/// Uses `tanh_poly`, not `f32::tanh`, so this is bit-identical to the scalar
 /// tail the AVX2 kernel falls back on and to the no-AVX2 path.
 #[inline]
 pub fn gelu_tanh(x: f32) -> f32 {
@@ -1184,7 +1186,7 @@ pub fn glu_mul_inplace(activation: Activation, gate: &mut [f32], up: &[f32], n: 
 
 /// Grouped-Query Attention for single-token decode.
 ///
-/// 1. Project input → Q[num_heads*head_dim], K[num_kv_heads*head_dim], V[num_kv_heads*head_dim]
+/// 1. Project input → `Q[num_heads*head_dim]`, `K[num_kv_heads*head_dim]`, `V[num_kv_heads*head_dim]`
 /// 2. Apply RoPE to Q and K
 /// 3. Store K,V in cache at `pos`
 /// 4. For each query head, attend over all cached K,V (with GQA head mapping)
@@ -2491,6 +2493,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Distance in units in the last place between two finite f32 values.
+    #[cfg(target_arch = "x86_64")]
     fn ulp_distance(a: f32, b: f32) -> u32 {
         // Map the sign-magnitude bit patterns onto one monotonic integer line.
         fn ordered(x: f32) -> i64 {

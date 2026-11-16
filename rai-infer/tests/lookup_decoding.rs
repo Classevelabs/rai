@@ -275,6 +275,43 @@ fn lookup_falls_back_to_plain_decoding_without_a_match() {
     assert!(!tokens.is_empty());
 }
 
+/// A decoder given a shorter prompt after a longer one decodes it exactly as
+/// a fresh decoder does: the first prompt's tail no longer counts as context.
+#[test]
+fn a_reused_decoder_decodes_its_new_prompt_as_a_fresh_one_does() {
+    let model = RaiModel::load(&fixture("tiny-tied.raimodel")).expect("load fixture");
+    let vocab = model.config.vocab_size as usize;
+    let config = LookupConfig {
+        max_draft: 4,
+        max_ngram: 3,
+        min_ngram: 1,
+        sampler: exact_sampler(),
+    };
+    let decode = |decoder: &mut LookupDecoder, prompt: &[usize]| -> Vec<usize> {
+        let mut rng = StdRng::seed_from_u64(0x5EED);
+        let mut pos = decoder.prefill(prompt).expect("prefill");
+        let mut context = prompt.to_vec();
+        while context.len() < prompt.len() + TOKENS_PER_RUN {
+            let (tokens, metrics) = decoder
+                .step(pos, &context, &config, &mut rng)
+                .expect("step after prefill");
+            pos += metrics.produced;
+            context.extend_from_slice(&tokens);
+        }
+        context.split_off(prompt.len())
+    };
+
+    let long_prompt: Vec<usize> = (0..30).map(|i| (i * 3 + 1) % vocab).collect();
+    let short_prompt = prompt_for_run(2, vocab);
+    let mut reused = LookupDecoder::new(&model, MAX_CTX).expect("decoder");
+    decode(&mut reused, &long_prompt);
+    let mut fresh = LookupDecoder::new(&model, MAX_CTX).expect("decoder");
+    assert_eq!(
+        decode(&mut reused, &short_prompt),
+        decode(&mut fresh, &short_prompt)
+    );
+}
+
 #[test]
 fn lookup_rejects_unsupported_sampler_settings() {
     let model = RaiModel::load(&fixture("tiny-tied.raimodel")).expect("load fixture");

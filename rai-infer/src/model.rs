@@ -966,7 +966,9 @@ impl RaiModel {
     /// invisible in the cache.
     ///
     /// Positions `0..start` must already be in the cache, which is how a
-    /// caller reuses the K/V of a prefix it has already processed.
+    /// caller reuses the K/V of a prefix it has already processed. Whatever
+    /// the cache held from `start` on is discarded first, so afterwards it
+    /// holds exactly `0..start + tokens.len()`.
     pub fn prefill(
         &self,
         tokens: &[usize],
@@ -991,9 +993,6 @@ impl RaiModel {
         scratch: &mut BatchScratch,
         mut keep_going: impl FnMut() -> bool,
     ) -> Result<bool> {
-        if tokens.is_empty() {
-            return Ok(true);
-        }
         let end = start
             .checked_add(tokens.len())
             .context("prefill range overflows")?;
@@ -1008,6 +1007,13 @@ impl RaiModel {
              (filled {})",
             kv_cache.filled_min()
         );
+        // Entries past `end` belong to an earlier sequence but would still
+        // count as context: a decoder reused for a shorter prompt then failed
+        // its first step, or resumed from the old prompt's tail.
+        kv_cache.truncate(start);
+        if tokens.is_empty() {
+            return Ok(true);
+        }
         let hs = self.config.hidden_size as usize;
         let mut hiddens = Vec::new();
         let mut positions = Vec::with_capacity(PREFILL_CHUNK.min(tokens.len()));

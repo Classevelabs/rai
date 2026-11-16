@@ -156,6 +156,9 @@ impl<'a> SpeculativeDecoder<'a> {
         if self.draft_room(prefix.len()) > 0 {
             self.draft
                 .prefill(prefix, 0, &mut self.draft_kv, &mut self.draft_batch_scratch)?;
+        } else {
+            // Nothing of an earlier prompt may stay counted as this one's.
+            self.draft_kv.truncate(0);
         }
         self.target.prefill(
             prefix,

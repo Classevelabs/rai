@@ -132,12 +132,14 @@ fn quantize_input_split(
     group_size: usize,
     num_groups: usize,
 ) {
-    debug_assert!(
+    // Checked in release builds too: this is a safe function, and the one
+    // load it costs is nothing beside the vector it quantizes.
+    assert!(
         has_avx2(),
         "int8 activations exist only for the AVX2 kernels"
     );
-    // SAFETY: the callers only quantize after `has_avx2()` returned true, and
-    // `validate_weight_buffers` established the buffer bounds.
+    // SAFETY: AVX2 is present (asserted above), and `validate_weight_buffers`
+    // established the buffer bounds.
     unsafe {
         quantize_input_split_avx2(
             input,
@@ -743,9 +745,12 @@ struct Int8Hidden {
 
 #[cfg(target_arch = "x86_64")]
 impl Int8Hidden {
-    /// Only called after `has_avx2()` returned true and the buffers were
-    /// validated.
+    /// Only called once the buffers were validated.
     fn quantize(hidden: &[f32], tokens: usize, hidden_size: usize, group_size: usize) -> Self {
+        assert!(
+            has_avx2(),
+            "int8 hidden states exist only for the AVX2 LM head"
+        );
         let num_groups = hidden_size.div_ceil(group_size);
         let mut out = Self {
             values: vec![0; tokens * hidden_size],
@@ -753,8 +758,8 @@ impl Int8Hidden {
             qsums: vec![0.0; tokens * num_groups],
         };
         for t in 0..tokens {
-            // SAFETY: `has_avx2()` returned true (see above); each slice is
-            // exactly one token's `hidden_size` values or `num_groups` groups.
+            // SAFETY: AVX2 is present (asserted above); each slice is exactly
+            // one token's `hidden_size` values or `num_groups` groups.
             unsafe {
                 quantize_hidden_i8_avx2(
                     &hidden[t * hidden_size..(t + 1) * hidden_size],
@@ -1225,8 +1230,8 @@ struct Int8Activations {
 
 #[cfg(target_arch = "x86_64")]
 impl Int8Activations {
-    /// Quantize `tokens` rows of `cols` values each. Only called after
-    /// `has_avx2()` returned true and the buffers were validated.
+    /// Quantize `tokens` rows of `cols` values each. Only called once the
+    /// buffers were validated; [`quantize_input_split`] checks for AVX2.
     fn quantize(input: &[f32], tokens: usize, cols: usize, group_size: usize) -> Self {
         let num_groups = cols.div_ceil(group_size);
         let half = cols / 2;
@@ -1837,7 +1842,7 @@ pub fn embed_lookup(
 ///
 /// On AVX2 hosts the hidden state is quantized to int8 (range ±63) per group
 /// for the integer PMADDUBSW path; the scalar fallback uses the f32 hidden
-/// directly. Both spread the vocabulary across the pool in [`LM_CHUNK`]-row
+/// directly. Both spread the vocabulary across the pool in `LM_CHUNK`-row
 /// chunks.
 ///
 /// # Panics
@@ -2535,6 +2540,59 @@ mod tests {
 
         let expected = reference_matvec(&nibbles, 0.5, -4.0, &input, rows, cols);
         assert_close(&output, &expected, 5e-3, "parallel matvec");
+    }
+
+    /// Every even group size the container allows, not only multiples of 32:
+    /// a group that ends partway through a SIMD vector, and a short tail group
+    /// at the end of the row, are where a kernel goes wrong. Each one through
+    /// the single-token and the batched kernel, against the f64 reference.
+    #[test]
+    fn group_sizes_off_the_simd_width_match_the_dequantized_reference() {
+        let (rows, cols, tokens) = (40, 610, 3);
+        for group_size in [2usize, 6, 48, 100, 126, 254] {
+            let nibbles = pack_nibbles(rows, cols, group_size);
+            let params = pack_group_params(rows, cols.div_ceil(group_size), 0.5, -4.0);
+            let input = exact_quant_input(cols, group_size, 127);
+            let expected = reference_matvec(&nibbles, 0.5, -4.0, &input, rows, cols);
+
+            let mut single = vec![0.0f32; rows];
+            w4a8_matvec(
+                &mut single,
+                &nibbles,
+                &params,
+                &input,
+                rows,
+                cols,
+                group_size,
+            );
+            assert_close(
+                &single,
+                &expected,
+                1e-3,
+                &format!("matvec, group size {group_size}"),
+            );
+
+            let batch_input: Vec<f32> = input.iter().copied().cycle().take(tokens * cols).collect();
+            let mut batched = vec![0.0f32; tokens * rows];
+            w4a8_matmul(
+                &mut batched,
+                &nibbles,
+                &params,
+                &batch_input,
+                rows,
+                cols,
+                tokens,
+                group_size,
+            );
+            for token in batched.chunks(rows) {
+                assert_close(
+                    token,
+                    &expected,
+                    1e-3,
+                    &format!("matmul, group size {group_size}"),
+                );
+            }
+        }
     }
 
     #[test]
