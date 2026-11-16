@@ -555,6 +555,16 @@ def test_default_output_name_matches_rai_convert():
         raise AssertionError("an empty output name was accepted")
 
 
+def test_an_export_into_a_new_folder_creates_it():
+    with tempfile.TemporaryDirectory() as td:
+        output = Path(td) / "new" / "deeper" / "model.raimodel"
+        raimodel.prepare_output_folder(output)
+        assert output.parent.is_dir()
+        raimodel.write_chat_record(output, {"chat_template": None})
+        # Asking again for a folder that exists is not an error.
+        raimodel.prepare_output_folder(output)
+
+
 def test_checkpoint_tokenizer_json_is_the_checkpoints_own_bytes():
     with tempfile.TemporaryDirectory() as td:
         own = b'{"model": {"merges": ["a b"]}}'
@@ -998,6 +1008,7 @@ TESTS = [
     test_require_calibration_chunks,
     test_place_tokenizer_json,
     test_default_output_name_matches_rai_convert,
+    test_an_export_into_a_new_folder_creates_it,
     test_checkpoint_tokenizer_json_is_the_checkpoints_own_bytes,
     test_chat_record_says_how_the_model_is_prompted,
     test_a_failed_write_leaves_nothing_behind,

@@ -78,6 +78,7 @@ def main():
     # already beside the output would otherwise cost the whole export.
     tokenizer_json = raimodel.checkpoint_tokenizer_json(model_name, tokenizer)
     output_path = Path(args.output)
+    raimodel.prepare_output_folder(output_path)
     tokenizer_dst = output_path.parent / "tokenizer.json"
     raimodel.check_tokenizer_destination(tokenizer_json, tokenizer_dst)
     model.eval()

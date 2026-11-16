@@ -733,6 +733,13 @@ def saved_tokenizer_json(tokenizer):
         return saved.read_bytes()
 
 
+def prepare_output_folder(output_path):
+    """Create the folder the model and its tokenizer are written into, before
+    any work, as `rai convert` does: an export into a new folder used to fail
+    at the very end, when the finished model was written."""
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+
+
 def check_tokenizer_destination(tokenizer_json, dst_path):
     """Refuse when a DIFFERENT tokenizer.json already sits where this one goes.
 

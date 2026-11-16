@@ -204,6 +204,9 @@ versioning for its pre-1.0 releases.
   it with warnings as errors.
 - Kernel entry points that run AVX2 code check for it in release builds too,
   not only in debug builds.
+- The Python exporters failed at the very end, after the whole export, when
+  `--output` named a folder that did not exist yet; they create it first, as
+  `rai convert` does.
 
 ### Security
 - `rai serve` gives a client 15 seconds from connecting to send its whole
