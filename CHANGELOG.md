@@ -25,6 +25,17 @@ versioning for its pre-1.0 releases.
 - `POST /api/chat` takes `repetition_penalty`.
 
 ### Fixed
+- The Windows launcher broke on folder names holding `&`, `)` or `!`: a `&`
+  ran the rest of the name as a command, an archive extracted twice into
+  "rai (1)" failed to parse, and `!` vanished from paths. Paths are expanded
+  only inside quotes now, and a test runs the launcher from such a folder.
+  `RAI_NO_BROWSER=1` starts the server without opening a browser.
+- The launchers probed only 127.0.0.1, so they never saw a server on IPv6
+  loopback, and after two minutes they reported a slow model load as a failed
+  start. They probe both, and say to open the page once the model is ready.
+- The Linux desktop entry put an unquoted path in `Exec=`, which broke on the
+  first space, and its install command broke on `&`, `|` or a backslash in
+  the folder name.
 - The int8 activation path applied each group's zero point to the exact f32
   sum of the activations instead of the sum of their quantized values, so the
   rounding error was weighted by the raw codes rather than the dequantized

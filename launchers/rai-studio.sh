@@ -113,7 +113,15 @@ open_url() {
 
 port_is_open() {
     # Bash's /dev/tcp needs no external tool and is present everywhere bash is.
-    (exec 3<>"/dev/tcp/127.0.0.1/${PORT}") 2>/dev/null && exec 3<&- 3>&-
+    # Both loopback families: rai serve binds IPv6 loopback on a machine
+    # without an IPv4 one, and a probe of 127.0.0.1 alone never saw it.
+    local host
+    for host in 127.0.0.1 ::1; do
+        if (exec 3<>"/dev/tcp/${host}/${PORT}") 2>/dev/null; then
+            return 0
+        fi
+    done
+    return 1
 }
 
 deadline=$((SECONDS + 120))
@@ -127,6 +135,11 @@ while [ "${SECONDS}" -lt "${deadline}" ]; do
     fi
     sleep 0.5
 done
+if [ "${SECONDS}" -ge "${deadline}" ]; then
+    # A large model can take longer to load than this waits.
+    printf '  Still not answering after two minutes. If the model is still loading,\n'
+    printf '  open %s yourself once it is ready.\n' "${URL}"
+fi
 
 # Hand the terminal back to the server so Ctrl+C reaches it.
 wait "${SERVER_PID}"

@@ -10,7 +10,7 @@
 //! The archive layout is fixed by `.github/workflows/release.yml`:
 //!
 //! ```text
-//!   rai-0.2.0-<target>/
+//!   rai-<version>-<target>/
 //!     rai(.exe)          <- the binary
 //!     launchers/         <- these scripts, one level down
 //! ```
@@ -88,6 +88,92 @@ fn the_launchers_start_the_binary_this_workspace_builds() {
         assert!(
             script.contains("serve"),
             "{name} should start the local server"
+        );
+    }
+}
+
+/// The Windows launcher, run from a folder whose name holds the characters
+/// batch files trip on: a bare `&` ran a command, a bare `)` ended a block
+/// (an archive extracted twice lands in "rai (1)"), and delayed expansion ate
+/// `!`. It must find the binary and the model there and hand rai the exact
+/// model path. `RAI_NO_BROWSER` keeps the browser probe out of the test.
+#[cfg(windows)]
+#[test]
+fn the_windows_launcher_survives_awkward_folder_names() {
+    use std::os::windows::process::CommandExt;
+    use std::time::{Duration, Instant};
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let root = std::env::temp_dir().join(format!("rai launcher & (1) !x {}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("launchers")).expect("creating the folder");
+    std::fs::copy(env!("CARGO_BIN_EXE_rai"), root.join("rai.exe")).expect("placing rai.exe");
+    let model = root.join("model.raimodel");
+    std::fs::write(&model, b"not a model").expect("placing a model file");
+    let launcher = root.join("launchers").join("rai-studio.cmd");
+    std::fs::copy(launcher_dir().join("rai-studio.cmd"), &launcher).expect("placing the launcher");
+
+    let mut child = std::process::Command::new(&launcher)
+        .env("RAI_NO_BROWSER", "1")
+        .env_remove("RAI_MODEL")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .expect("starting the launcher");
+    // The model is not a model, so rai refuses it and the launcher ends; a
+    // launcher that hangs instead is a failure, not a slow test.
+    let started = Instant::now();
+    while child.try_wait().expect("polling the launcher").is_none() {
+        if started.elapsed() > Duration::from_secs(60) {
+            let _ = child.kill();
+            panic!("the launcher did not finish within a minute");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let output = child
+        .wait_with_output()
+        .expect("reading the launcher's output");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert!(
+        stdout.contains(&format!("Model:  \"{}\"", model.display())),
+        "the launcher did not pick the model by its exact path:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("rai serve exited with code"),
+        "the launcher did not reach `rai serve`:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        !output.status.success(),
+        "a refused model must fail the launcher"
+    );
+}
+
+/// `Exec=` holds no path: an unquoted one broke on the first space, and the
+/// directory belongs in `Path=`, a plain string the script runs relative to.
+#[test]
+fn the_desktop_entry_keeps_the_path_out_of_exec() {
+    let entry = read("rai-studio.desktop");
+    let exec = entry
+        .lines()
+        .find(|line| line.starts_with("Exec="))
+        .expect("the entry has an Exec line");
+    assert!(!exec.contains("@LAUNCHER_DIR@"), "{exec}");
+    assert!(entry.lines().any(|line| line == "Path=@LAUNCHER_DIR@"));
+}
+
+/// rai serve binds IPv6 loopback on a machine without an IPv4 one, so a
+/// launcher that probes only 127.0.0.1 never sees the server come up.
+#[test]
+fn the_unix_launchers_probe_both_loopback_families() {
+    for name in ["rai-studio.sh", "rai-studio.command"] {
+        assert!(
+            read(name).contains("for host in 127.0.0.1 ::1"),
+            "{name} should probe IPv4 and IPv6 loopback"
         );
     }
 }
