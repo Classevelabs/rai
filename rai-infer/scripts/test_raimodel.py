@@ -12,6 +12,7 @@ Also (re)generates the golden fixtures used by the Rust conformance tests:
 import argparse
 import io
 import json
+import os
 import struct
 import sys
 import tempfile
@@ -532,6 +533,40 @@ def test_place_tokenizer_json():
         assert sorted(p.name for p in Path(td).iterdir()) == ["tokenizer.json"]
 
 
+def test_default_output_name_matches_rai_convert():
+    # A repo id or a path from either platform: the last component, as typed.
+    assert raimodel.default_output_name("Qwen/Qwen2.5-0.5B-Instruct", 4) == "Qwen2.5-0.5B-Instruct-q4.raimodel"
+    assert raimodel.default_output_name("C:\\models\\My Model\\", 4) == "My Model-q4.raimodel"
+    # A directory on this machine is named for what it is, `.` included.
+    with tempfile.TemporaryDirectory() as td:
+        here = Path(td) / "Tiny Llama"
+        here.mkdir()
+        previous = os.getcwd()
+        os.chdir(here)
+        try:
+            assert raimodel.default_output_name(".", 4) == "Tiny Llama-q4.raimodel"
+        finally:
+            os.chdir(previous)
+    try:
+        raimodel.default_output_name("/", 4)
+    except ValueError as exc:
+        assert "--output" in str(exc)
+    else:
+        raise AssertionError("an empty output name was accepted")
+
+
+def test_checkpoint_tokenizer_json_is_the_checkpoints_own_bytes():
+    with tempfile.TemporaryDirectory() as td:
+        own = b'{"model": {"merges": ["a b"]}}'
+        (Path(td) / "tokenizer.json").write_bytes(own)
+
+        class _Saves:
+            def save_pretrained(self, directory):
+                raise AssertionError("a checkpoint with a tokenizer.json is not re-serialized")
+
+        assert raimodel.checkpoint_tokenizer_json(td, _Saves()) == own
+
+
 def test_chat_record_says_how_the_model_is_prompted():
     tokenizer = _Stub(chat_template={"tool_use": "tools", "default": "chat"},
                       bos_token="<s>", eos_token="</s>")
@@ -962,6 +997,8 @@ TESTS = [
     test_validate_export_options,
     test_require_calibration_chunks,
     test_place_tokenizer_json,
+    test_default_output_name_matches_rai_convert,
+    test_checkpoint_tokenizer_json_is_the_checkpoints_own_bytes,
     test_chat_record_says_how_the_model_is_prompted,
     test_a_failed_write_leaves_nothing_behind,
     test_write_minimal_model,

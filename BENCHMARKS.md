@@ -319,7 +319,7 @@ every calibration token is held at once, which is 8,192 × `hidden_size` floats
 at the default settings.
 
 It **refuses** rather than approximating. Mixture-of-experts routing,
-sandwich-normed and post-norm checkpoints, and per-head QK norms each produce a
+sandwich-normed and post-norm checkpoints, and QK norms each produce a
 named error telling the user to convert without `--calibration-text`. Which
 expert sees which token, or how a QK norm reshapes attention, is part of the
 model: a pass that skipped it would collect statistics for a model that does not

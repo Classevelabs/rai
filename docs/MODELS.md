@@ -73,12 +73,14 @@ that this format does store.
 | Qwen3 (dense: 0.6B, 1.7B, 4B, 8B, 14B, 32B) | **Converts** | — | Per-head QK norm is stored in the v2 layer section. Verified: Qwen3-0.6B converts to 399 MB and generates. |
 | Gemma2 (2B, 9B, 27B) | **Converts** | — | Logit softcapping and the two block-output norms are stored. Convert with `--max-context 4096` or lower (see sliding windows). Verified: gemma-2-2b-it converts to 1.70 GB and generates. |
 | OLMo2 | **Converts** | — | Projection-wide QK norms and post-norm placement are both stored. Verified: OLMo-2-1B-Instruct converts in 47.2 s to 898 MB and generates. |
-| Gemma3, Gemma3-text | **Converts** | — | Both RoPE bases and the layer stride are stored. Convert with `--max-context 512` or lower (its sliding window). Verified: gemma-3-1b-it converts in 41.5 s to 660 MB and generates. |
+| Gemma3 270M and 1B (`gemma3_text`) | **Converts** | — | Both RoPE bases and the layer stride are stored. Convert with `--max-context 512` or lower (its sliding window). Verified: gemma-3-1b-it converts in 41.5 s to 660 MB and generates. |
+| Gemma3 4B, 12B, 27B (`gemma3`) | **Refused** | Gemma2 or Qwen3 of a similar size | Multimodal: the language model's settings sit under `text_config`, beside a vision tower the container does not store, and its full-attention layers use `linear` RoPE scaling. |
 | Mixtral-8x7B | **Converts** | — | Router and every expert are stored. A 4-bit Mixtral-8x7B is ~24 GB on disk and needs that much RAM to run — check before you start. |
 | Qwen3-MoE (30B-A3B) | **Converts** | — | Routed experts are stored. Verified on OLMoE-1B-7B (64 experts, 8 per token): converts in 121.3 s to 3.5 GB and generates. |
 | Mixtral-8x22B, Qwen3-MoE 235B-A22B | **Refused** | Mixtral-8x7B, Qwen3-30B-A3B | At 4 bits every stored expert comes to more than the reader's 64 GiB file limit, so the conversion is refused before it starts rather than producing a file that cannot be loaded. |
 | Any config with `shared_expert_intermediate_size` or `n_shared_experts` | **Refused** | The same family without a shared expert | A shared expert runs for *every* token alongside the routed ones; the container stores routed experts only, so dropping it would remove a pathway rather than degrade one. |
-| Phi-3, Phi-3.5 | **Converts** | — | Its fused `qkv_proj` and `gate_up_proj` are split at conversion. Convert with `--max-context 2047` or lower (see sliding windows). Verified: Phi-3-mini-4k-instruct converts to 2,083 MB in 22.8 s and generates. |
+| Phi-3 with a 4k context | **Converts** | — | Its fused `qkv_proj` and `gate_up_proj` are split at conversion. Convert with `--max-context 2047` or lower (see sliding windows). Verified: Phi-3-mini-4k-instruct converts to 2,083 MB in 22.8 s and generates. |
+| Phi-3 128k, Phi-3.5 | **Refused** | `microsoft/Phi-3-mini-4k-instruct` | `longrope` RoPE scaling, which the container does not store. |
 | Phi-2 | **Refused** | `meta-llama/Llama-3.2-3B-Instruct` | Not a Llama-shaped module tree; unlike Phi-3 it is not a fused variant of one. |
 | Falcon | **Refused** | `mistralai/Mistral-7B-Instruct-v0.3` | No Llama-style module tree. |
 | GPT-NeoX, Pythia | **Refused** | `meta-llama/Llama-3.2-1B-Instruct` (or SmolLM2 below 1B) | No Llama-style module tree. |
@@ -176,10 +178,11 @@ The three fields that decide it most often are `model_type`, `num_experts`, and
 
 | Field | Convert it | Do not download |
 | --- | --- | --- |
-| `model_type` | `llama`, `mistral`, `qwen2`, `qwen3`, `qwen3_moe`, `gemma`, `gemma2`, `gemma3`, `gemma3_text`, `phi3`, `olmo2`, `olmoe`, `mixtral` | Any other, such as `phi`, `falcon`, `mpt`, `gpt_neox`, `gpt2`, `granite`, `smollm3` |
+| `model_type` | `llama`, `mistral`, `qwen2`, `qwen3`, `qwen3_moe`, `gemma`, `gemma2`, `gemma3_text`, `phi3`, `olmo2`, `olmoe`, `mixtral` | Any other, such as `gemma3` (multimodal), `phi`, `falcon`, `mpt`, `gpt_neox`, `gpt2`, `granite`, `smollm3` |
+| `text_config` | Absent | Present: a multimodal checkpoint |
 | `num_experts` / `num_local_experts` | Any value — routed experts convert | — |
 | `shared_expert_intermediate_size` | Absent or zero | Any positive value: a shared expert has no slot |
-| `rope_scaling`, or `rope_parameters` in a config written by transformers 5 | `null`, absent, `{"rope_type": "default"}`, or `{"rope_type": "llama3", ...}` | Any other `rope_type`, including `linear`, `dynamic`, `yarn` |
+| `rope_scaling`, or `rope_parameters` in a config written by transformers 5 | `null`, absent, `{"rope_type": "default"}`, or `{"rope_type": "llama3", ...}` | Any other `rope_type`, including `linear`, `dynamic`, `yarn`, `longrope` |
 | `partial_rotary_factor` (top level or inside `rope_parameters`) | Absent or `1.0` | Anything below 1 |
 | `no_rope_layers` | Absent, or every entry `1` | Any entry `0` |
 | `embedding_multiplier`, `residual_multiplier`, `logits_scaling`, `scale_emb` | Absent or `1.0` | Any other value |
@@ -194,14 +197,15 @@ stores, and it collects every problem it finds before failing. The error names
 the count, the first offending tensor, and the reason, one bullet per problem:
 
 ```
-tensor 'model.layers.0.self_attn.q_norm.weight' holds 4096 values but
-head_dim is 128; this container implements the per-head QK norm shared
-across heads (Qwen3, Gemma3), not a norm over the whole projection (OLMo2).
+tensor 'model.layers.0.self_attn.q_norm.weight' holds 96 values, which is
+neither head_dim (128, a per-head norm as Qwen3 uses) nor num_heads*head_dim
+(4096, a projection-wide norm as OLMo2 uses); the container implements those
+two shapes.
 ```
 
-That is the OLMo2 case, and it is deliberately specific: the tensor has the
-name RAI supports and the wrong width, which a message saying only
-"unsupported architecture" would have hidden.
+It is deliberately specific: the tensor has a name RAI supports and a width it
+does not, which a message saying only "unsupported architecture" would have
+hidden.
 
 It fails before calibration, so a refusal costs seconds, not hours.
 
@@ -282,7 +286,7 @@ file that converts always loads:
 | `num_heads * head_dim` is even | Required by nibble-packed 4-bit weights. |
 | `hidden_size` and `intermediate_size` are even | Required by nibble-packed 4-bit weights. |
 | `num_heads` divisible by `num_kv_heads` | Required by the grouped-query head mapping. |
-| At most 1024 quantization groups per row | `hidden_size` and `intermediate_size` divided by `--group-size` must each be at most 1024. At the default 128 that allows 131,072, which no published architecture approaches; at `--group-size 32` it allows 32,768, which covers every model in the table above. |
+| At most 1024 quantization groups per row | `hidden_size` and `intermediate_size` divided by `--group-size` must each be at most 1024. At the default 128 that allows 131,072, which no published architecture approaches; at `--group-size 32` it allows 32,768, which covers every model in the table above that fits the 64 GiB file limit except Gemma2-27B, whose 36,864-wide MLP needs `--group-size 64` or more. |
 | Group sizes are even and at most 254 | The group size is one header byte. |
 | RoPE table at most 512 MB | The table costs `max_context * head_dim / 2 * 8` bytes. At `head_dim 128` that allows 1,048,576 positions, so the separate hard cap of 1,000,000 on `--max-context` binds first. |
 

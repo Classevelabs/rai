@@ -157,8 +157,10 @@ jobs:
           set -euo pipefail
           deadline=$(( $(date +%s) + 90 * 60 ))
           while :; do
+            # A pull_request run tests the branch merged into main, not this
+            # commit, so only runs of the commit itself count.
             runs=$(gh api "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&per_page=100" \
-                     --jq '.workflow_runs')
+                     --jq '[.workflow_runs[] | select(.event == "push" or .event == "workflow_dispatch")]')
             passed=$(jq '[.[] | select(.status == "completed" and .conclusion == "success")] | length' <<<"$runs")
             running=$(jq '[.[] | select(.status != "completed")] | length' <<<"$runs")
             if [ "$passed" -gt 0 ]; then
@@ -201,20 +203,38 @@ jobs:
           #
           # Creating it through the REST API rather than `gh release create` is
           # what makes the id available without asking for it: the POST returns
-          # the release it just made. Listing releases to find one we already
-          # know we created is an extra dependency on an endpoint that has
-          # returned 503 mid-release, so it is only the fallback for the
-          # already-exists case.
-          list_id() {
+          # the release it just made.
+          #
+          # A release for this tag is looked for first. A draft is not bound to
+          # its tag until it is published, so GitHub accepts a second draft
+          # for the same tag: a re-run that created before looking left the
+          # first draft behind with half its archives. The listing has returned
+          # 503 mid-release, so a failed call is retried; an empty answer is
+          # the normal first run.
+          find_release() {
+            local listing
             for attempt in 1 2 3 4 5; do
-              id=$(gh api "repos/$REPO/releases" --paginate \
-                     --jq '.[] | "\(.tag_name) \(.id)"' 2>/dev/null \
-                   | awk -v tag="$TAG" '$1 == tag { print $2; exit }') || true
-              if [ -n "${id:-}" ]; then printf '%s' "$id"; return 0; fi
-              echo "releases list gave nothing (attempt $attempt) — retrying" >&2
+              if listing=$(gh api "repos/$REPO/releases" --paginate \
+                             --jq '.[] | "\(.tag_name) \(.id)"'); then
+                awk -v tag="$TAG" '$1 == tag { print $2; exit }' <<<"$listing"
+                return 0
+              fi
+              echo "listing releases failed (attempt $attempt) — retrying" >&2
               sleep $((attempt * 5))
             done
             return 1
+          }
+
+          # Only a draft is resumed. A published release is immutable: a re-run
+          # used to rebuild and replace its archives and rewrite SHA256SUMS
+          # weeks later, under hashes people had already pinned.
+          resume_draft() {
+            if [ "$(gh api "repos/$REPO/releases/$1" --jq '.draft')" != "true" ]; then
+              echo "::error::$TAG is already published. Published artifacts are never"
+              echo "::error::replaced; fix forward with a new version."
+              exit 1
+            fi
+            echo "Release $TAG exists as a draft — resuming it."
           }
 
           cat > notes.md <<'NOTES'
@@ -255,17 +275,17 @@ jobs:
           see `CHANGELOG.md`.
           NOTES
 
-          # The heredoc body carries this file's YAML indentation; strip it so
-          # the release page is not one big code block.
-          sed -i 's/^          //' notes.md
-
-          # Three outcomes worth telling apart. 422 means the release already
-          # exists, which is the rerun case. 5xx means GitHub is having a bad
-          # day — that has taken a release down mid-flight, and it deserves a
-          # retry rather than a tag that has to be cut again. Anything else is
-          # a real failure and should stop the release.
-          id=""
+          # Three outcomes of the POST worth telling apart. 422 means the
+          # release appeared since it was looked for. 5xx means GitHub is having
+          # a bad day — that has taken a release down mid-flight, and it
+          # deserves a retry rather than a tag that has to be cut again.
+          # Anything else is a real failure and should stop the release.
+          id=$(find_release)
+          if [ -n "$id" ]; then
+            resume_draft "$id"
+          fi
           for attempt in 1 2 3 4 5 6; do
+            [ -z "$id" ] || break
             if id=$(gh api --method POST "repos/$REPO/releases" \
                       -f tag_name="$TAG" \
                       -f name="RAI $TAG" \
@@ -280,16 +300,12 @@ jobs:
             cat create.err >&2
 
             if grep -q 'already_exists\|HTTP 422' create.err; then
-              id=$(list_id)
-              # Only a draft is resumed. A published release is immutable: a
-              # re-run used to rebuild and replace its archives and rewrite
-              # SHA256SUMS weeks later, under hashes people had already pinned.
-              if [ "$(gh api "repos/$REPO/releases/$id" --jq '.draft')" != "true" ]; then
-                echo "::error::$TAG is already published. Published artifacts are never"
-                echo "::error::replaced; fix forward with a new version."
+              id=$(find_release)
+              if [ -z "$id" ]; then
+                echo "::error::GitHub says $TAG has a release, but none is listed for it"
                 exit 1
               fi
-              echo "Release $TAG exists as a draft — resuming it."
+              resume_draft "$id"
               break
             fi
 
@@ -555,8 +571,8 @@ jobs:
             INSTALL.md, README.md, and https://github.com/Classevelabs/rai
           RUNNING
 
-          # As above: the heredoc body carries this file's YAML indentation.
-          sed -i.bak 's/^          //' "$stage/RUNNING.txt" && rm -f "$stage/RUNNING.txt.bak"
+          # YAML has already taken off the block's own indentation, so the
+          # heredoc body is written as it should read.
 
           ls -l "$stage"
           cat "$stage/RUNNING.txt"

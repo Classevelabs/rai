@@ -2207,7 +2207,7 @@ fn a_calibrated_conversion_runs_and_changes_the_rounding() {
     convert(&options(&model_dir, &rounded)).unwrap_or_else(|error| panic!("{error:#}"));
     let calibrated = root.join("calibrated").join("model.raimodel");
     convert(&ConvertOptions {
-        calibration_text: Some(text_path),
+        calibration_text: Some(text_path.clone()),
         calibration_sequences: 4,
         calibration_seq_len: 32,
         ..options(&model_dir, &calibrated)
@@ -2220,6 +2220,25 @@ fn a_calibrated_conversion_runs_and_changes_the_rounding() {
     assert_ne!(a, b, "calibrated codes must differ from round-to-nearest");
     let logits = run_forward(&RaiModel::load(&calibrated).unwrap(), &[1, 5, 9, 13]);
     assert!(logits.iter().all(|value| value.is_finite()));
+
+    // A model the pass cannot reproduce is refused, by what it carries.
+    let qwen3_dir = root.join("qwen3");
+    write_checkpoint(&qwen3_dir, &qwen3_spec());
+    std::fs::copy(
+        model_dir.join("tokenizer.json"),
+        qwen3_dir.join("tokenizer.json"),
+    )
+    .unwrap();
+    let refused = root.join("qwen3-out").join("model.raimodel");
+    let error = convert(&ConvertOptions {
+        calibration_text: Some(text_path),
+        calibration_sequences: 4,
+        calibration_seq_len: 32,
+        ..options(&qwen3_dir, &refused)
+    })
+    .expect_err("QK norms are not calibrated");
+    assert!(format!("{error:#}").contains("QK norms"), "{error:#}");
+    assert!(!refused.exists());
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -2280,4 +2299,61 @@ fn a_conversion_records_the_checkpoints_chat_template() {
     assert!(!refused.exists());
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Studio's Check runs the conversion's own pre-write checks once the weights
+/// are on disk, so it refuses what `rai convert` refuses, for the same reason:
+/// a missing tokenizer.json, a malformed generation_config.json, and a
+/// sandwich-normed family whose checkpoint has post-norm layers. Check used to
+/// skip all three and call each of them convertible.
+#[test]
+fn check_refuses_what_the_conversion_refuses() {
+    use rai_infer::convert::preflight;
+    let no_tokenizer: fn(&Path) = |dir| std::fs::remove_file(dir.join("tokenizer.json")).unwrap();
+    let bad_generation_config: fn(&Path) =
+        |dir| std::fs::write(dir.join("generation_config.json"), "{").unwrap();
+    let unchanged: fn(&Path) = |_| {};
+    let post_norm_gemma2 = Spec {
+        post_norm: true,
+        sandwich_norm: false,
+        qk_norm: QkNorm::None,
+        ..gemma2_spec()
+    };
+    for (label, spec, mutate, needle) in [
+        (
+            "no-tokenizer",
+            Spec::default(),
+            no_tokenizer,
+            "tokenizer.json",
+        ),
+        (
+            "bad-generation-config",
+            Spec::default(),
+            bad_generation_config,
+            "generation_config.json",
+        ),
+        (
+            "post-norm-gemma2",
+            post_norm_gemma2,
+            unchanged,
+            "sandwich-normed",
+        ),
+    ] {
+        let root = scratch_dir(&format!("check-{label}"));
+        let model_dir = root.join("checkpoint");
+        let output = root.join("out").join("x.raimodel");
+        write_checkpoint(&model_dir, &spec);
+        mutate(&model_dir);
+        let hf: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(model_dir.join("config.json")).unwrap()).unwrap();
+        let report = preflight(&hf, Some(&model_dir), GROUP_SIZE, GROUP_SIZE, MAX_CONTEXT)
+            .expect("a report");
+        let converted =
+            convert(&options(&model_dir, &output)).map_err(|error| format!("{error:#}"));
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(!report.supported, "{label}: Check called it convertible");
+        assert!(report.reason.contains(needle), "{label}: {}", report.reason);
+        let error = converted.expect_err("the conversion refuses it");
+        assert!(error.contains(needle), "{label}: {error}");
+    }
 }

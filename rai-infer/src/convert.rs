@@ -92,7 +92,6 @@ pub const VERIFIED_MODEL_TYPES: &[&str] = &[
     "qwen3_moe",
     "gemma",
     "gemma2",
-    "gemma3",
     "gemma3_text",
     "phi3",
     "olmo2",
@@ -102,11 +101,11 @@ pub const VERIFIED_MODEL_TYPES: &[&str] = &[
 /// Model families that need the container's Gemma-specific conversion folds:
 /// the `1 + w` RMSNorm and the `sqrt(hidden_size)` embedding scale. Gemma2 uses
 /// both, on all four of its norms.
-const GEMMA_MODEL_TYPES: [&str; 4] = ["gemma", "gemma2", "gemma3", "gemma3_text"];
+const GEMMA_MODEL_TYPES: [&str; 3] = ["gemma", "gemma2", "gemma3_text"];
 
 /// Families that use Gemma2's sandwich normalization, i.e. carry
 /// `pre_feedforward_layernorm` and `post_feedforward_layernorm` per layer.
-const SANDWICH_NORM_MODEL_TYPES: [&str; 3] = ["gemma2", "gemma3", "gemma3_text"];
+const SANDWICH_NORM_MODEL_TYPES: [&str; 2] = ["gemma2", "gemma3_text"];
 
 /// [`ConvertOptions::max_context`] value meaning "store the context the model
 /// itself declares".
@@ -117,7 +116,7 @@ const SANDWICH_NORM_MODEL_TYPES: [&str; 3] = ["gemma2", "gemma3", "gemma3_text"]
 /// forever — a Qwen3-0.6B whose config says `max_position_embeddings=40960`
 /// was stored at 2048 and could not be persuaded otherwise without a
 /// re-conversion. The default is now this sentinel, resolved per checkpoint by
-/// [`resolve_max_context`].
+/// `resolve_max_context`.
 ///
 /// Zero, rather than `Option<u32>`, because it is not a legal context (the
 /// reader requires `1..=MAX_CONTEXT`) so it cannot collide with a real
@@ -494,6 +493,9 @@ pub fn convert_with_progress(
         .with_context(|| format!("reading {}", config_path.display()))?;
     let hf: serde_json::Value = serde_json::from_slice(&raw_config)
         .with_context(|| format!("parsing {}", config_path.display()))?;
+    if let Some(problem) = family_problem(&hf) {
+        bail!("{problem}");
+    }
 
     let hidden_size = required_u32(&hf, "hidden_size")?;
     let num_layers = required_u32(&hf, "num_hidden_layers")?;
@@ -593,14 +595,11 @@ pub fn convert_with_progress(
         Some(path) => path.clone(),
         None => PathBuf::from(default_output_name(&options.model_dir)?),
     };
+    // Read now, so a missing tokenizer.json, or a malformed
+    // tokenizer_config.json or generation_config.json, is refused before
+    // quantizing rather than after.
+    let chat_record = read_companion_files(&options.model_dir)?;
     let tokenizer_src = options.model_dir.join("tokenizer.json");
-    if !tokenizer_src.is_file() {
-        bail!(
-            "{} has no tokenizer.json; the runtime needs it next to the model, so there is \
-             nothing to convert into a usable model",
-            options.model_dir.display()
-        );
-    }
     let tokenizer_dst = match &options.tokenizer_out {
         Some(path) => path.clone(),
         None => output_path
@@ -613,9 +612,6 @@ pub fn convert_with_progress(
     // model's tokenizer — a pair that loads and produces fluent nonsense. The
     // copy at the end checks again, for a file that appears meanwhile.
     check_tokenizer_destination(&tokenizer_src, &tokenizer_dst)?;
-    // Read now, so a malformed tokenizer_config.json or generation_config.json
-    // is refused before quantizing rather than after.
-    let chat_record = ChatRecord::from_checkpoint(&options.model_dir)?;
 
     // Progress accounting: one unit per section (the embedding, each layer,
     // the final norm, and `lm_head` when untied), so `percent` advances once
@@ -662,12 +658,6 @@ pub fn convert_with_progress(
     config.has_qk_norm = qk_norm == QkNormKind::PerHead;
     config.has_full_qk_norm = qk_norm == QkNormKind::FullWidth;
     config.post_norm = resolve_post_norm(&store, num_layers)?;
-    if config.post_norm && config.has_sandwich_norm {
-        bail!(
-            "checkpoint has no input_layernorm but its model_type is sandwich-normed; those \
-             describe incompatible layer shapes and the converter cannot tell which is meant."
-        );
-    }
     validate_model_config(&config)?;
 
     let hidden = hidden_size as usize;
@@ -678,84 +668,7 @@ pub fn convert_with_progress(
 
     // Confirm every tensor exists with the shape the reader will demand, before
     // a single byte is written.
-    let layout = ProjectionLayout::detect(&store, num_layers)?;
-    layout.check_fused_tensors(&store, num_layers, &linear_dims)?;
-    let expert_layout = if config.num_experts > 0 {
-        let experts = ExpertLayout::detect(&store)?;
-        if config.bias_mask != 0 {
-            bail!(
-                "checkpoint declares experts and projection biases; the bias mask addresses the seven dense projections and has no slot for a per-expert bias."
-            );
-        }
-        // Every expert of every layer, checked before a byte is written: a
-        // checkpoint missing expert 47 of layer 12 must fail now, not after
-        // twenty minutes of quantization.
-        for layer in 0..num_layers {
-            check_vector(
-                &store,
-                &experts.router(layer),
-                config.num_experts as usize * hidden,
-            )
-            .or_else(|_| {
-                check_tensor(
-                    &store,
-                    &experts.router(layer),
-                    config.num_experts as usize,
-                    hidden,
-                )
-            })?;
-            for expert in 0..config.num_experts as usize {
-                for (name, (rows, cols)) in experts
-                    .expert(layer, expert)
-                    .into_iter()
-                    .zip(&linear_dims[4..])
-                {
-                    check_tensor(&store, &name, *rows, *cols)?;
-                }
-            }
-        }
-        Some(experts)
-    } else {
-        None
-    };
-    check_tensor(&store, "model.embed_tokens.weight", vocab, hidden)?;
-    for layer in 0..num_layers {
-        for (index, (name, (rows, cols))) in LAYER_LINEAR_NAMES.iter().zip(linear_dims).enumerate()
-        {
-            // A fused projection was already checked as a whole, above; its
-            // parts have no tensor of their own to check.
-            let source = match (expert_layout, index) {
-                // A sparse layer has no `mlp.gate_proj`: its first expert is
-                // the layer's MLP, which is what keeps a dense file unchanged.
-                (Some(experts), 4..=6) => ProjectionSource {
-                    tensor: experts.expert(layer, 0)[index - 4].clone(),
-                    row_offset: 0,
-                },
-                _ => layout.source(layer, index, &linear_dims),
-            };
-            if source.row_offset == 0 && source.tensor == layer_linear_name(layer, name) {
-                check_tensor(&store, &source.tensor, rows, cols)?;
-            }
-            if config.has_bias(index) {
-                check_vector(&store, &layer_bias_name(layer, name), rows)?;
-            }
-        }
-        for name in tail_norm_names(layer, config.has_sandwich_norm, config.post_norm) {
-            check_vector(&store, &name, hidden)?;
-        }
-        if config.has_qk_norm {
-            for name in qk_norm_names(layer) {
-                check_vector(&store, &name, head_dim as usize)?;
-            }
-        }
-    }
-    if config.has_sandwich_norm {
-        check_sandwich_norms(&store, num_layers, hidden)?;
-    }
-    check_vector(&store, "model.norm.weight", hidden)?;
-    if !tied {
-        check_tensor(&store, "lm_head.weight", vocab, hidden)?;
-    }
+    let (layout, expert_layout) = check_checkpoint_tensors(&store, &config, tied)?;
 
     log(&format!(
         "{model_type}: {num_layers}L h={hidden_size} inter={intermediate_size} \
@@ -905,8 +818,8 @@ pub fn convert_with_progress(
         log(
             "\nQuantizing by round-to-nearest. On SmolLM2-1.7B this costs 30.3% perplexity \
              against the fp16 checkpoint where --calibration-text costs 16.6%, for a file of \
-             exactly the same size. Pass --calibration-text <file> with a few thousand tokens \
-             of representative text to use it.",
+             exactly the same size. Pass --calibration-text <file> with representative text \
+             (8,192 tokens by default) to use it.",
         );
     }
 
@@ -1260,8 +1173,125 @@ fn validate_options(options: &ConvertOptions) -> Result<()> {
     Ok(())
 }
 
-/// Mirror of `raimodel.validate_model_config` / the reader's `validate_config`.
+/// Every tensor the container will read, present and in the shape the reader
+/// demands: the fused projections as a whole, every expert of every layer, the
+/// biases, norms and heads. Conversion runs it before a byte is written, and
+/// [`preflight`] runs the same function, so a checkpoint Check calls
+/// convertible cannot then fail at layer 12.
+fn check_checkpoint_tensors(
+    store: &SafeTensorsSet,
+    config: &RaiConfig,
+    tied: bool,
+) -> Result<(ProjectionLayout, Option<ExpertLayout>)> {
+    let num_layers = config.num_layers;
+    let hidden = config.hidden_size as usize;
+    let vocab = config.vocab_size as usize;
+    let head_dim = config.head_dim;
+    let linear_dims = config.projection_dims();
+    let layout = ProjectionLayout::detect(store, num_layers)?;
+    layout.check_fused_tensors(store, num_layers, &linear_dims)?;
+    let expert_layout = if config.num_experts > 0 {
+        let experts = ExpertLayout::detect(store)?;
+        if config.bias_mask != 0 {
+            bail!(
+                "checkpoint declares experts and projection biases; the bias mask addresses the seven dense projections and has no slot for a per-expert bias."
+            );
+        }
+        // Every expert of every layer, checked before a byte is written: a
+        // checkpoint missing expert 47 of layer 12 must fail now, not after
+        // twenty minutes of quantization.
+        for layer in 0..num_layers {
+            check_vector(
+                store,
+                &experts.router(layer),
+                config.num_experts as usize * hidden,
+            )
+            .or_else(|_| {
+                check_tensor(
+                    store,
+                    &experts.router(layer),
+                    config.num_experts as usize,
+                    hidden,
+                )
+            })?;
+            for expert in 0..config.num_experts as usize {
+                for (name, (rows, cols)) in experts
+                    .expert(layer, expert)
+                    .into_iter()
+                    .zip(&linear_dims[4..])
+                {
+                    check_tensor(store, &name, *rows, *cols)?;
+                }
+            }
+        }
+        Some(experts)
+    } else {
+        None
+    };
+    check_tensor(store, "model.embed_tokens.weight", vocab, hidden)?;
+    for layer in 0..num_layers {
+        for (index, (name, (rows, cols))) in LAYER_LINEAR_NAMES.iter().zip(linear_dims).enumerate()
+        {
+            // A fused projection was already checked as a whole, above; its
+            // parts have no tensor of their own to check.
+            let source = match (expert_layout, index) {
+                // A sparse layer has no `mlp.gate_proj`: its first expert is
+                // the layer's MLP, which is what keeps a dense file unchanged.
+                (Some(experts), 4..=6) => ProjectionSource {
+                    tensor: experts.expert(layer, 0)[index - 4].clone(),
+                    row_offset: 0,
+                },
+                _ => layout.source(layer, index, &linear_dims),
+            };
+            if source.row_offset == 0 && source.tensor == layer_linear_name(layer, name) {
+                check_tensor(store, &source.tensor, rows, cols)?;
+            }
+            if config.has_bias(index) {
+                check_vector(store, &layer_bias_name(layer, name), rows)?;
+            }
+        }
+        for name in tail_norm_names(layer, config.has_sandwich_norm, config.post_norm) {
+            check_vector(store, &name, hidden)?;
+        }
+        if config.has_qk_norm {
+            for name in qk_norm_names(layer) {
+                check_vector(store, &name, head_dim as usize)?;
+            }
+        }
+    }
+    if config.has_sandwich_norm {
+        check_sandwich_norms(store, num_layers, hidden)?;
+    }
+    check_vector(store, "model.norm.weight", hidden)?;
+    if !tied {
+        check_tensor(store, "lm_head.weight", vocab, hidden)?;
+    }
+    Ok((layout, expert_layout))
+}
+
+/// The files beside the weights a usable model needs: `tokenizer.json`, and
+/// the chat settings `tokenizer_config.json` and `generation_config.json` hold.
+/// Shared with [`preflight`], so Check refuses what the conversion would.
+fn read_companion_files(model_dir: &Path) -> Result<ChatRecord> {
+    if !model_dir.join("tokenizer.json").is_file() {
+        bail!(
+            "{} has no tokenizer.json; the runtime needs it next to the model, so there is \
+             nothing to convert into a usable model",
+            model_dir.display()
+        );
+    }
+    ChatRecord::from_checkpoint(model_dir)
+}
+
+/// Mirror of `raimodel.validate_model_config` / the reader's `validate_config`,
+/// plus the layer-shape conflicts only a conversion can meet.
 fn validate_model_config(config: &RaiConfig) -> Result<()> {
+    if config.post_norm && config.has_sandwich_norm {
+        bail!(
+            "checkpoint has no input_layernorm but its model_type is sandwich-normed; those \
+             describe incompatible layer shapes and the converter cannot tell which is meant."
+        );
+    }
     let bounded = [
         ("hidden_size", config.hidden_size, MAX_HIDDEN_SIZE),
         ("num_layers", config.num_layers, MAX_LAYERS),
@@ -2298,6 +2328,41 @@ fn resolve_attn_scale(hf: &serde_json::Value, head_dim: u32) -> Result<f32> {
     Ok(if scale == default { 0.0 } else { scale })
 }
 
+/// Why this config's family cannot be converted, or `None` when it can.
+///
+/// Settled before any other field is read: another family's config names its
+/// fields differently (GPT-2's `n_embd`), and a multimodal one keeps its
+/// language model's under `text_config`, so the next refusal would otherwise
+/// be "missing hidden_size" when the reason is the family.
+fn family_problem(hf: &serde_json::Value) -> Option<String> {
+    let model_type = hf.get("model_type").and_then(|v| v.as_str());
+    if hf
+        .get("text_config")
+        .is_some_and(serde_json::Value::is_object)
+    {
+        return Some(format!(
+            "model_type '{}' is a multimodal checkpoint: its language model's settings sit \
+             under text_config, beside a vision tower the container does not store. Convert a \
+             text-only checkpoint of the family instead.",
+            model_type.unwrap_or("?")
+        ));
+    }
+    match model_type {
+        Some(model_type) if VERIFIED_MODEL_TYPES.contains(&model_type) => None,
+        Some(model_type) => Some(format!(
+            "model_type '{model_type}' has no verified forward pass in this runtime (verified: \
+             {}). A family with the same tensor names can still rotate, scale or normalize \
+             differently, and would convert into a model that computes something else.",
+            VERIFIED_MODEL_TYPES.join(", ")
+        )),
+        None => Some(
+            "config.json declares no model_type, so the architecture cannot be checked against \
+             the ones this runtime implements."
+                .to_string(),
+        ),
+    }
+}
+
 /// Mirror of `raimodel.assert_exportable_architecture`, driven by the config
 /// and the checkpoint's tensor names instead of a live torch module tree.
 ///
@@ -2312,20 +2377,7 @@ fn assert_exportable_architecture(
 ) -> Result<()> {
     let mut problems: Vec<String> = Vec::new();
 
-    match hf.get("model_type").and_then(|v| v.as_str()) {
-        Some(model_type) if VERIFIED_MODEL_TYPES.contains(&model_type) => {}
-        Some(model_type) => problems.push(format!(
-            "model_type '{model_type}' has no verified forward pass in this runtime (verified: \
-             {}). A family with the same tensor names can still rotate, scale or normalize \
-             differently, and would convert into a model that computes something else.",
-            VERIFIED_MODEL_TYPES.join(", ")
-        )),
-        None => problems.push(
-            "config.json declares no model_type, so the architecture cannot be checked against \
-             the ones this runtime implements."
-                .to_string(),
-        ),
-    }
+    problems.extend(family_problem(hf));
 
     if let Some(store) = store {
         // Either a separate q_proj or a fused qkv_proj (Phi-3) is enough; both
@@ -2565,9 +2617,9 @@ pub struct PreflightReport {
 /// weights.
 ///
 /// This is the converter's own preflight, not a second implementation of it:
-/// [`resolve_head_dim`], [`resolve_activation`], [`resolve_rope_scaling`],
-/// [`assert_exportable_architecture`], [`resolve_bias_mask`] and
-/// [`validate_model_config`] are called in the order `convert` calls them, and
+/// `resolve_head_dim`, `resolve_activation`, `resolve_rope_scaling`,
+/// `assert_exportable_architecture`, `resolve_bias_mask` and
+/// `validate_model_config` are called in the order `convert` calls them, and
 /// the accept/reject answer is theirs. It exists so a user learns a 14 GB
 /// checkpoint is unsupported before downloading it, which is why `model_dir`
 /// is optional: with no weights on disk, the config-level rules still run.
@@ -2586,6 +2638,13 @@ pub fn preflight(
     embed_group_size: u32,
     max_context: u32,
 ) -> Result<PreflightReport> {
+    // A config without the fields a report is made of is another family's, or
+    // a multimodal one; that is the answer, rather than "missing hidden_size".
+    if hf.get("hidden_size").is_none() {
+        if let Some(problem) = family_problem(hf) {
+            bail!("{problem}");
+        }
+    }
     let hidden_size = required_u32(hf, "hidden_size")?;
     let num_layers = required_u32(hf, "num_hidden_layers")?;
     let num_heads = required_u32(hf, "num_attention_heads")?;
@@ -2712,15 +2771,9 @@ pub fn preflight(
             Some(store) => resolve_post_norm(store, num_layers)?,
             None => false,
         };
-        let has_sandwich_norm =
-            SANDWICH_NORM_MODEL_TYPES.contains(&model_type.as_str()) && !post_norm;
+        let has_sandwich_norm = SANDWICH_NORM_MODEL_TYPES.contains(&model_type.as_str());
         let per_layer_rope = resolve_per_layer_rope(hf, num_layers)?;
         let experts = resolve_experts(hf, raw_intermediate_size)?;
-        if has_sandwich_norm {
-            if let Some(store) = store.as_ref() {
-                check_sandwich_norms(store, num_layers, hidden_size as usize)?;
-            }
-        }
         let config = RaiConfig {
             hidden_size,
             num_layers,
@@ -2759,12 +2812,12 @@ pub fn preflight(
         };
         validate_model_config(&config)?;
         // Studio's Check and `rai convert` are documented as running the same
-        // preflight, so the fused-projection widths are settled here too: a
-        // report saying "supported" that then failed at layer 0 on a shape
-        // would be worse than no report.
-        if let Some(store) = store.as_ref() {
-            let layout = ProjectionLayout::detect(store, num_layers)?;
-            layout.check_fused_tensors(store, num_layers, &config.projection_dims())?;
+        // preflight, so with the weights in hand every check the conversion
+        // makes before writing runs here too: a report saying "supported" that
+        // then failed at layer 12 would be worse than no report.
+        if let (Some(store), Some(dir)) = (store.as_ref(), model_dir) {
+            check_checkpoint_tensors(store, &config, tied)?;
+            read_companion_files(dir)?;
         }
         let (section_sizes, output_bytes) = plan_sections(&config, tied)?;
         Ok(PreflightContainer {
@@ -3123,6 +3176,10 @@ fn collect_calibration_energy(
         !config.has_sandwich_norm && !config.post_norm,
         "calibrated conversion does not support sandwich-normed or post-norm checkpoints yet. Convert without --calibration-text."
     );
+    ensure!(
+        !config.has_qk_norm && !config.has_full_qk_norm,
+        "calibrated conversion does not support QK norms yet (Qwen3, Gemma3, OLMo2). Convert without --calibration-text."
+    );
 
     let hidden = config.hidden_size as usize;
     let heads = config.num_heads as usize;
@@ -3209,12 +3266,6 @@ fn collect_calibration_energy(
                 rows,
                 cols,
             )?;
-        }
-
-        if config.has_qk_norm || config.has_full_qk_norm {
-            bail!(
-                "calibrated conversion does not support per-head QK norms yet (Qwen3, Gemma3). Convert without --calibration-text."
-            );
         }
 
         // ---- rotary position embedding, per sequence ------------------------
@@ -4876,6 +4927,44 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("--calibration-seq-len"));
+    }
+
+    /// A config from another family, or a multimodal one, is refused for that
+    /// before any field it names differently is missed: Gemma3 4B and larger
+    /// keep their language model under `text_config`, GPT-2 its width in
+    /// `n_embd`. Both used to be refused for a missing `hidden_size`.
+    #[test]
+    fn the_family_is_the_reason_a_foreign_config_is_refused() {
+        let multimodal = serde_json::json!({
+            "model_type": "gemma3",
+            "text_config": { "model_type": "gemma3_text", "hidden_size": 2560 },
+            "vision_config": { "model_type": "siglip_vision_model" },
+        });
+        let gpt2 = serde_json::json!({ "model_type": "gpt2", "n_embd": 768, "n_layer": 12 });
+        for (hf, expected) in [(&multimodal, "multimodal"), (&gpt2, "model_type 'gpt2'")] {
+            let error = preflight(hf, None, 128, 64, FOLLOW_MODEL_CONTEXT)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+
+            let dir = std::env::temp_dir().join(format!(
+                "rai-family-{}-{}",
+                std::process::id(),
+                expected.len()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("config.json"), hf.to_string()).unwrap();
+            let error = convert(&ConvertOptions {
+                model_dir: dir.clone(),
+                output: Some(dir.join("out.raimodel")),
+                quiet: true,
+                ..ConvertOptions::default()
+            })
+            .unwrap_err()
+            .to_string();
+            std::fs::remove_dir_all(&dir).ok();
+            assert!(error.contains(expected), "{error}");
+        }
     }
 
     /// The preflight behind Studio's Check is a report, not a crash: a group

@@ -16,13 +16,15 @@ target
 **/.venv
 **/venv
 
-# Model weights, calibration data and other large local assets
-*.raimodel
-*.safetensors
-*.bin
-*.gguf
-*.npy
-test_weights
+# Model weights, calibration data and other large local assets, at any depth
+# as in .gitignore: Docker matches a bare `*.safetensors` at the root only, so
+# a checkpoint folder beside the Dockerfile went into the context whole.
+**/*.raimodel
+**/*.safetensors
+**/*.bin
+**/*.gguf
+**/*.npy
+**/test_weights
 rai-infer/scripts/tokenizer.json
 rai-infer/scripts/mistral-tokenizer.json
 rai-infer/scripts/teacher_data
@@ -35,3 +37,6 @@ rai-infer/scripts/train.log
 **/*.swo
 **/.DS_Store
 **/Thumbs.db
+
+# Golden conformance fixtures are test inputs, not exported models
+!rai-infer/tests/fixtures/*.raimodel

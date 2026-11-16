@@ -191,11 +191,11 @@ rai models .
 ```
 
 Not every checkpoint converts. RAI runs Qwen2/2.5, Qwen3 (dense and MoE),
-Llama-2/3/3.1/3.2, Gemma 1/2/3, OLMo2, Phi-3, Mistral, Mixtral, TinyLlama, and
-SmolLM. What is refused is refused for something a checkpoint contains — a
-shared expert, a RoPE scheme other than `default` or `llama3`, an `lm_head`
-bias, a module tree that is not Llama-shaped — with the reason named at
-conversion time. Check [docs/MODELS.md](./docs/MODELS.md) before downloading
+Llama-2/3/3.1/3.2, Gemma 1/2, text-only Gemma3, OLMo2, Phi-3, Mistral, Mixtral,
+TinyLlama, and SmolLM. What is refused is refused for something a checkpoint
+contains — a shared expert, a RoPE scheme other than `default` or `llama3`, an
+`lm_head` bias, a module tree that is not Llama-shaped — with the reason named
+at conversion time. Check [docs/MODELS.md](./docs/MODELS.md) before downloading
 weights.
 
 **The one thing that trips everybody up:** instruction-tuned checkpoints need

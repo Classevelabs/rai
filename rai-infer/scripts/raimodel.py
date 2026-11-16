@@ -118,21 +118,27 @@ def validate_export_options(parser, args):
 
 
 def default_output_name(model, bits):
-    """`<last path component or repo name>-q<bits>.raimodel`.
+    """`<directory or repo name>-q<bits>.raimodel`, as `rai convert` names it.
 
-    Mirrors `default_output_name` in rai-infer/src/convert.rs, including its
-    two platform rules:
+    Mirrors `default_output_name` in rai-infer/src/convert.rs:
 
-    * Both separators are split on, because `--model` is equally likely to be a
-      HuggingFace repo id (`Qwen/Qwen2.5-0.5B-Instruct`), a POSIX path, or a
-      Windows path. `str.split('/')` alone left `C:\\models\\Foo` intact and
-      derived an output name containing a drive letter and backslashes.
-    * The case is preserved. Lowercasing is invisible on Windows and macOS and
-      a trap on Linux, where the file the exporter wrote and the name the user
-      types from the checkpoint directory are then two different files.
+    * A directory on this machine is resolved first, so `--model .` is named
+      after the directory it is rather than `.`.
+    * Anything else is a HuggingFace repo id (`Qwen/Qwen2.5-0.5B-Instruct`), and
+      both separators are split on: `str.split('/')` alone left `C:\\models\\Foo`
+      intact and derived an output name containing a drive letter.
+    * The name is kept as it is, case and spaces included. Lowercasing is
+      invisible on Windows and macOS and a trap on Linux, where the file the
+      exporter wrote and the name the user types are then two different files.
     """
-    tail = re.split(r"[\\/]+", str(model).rstrip("\\/"))[-1]
-    return f"{tail.replace(' ', '-')}-q{bits}.raimodel"
+    local = Path(model)
+    if local.is_dir():
+        tail = local.resolve().name
+    else:
+        tail = re.split(r"[\\/]+", str(model).rstrip("\\/"))[-1]
+    if not tail:
+        raise ValueError(f"cannot derive an output name from {model}; pass --output")
+    return f"{tail}-q{bits}.raimodel"
 
 
 def validate_model_config(config):
@@ -695,6 +701,28 @@ def _write_atomically(path, write):
 # Tokenizer copy
 # =============================================================================
 
+def checkpoint_tokenizer_json(model, tokenizer):
+    """The checkpoint's own tokenizer.json bytes, which `rai convert` copies.
+
+    Both tools then write the same file, so the check beside a model compares
+    like with like: the copy a tokenizer saves is re-serialized (newer
+    `tokenizers` write BPE merges as pairs) and was refused as another model's
+    when `rai convert` had already put the original there. A checkpoint with no
+    tokenizer.json of its own gets the one its fast tokenizer saves.
+    """
+    if Path(model).is_dir():
+        path = Path(model) / "tokenizer.json"
+        path = path if path.is_file() else None
+    else:
+        # A repo id: the file from_pretrained has just put in the cache.
+        from transformers.utils import cached_file
+
+        path = cached_file(model, "tokenizer.json", _raise_exceptions_for_missing_entries=False)
+    if path is not None:
+        return Path(path).read_bytes()
+    return saved_tokenizer_json(tokenizer)
+
+
 def saved_tokenizer_json(tokenizer):
     """The tokenizer.json bytes a fast tokenizer saves: the file the runtime reads."""
     with tempfile.TemporaryDirectory(prefix="rai_tokenizer_") as tmp_dir:
@@ -795,7 +823,6 @@ VERIFIED_MODEL_TYPES = (
     "qwen3_moe",
     "gemma",
     "gemma2",
-    "gemma3",
     "gemma3_text",
     "phi3",
     "olmo2",
@@ -807,7 +834,6 @@ VERIFIED_MODEL_TYPES = (
 _UNSUPPORTED_MODEL_TYPES = {
     "gemma": "Gemma scales embeddings by sqrt(hidden) and its RMSNorm applies (1 + weight)",
     "gemma2": "Gemma2 adds logit softcapping and (1 + weight) RMSNorm",
-    "gemma3": "Gemma3 adds per-head QK norm and (1 + weight) RMSNorm",
     "gemma3_text": "Gemma3 adds per-head QK norm and (1 + weight) RMSNorm",
 }
 

@@ -80,7 +80,7 @@ CMD ["mcp"]
 # It is useless without a model, which has to be mounted in; models are far
 # larger than this image and are deliberately not baked into it.
 #
-#   docker run --rm -v "$PWD:/work" -w /work rai \
+#   docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" -w /work rai \
 #     rai convert ./TinyLlama-1.1B-Chat-v1.0 -o ./tinyllama.raimodel
 #
 #   docker run --rm -v "$PWD:/work" -w /work rai \

@@ -106,7 +106,7 @@ impl ChannelNorm {
     /// widest row the block touches sets its budget. Applying `abs_tol` to the
     /// normalized values directly made the bound row-relative: a row with a
     /// spread of 10 was allowed ten times the stated error.
-    pub fn block_tolerance(&self, abs_tol: f64, start: usize, len: usize) -> f64 {
+    pub(crate) fn block_tolerance(&self, abs_tol: f64, start: usize, len: usize) -> f64 {
         let rows = self.scales.len();
         let widest = if len >= rows {
             self.scales.iter().copied().fold(0.0, f64::max)

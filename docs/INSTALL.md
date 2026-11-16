@@ -71,11 +71,15 @@ CLI, the product; models are mounted in, never baked into the image:
 
 ```bash
 docker build -t rai .
-docker run --rm -v "$PWD:/work" -w /work rai \
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" -w /work rai \
   rai convert ./TinyLlama-1.1B-Chat-v1.0 -o ./tinyllama.raimodel
 docker run --rm -v "$PWD:/work" -w /work rai \
   rai run ./tinyllama.raimodel --chat-template auto --prompt "Hello"
 ```
+
+`--user` runs the conversion as you, so on Linux it can write into your folder
+and the files it writes are yours; the image's own user cannot write to a
+folder only you can.
 
 `rai serve` binds loopback inside the container and refuses foreign `Host`
 headers, so it is not reachable through a published port; run it on the host.
@@ -101,7 +105,7 @@ server:
 
 ```bash
 docker build --target cli -t rai-cli .
-docker run --rm -v "$PWD:/work" -w /work rai-cli \
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" -w /work rai-cli \
   rai convert ./TinyLlama-1.1B-Chat-v1.0 -o ./tinyllama.raimodel
 ```
 
@@ -127,7 +131,7 @@ and refuse all three.
 | Path | Tool | Needs | Use it when |
 | --- | --- | --- | --- |
 | Round-to-nearest | `rai convert` | Nothing beyond the RAI build | Default. No Python, no torch. |
-| Calibrated | `rai convert --calibration-text <file>` | Nothing beyond the RAI build, and a few thousand tokens of representative text | Better quality at the same file size, still without Python, on every model `rai convert` takes. Each group's rounding is weighted by how much the model drives its channels; not GPTQ. |
+| Calibrated | `rai convert --calibration-text <file>` | Nothing beyond the RAI build, and representative text: 8,192 tokens by default | Better quality at the same file size, still without Python. Refused for mixture-of-experts, sandwich-norm, post-norm and QK-norm checkpoints (below). Each group's rounding is weighted by how much the model drives its channels; not GPTQ. |
 | Round-to-nearest | `export_rtn.py` | Python, torch, transformers | You want the reference implementation to compare against. |
 | GPTQ (calibrated) | `export_raimodel.py`, `export_fast.py` | Python, torch, transformers, datasets, and a calibration corpus | You want calibrated quantization, can spend the time, **and your checkpoint is container-v1 shaped** — see the paragraph above. Qwen2/2.5, Qwen3, Gemma, OLMo2 and Phi-3 are refused by this path. |
 
@@ -139,8 +143,9 @@ size in the same container and load through the same code, so the difference is
 free at run time; it costs an hour of calibration on a GPU. The full
 measurement, including why the paired comparison is the honest one, is in
 [BENCHMARKS.md](../BENCHMARKS.md#the-calibrated-quantizer-measured-end-to-end).
-If your checkpoint is one this path refuses, use `rai convert
---calibration-text`: on SmolLM2-1.7B it costs **+16.6%**, between the two
+If your checkpoint is one this path refuses, `rai convert --calibration-text`
+takes Qwen2/2.5 and Llama-3.1/3.2 among them (not Qwen3, Gemma2/3 or OLMo2;
+see below): on SmolLM2-1.7B it costs **+16.6%**, between the two
 (BENCHMARKS.md has all three).
 
 ### Default path: `rai convert` (no Python)
@@ -186,13 +191,14 @@ identical file size, no GPU and no Python:
 rai convert /path/to/model --calibration-text wiki.train.raw
 ```
 
-Any few thousand tokens of text representative of what the model will be used
-for will do; the default reads 16 sequences of 512 tokens from the start of the
-file. Conversion goes from seconds to minutes, and the resulting file is the
-same format and the same size — nothing about running it differs.
+Text representative of what the model will be used for will do, as long as
+it is long enough: the default reads 16 sequences of 512 tokens (8,192 tokens)
+from the start of the file, and fewer sequences need less. Conversion goes
+from seconds to minutes, and the resulting file is the same format and the
+same size — nothing about running it differs.
 
 Calibration is refused for mixture-of-experts, sandwich-normed and post-norm
-checkpoints and for per-head QK norms (Qwen3, Gemma3): reproducing those
+checkpoints and for QK norms (Qwen3, Gemma2/3, OLMo2): reproducing those
 faithfully is work not yet done, and quantizing against statistics collected
 from a model that behaves differently would be worse than not calibrating.
 
