@@ -65,7 +65,9 @@ FROM base AS server
 
 COPY --from=build-server /src/target/release/rai-server /usr/local/bin/rai-server
 
-LABEL org.opencontainers.image.source="https://github.com/Classevelabs/rai"       org.opencontainers.image.licenses="Apache-2.0"       org.opencontainers.image.title="RAI server"
+LABEL org.opencontainers.image.source="https://github.com/Classevelabs/rai" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.title="RAI server"
 
 USER 10001:10001
 ENTRYPOINT ["/usr/local/bin/rai-server"]
@@ -78,9 +80,11 @@ CMD ["mcp"]
 # It is useless without a model, which has to be mounted in; models are far
 # larger than this image and are deliberately not baked into it.
 #
-#   docker run --rm -v "$PWD:/work" -w /work rai #     rai convert ./TinyLlama-1.1B-Chat-v1.0 -o ./tinyllama.raimodel
+#   docker run --rm -v "$PWD:/work" -w /work rai \
+#     rai convert ./TinyLlama-1.1B-Chat-v1.0 -o ./tinyllama.raimodel
 #
-#   docker run --rm -v "$PWD:/work" -w /work rai #     rai run ./tinyllama.raimodel --chat-template zephyr --prompt "Hello"
+#   docker run --rm -v "$PWD:/work" -w /work rai \
+#     rai run ./tinyllama.raimodel --chat-template auto --prompt "Hello"
 #
 # `rai serve` is reachable from this image only in principle. It hard-binds
 # 127.0.0.1 and rejects any request whose Host/Origin is not localhost, which is
@@ -90,7 +94,9 @@ FROM base AS cli
 
 COPY --from=build-cli /src/target/release/rai /usr/local/bin/rai
 
-LABEL org.opencontainers.image.source="https://github.com/Classevelabs/rai"       org.opencontainers.image.licenses="Apache-2.0"       org.opencontainers.image.title="RAI inference CLI"
+LABEL org.opencontainers.image.source="https://github.com/Classevelabs/rai" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.title="RAI inference CLI"
 
 USER 10001:10001
 CMD ["rai", "--help"]

@@ -43,14 +43,14 @@
 //! # Panics
 //!
 //! Loading and generation return [`anyhow::Result`]; a malformed or hostile
-//! `.raimodel` produces an error, not a panic. The kernels do assert their
-//! shape invariants, which `.raimodel` validation establishes before any
-//! kernel runs. Every such entry point documents the conditions under
+//! `.raimodel` produces an error, not a panic, and so does a decoder asked to
+//! step from a position it is not at. The kernels do assert their shape
+//! invariants, which `.raimodel` validation establishes before any kernel
+//! runs, and each kernel that asserts documents its conditions under
 //! `# Panics`.
 
-/// Calibration for the converter's GPTQ path: activation Hessians, gathered
-/// one layer at a time so the better quantizer needs neither Python nor a
-/// machine that can hold every layer's statistics at once.
+/// Calibration for `rai convert --calibration-text`: per-channel activation
+/// energy from the unquantized model, used to weight each group's rounding.
 pub mod calibrate;
 /// What a loaded model's prompts look like and where its replies end: the
 /// chat template recorded at conversion, or a built-in one.

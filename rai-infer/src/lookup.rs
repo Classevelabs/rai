@@ -22,27 +22,18 @@
 //! When no n-gram matches at all, no draft is produced and the step degenerates
 //! to a single ordinary decode — verification is never paid for an empty draft.
 //!
-//! MEASURED STATUS ON THIS ENGINE (TinyLlama-1.1B-q4, a consumer laptop CPU, 2026-08-13).
-//! The drafting works; the speedup does not, yet. On a 315-token
-//! context-quoting QA prompt, K=2 accepts 55.8% of drafted tokens, drafts on
-//! 89.6% of steps and yields 1.98 tokens/step — a genuine 2x cut in decode
-//! STEPS — but throughput came out at 0.93x baseline (median of 5 interleaved
-//! A/B repetitions, range 0.79-1.10x). The reason is that `forward_batch` only
-//! partially amortises weight reads on this kernel: fitting cost = a + b*batch
-//! to the step timings puts the marginal cost of one extra verification slot at
-//! ~44% of a full single-token decode step, instead of the ~0% the technique
-//! assumes. That caps ANY speculative scheme here at about (a+b)/b ~= 2.2x even
-//! with 100% acceptance, and the break-even at K=2 needs ~1.89 tokens/step
-//! against the 1.98 actually achieved — i.e. it straddles break-even. The
-//! algorithm is the right one and is exact; the batched GEMM is what has to
-//! improve for it to pay.
+//! MEASURED (BENCHMARKS.md, "Prompt-lookup speculative decoding"; TinyLlama-1.1B-q4,
+//! `--lookup-k 2`, interleaved against baseline): 1.12-1.20x when the output
+//! repeats its context, at 82-90% acceptance and about 2.6 tokens per step,
+//! and 0.74-0.88x on original creative writing. A real gain when the output
+//! reuses context and a real loss otherwise, which is why it is off by default.
+//! Before the batched-GEMM rewrite the same benchmark measured 0.93x: one more
+//! verification slot then cost about 44% of a decode step, against nearly
+//! nothing now.
 //!
-//! On non-repetitive text (open-ended creative writing) `min_ngram = 1` is
-//! actively harmful: it still drafts on 40% of steps but yields only 1.12
-//! tokens/step, measuring ~0.58x baseline. Raising `min_ngram` to 2 suppresses
-//! those weak single-token matches — drafting drops to 5.6% of steps at 1.00
-//! tokens/step, i.e. the path genuinely degrades to plain decoding instead of
-//! paying for drafts that cannot pay back.
+//! On non-repetitive text `min_ngram = 1` still drafts on weak single-token
+//! matches that cannot pay back; raising it to 2 suppresses them, so the path
+//! degrades to plain decoding instead of paying for drafts.
 //!
 //! Exact sampling requires an unfiltered positive-temperature softmax; other
 //! sampler configurations are rejected, matching the other speculative paths.

@@ -1,8 +1,8 @@
-//! KV cache for autoregressive generation with recurrent pondering support.
+//! KV cache for autoregressive generation.
 //!
-//! During normal generation, each token's K,V are computed once and stored at its position.
-//! During pondering (recurrent iteration), the current position's K,V are overwritten
-//! each iteration — only the final converged values persist for future tokens.
+//! Each token's K,V are computed once and stored at its position. Pondering's
+//! extra passes read the cache and write nothing; the speculative decoders
+//! overwrite drafted positions when they verify and truncate the rejected ones.
 //!
 //! Layout per layer: `[num_kv_heads, max_ctx, head_dim]` stored flat.
 //!

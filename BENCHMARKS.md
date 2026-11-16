@@ -899,5 +899,5 @@ MODEL=rai-infer/scripts/smollm-135m-q4.raimodel
   --prompt "The future of computing is" --max-tokens 128
 
 # Compression kernels (criterion)
-cargo bench -p rai-compress
+cargo bench -p classeve-rai-compress
 ```

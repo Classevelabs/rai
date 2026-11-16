@@ -30,10 +30,11 @@ use rai_infer::cli::run::{GenerationArgs, RunArgs};
         "\n",
         "EXAMPLE:\n",
         "  rai-generate --model tinyllama-q4.raimodel --tokenizer tokenizer.json \\\n",
-        "    --chat-template zephyr --prompt \"Explain photosynthesis.\" --max-tokens 80\n",
+        "    --chat-template auto --prompt \"Explain photosynthesis.\" --max-tokens 80\n",
         "\n",
-        "Instruction-tuned models need --chat-template. Without it they usually\n",
-        "emit end-of-sequence immediately and print nothing."
+        "Instruction-tuned models need --chat-template auto (their own template,\n",
+        "recorded at conversion). Without it they usually emit end-of-sequence\n",
+        "immediately and print nothing."
     )
 )]
 struct Args {

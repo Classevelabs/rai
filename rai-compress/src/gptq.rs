@@ -560,20 +560,20 @@ mod tests {
         let gptq_result = gptq_quantize(&weights, &hessian, 4, 32, 32).unwrap();
         let gptq_decompressed = gptq_decompress(&gptq_result).unwrap();
 
-        // Reconstruct uniform quantized matrix for weighted comparison
-        let flat: Vec<f64> = weights.iter().cloned().collect();
-        let mut uniform_recon = vec![0.0f64; rows * cols];
-        for (i, chunk) in flat.chunks(32).enumerate() {
-            let block = crate::quantize::quantize_uniform(chunk, 4).unwrap();
-            let recovered = crate::quantize::dequantize(&block).unwrap();
-            let start = i * 32;
-            for (j, &v) in recovered.iter().enumerate() {
-                if start + j < uniform_recon.len() {
-                    uniform_recon[start + j] = v;
+        // Round-to-nearest over the same groups GPTQ uses — 32 consecutive
+        // columns within a row — so the comparison is the algorithm, not a
+        // different grouping axis.
+        let mut uniform_mat = DMatrix::zeros(rows, cols);
+        for r in 0..rows {
+            let row: Vec<f64> = weights.row(r).iter().cloned().collect();
+            for (g, group) in row.chunks(32).enumerate() {
+                let block = crate::quantize::quantize_uniform(group, 4).unwrap();
+                let recovered = crate::quantize::dequantize(&block).unwrap();
+                for (j, &v) in recovered.iter().enumerate() {
+                    uniform_mat[(r, g * 32 + j)] = v;
                 }
             }
         }
-        let uniform_mat = DMatrix::from_iterator(rows, cols, uniform_recon.iter().cloned());
 
         let gptq_wmse = hessian_weighted_mse(&weights, &gptq_decompressed, &hessian).unwrap();
         let uniform_wmse = hessian_weighted_mse(&weights, &uniform_mat, &hessian).unwrap();

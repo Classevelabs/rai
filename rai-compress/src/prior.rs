@@ -181,9 +181,13 @@ impl WeightPrior {
         Ok((prior_var / total_var).clamp(0.0, 1.0))
     }
 
-    /// Find optimal rank that minimizes total compressed size.
+    /// Estimate the rank, up to 64, that minimizes the modeled size.
     ///
-    /// Balances: prior_size (grows with rank) vs residual_bits (shrinks with rank).
+    /// Balances the f16 prior (grows with rank) against an estimate of the
+    /// residual's bits per weight: `log2` of ten times the residual's RMS,
+    /// held between 0.5 and `target_bits`. A heuristic: it does not see the
+    /// error tolerance the residual is later quantized to, so it ranks
+    /// candidates rather than predicting the final size.
     pub fn optimal_rank(
         weights: &DMatrix<f64>,
         block_size: usize,

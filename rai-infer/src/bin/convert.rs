@@ -15,7 +15,7 @@ use rai_infer::cli::convert::{ConvertArgs, ConvertTuning};
 #[command(
     name = "rai-convert",
     version,
-    about = "Convert a HuggingFace checkpoint to .raimodel (round-to-nearest 4-bit)",
+    about = "Convert a HuggingFace checkpoint to .raimodel (4-bit; calibrated with --calibration-text)",
     after_help = "DEPRECATED: use `rai convert <model-dir>` instead. This binary is a wrapper \
                   kept for compatibility and will be removed in a future release."
 )]

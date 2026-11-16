@@ -1,50 +1,42 @@
-//! Calibration for GPTQ quantization, inside the converter.
+//! Calibration for `rai convert --calibration-text`, without Python.
 //!
-//! # What calibration is for
+//! # What the converter does with it
 //!
-//! Round-to-nearest picks each weight's 4-bit code by looking at the weight.
-//! GPTQ picks it by looking at what the weight *does*: it minimizes the error
-//! in the layer's output under the distribution of inputs the layer actually
-//! sees, which needs a sample of those inputs. That sample is the Hessian
-//! `H = XᵀX`, where `X` is the stack of activations entering a projection over
-//! some calibration text.
+//! Round-to-nearest fits each group's scale and zero point to the weights
+//! alone. A calibrated conversion first runs the checkpoint, unquantized, over
+//! some representative text and measures how much energy each input channel of
+//! every projection carries ([`accumulate_channel_energy`]: the diagonal of the
+//! activation Hessian `H = XᵀX`). It then fits each group's scale and zero
+//! point to minimize the rounding error weighted by that energy
+//! ([`group_params_weighted`]), so a weight on a channel the model actually
+//! drives is rounded more carefully. The file is byte-for-byte the same shape
+//! either way.
 //!
-//! Measured on SmolLM2-1.7B, that difference is worth 8.80 perplexity against
-//! 10.30 at an identical file size — most of the gap between this engine and
-//! llama.cpp.
+//! It is not GPTQ. GPTQ also carries each column's rounding error into the
+//! columns not yet quantized, which needs the full `cols × cols` Hessian and
+//! the Cholesky factor of its inverse; `scripts/export_raimodel.py` does that,
+//! on a GPU, and writes container v1 only. Measured on SmolLM2-1.7B
+//! (BENCHMARKS.md, wikitext-2): fp16 7.91, GPTQ 8.80, `--calibration-text`
+//! 9.22, round-to-nearest 10.30.
 //!
 //! # Why this lives in Rust and not in the Python exporter
 //!
-//! The Python exporter has done this since the beginning, and it is the reason
-//! the good numbers were unreachable: it writes container v1, so it refuses
-//! every checkpoint with projection biases, per-head QK norms, RoPE scaling or
-//! MoE routing — Qwen2/2.5, Qwen3, Gemma, Llama-3.1. The engine's own converter
-//! writes v2 and accepts all of them, and it needs no Python at all. Moving
-//! calibration here is what makes the better quantizer the default rather than
-//! a footnote most users cannot reach.
+//! The Python exporter writes container v1, so it refuses every checkpoint
+//! with projection biases, per-head QK norms, RoPE scaling or MoE routing —
+//! Qwen2/2.5, Qwen3, Gemma, Llama-3.1. The engine's own converter writes v2 and
+//! accepts all of them, with no Python at all, which is what puts a calibrated
+//! quantizer within reach of those models.
 //!
-//! # Sequential, not parallel
+//! # The cost
 //!
-//! `scripts/export_raimodel.py` registers forward hooks on the unquantized
-//! model and collects every layer's Hessian in one pass. That is the simplest
-//! thing to write and it has two costs. It holds all of them at once — for a
-//! 7B that is about 32 GB, which is why it needs a large machine — and it
-//! calibrates each layer against inputs produced by *unquantized* earlier
-//! layers, which is not what the finished model will feed it.
+//! The energy is a diagonal, `cols` numbers per projection, so it costs
+//! nothing to hold. The time goes into the f32 forward pass over the
+//! calibration tokens: 462 s against 20 s for round-to-nearest on
+//! SmolLM2-1.7B, paid once at conversion.
 //!
-//! This calibrates one layer at a time and then propagates through the layer it
-//! just quantized. One layer's Hessians are alive at once (about 1 GB for a
-//! 7B), and every layer after the first is calibrated against the error the
-//! earlier ones really introduce.
-//!
-//! # The cost that cannot be argued away
-//!
-//! `H` is `cols × cols`. For a 7B MLP that is 14336², or 1.6 GB in f64, and
-//! accumulating it over `n` tokens costs `n · cols²` multiply-adds. Calibrated
-//! conversion is therefore not the streaming, 85 MB operation that
-//! round-to-nearest is; it is minutes to hours and gigabytes. That is the
-//! price of the quality, it is paid once at conversion, and the run-time model
-//! is byte-for-byte the same shape either way.
+//! [`accumulate_gram`] builds the full Hessian, the input the GPTQ step needs.
+//! The converter does not call it; `benches/gemm.rs` measures what it would
+//! cost, since `H` for a 7B MLP is 14336², 1.6 GB in f64.
 
 use anyhow::{ensure, Result};
 use rayon::prelude::*;

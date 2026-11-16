@@ -18,7 +18,7 @@ use nalgebra::DMatrix;
 ///   ↓ residual
 /// [Stage 3: Sparse Outlier Extract] — top 1% at full precision
 ///   ↓ dense_residual (much smaller dynamic range)
-/// [Stage 4: Adaptive Quantization]  — 1-3 bits on what's left
+/// [Stage 4: Adaptive Quantization]  — 1-8 bits per block on what's left
 ///   ↓
 /// Compressed
 /// ```
@@ -81,7 +81,10 @@ pub struct HRCConfig {
     pub rank: usize,
     /// Fraction of values to extract as sparse outliers.
     pub outlier_fraction: f64,
-    /// Absolute error tolerance for adaptive bit allocation.
+    /// Largest error, in weight units, the dense blocks may add to any element
+    /// (unless a block would need more than 8 bits). Converted per block into
+    /// the normalized units the blocks are quantized in, so it means the same
+    /// thing as [`crate::compress::RCConfig::abs_tol`].
     pub abs_tol: f64,
 }
 
@@ -168,8 +171,11 @@ pub fn hrc_compress(
     let mut dense_blocks = Vec::new();
     let mut total_dense_bits = 0usize;
 
-    for chunk in decomp.dense.chunks(config.block_size) {
-        let bits = choose_bits(chunk, config.abs_tol)?;
+    for (index, chunk) in decomp.dense.chunks(config.block_size).enumerate() {
+        // `abs_tol` is in weight units; these values are normalized per row.
+        let tolerance =
+            channel_norm.block_tolerance(config.abs_tol, index * config.block_size, chunk.len());
+        let bits = choose_bits(chunk, tolerance)?;
         let block = quantize_uniform(chunk, bits)?;
         total_dense_bits += chunk.len() * bits as usize;
         dense_blocks.push(block);

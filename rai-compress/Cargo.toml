@@ -8,7 +8,7 @@ license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 description = "Weight quantization and compression toolkit — GPTQ with calibration, adaptive bit allocation, bit-packing"
-readme = "../README.md"
+readme = "README.md"
 keywords = ["quantization", "compression", "gptq", "machine-learning"]
 categories = ["compression", "science"]
 

@@ -31,6 +31,10 @@
 //! - Pass 1: clean (writes KV cache normally)
 //! - Pass 2..N: noisy (read-only, don't modify KV cache)
 //!
+//! The noisy passes write nothing, so they attend the clean pass's keys and
+//! values, the current position's included: the noise reaches the current
+//! token's queries and MLP, not what earlier positions see of it.
+//!
 //! Cost: N forward passes per token. Unmeasured here.
 //!
 //! ## 3. Adaptive confidence gating
@@ -38,7 +42,8 @@
 //! entropy pays for the contrastive/ensemble passes. The entropy threshold
 //! and the 0.7/0.3 blend in `forward_adaptive` are unvalidated constants.
 //!
-//! Cost: 1x on confident tokens, 2-N x on uncertain ones.
+//! Cost: 1 pass on a confident token, 2 on an uncertain one, and 3 when it is
+//! still uncertain after the contrast and `ensemble_n` is above 2.
 
 // Pondering passes coordinate several cache/work buffers by index, and the explicit function
 // arguments make mutation and cache-write policy visible at each strategy boundary.
@@ -58,7 +63,9 @@ pub enum PonderStrategy {
     CFG,
     /// Embedding noise ensemble: N forward passes with noise, average logits.
     Ensemble,
-    /// CFG + Ensemble combined: unconditional + N-1 noisy conditional passes.
+    /// Contrastive guidance over an ensemble: one clean and N-2 noisy
+    /// conditional passes, averaged, against one unconditional pass — N passes
+    /// in all.
     CFGEnsemble,
     /// Adaptive: 1 pass for easy tokens, CFG for hard tokens.
     Adaptive,
@@ -103,7 +110,8 @@ impl PonderConfig {
         }
     }
 
-    /// Classifier-Free Guidance with the given scale.
+    /// Contrastive guidance with the given scale (the module doc says why it
+    /// is not the diffusion literature's classifier-free guidance).
     pub fn cfg(guidance_scale: f32) -> Self {
         Self {
             strategy: PonderStrategy::CFG,

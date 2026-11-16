@@ -73,12 +73,12 @@ that this format does store.
 | Qwen3 (dense: 0.6B, 1.7B, 4B, 8B, 14B, 32B) | **Converts** | — | Per-head QK norm is stored in the v2 layer section. Verified: Qwen3-0.6B converts to 399 MB and generates. |
 | Gemma2 (2B, 9B, 27B) | **Converts** | — | Logit softcapping and the two block-output norms are stored. Convert with `--max-context 4096` or lower (see sliding windows). Verified: gemma-2-2b-it converts to 1.70 GB and generates. |
 | OLMo2 | **Converts** | — | Projection-wide QK norms and post-norm placement are both stored. Verified: OLMo-2-1B-Instruct converts in 47.2 s to 898 MB and generates. |
-| Gemma3, Gemma3-text | **Converts** | — | Both RoPE bases and the layer stride are stored. Convert with `--max-context 512` or lower (its sliding window), and run with `--chat-template gemma`. Verified: gemma-3-1b-it converts in 41.5 s to 660 MB and generates. |
+| Gemma3, Gemma3-text | **Converts** | — | Both RoPE bases and the layer stride are stored. Convert with `--max-context 512` or lower (its sliding window). Verified: gemma-3-1b-it converts in 41.5 s to 660 MB and generates. |
 | Mixtral-8x7B | **Converts** | — | Router and every expert are stored. A 4-bit Mixtral-8x7B is ~24 GB on disk and needs that much RAM to run — check before you start. |
 | Qwen3-MoE (30B-A3B) | **Converts** | — | Routed experts are stored. Verified on OLMoE-1B-7B (64 experts, 8 per token): converts in 121.3 s to 3.5 GB and generates. |
 | Mixtral-8x22B, Qwen3-MoE 235B-A22B | **Refused** | Mixtral-8x7B, Qwen3-30B-A3B | At 4 bits every stored expert comes to more than the reader's 64 GiB file limit, so the conversion is refused before it starts rather than producing a file that cannot be loaded. |
 | Any config with `shared_expert_intermediate_size` or `n_shared_experts` | **Refused** | The same family without a shared expert | A shared expert runs for *every* token alongside the routed ones; the container stores routed experts only, so dropping it would remove a pathway rather than degrade one. |
-| Phi-3, Phi-3.5 | **Converts** | — | Its fused `qkv_proj` and `gate_up_proj` are split at conversion. Convert with `--max-context 2047` or lower (see sliding windows), and run with `--chat-template phi3`. Verified: Phi-3-mini-4k-instruct converts to 2,083 MB in 22.8 s and generates. |
+| Phi-3, Phi-3.5 | **Converts** | — | Its fused `qkv_proj` and `gate_up_proj` are split at conversion. Convert with `--max-context 2047` or lower (see sliding windows). Verified: Phi-3-mini-4k-instruct converts to 2,083 MB in 22.8 s and generates. |
 | Phi-2 | **Refused** | `meta-llama/Llama-3.2-3B-Instruct` | Not a Llama-shaped module tree; unlike Phi-3 it is not a fused variant of one. |
 | Falcon | **Refused** | `mistralai/Mistral-7B-Instruct-v0.3` | No Llama-style module tree. |
 | GPT-NeoX, Pythia | **Refused** | `meta-llama/Llama-3.2-1B-Instruct` (or SmolLM2 below 1B) | No Llama-style module tree. |
@@ -218,21 +218,24 @@ only, so they still refuse everything v2 added:
 | Llama-3.1, Llama-3.2 | Converts | Refused — `rope_type: "llama3"` |
 | Gemma | Converts | Refused — embedding scale and `(1 + w)` RMSNorm |
 
-Use `rai convert` unless you specifically want calibrated GPTQ quantization,
-which only the Python path implements — and note that the trade is real in both
-directions. On SmolLM2, a checkpoint both paths accept, the calibrated export
-costs +11.2% perplexity against fp16 where round-to-nearest costs +30.3%
-([BENCHMARKS.md](../BENCHMARKS.md#the-calibrated-quantizer-measured-end-to-end)).
+Use `rai convert` unless you specifically want GPTQ, which only the Python
+path implements — and note that the trade is real in both directions. On
+SmolLM2-1.7B, a checkpoint both paths accept, GPTQ costs +11.2% perplexity
+against fp16, `rai convert --calibration-text` +16.6% and plain round-to-nearest
++30.3% ([BENCHMARKS.md](../BENCHMARKS.md#the-calibrated-quantizer-measured-end-to-end)).
 So for a model in the "Refused" column above, `rai convert` is not merely the
-easier path, it is the only one, and it is the more expensive one in quality.
+easier path, it is the only one; give it `--calibration-text` to close most of
+the gap.
 
 ## Why the line falls where it does
 
 The `.raimodel` container stores exactly this and nothing else:
 
-- a header holding the architecture dimensions, **one** `rope_theta`,
-  `norm_eps`, the activation code, the RoPE scaling parameters, the bias mask,
-  the embedding scale, the two logit softcaps, and the attention scale
+- a header holding the architecture dimensions, `rope_theta` (and, for
+  models whose layers alternate between two bases, a second one with the
+  layer stride that picks between them), `norm_eps`, the activation code, the
+  RoPE scaling parameters, the bias mask, the embedding scale, the two logit
+  softcaps, the attention scale, and the expert counts
 - one 8-bit quantized embedding table
 - per layer: seven 4-bit projections (`q`, `k`, `v`, `o`, `gate`, `up`,
   `down`), an optional f32 bias vector per projection, an optional pair of
@@ -246,13 +249,11 @@ why a model needing none of them still writes a file byte-identical to what
 earlier versions produced.
 
 The kernels implement exactly this and nothing else: RMSNorm as `x / rms * w`,
-applied per token or per head; rotary embeddings from **one** theta with an
-optional `llama3` frequency rescale; full causal attention with grouped-query
-head mapping, an optional non-default scale and an optional `tanh` softcap on
-the scores; and a gated MLP with either a SiLU or a GeLU-tanh gate.
-
-The emphasis on *one* theta is where Gemma3 falls out: a model that rotates
-different layers at different frequencies has nowhere to say so.
+applied per token or per head; rotary embeddings from one theta per layer (two
+tables at most, as Gemma3 needs) with an optional `llama3` frequency rescale;
+full causal attention with grouped-query head mapping, an optional non-default
+scale and an optional `tanh` softcap on the scores; and a gated MLP with either
+a SiLU or a GeLU-tanh gate, routed to experts where the file has them.
 
 A model needing a weight or an operation outside those two lists has nowhere to
 put it. It would be dropped at export and the resulting file would load cleanly

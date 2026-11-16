@@ -510,6 +510,7 @@ jobs:
                             rai run <model.raimodel>    generate text
                             rai serve <model.raimodel>  local chat UI (:8090)
                             rai models [dir]            what is on this machine
+                            rai perplexity <model>      quality on a text file
             launchers/    double-click scripts that start the chat UI
 
             rai-convert, rai-generate and rai-chat are deprecated wrappers over

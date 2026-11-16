@@ -98,6 +98,30 @@ impl ChannelNorm {
         Ok(result)
     }
 
+    /// The error budget, in normalized units, that keeps every element of one
+    /// block of the column-major flattened matrix within `abs_tol` in weight
+    /// units once denormalized.
+    ///
+    /// A normalized error `e` on row `i` comes back as `e * scales[i]`, so the
+    /// widest row the block touches sets its budget. Applying `abs_tol` to the
+    /// normalized values directly made the bound row-relative: a row with a
+    /// spread of 10 was allowed ten times the stated error.
+    pub fn block_tolerance(&self, abs_tol: f64, start: usize, len: usize) -> f64 {
+        let rows = self.scales.len();
+        let widest = if len >= rows {
+            self.scales.iter().copied().fold(0.0, f64::max)
+        } else {
+            (start..start + len)
+                .map(|index| self.scales[index % rows])
+                .fold(0.0, f64::max)
+        };
+        if widest > 0.0 {
+            abs_tol / widest
+        } else {
+            abs_tol
+        }
+    }
+
     /// Storage cost in bytes (FP16 per value).
     pub fn size_bytes(&self) -> Result<usize, ChannelError> {
         self.validate()?;

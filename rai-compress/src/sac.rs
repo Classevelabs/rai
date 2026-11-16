@@ -78,7 +78,10 @@ pub struct SACConfig {
     pub block_size: usize,
     /// Fraction of values to extract as sparse outliers.
     pub outlier_fraction: f64,
-    /// Absolute error tolerance for adaptive bit allocation.
+    /// Largest error, in weight units, the dense blocks may add to any element
+    /// (unless a block would need more than 8 bits). Converted per block into
+    /// the normalized units the blocks are quantized in, so it means the same
+    /// thing as [`crate::compress::RCConfig::abs_tol`].
     pub abs_tol: f64,
 }
 
@@ -145,8 +148,11 @@ pub fn sac_compress(
     let mut dense_blocks = Vec::new();
     let mut total_dense_bits = 0usize;
 
-    for chunk in decomp.dense.chunks(config.block_size) {
-        let bits = choose_bits(chunk, config.abs_tol)?;
+    for (index, chunk) in decomp.dense.chunks(config.block_size).enumerate() {
+        // `abs_tol` is in weight units; these values are normalized per row.
+        let tolerance =
+            channel_norm.block_tolerance(config.abs_tol, index * config.block_size, chunk.len());
+        let bits = choose_bits(chunk, tolerance)?;
         let block = quantize_uniform(chunk, bits)?;
         total_dense_bits += chunk.len() * bits as usize;
         dense_blocks.push(block);
@@ -332,5 +338,33 @@ mod tests {
             ),
             Err(CompressionError::InvalidInput(_))
         ));
+    }
+
+    /// `abs_tol` bounds the error in weight units whatever a row's spread.
+    /// The dense values are normalized per row, so the bound has to be
+    /// converted into each block's units; applied as is, a row with a spread
+    /// near 6 was allowed about six times the stated error.
+    #[test]
+    fn abs_tol_bounds_the_error_in_weight_units() {
+        let mut rng = StdRng::seed_from_u64(0x5EED_4002);
+        let w = DMatrix::from_fn(16, 64, |i, _| {
+            let spread = if i % 2 == 0 { 10.0 } else { 0.01 };
+            rng.gen_range(-1.0..1.0) * spread
+        });
+        let config = SACConfig {
+            abs_tol: 0.2,
+            outlier_fraction: 0.0,
+            ..Default::default()
+        };
+        let recovered = sac_decompress(&sac_compress(&w, &config).unwrap()).unwrap();
+        let worst = w
+            .iter()
+            .zip(recovered.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max);
+        assert!(
+            worst <= config.abs_tol,
+            "worst error {worst} exceeds abs_tol 0.2"
+        );
     }
 }

@@ -4,9 +4,14 @@ All notable changes to RAI are documented here. The project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and uses semantic
 versioning for its pre-1.0 releases.
 
-## [Unreleased]
+## [0.2.6] - Unreleased
 
 ### Added
+- `rai serve` keeps the keys and values of the prompt prefix a request shares
+  with the previous one and prefills only the rest. A chat client re-sends
+  the whole thread every turn: on Qwen2.5-0.5B the fifth turn's prefill went
+  from 7.1 s to 0.3 s.
+- `/api/chat` reports `stop_reason`, and temperature 0 (greedy) is accepted.
 - Every conversion records the checkpoint's own chat template, its special
   tokens and its end-of-sequence ids beside the model, as `<name>.chat.json`,
   from `rai convert` and the Python exporters alike. `--chat-template auto`,
@@ -20,6 +25,35 @@ versioning for its pre-1.0 releases.
 - `POST /api/chat` takes `repetition_penalty`.
 
 ### Fixed
+- The int8 activation path applied each group's zero point to the exact f32
+  sum of the activations instead of the sum of their quantized values, so the
+  rounding error was weighted by the raw codes rather than the dequantized
+  weights. Against the fp32 reference on SmolLM2-135M (10,200 wikitext
+  tokens): perplexity 29.71 to 27.34, KL over the top 64 tokens 0.500 to
+  0.422, top-1 agreement 62.8% to 66.6%, at the same speed.
+- Softmax and SiLU use a range-reduced polynomial `exp`, within 2 ulp, instead
+  of a bit trick that was off by up to 3.9%; tails go through the same SIMD
+  body.
+- Gemma3's local RoPE table is never rescaled, as in the reference model.
+- Batched attention validates every position before sizing its scratch, KV
+  cache growth is reserved fallibly before each forward pass, and a request
+  that panics no longer takes `rai serve` down.
+- The reader refuses MLP biases in a mixture-of-experts file.
+- The README, the install guide, the model guide and the calibration module
+  described calibrated conversion three different ways. They now say what it
+  does: `--calibration-text` weights each group's rounding by how much the
+  model drives its channels (9.22 against 10.30 perplexity on SmolLM2-1.7B);
+  it is not GPTQ, which only the Python exporter does.
+- HRC and SAC applied `abs_tol` to row-normalized values, so the bound was
+  relative to each row's spread and the HRC-against-RC report compared two
+  different error budgets. It is converted per block, and now bounds every
+  element's error in weight units for all three compressors. The GPTQ test
+  compares against round-to-nearest over the same groups.
+- INSTALL.md, which ships in every archive, told users to unpack 0.2.3 files;
+  its commands name no version now, and CI rejects a doc that names another
+  release's archives. The container docs describe the default image the
+  Dockerfile builds, the docs list `rai perplexity`, and `RAYON_NUM_THREADS`'
+  default is described as it is.
 - Raw prompts and every built-in template but Gemma's were encoded without
   the beginning-of-sequence token, so Llama 2, TinyLlama, Mistral and Llama 3
   ran without the start token they were trained with. The tokenizer adds it
@@ -119,6 +153,16 @@ versioning for its pre-1.0 releases.
   does not exist.
 
 ### Security
+- `rai serve` runs on its own small HTTP/1.1 layer instead of tiny_http.
+  Bodies are capped before they are read (a declared `Content-Length` of
+  10^18 used to abort the server), connections have deadlines, a bounded
+  number are read at once, and IPv6 loopback is used only where IPv4 loopback
+  is missing.
+- Every `/api` route, `GET` included, refuses cross-origin and cross-site
+  requests; network and device paths are refused in every path field, since
+  opening one makes Windows authenticate to the host it names; conversions
+  write only the model, its chat record and `tokenizer.json`. SECURITY.md
+  documents the `rai serve` trust model.
 - The checkpoint reader refuses a shard index that names a file outside the
   checkpoint folder. A downloaded index could otherwise point the converter at
   any file, and on Windows a `\\host\share` shard name makes the machine
@@ -136,6 +180,16 @@ versioning for its pre-1.0 releases.
   context; `COPY . .` baked them into a layer.
 
 ### Changed
+- One chunked, batched prefill serves `rai run`, `rai serve` and all three
+  speculative decoders, and computes no logits for prompt tokens. Batched
+  tied output head, and shared-input Q/K/V and gate/up projections on the
+  batched path.
+- Attention reads each KV head as one contiguous slab; mixture-of-experts
+  lookup is constant time with no per-token allocation (validating a file was
+  quadratic in the expert count).
+- The scalar kernels (aarch64, and x86 without AVX2) run row-parallel, and the
+  default thread pool counts performance cores on each platform instead of
+  assuming two threads per core.
 - A release builds only a commit CI passed: it waits for CI on the tagged
   commit and refuses one with no successful run. v0.2.5 was tagged on a tree
   that failed clippy and the Python suite, because nothing enforced the rule.

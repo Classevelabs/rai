@@ -2289,7 +2289,7 @@ fn bind_loopback(port: u16) -> Result<HttpServer> {
 /// widen who can reach the server, which is what the `Host` check defends.
 ///
 /// The non-product `rai-server` implements this same defence separately, and
-/// deliberately so. It is a different HTTP stack (axum against `tiny_http`),
+/// deliberately so. It is a different HTTP stack (axum against `cli::http`),
 /// and sharing this function would mean `rai-server` depending on `rai-infer`
 /// — which would put the whole inference engine, and eventually a network
 /// stack, back on the wrong side of the product boundary. Two small

@@ -381,6 +381,9 @@ pub(crate) fn decode_normalized_matrix(
 
 /// Standard 4-bit uniform quantization (baseline for comparison).
 ///
+/// Blocks are `block_size` consecutive elements in column-major order, the
+/// layout RC, HRC and SAC quantize in, so the comparison is like for like.
+///
 /// # Errors
 ///
 /// Returns [`CompressionError::InvalidInput`] when the matrix is empty or

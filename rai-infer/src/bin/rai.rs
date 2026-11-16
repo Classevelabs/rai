@@ -24,12 +24,15 @@ use rai_infer::cli;
         "  rai run tinyllama.raimodel --prompt \"The capital of France is\"\n",
         "  rai serve tinyllama.raimodel        # chat UI on http://localhost:8090\n",
         "  rai models                          # what is in this directory\n",
+        "  rai perplexity tinyllama.raimodel --text wiki.test.raw\n",
         "\n",
-        "The tokenizer is written beside the model at conversion time and is\n",
-        "picked up automatically; --tokenizer overrides it.\n",
+        "The tokenizer and the model's chat template (<name>.chat.json) are\n",
+        "written beside the model at conversion time and picked up automatically;\n",
+        "--tokenizer overrides the first.\n",
         "\n",
-        "Instruction-tuned models need a matching --chat-template. Without one\n",
-        "they usually emit end-of-sequence immediately and print nothing."
+        "Instruction-tuned models need their chat template: pass\n",
+        "--chat-template auto to `rai run`. Without it they usually emit\n",
+        "end-of-sequence immediately and print nothing."
     ),
     subcommand_required = true,
     arg_required_else_help = true
@@ -43,13 +46,13 @@ struct Cli {
 enum Command {
     /// Convert a HuggingFace checkpoint to a .raimodel file
     #[command(
-        after_help = "EXAMPLE:\n  rai convert ./TinyLlama-1.1B-Chat -o tinyllama.raimodel\n\nReads .safetensors directly — no Python, no GPU. Writes tokenizer.json\nbeside the output so `rai run` and `rai serve` find it without a flag."
+        after_help = "EXAMPLE:\n  rai convert ./TinyLlama-1.1B-Chat -o tinyllama.raimodel\n\nReads .safetensors directly — no Python, no GPU. Writes tokenizer.json and\nthe model's chat template (<name>.chat.json) beside the output so `rai run`\nand `rai serve` find them without a flag."
     )]
     Convert(cli::convert::ConvertArgs),
 
     /// Generate text from a .raimodel
     #[command(
-        after_help = "EXAMPLE:\n  rai run tinyllama.raimodel --prompt \"The capital of France is\" --max-tokens 40\n  rai run zephyr-7b.raimodel --chat-template zephyr --prompt \"Explain photosynthesis.\"\n\n--tokenizer defaults to tokenizer.json beside the model.\nInstruction-tuned models need the matching --chat-template; without it\nthey usually emit end-of-sequence immediately and print nothing."
+        after_help = "EXAMPLE:\n  rai run tinyllama.raimodel --prompt \"The capital of France is\" --max-tokens 40\n  rai run zephyr-7b.raimodel --chat-template auto --prompt \"Explain photosynthesis.\"\n\n--tokenizer defaults to tokenizer.json beside the model.\nInstruction-tuned models need --chat-template auto, their own template as\nthe conversion recorded it; without it they usually emit end-of-sequence\nimmediately and print nothing."
     )]
     Run(cli::run::RunArgs),
 

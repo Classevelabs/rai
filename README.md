@@ -61,7 +61,7 @@ rai convert /path/to/Qwen2.5-0.5B-Instruct -o qwen2.5-0.5b-instruct-q4.raimodel
 
 # 3. Generate
 rai run qwen2.5-0.5b-instruct-q4.raimodel \
-  --chat-template chatml \
+  --chat-template auto \
   --prompt "Explain photosynthesis in simple terms." \
   --max-tokens 64
 
@@ -130,9 +130,8 @@ captured in `Cargo.lock`.
   reject each drafted token against the target model's own sampled
   distribution, with a correction sample on rejection; a seeded statistical
   smoke test guards that path.
-- **Local serving.** An HTTP chat server with a built-in web UI, plus a REST +
-  MCP server so agentic tools (e.g. Claude Desktop, Claude Code) can use RAI
-  as a tool backend.
+- **Local serving.** `rai serve`: an HTTP chat server on loopback with a
+  built-in web UI and a JSON chat API.
 
 ## Workspace layout
 
@@ -171,7 +170,7 @@ embedding from the configured provider and stores/queries state through
 | CPU | x86-64 with AVX2, FMA, and F16C for optimized paths; scalar fallbacks otherwise |
 | OS | Linux, Windows, or macOS |
 | GPU at runtime | **Not required** |
-| Python | Calibrated (GPTQ) export and draft-model preparation only. `rai convert` does round-to-nearest conversion without it. |
+| Python | GPTQ export through `scripts/export_raimodel.py`, and draft-model preparation, only. `rai convert` needs none, calibrated (`--calibration-text`) or not. |
 
 > `.cargo/config.toml` pins the x86-64 build to the **x86-64-v2** baseline —
 > the same floor the release archives use — so a binary you build here runs on
@@ -215,6 +214,10 @@ RAI runs models in its own `.raimodel` format. Two paths produce it:
 # Round-to-nearest — no Python, no torch
 rai convert /path/to/Mistral-7B-Instruct-v0.3 --max-context 4096
 
+# Calibrated, still no Python: each group's rounding weighted by how much the
+# model drives its channels (9.22 against 10.30 perplexity on SmolLM2-1.7B)
+rai convert /path/to/SmolLM2-1.7B --calibration-text corpus.txt
+
 # GPTQ, calibrated — needs the Python environment and a calibration corpus
 python3 rai-infer/scripts/export_raimodel.py \
   --model /path/to/SmolLM-135M \
@@ -255,7 +258,9 @@ repository shows a quality win from them** — the module doc in
 `rai-infer/src/ponder.rs` says exactly what each one computes. Leave them off.
 
 Set `RAYON_NUM_THREADS` to cap the inference worker count used by `rai run` and
-`rai serve`; it defaults to Rayon's own choice.
+`rai serve`. It defaults to the machine's performance cores plus one (physical
+cores where the platform does not tell them apart), never more than the CPUs
+the process may run on.
 
 ### Speculative decoding
 
@@ -295,8 +300,10 @@ Open `http://localhost:8090` for the built-in web UI, or POST to `/api/chat`
 (JSON) for programmatic access — either a single `message` or a `messages`
 array carrying the whole conversation, oldest first; the server keeps no chat
 state of its own, and the web UI replays the visible thread the same way.
-`--chat-template auto|none|few-shot|mistral|llama3|chatml|zephyr|phi3|gemma`
-selects prompt formatting. The chat server binds to `127.0.0.1` only and
+`--chat-template` selects prompt formatting: `auto` (the default) renders the
+chat template the conversion recorded beside the model, as transformers would;
+`none`, `few-shot`, `mistral`, `llama3`, `chatml`, `zephyr`, `phi3` and `gemma`
+name a built-in one. The chat server binds to `127.0.0.1` only and
 limits request bodies to 64 KiB.
 
 ### The memory service is not in the archive
@@ -336,13 +343,17 @@ Scale/zero parameters are round-tripped through f16 at export time so the reader
 and the exporter use the same stored values.
 
 Version 1 holds the architecture dimensions, `rope_theta`, and `norm_eps`.
-Version 2 extends the header to 128 bytes and adds the activation code, the
-`llama3` RoPE rescaling parameters, the bias mask, and the embedding scale — the
-four fields that brought Qwen2/2.5, Llama-3.1/3.2, and Gemma inside the
-supported set. A converter emits v1 whenever none of them is needed, so files
-that converted before v2 still produce the same bytes. There is no field for
-anything beyond that, which is what makes the compatibility list in
-[docs/MODELS.md](./docs/MODELS.md) what it is.
+Version 2 extends the header to 128 bytes: the activation code, the `llama3`
+RoPE rescaling parameters, projection biases, QK norms (per head or over the
+whole projection), sandwich and post-norm placement, the embedding scale, the
+two logit softcaps, the attention scale, a second RoPE base with its layer
+stride, and routed experts — the fields that brought Qwen2/2.5, Qwen3,
+Llama-3.1/3.2, Gemma 1–3, OLMo2, Phi-3 and the mixture-of-experts families
+inside the supported set. A converter emits v1 whenever none of them is needed,
+so files that converted before v2 still produce the same bytes. There is no
+field for anything beyond that, which is what makes the compatibility list in
+[docs/MODELS.md](./docs/MODELS.md) what it is (`rai-infer/src/format.rs` has
+the byte layout).
 
 The loader performs one read of the whole file into heap memory, validates the
 header and section bounds, and then hands out borrowed slices into that buffer.

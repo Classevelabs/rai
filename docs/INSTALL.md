@@ -66,14 +66,28 @@ cargo install classeve-rai-infer --locked
 
 ## Container
 
-The container is an MCP stdio image and runs as a non-root user. It does not
-expose a REST port because the built-in REST listener is loopback-only. Built
-on amd64 it targets `x86-64-v3`; built on arm64 — which is what `docker build`
-does by default on an Apple Silicon Mac — it takes the toolchain default and
-runs the scalar kernels, because there is no NEON implementation.
+The `Dockerfile` builds two images. The default target is the `rai` inference
+CLI, the product; models are mounted in, never baked into the image:
 
 ```bash
-docker build -t rai-server .
+docker build -t rai .
+docker run --rm -v "$PWD:/work" -w /work rai \
+  rai convert ./TinyLlama-1.1B-Chat-v1.0 -o ./tinyllama.raimodel
+docker run --rm -v "$PWD:/work" -w /work rai \
+  rai run ./tinyllama.raimodel --chat-template auto --prompt "Hello"
+```
+
+`rai serve` binds loopback inside the container and refuses foreign `Host`
+headers, so it is not reachable through a published port; run it on the host.
+
+The `server` target is the separate memory service, an MCP stdio image that is
+not part of the RAI product. Both images run as a non-root user. Built on
+amd64 they target `x86-64-v3`; built on arm64 — which is what `docker build`
+does by default on an Apple Silicon Mac — they take the toolchain default and
+run the scalar kernels, because there is no NEON implementation.
+
+```bash
+docker build --target server -t rai-server .
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
   | docker run --rm -i rai-server mcp
 ```
@@ -113,6 +127,7 @@ and refuse all three.
 | Path | Tool | Needs | Use it when |
 | --- | --- | --- | --- |
 | Round-to-nearest | `rai convert` | Nothing beyond the RAI build | Default. No Python, no torch. |
+| Calibrated | `rai convert --calibration-text <file>` | Nothing beyond the RAI build, and a few thousand tokens of representative text | Better quality at the same file size, still without Python, on every model `rai convert` takes. Each group's rounding is weighted by how much the model drives its channels; not GPTQ. |
 | Round-to-nearest | `export_rtn.py` | Python, torch, transformers | You want the reference implementation to compare against. |
 | GPTQ (calibrated) | `export_raimodel.py`, `export_fast.py` | Python, torch, transformers, datasets, and a calibration corpus | You want calibrated quantization, can spend the time, **and your checkpoint is container-v1 shaped** — see the paragraph above. Qwen2/2.5, Qwen3, Gemma, OLMo2 and Phi-3 are refused by this path. |
 
@@ -124,8 +139,9 @@ size in the same container and load through the same code, so the difference is
 free at run time; it costs an hour of calibration on a GPU. The full
 measurement, including why the paired comparison is the honest one, is in
 [BENCHMARKS.md](../BENCHMARKS.md#the-calibrated-quantizer-measured-end-to-end).
-If your checkpoint is one this path refuses, `rai convert`'s round-to-nearest
-is the only option and that +30.3% is what you are paying.
+If your checkpoint is one this path refuses, use `rai convert
+--calibration-text`: on SmolLM2-1.7B it costs **+16.6%**, between the two
+(BENCHMARKS.md has all three).
 
 ### Default path: `rai convert` (no Python)
 
@@ -246,17 +262,23 @@ into a plain directory with `snapshot_download(..., local_dir=...)`.
 ### Running a chat model
 
 Instruction-tuned checkpoints need the prompt format they were trained on.
-Passing a bare instruction makes the model emit end-of-sequence immediately and
-produce no output at all:
+`rai run` sends the prompt as raw text by default (`--chat-template none`),
+and a chat model given a bare instruction emits end-of-sequence immediately and
+produces no output at all. Ask for the model's own format:
 
 ```bash
 rai run tinyllama-1.1b-q4.raimodel \
-  --chat-template zephyr --prompt "Explain photosynthesis in simple terms."
+  --chat-template auto --prompt "Explain photosynthesis in simple terms."
 ```
 
-Available templates: `none`, `few-shot`, `mistral`, `llama3`, `chatml`,
-`zephyr`, `phi3`, `gemma`, and `auto`. `auto` identifies a family by probing
-the tokenizer for sentinel tokens, so it detects Gemma, Mistral, Llama-3,
-ChatML, Phi-3, and Zephyr-style vocabularies — but **not** TinyLlama-Chat,
-whose `<|user|>` markers are ordinary text rather than vocabulary entries.
-Pass `--chat-template zephyr` explicitly for it.
+Every conversion records the checkpoint's own chat template beside the model,
+as `<name>.chat.json`, and `auto` (the default for `rai serve`) renders it the
+way transformers does, so TinyLlama-Chat, Zephyr and Mistral get their own
+format with no flag. A model recorded without a template is a base model and is
+prompted few-shot. A model converted by an earlier release has no record:
+`auto` then probes the vocabulary for sentinel tokens, which finds Gemma,
+Llama-3, ChatML, Phi-3 and Mistral v0.3 but not TinyLlama-Chat, whose
+`<|user|>` markers are ordinary text. Convert such a model again, or name a
+built-in template: `none`, `few-shot`, `mistral`, `llama3`, `chatml`,
+`zephyr`, `phi3`, `gemma`. `model` asks for the recorded template and is an
+error when there is none.

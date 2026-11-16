@@ -149,6 +149,23 @@ jobs:
       - name: Verify publishable crate archives
         run: cargo package -p classeve-rai-infer -p classeve-rai-compress --locked
 
+      # INSTALL.md ships inside every archive, and once told users of 0.2.5 to
+      # unpack rai-0.2.3 files. The docs either use a placeholder or name the
+      # version this tree builds.
+      - name: Docs name no other release's archives
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --locked --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "classeve-rai-infer") | .version')
+          stale=$(grep -rnoE 'rai-[0-9]+\.[0-9]+\.[0-9]+[^ ]*-(x86_64|aarch64)-' \
+                    README.md INSTALL.md docs launchers \
+                  | grep -v "rai-$version-" || true)
+          if [ -n "$stale" ]; then
+            echo "::error::documentation names release archives that are not $version:"
+            echo "$stale"
+            exit 1
+          fi
+
       # Licenses, bans and sources over the whole graph. Nothing previously
       # checked what a dependency's license actually permitted, which matters
       # because a release archive is a binary distribution of every crate below

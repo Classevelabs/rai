@@ -752,8 +752,9 @@ pub fn run(args: &RunArgs) -> Result<()> {
             // sequence immediately because nothing marks a turn.
             eprintln!(
                 "\nNo tokens generated: the model emitted end-of-sequence first. \
-                 If this is an instruction-tuned model, pass the matching \
-                 --chat-template (auto, mistral, llama3, chatml, zephyr, phi3, gemma, few-shot)."
+                 If this is an instruction-tuned model, pass --chat-template auto \
+                 (its own template, recorded at conversion) or name one: mistral, \
+                 llama3, chatml, zephyr, phi3, gemma, few-shot."
             );
         }
         eprintln!("\n--- Stats ---");

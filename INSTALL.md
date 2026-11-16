@@ -4,9 +4,9 @@ RAI is one command-line program and no installer:
 
 | Binary | What it is for |
 | --- | --- |
-| `rai` | Convert checkpoints, generate text, serve a local chat UI, list models |
+| `rai` | Convert checkpoints, generate text, serve a local chat UI, list models, measure perplexity |
 
-`rai` has four subcommands:
+`rai` has five subcommands:
 
 | Command | What it does |
 | --- | --- |
@@ -14,6 +14,7 @@ RAI is one command-line program and no installer:
 | `rai run <model.raimodel>` | Generate text on the CPU |
 | `rai serve <model.raimodel>` | Serve a local chat UI over HTTP |
 | `rai models [dir]` | List the `.raimodel` files in a directory |
+| `rai perplexity <model.raimodel> --text <file>` | Measure what quantization cost the model on a text |
 
 The archives also carry `rai-convert`, `rai-generate`, and `rai-chat`. Those
 are deprecated wrappers over the same code, kept so existing scripts keep
@@ -75,7 +76,7 @@ Linux and macOS:
 
 ```bash
 sha256sum --ignore-missing -c SHA256SUMS
-# rai-0.2.3-x86_64-unknown-linux-gnu.tar.gz: OK
+# rai-<version>-x86_64-unknown-linux-gnu.tar.gz: OK
 ```
 
 macOS without GNU coreutils:
@@ -87,14 +88,22 @@ shasum -a 256 --ignore-missing -c SHA256SUMS
 Windows PowerShell:
 
 ```powershell
-$file = "rai-0.2.3-x86_64-pc-windows-msvc.zip"
+$file = (Get-ChildItem rai-*-x86_64-pc-windows-msvc.zip | Select-Object -First 1).Name
 $want = (Select-String -Path SHA256SUMS -Pattern ([regex]::Escape($file))).Line.Split()[0]
 $got  = (Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
 if ($want -eq $got) { "OK" } else { throw "checksum mismatch" }
 ```
 
 `--ignore-missing` is what lets you check one archive against a `SHA256SUMS`
-that lists all three. If the check fails, delete the download; do not run it.
+that lists every platform's. If the check fails, delete the download; do not
+run it.
+
+Each archive also carries a signed build-provenance attestation tying it to
+this repository's release workflow and the tagged commit. With the GitHub CLI:
+
+```bash
+gh attestation verify rai-<version>-<target>.tar.gz --repo Classevelabs/rai
+```
 
 ## 3. Put the binaries on your PATH
 
@@ -104,11 +113,15 @@ self-contained and can live anywhere.
 Linux and macOS:
 
 ```bash
-tar xzf rai-0.2.3-x86_64-unknown-linux-gnu.tar.gz
-cd rai-0.2.3-x86_64-unknown-linux-gnu
+archive=$(ls rai-*-x86_64-unknown-linux-gnu.tar.gz)   # the archive you downloaded
+tar xzf "$archive"
+cd "${archive%.tar.gz}"
 install -m 0755 rai ~/.local/bin/
 rai --help
 ```
+
+On macOS the archive ends in `-x86_64-apple-darwin.tar.gz` (Intel) or
+`-aarch64-apple-darwin.tar.gz` (Apple Silicon); use that name instead.
 
 If `~/.local/bin` is not on your `PATH`, add it (`export
 PATH="$HOME/.local/bin:$PATH"` in your shell profile), or use `/usr/local/bin`
@@ -124,8 +137,9 @@ xattr -d com.apple.quarantine rai
 Windows PowerShell:
 
 ```powershell
-Expand-Archive rai-0.2.3-x86_64-pc-windows-msvc.zip -DestinationPath $HOME\bin
-$dir = "$HOME\bin\rai-0.2.3-x86_64-pc-windows-msvc"
+$zip = Get-ChildItem rai-*-x86_64-pc-windows-msvc.zip | Select-Object -First 1
+Expand-Archive $zip.FullName -DestinationPath $HOME\bin
+$dir = "$HOME\bin\$($zip.BaseName)"
 [Environment]::SetEnvironmentVariable(
   "Path", "$([Environment]::GetEnvironmentVariable('Path','User'));$dir", "User")
 # open a new terminal, then:
@@ -142,12 +156,13 @@ TinyLlama-1.1B-Chat is the one these instructions were verified against.
 
 ```bash
 # Convert it once. No Python, no torch — `rai convert` reads the checkpoint
-# directory directly and writes tokenizer.json next to the model file.
+# directory directly and writes tokenizer.json and the model's chat template
+# next to the model file.
 rai convert /path/to/TinyLlama-1.1B-Chat-v1.0 -o tinyllama-q4.raimodel
 
-# Generate. The tokenizer beside the model is found automatically.
+# Generate. The tokenizer and template beside the model are found automatically.
 rai run tinyllama-q4.raimodel \
-        --chat-template zephyr \
+        --chat-template auto \
         --prompt "Explain photosynthesis in simple terms."
 ```
 
@@ -184,11 +199,11 @@ conversion time. Check [docs/MODELS.md](./docs/MODELS.md) before downloading
 weights.
 
 **The one thing that trips everybody up:** instruction-tuned checkpoints need
-the prompt format they were trained on. Pass a bare instruction without
-`--chat-template` and the model emits end-of-sequence immediately and prints
-nothing at all. That is not a crash and not a broken conversion. TinyLlama-Chat
-needs `--chat-template zephyr` specifically — `auto` cannot detect it, because
-its `<|user|>` markers are ordinary text rather than vocabulary entries. See
+the prompt format they were trained on, and `rai run` sends raw text unless
+told otherwise. Pass a bare instruction without `--chat-template` and the model
+emits end-of-sequence immediately and prints nothing at all. That is not a
+crash and not a broken conversion: pass `--chat-template auto`, which uses the
+chat template the conversion recorded beside the model. See
 [Running a chat model](./docs/INSTALL.md#running-a-chat-model).
 
 ## Installing from source
@@ -225,10 +240,9 @@ runtime-dispatched, not selected by the compile-time baseline.
 
 ## Container
 
-The published `Dockerfile` builds the MCP stdio image. See
-[docs/INSTALL.md](./docs/INSTALL.md#container) for how to run it, and
-[Dockerfile](./Dockerfile) for the `--target` stages, including one that carries
-the inference CLI instead of the server.
+The `Dockerfile` builds the `rai` inference CLI by default, and the separate
+memory service with `--target server`. See
+[docs/INSTALL.md](./docs/INSTALL.md#container) for how to run each.
 
 ## Uninstalling
 

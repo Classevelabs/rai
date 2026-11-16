@@ -83,11 +83,13 @@ f32 arithmetic, and no equivalence claim is made without measured tolerances.
 `--no-default-features` compiles the inference library — format reader,
 kernels, model, sampling, speculative decoding — against `half`, `rayon`,
 `anyhow`, and `rand` alone. The default-on `cli` feature adds `clap`,
-`tokenizers`, `tiny_http`, `serde`, `serde_json`, and `memmap2`; every binary
-(`rai`, the deprecated `rai-convert`/`rai-generate`/`rai-chat` wrappers, and the
-`profile-fwd`, `gemm-bench`, `bw-bench` dev tools) requires it, as do the
-checkpoint converter and the tokenizer-aware `ChatTemplate::auto_detect` and
-`ChatTemplate::from_str_arg` helpers.
+`tokenizers`, `httparse` (under `rai serve`'s own HTTP/1.1 layer), `serde`,
+`serde_json`, `memmap2`, and `minijinja` (which renders each model's own chat
+template); every binary (`rai`, the deprecated
+`rai-convert`/`rai-generate`/`rai-chat` wrappers, and the `profile-fwd`,
+`gemm-bench`, `bw-bench` dev tools) requires it, as do the checkpoint
+converter, `chat_format`, and the tokenizer-aware `ChatTemplate::auto_detect`
+and `ChatTemplate::from_str_arg` helpers.
 
 Each `rai` subcommand's implementation lives in `src/cli/`, not in `src/bin/`,
 so argument validation and the model/tokenizer resolution rules are unit
