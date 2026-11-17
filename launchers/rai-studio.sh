@@ -148,7 +148,10 @@ else
     "${RAI}" serve --port "${PORT}" &
 fi
 SERVER_PID=$!
-trap 'kill "${SERVER_PID}" 2>/dev/null || true' EXIT INT TERM
+# Ctrl+C or a close stops the server; STOPPING tells the end of this script
+# that the exit code it then sees was asked for.
+trap 'kill "${SERVER_PID}" 2>/dev/null || true' EXIT
+trap 'STOPPING=1; kill "${SERVER_PID}" 2>/dev/null || true' INT TERM
 
 # --- wait for the port, then open the browser -------------------------------
 open_url() {
@@ -201,5 +204,13 @@ if [ "${SECONDS}" -ge "${deadline}" ]; then
     printf '  open %s yourself once it is ready.\n' "${URL}"
 fi
 
-# Hand the terminal back to the server so Ctrl+C reaches it.
-wait "${SERVER_PID}"
+# Hand the terminal back to the server so Ctrl+C reaches it. A server that
+# stops on its own with an error says so even after the page opened: another
+# program holding the port answers the probe above, and rai serve then exits.
+code=0
+wait "${SERVER_PID}" || code=$?
+trap - EXIT
+if [ "${code}" -ne 0 ] && [ -z "${STOPPING:-}" ]; then
+    printf '\n  rai serve exited with code %s; see the messages above.\n' "${code}" >&2
+    exit "${code}"
+fi

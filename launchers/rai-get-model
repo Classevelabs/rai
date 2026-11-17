@@ -233,7 +233,7 @@ if [ "$YES" = 0 ] && [ -t 0 ]; then
 fi
 
 # --- download and check every file -------------------------------------------------
-printf '%s\n' "$FILES" | while IFS="$TAB" read -r path bytes digest; do
+printf '%s\n' "$FILES" | while IFS="$TAB" read -r path _ digest; do
     [ -n "$path" ] || continue
     target="$DOWNLOAD_DIR/$path"
     if [ -f "$target" ] && [ -n "$digest" ] && [ "$(sha256 "$target")" = "$digest" ]; then
