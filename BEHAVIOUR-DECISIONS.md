@@ -46,6 +46,36 @@ clean-room runs, which download through the script on every platform.
 **If regressed.** `rai` gains a network dependency and an attack surface its
 users were told it does not have.
 
+## 2026-11-17 — The Windows scripts hash and unzip through .NET
+
+**Decision.** `install.ps1` and `rai-get-model.ps1` compute SHA-256 with
+`System.Security.Cryptography.SHA256` and unzip with
+`System.IO.Compression.ZipFile`, not `Get-FileHash` and `Expand-Archive`; the
+`.cmd` launchers clear `PSModulePath` before starting Windows PowerShell.
+
+**Symptom.** Windows PowerShell started from a PowerShell 7 window inherits
+PowerShell 7's module path and loses `Get-FileHash`, so the installer stopped
+at its checksum step there, as did `rai-get-model`.
+
+**Verified against.** The clean room, which starts Windows PowerShell 5.1
+from PowerShell 7 to run the one-line installer.
+
+**If regressed.** "The term 'Get-FileHash' is not recognized" for anyone who
+installs or downloads a model from a PowerShell 7 window.
+
+## 2026-11-17 — `rai run` prints only the reply when it uses a chat template
+
+**Decision.** With a chat template, `rai run` writes the reply alone to
+stdout; with `--chat-template none` it writes the prompt and then the
+continuation, as a completion reads.
+
+**Symptom.** The answer was printed glued to the question's last word
+("...one word.Paris"), and a script reading stdout had to strip the prompt.
+
+**Verified against.** The clean room's `rai run` check on every platform.
+
+**If regressed.** Answers start mid-line after the echoed question.
+
 ## 2026-11-17 — Windows links the C runtime statically; Linux builds on glibc 2.28
 
 **Decision.** `.cargo/config.toml` sets `+crt-static` for
