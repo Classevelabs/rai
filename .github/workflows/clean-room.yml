@@ -86,7 +86,10 @@ jobs:
 
           $hidden = 0
           foreach ($dir in "$env:WINDIR\System32", "$env:WINDIR\SysWOW64") {
-            Get-ChildItem -LiteralPath $dir -File | Where-Object { $_.Name -match '^(msvcp140|vcruntime140|concrt140|vccorlib140)(_\w+)?\.dll$' } | ForEach-Object {
+            # The redistributable's files only. vcruntime140_clr0400.dll and
+            # msvcp140_clr0400.dll belong to the .NET Framework every Windows
+            # ships, and hiding them breaks Windows PowerShell itself.
+            Get-ChildItem -LiteralPath $dir -File | Where-Object { $_.Name -match '^(msvcp140|vcruntime140|concrt140|vccorlib140)(_\w+)?\.dll$' -and $_.Name -notmatch '_clr0400\.dll$' } | ForEach-Object {
               & takeown.exe /f $_.FullName | Out-Null
               & icacls.exe $_.FullName /grant '*S-1-5-32-544:F' | Out-Null
               Rename-Item -LiteralPath $_.FullName -NewName "$($_.Name).clean-room"
@@ -195,13 +198,17 @@ jobs:
           }
 
           # --- removing a PowerShell install, with the steps INSTALL.md gives ------
+          # A failure here is recorded with the rest rather than ending the step,
+          # so the report lists everything that went wrong.
           $dir = Join-Path $env:LOCALAPPDATA 'Programs\RAI'
-          Remove-Item -Recurse -Force $dir
-          Remove-Item -Force (Join-Path ([Environment]::GetFolderPath('Programs')) 'RAI Studio.lnk')
-          $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
-          $path = $key.GetValue('Path', '', 'DoNotExpandEnvironmentNames')
-          $key.SetValue('Path', (($path.Split(';') | Where-Object { $_ -and $_.TrimEnd('\') -ne $dir }) -join ';'), 'ExpandString')
-          $key.Close()
+          try {
+            Remove-Item -Recurse -Force $dir
+            Remove-Item -Force (Join-Path ([Environment]::GetFolderPath('Programs')) 'RAI Studio.lnk')
+            $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+            $path = $key.GetValue('Path', '', 'DoNotExpandEnvironmentNames')
+            $key.SetValue('Path', (($path.Split(';') | Where-Object { $_ -and $_.TrimEnd('\') -ne $dir }) -join ';'), 'ExpandString')
+            $key.Close()
+          } catch { $failures.Add("the documented removal failed: $($_.Exception.Message)") }
           if (Test-Path -LiteralPath $dir) { $failures.Add('the documented removal left the RAI folder') }
           $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
           if ($userPath -and ($userPath.Split(';') -contains $dir)) { $failures.Add('the documented removal left RAI on the PATH') }
@@ -262,11 +269,15 @@ jobs:
 
           RAI_NO_BROWSER=1 RAI_PORT=18090 rai-studio > studio.log 2>&1 &
           studio=$!
+          # Whole bodies into variables: `curl | grep -q` under pipefail fails
+          # when grep stops reading at its match and curl cannot write the rest.
           for _ in $(seq 1 180); do
-            if curl -fsS http://127.0.0.1:18090/api/info 2>/dev/null | grep -q '"loaded":true'; then break; fi
+            info=$(curl -fsS http://127.0.0.1:18090/api/info 2>/dev/null || true)
+            case "$info" in *'"loaded":true'*) break ;; esac
             sleep 1
           done
-          curl -fsS http://127.0.0.1:18090/ | grep -q 'RAI Studio' || { cat studio.log; echo "::error::Studio did not come up"; exit 1; }
+          page=$(curl -fsS http://127.0.0.1:18090/ || true)
+          case "$page" in *'RAI Studio'*) ;; *) cat studio.log; echo "::error::Studio did not come up"; exit 1 ;; esac
           reply=$(curl -fsS -X POST -H 'Content-Type: application/json' \
                   -d "{\"message\": \"$QUESTION\", \"temperature\": 0, \"max_tokens\": 16}" \
                   http://127.0.0.1:18090/api/chat)
@@ -286,8 +297,8 @@ jobs:
           - { image: 'ubuntu:20.04', method: deb }
           - { image: 'ubuntu:22.04', method: deb }
           - { image: 'ubuntu:24.04', method: deb }
-          - { image: 'debian:11', method: deb }
           - { image: 'debian:12', method: deb }
+          - { image: 'debian:13', method: deb }
           - { image: 'fedora:latest', method: rpm }
           - { image: 'rockylinux:8', method: rpm }
           - { image: 'rockylinux:9', method: rpm }
@@ -378,11 +389,15 @@ jobs:
 
           RAI_NO_BROWSER=1 RAI_PORT=18090 rai-studio > studio.log 2>&1 &
           studio=$!
+          # Whole bodies into variables: `curl | grep -q` under pipefail fails
+          # when grep stops reading at its match and curl cannot write the rest.
           for _ in $(seq 1 180); do
-            if curl -fsS http://127.0.0.1:18090/api/info 2>/dev/null | grep -q '"loaded":true'; then break; fi
+            info=$(curl -fsS http://127.0.0.1:18090/api/info 2>/dev/null || true)
+            case "$info" in *'"loaded":true'*) break ;; esac
             sleep 1
           done
-          curl -fsS http://127.0.0.1:18090/ | grep -q 'RAI Studio' || { cat studio.log; echo "::error::Studio did not come up"; exit 1; }
+          page=$(curl -fsS http://127.0.0.1:18090/ || true)
+          case "$page" in *'RAI Studio'*) ;; *) cat studio.log; echo "::error::Studio did not come up"; exit 1 ;; esac
           reply=$(curl -fsS -X POST -H 'Content-Type: application/json' \
                   -d "{\"message\": \"$QUESTION\", \"temperature\": 0, \"max_tokens\": 16}" \
                   http://127.0.0.1:18090/api/chat)

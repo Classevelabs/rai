@@ -282,6 +282,9 @@ versioning for its pre-1.0 releases.
 - A reply may run to 512 tokens unless you ask for another limit, in
   `rai run` (was 64) and in `/api/chat` (was 200), so ordinary answers are no
   longer cut off partway. A model still stops as soon as it ends its turn.
+- `rai run` prints only the reply when it uses a chat template, instead of
+  the prompt with the reply glued to its last word. With
+  `--chat-template none` it still prints the prompt and its continuation.
 - Every download is installed and used on clean machines before a release is
   published: Windows Server 2022 and 2025 with the Visual C++ runtime
   removed, macOS on Apple Silicon and Intel, and ten Linux distributions from

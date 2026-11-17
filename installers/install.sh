@@ -32,6 +32,12 @@ NO_PATH="${RAI_NO_PATH:-0}"
 say() { printf '%s\n' "$*"; }
 die() { printf '\nRAI installer: %s\n\n' "$*" >&2; exit 1; }
 
+# Every desktop has these; a minimal container image may not, and saying so
+# beats a "command not found" halfway through.
+for tool in awk tar; do
+    command -v "$tool" >/dev/null 2>&1 || die "this system has no $tool. Install it with your package manager (for awk: gawk or mawk), then run this again."
+done
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --model) shift; [ $# -gt 0 ] || die "--model needs a name"; MODEL="$1" ;;

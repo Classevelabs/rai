@@ -364,8 +364,13 @@ pub fn run(args: &RunArgs) -> Result<()> {
     let mut rng = rand::rngs::StdRng::seed_from_u64(generation.seed);
     let mut all_tokens = prompt_tokens.clone();
 
-    print!("{}", generation.prompt);
-    io::stdout().flush()?;
+    // Plain text is a completion: the prompt is printed and the model's
+    // continuation follows it. A chat reply is printed alone, so a question
+    // is answered on its own line rather than glued to its last word.
+    if format.builtin() == Some(ChatTemplate::None) {
+        print!("{}", generation.prompt);
+        io::stdout().flush()?;
+    }
 
     // Which token ids end generation: the format's, which covers the
     // checkpoint's own end-of-sequence ids, every family's end markers among

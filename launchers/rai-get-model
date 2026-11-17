@@ -38,6 +38,8 @@ WHAT=""
 say() { printf '%s\n' "$*"; }
 die() { printf '\nrai-get-model: %s\n\n' "$*" >&2; exit 1; }
 
+command -v awk >/dev/null 2>&1 || die "this system has no awk. Install it with your package manager (gawk or mawk), then run this again."
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --keep) KEEP=1 ;;

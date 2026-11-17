@@ -70,9 +70,12 @@ install -d "$deb/DEBIAN"
     printf 'Architecture: amd64\n'
     printf 'Maintainer: ClassEve <security@classeve.com>\n'
     printf 'Installed-Size: %s\n' "$size_kb"
-    # glibc 2.28 is the floor the release is built for; curl fetches models.
-    printf 'Depends: libc6 (>= 2.28)\n'
-    printf 'Recommends: curl, xdg-utils\n'
+    # glibc 2.28 is the floor the release is built for; rai-get-model reads
+    # its model list with awk and downloads with curl. xdg-utils only opens a
+    # browser, which a desktop already has and a server does not need.
+    printf 'Depends: libc6 (>= 2.28), awk\n'
+    printf 'Recommends: curl\n'
+    printf 'Suggests: xdg-utils\n'
     printf 'Homepage: https://github.com/Classevelabs/rai\n'
     printf 'Description: %s\n' "$summary"
     printf '%s\n' "$long" | sed 's/^/ /'
@@ -95,6 +98,9 @@ URL:            https://github.com/Classevelabs/rai
 # requirement is stated rather than scanned.
 AutoReqProv:    no
 Requires:       glibc >= 2.28
+# rai-get-model reads its model list with awk; a minimal openSUSE has none.
+# gawk is the package every rpm distribution names it.
+Requires:       gawk
 Recommends:     curl
 
 %description
