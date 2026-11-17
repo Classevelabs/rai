@@ -78,7 +78,8 @@ VERSION="${VERSION#v}"
 # trailing slash would put the staging folder inside the install folder.
 absolute() {
     p="$1"
-    case "$p" in "~") p="$HOME" ;; "~/"*) p="$HOME/${p#??}" ;; esac
+    tilde='~'
+    case "$p" in "$tilde") p="$HOME" ;; "$tilde"/*) p="$HOME/${p#??}" ;; esac
     case "$p" in /*) ;; *) p="$(pwd)/$p" ;; esac
     while [ "${#p}" -gt 1 ] && [ "${p%/}" != "$p" ]; do p="${p%/}"; done
     printf '%s' "$p"
@@ -196,8 +197,17 @@ unpacked="$tmp/rai-$VERSION-$target"
 # is ever replaced. A file named `rai` proves nothing: after one install,
 # ~/.local/bin holds one, and --dir pointed there must not empty it.
 MARK=.rai-install
-# .DS_Store is what Finder leaves in a folder it has merely shown.
-if [ -d "$DIR" ] && [ ! -f "$DIR/$MARK" ] && [ -n "$(ls -A "$DIR" 2>/dev/null | grep -v '^\.DS_Store$')" ]; then
+# Whether folder $1 holds anything but .DS_Store, which Finder leaves in a
+# folder it has merely shown.
+holds_files() {
+    for entry in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        [ "${entry##*/}" = .DS_Store ] && continue
+        return 0
+    done
+    return 1
+}
+if [ -d "$DIR" ] && [ ! -f "$DIR/$MARK" ] && holds_files "$DIR"; then
     die "$DIR already holds other files and is not an earlier RAI install. Choose an empty folder with --dir."
 fi
 
