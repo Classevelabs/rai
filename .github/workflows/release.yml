@@ -254,7 +254,7 @@ jobs:
 
           - Ubuntu and Debian: `sudo apt install ./rai_@VERSION@_amd64.deb`
           - Fedora and RHEL: `sudo dnf install ./rai-@VERSION@-1.x86_64.rpm`
-          - openSUSE: `sudo zypper install ./rai-@VERSION@-1.x86_64.rpm`
+          - openSUSE: `sudo zypper install --allow-unsigned-rpm ./rai-@VERSION@-1.x86_64.rpm`
 
           Then open **RAI Studio** from the Start menu or your app menu, or run `rai-studio`. The first time, it offers to download a model to chat with. The archives (`.zip`, `.tar.gz`) hold the same program for running without installing.
 

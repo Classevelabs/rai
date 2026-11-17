@@ -18,15 +18,18 @@ The buttons along the left edge open its three screens:
 - **Library** lists the models on this computer. Pick one to load it.
 - **Convert** turns a model folder you downloaded yourself into a RAI model.
   **Check** tells you first whether it will work, before anything is written.
-  Given just a file name, the model is saved in your RAI folder (`~/RAI`, or
-  `%USERPROFILE%\RAI` on Windows).
+  Studio suggests saving it as `models/<name>/<name>-q4.raimodel` in your RAI
+  folder (`~/RAI`, or `%USERPROFILE%\RAI` on Windows): one folder per model,
+  where RAI finds it. Keep that form; two models in one folder would share
+  one tokenizer file, and the second conversion is refused.
 - **Chat** is where you talk to the model. Conversations stay in the chat
   list until you delete them, and **Stop** ends a reply early.
 
 Along the top of the chat, the model menu switches models and the settings
 button opens **Tuning**: how long a reply may be (**Max new tokens**), how
 adventurous the wording is (**Temperature**; 0 always picks the most likely
-word), the chat format and the context window. The system monitor button
+word), the chat format and the context window, which is how much of the
+conversation the model can see at once. The system monitor button
 beside it shows your processor, memory and how much of the model's context
 the conversation has used.
 
@@ -47,6 +50,9 @@ Ask one question:
 ```bash
 rai run ~/RAI/models/qwen2.5-1.5b/qwen2.5-1.5b-q4.raimodel --prompt "Give me three names for a cat."
 ```
+
+On Windows, in PowerShell, the same model is at
+`"$env:USERPROFILE\RAI\models\qwen2.5-1.5b\qwen2.5-1.5b-q4.raimodel"`.
 
 | Option | What it changes |
 | --- | --- |
@@ -107,7 +113,7 @@ The answer, shortened to the fields most programs need:
 
 | Field | Meaning |
 | --- | --- |
-| `messages` | The conversation: `role` is `system`, `user` or `assistant`, and the last one is `user` |
+| `messages` | The conversation: `role` is `user` or `assistant`, and the last one is `user` |
 | `message` | Instead of `messages`, a single question |
 | `temperature` | 0 to 2. Default 0.7 |
 | `max_tokens` | Longest reply allowed. Default 512, or what the context has room for if that is less |
@@ -132,7 +138,8 @@ visit can't use your model behind your back. Bodies are limited to 64 KB.
 
 ## Faster replies with a draft model
 
-With two models that share a tokenizer, a small one can guess a few words
+With two models that share a tokenizer (the same vocabulary, as models of
+one family do), a small one can guess a few words
 ahead and the large one checks them, which can make the large one faster:
 
 ```bash

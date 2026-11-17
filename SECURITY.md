@@ -47,12 +47,13 @@ fixture.
   GitHub releases and refuse any file whose SHA-256 differs from the release's
   `SHA256SUMS`. Every release file also carries a signed build-provenance
   attestation (`gh attestation verify <file> --repo Classevelabs/rai`).
-- `rai-get-model` downloads over HTTPS from huggingface.co. A starter model is
+- `rai-get-model` downloads over HTTPS from huggingface.co, or from the
+  address in `HF_ENDPOINT` if you set one for a mirror. A starter model is
   pinned to one commit, and each of its files must match a SHA-256 recorded in
   `launchers/models.tsv` before it is converted. Any other repository is taken
   as Hugging Face serves it, and `rai check` reads its configuration before
-  the weights are fetched. A `HF_TOKEN` you set is sent to huggingface.co
-  only.
+  the weights are fetched. A `HF_TOKEN` you set is sent only to that same
+  address.
 - Only `.safetensors` weights are read. Pickle formats (`pytorch_model.bin`,
   `.pt`, `.pth`) are refused, because loading one can run code.
 

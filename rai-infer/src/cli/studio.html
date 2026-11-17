@@ -391,7 +391,7 @@ input:disabled,select:disabled,textarea:disabled{color:var(--fg-3);cursor:not-al
             </div>
             <p class="hint" id="ctxCost">Context is the KV-cache window baked into the file. The model's own keeps the window it was trained for; a smaller one saves memory at run time.</p>
             <div class="field" style="margin-top:var(--s3)"><span class="lbl">Output file</span>
-              <input type="text" id="out" placeholder="model-q4.raimodel" spellcheck="false"></div>
+              <input type="text" id="out" placeholder="models/my-model/my-model-q4.raimodel" spellcheck="false"></div>
           </div>
           <button class="btn" id="convertBtn" style="width:100%;justify-content:center" disabled>
             <svg viewBox="0 0 24 24"><path d="M12 3v11"/><path d="M8 10l4 4 4-4"/><path d="M4 17v3h16v-3"/></svg>Convert</button>
@@ -1667,8 +1667,11 @@ $("#inspectBtn").addEventListener("click",async()=>{
     bindNextStep();
     $("#convertBtn").disabled=!r.supported;
     if(r.supported&&!$("#out").value.trim()){
+      /* A folder of its own under models/, where the launchers and the library
+         look: two models side by side would share one tokenizer.json, and the
+         second conversion would be refused. */
       const base=source.replace(/[\\/]+$/,"").split(/[\\/]/).pop().toLowerCase();
-      $("#out").value=base+"-q4.raimodel";
+      $("#out").value="models/"+base+"/"+base+"-q4.raimodel";
     }
   }catch(e){
     const notLocal=e.status===501||/not a path on this machine/.test(e.message||"");

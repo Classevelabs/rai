@@ -14,7 +14,7 @@ losing them.
 - [Updating](#updating)
 - [Removing RAI](#removing-rai)
 
-If something goes wrong, [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)
+If something goes wrong, [docs/TROUBLESHOOTING.md](https://github.com/Classevelabs/rai/blob/main/docs/TROUBLESHOOTING.md)
 lists the usual problems and their fixes.
 
 ## Windows
@@ -95,7 +95,7 @@ sudo apt install ./rai_<version>_amd64.deb
 sudo dnf install ./rai-<version>-1.x86_64.rpm
 
 # openSUSE
-sudo zypper install ./rai-<version>-1.x86_64.rpm
+sudo zypper install --allow-unsigned-rpm ./rai-<version>-1.x86_64.rpm
 ```
 
 The package puts `rai`, `rai-studio` and `rai-get-model` in `/usr/bin` and adds
@@ -104,7 +104,8 @@ RAI Studio to the app menu.
 ## Without installing
 
 Each release also has a plain archive per platform. Unpack it anywhere and
-start RAI Studio from the `launchers` folder inside:
+start RAI Studio from the `launchers` folder inside. On a Mac, do the step
+below the table first.
 
 | Computer | Archive | Start |
 | --- | --- | --- |
@@ -116,8 +117,10 @@ start RAI Studio from the `launchers` folder inside:
 On an Apple Silicon Mac, take the Apple Silicon archive: the Intel one would
 run under translation and be slower.
 
-macOS holds back programs downloaded through a browser. If it says "rai"
-cannot be opened, allow the folder once, in Terminal:
+macOS holds back programs downloaded through a browser, and an archive
+unpacked in Finder passes that on: double-clicking `rai-studio.command` would
+only say it cannot be opened. Allow the unpacked folder once, in Terminal,
+before the first double-click:
 
 ```bash
 xattr -dr com.apple.quarantine /path/to/the/unpacked/folder
@@ -145,7 +148,7 @@ needs free space of about one and a half times the download. When it is done,
 it deletes the download and keeps only the converted model.
 
 Any other model from a supported family works the same way, by its Hugging
-Face name. [docs/MODELS.md](docs/MODELS.md) has the list.
+Face name. [docs/MODELS.md](https://github.com/Classevelabs/rai/blob/main/docs/MODELS.md) has the list.
 
 ```bash
 rai-get-model HuggingFaceTB/SmolLM2-1.7B-Instruct
@@ -164,7 +167,8 @@ shasum -a 256 --ignore-missing -c SHA256SUMS     # macOS
 
 On Windows, in PowerShell, compare the output of
 `Get-FileHash <file> -Algorithm SHA256` with the line for that file in
-`SHA256SUMS`. If they differ, delete the download and don't run it.
+`SHA256SUMS`; capital letters don't matter. If they differ in anything else,
+delete the download and don't run it.
 
 Each file also carries a signed build record that ties it to this repository
 and the exact commit it was built from. With the

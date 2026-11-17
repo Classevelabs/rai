@@ -2,8 +2,11 @@
 
 You need [Rust](https://rustup.rs) 1.87 or newer. The repository pins 1.95.0
 in `rust-toolchain.toml`, and `rustup` fetches it the first time you build.
-Nothing else: no C compiler for the parts RAI ships, no Python, no system
-libraries.
+Rust links with the system's own tools: on Windows, Microsoft's C++ Build
+Tools (the "Desktop development with C++" workload, which `rustup` offers to
+install); on macOS, the Xcode Command Line Tools (`xcode-select --install`);
+on Linux, gcc or clang from your package manager. Nothing else: no Python and
+no other libraries.
 
 ## From a checkout
 

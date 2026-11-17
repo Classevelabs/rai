@@ -11,17 +11,16 @@ Windows shows this for programs it hasn't seen often. Choose **More info**,
 then **Run anyway**. To check the file first, compare its fingerprint with the
 release's `SHA256SUMS` ([INSTALL.md](../INSTALL.md#check-your-download)).
 
-### "rai" cannot be opened (macOS)
+### "rai-studio.command" cannot be opened, or "Apple could not verify" it (macOS)
 
-macOS holds back programs downloaded through a browser. The terminal installer
-avoids this. For an archive you unpacked yourself, allow the folder once:
+macOS holds back programs downloaded through a browser, and an archive
+unpacked in Finder passes that on. The terminal installer avoids this. For an
+archive you unpacked yourself, allow the folder once in Terminal, then
+double-click again:
 
 ```bash
 xattr -dr com.apple.quarantine /path/to/the/unpacked/folder
 ```
-
-RAI Studio's launcher prints this command, with your folder filled in, when it
-sees the problem.
 
 ### `rai: command not found`, or "'rai' is not recognized"
 
@@ -50,7 +49,7 @@ The file lost its "can run" mark on the way, which happens when an archive is
 unpacked by some tools. Restore it once:
 
 ```bash
-chmod +x launchers/rai-studio.sh launchers/rai-studio.command launchers/rai-get-model
+chmod +x rai launchers/rai-studio.sh launchers/rai-studio.command launchers/rai-get-model
 ```
 
 ## Getting a model

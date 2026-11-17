@@ -31,7 +31,7 @@ curl -fsSL https://github.com/Classevelabs/rai/releases/latest/download/install.
 ```
 
 Ubuntu, Debian, Fedora, RHEL and openSUSE can also use the `.deb` or `.rpm`
-package from the release page. [INSTALL.md](INSTALL.md) has every way to
+package from the release page. [INSTALL.md](https://github.com/Classevelabs/rai/blob/main/INSTALL.md) has every way to
 install, how to update and remove RAI, and what to do when something goes
 wrong.
 
@@ -42,15 +42,21 @@ in a terminal. The first time, it offers to download a model to talk to. Say
 yes, wait for the download, and the chat opens in your browser at
 <http://localhost:8090>.
 
-Prefer the terminal?
+Prefer the terminal? On macOS and Linux:
 
 ```bash
 rai-get-model qwen2.5-1.5b
 rai run ~/RAI/models/qwen2.5-1.5b/qwen2.5-1.5b-q4.raimodel --prompt "Why is the sky blue?"
 ```
 
-On Windows the model lands in `%USERPROFILE%\RAI\models` instead.
-[docs/USING.md](docs/USING.md) covers Studio, every command and the chat API.
+On Windows, in PowerShell:
+
+```powershell
+rai-get-model qwen2.5-1.5b
+rai run "$env:USERPROFILE\RAI\models\qwen2.5-1.5b\qwen2.5-1.5b-q4.raimodel" --prompt "Why is the sky blue?"
+```
+
+[docs/USING.md](https://github.com/Classevelabs/rai/blob/main/docs/USING.md) covers Studio, every command and the chat API.
 
 ## Models
 
@@ -72,7 +78,7 @@ text-only Gemma 3 sizes, Phi-3 mini 4k, OLMo 2, OLMoE, TinyLlama, SmolLM and
 their fine-tunes. Give `rai-get-model` the model's name, such as
 `rai-get-model Qwen/Qwen2.5-3B-Instruct`; it reads the model's settings first
 and stops before the big download if RAI cannot run it.
-[docs/MODELS.md](docs/MODELS.md) lists what works, what doesn't and why.
+[docs/MODELS.md](https://github.com/Classevelabs/rai/blob/main/docs/MODELS.md) lists what works, what doesn't and why.
 
 ## What it needs
 
@@ -108,7 +114,7 @@ TinyLlama 1.1B model:
   in 82.6 seconds in 26 MB of memory, so even a 16 GB laptop converts models
   that size.
 
-[BENCHMARKS.md](BENCHMARKS.md) has the method and the full record, including
+[BENCHMARKS.md](https://github.com/Classevelabs/rai/blob/main/BENCHMARKS.md) has the method and the full record, including
 what 4-bit storage costs in accuracy.
 
 ## Commands
@@ -138,9 +144,9 @@ cargo build --release --locked -p classeve-rai-infer
 
 The engine is also a library on crates.io,
 [`classeve-rai-infer`](https://crates.io/crates/classeve-rai-infer).
-[docs/BUILDING.md](docs/BUILDING.md) covers building, the container image and
-using the library. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) explains how
-the engine is put together, and [CONTRIBUTING.md](CONTRIBUTING.md) how to send
+[docs/BUILDING.md](https://github.com/Classevelabs/rai/blob/main/docs/BUILDING.md) covers building, the container image and
+using the library. [docs/ARCHITECTURE.md](https://github.com/Classevelabs/rai/blob/main/docs/ARCHITECTURE.md) explains how
+the engine is put together, and [CONTRIBUTING.md](https://github.com/Classevelabs/rai/blob/main/CONTRIBUTING.md) how to send
 a change.
 
 The workspace holds two crates that make up RAI, `rai-infer` (the engine and
@@ -150,14 +156,14 @@ that belong to a separate memory service and are not part of RAI: `rai-core`,
 
 ## Help
 
-- Something not working: [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md),
-  then [SUPPORT.md](SUPPORT.md).
-- Security issues: [SECURITY.md](SECURITY.md). Please don't file them as
+- Something not working: [docs/TROUBLESHOOTING.md](https://github.com/Classevelabs/rai/blob/main/docs/TROUBLESHOOTING.md),
+  then [SUPPORT.md](https://github.com/Classevelabs/rai/blob/main/SUPPORT.md).
+- Security issues: [SECURITY.md](https://github.com/Classevelabs/rai/blob/main/SECURITY.md). Please don't file them as
   public issues.
-- What changed in each release: [CHANGELOG.md](CHANGELOG.md).
-- Why RAI behaves the way it does: [BEHAVIOUR-DECISIONS.md](BEHAVIOUR-DECISIONS.md).
+- What changed in each release: [CHANGELOG.md](https://github.com/Classevelabs/rai/blob/main/CHANGELOG.md).
+- Why RAI behaves the way it does: [BEHAVIOUR-DECISIONS.md](https://github.com/Classevelabs/rai/blob/main/BEHAVIOUR-DECISIONS.md).
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE).
+Apache License 2.0. See [LICENSE](https://github.com/Classevelabs/rai/blob/main/LICENSE).
 Copyright 2025-2026 ClassEve.
