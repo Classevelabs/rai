@@ -56,8 +56,10 @@ VIAddVersionKey "LegalCopyright" "${COMPANYNAME}"
 !include MUI2.nsh
 
 !define MUI_ABORTWARNING
+; No folder page: RAI installs for one person, in the folder Windows keeps for
+; that, and a typed folder such as D:\Tools would be one the uninstaller later
+; had to tell apart from the user's own files.
 !insertmacro MUI_PAGE_WELCOME
-!insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 !define MUI_FINISHPAGE_RUN "$INSTDIR\rai-studio.cmd"
 !define MUI_FINISHPAGE_RUN_TEXT "Open RAI Studio (it offers to download a model to chat with)"
@@ -76,6 +78,29 @@ VIAddVersionKey "LegalCopyright" "${COMPANYNAME}"
         MessageBox MB_OK|MB_ICONEXCLAMATION "RAI Setup is already running. Finish that one first." /SD IDOK
         Abort
     ${EndIf}
+!macroend
+
+; The files RAI installs, which an update replaces and the uninstaller
+; removes: only these, so anything else in the folder is left alone. The
+; release workflow fails the build if the payload holds a file this list does
+; not name. rai-convert.exe, rai-generate.exe, rai-chat.exe and RUNNING.txt
+; come with install.ps1, which uses the same folder.
+!macro RAI_DELETE_FILES
+    Delete "$INSTDIR\rai.exe"
+    Delete "$INSTDIR\rai-convert.exe"
+    Delete "$INSTDIR\rai-generate.exe"
+    Delete "$INSTDIR\rai-chat.exe"
+    Delete "$INSTDIR\rai-studio.cmd"
+    Delete "$INSTDIR\rai-get-model.cmd"
+    Delete "$INSTDIR\rai-get-model-windows.ps1"
+    Delete "$INSTDIR\models.tsv"
+    Delete "$INSTDIR\LICENSE"
+    Delete "$INSTDIR\NOTICE"
+    Delete "$INSTDIR\THIRD-PARTY-NOTICES.md"
+    Delete "$INSTDIR\README.md"
+    Delete "$INSTDIR\INSTALL.md"
+    Delete "$INSTDIR\RUNNING.txt"
+    Delete "$INSTDIR\.rai-install"
 !macroend
 
 ; PATH is edited through the registry with its %VARIABLES% left unexpanded,
@@ -110,20 +135,20 @@ Section "Install"
         ${EndIf}
     ${EndIf}
 
-    ; An upgrade starts from an empty folder, so no file a newer version
-    ; dropped lingers. Guarded on RAI's own files: this only ever removes a
-    ; folder that is demonstrably an earlier RAI, never a path typed by
-    ; mistake. Models are in %USERPROFILE%\RAI and are not touched.
-    ${If} ${FileExists} "$INSTDIR\uninstall.exe"
-    ${OrIf} ${FileExists} "$INSTDIR\rai-studio.cmd"
-        RMDir /r "$INSTDIR"
-    ${EndIf}
+    ; An update replaces RAI's own files, so none a newer version dropped
+    ; lingers, and leaves anything else in the folder alone. Models are in
+    ; %USERPROFILE%\RAI and are not touched.
+    !insertmacro RAI_DELETE_FILES
 
     SetOutPath "$INSTDIR"
     ; rai.exe last: started while Setup is still writing, it never finds the
     ; launchers and model list missing.
     File /r /x "rai.exe" "${PAYLOAD_DIR}\*.*"
     File "${PAYLOAD_DIR}\rai.exe"
+    ; The mark install.ps1 looks for before it replaces this folder.
+    FileOpen $0 "$INSTDIR\.rai-install" w
+    FileWrite $0 "${VERSION}$\r$\n"
+    FileClose $0
 
     CreateDirectory "$SMPROGRAMS\${APPNAME}"
     CreateShortcut "$SMPROGRAMS\${APPNAME}\RAI Studio.lnk" "$INSTDIR\rai-studio.cmd" "" "$INSTDIR\rai.exe" 0
@@ -156,6 +181,18 @@ Section "Install"
 SectionEnd
 
 Section "Uninstall"
+    ; A running rai.exe (RAI Studio left open) cannot be removed. Say so, rather
+    ; than removing the Apps entry and leaving the program behind.
+  un_check_running:
+    ClearErrors
+    ${If} ${FileExists} "$INSTDIR\rai.exe"
+        Delete "$INSTDIR\rai.exe"
+        ${If} ${Errors}
+            MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "RAI is running (RAI Studio may be open). Close it, then choose Retry." /SD IDCANCEL IDRETRY un_check_running
+            Abort
+        ${EndIf}
+    ${EndIf}
+
     Delete "$SMPROGRAMS\${APPNAME}\RAI Studio.lnk"
     Delete "$SMPROGRAMS\${APPNAME}\Uninstall RAI.lnk"
     RMDir "$SMPROGRAMS\${APPNAME}"
@@ -176,6 +213,10 @@ Section "Uninstall"
       keep_models:
     ${EndIf}
 
-    RMDir /r "$INSTDIR"
+    ; RAI's files only, then the folder if nothing else is in it: a folder the
+    ; user also keeps other things in keeps them.
+    !insertmacro RAI_DELETE_FILES
+    Delete "$INSTDIR\uninstall.exe"
+    RMDir "$INSTDIR"
     DeleteRegKey HKCU "${UNINSTKEY}"
 SectionEnd

@@ -205,7 +205,7 @@ fn the_windows_launcher_starts_the_page_without_a_model() {
     for name in [
         "rai-studio.cmd",
         "rai-get-model.cmd",
-        "rai-get-model.ps1",
+        "rai-get-model-windows.ps1",
         "models.tsv",
     ] {
         std::fs::copy(launcher_dir().join(name), root.join("launchers").join(name))

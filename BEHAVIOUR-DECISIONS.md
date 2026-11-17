@@ -46,9 +46,30 @@ clean-room runs, which download through the script on every platform.
 **If regressed.** `rai` gains a network dependency and an attack surface its
 users were told it does not have.
 
+## 2026-11-17 — An installer replaces only a folder it made, and removes only its own files
+
+**Decision.** `install.sh` and `install.ps1` replace an install folder only if
+it is empty or carries `.rai-install`, which they and Setup write. Setup has
+no folder page, and both its updates and its uninstaller delete the files it
+lists in `RAI_DELETE_FILES` and nothing else; `dist.yml` fails if Setup's
+payload holds a file the list does not name. The launchers start `rai serve`
+in RAI's home folder, not beside the program, so a model Studio converts to a
+bare file name is never written where an update or uninstall would remove it.
+
+**Symptom.** A file named `rai` was taken as proof of an earlier install, so
+`--dir ~/.local/bin` after a first install would have emptied that folder;
+Setup's uninstaller ran `RMDir /r` on whatever folder had been chosen,
+`D:\Tools` included; and a model converted in Studio landed in the install
+folder.
+
+**Verified against.** The clean room's update-in-place and refusal checks
+(`~/.local/bin` must come out unchanged) and Setup's uninstall checks.
+
+**If regressed.** An update or uninstall deletes a user's files.
+
 ## 2026-11-17 — The Windows scripts hash and unzip through .NET
 
-**Decision.** `install.ps1` and `rai-get-model.ps1` compute SHA-256 with
+**Decision.** `install.ps1` and `rai-get-model-windows.ps1` compute SHA-256 with
 `System.Security.Cryptography.SHA256` and unzip with
 `System.IO.Compression.ZipFile`, not `Get-FileHash` and `Expand-Archive`; the
 `.cmd` launchers clear `PSModulePath` before starting Windows PowerShell.

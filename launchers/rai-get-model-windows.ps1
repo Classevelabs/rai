@@ -97,18 +97,26 @@ if ($env:HF_TOKEN) { $Headers['Authorization'] = "Bearer $($env:HF_TOKEN)" }
 function Get-RepoFile([string]$Path, [string]$Target) {
     $url = "$Endpoint/$Repo/resolve/$Revision/$Path"
     $part = "$Target.part"
+    $code = $null
     if ($Curl) {
         $curlArgs = @('-L', '-#', '-C', '-', '--retry', '5', '--retry-delay', '5', '-w', '%{http_code}', '-o', $part)
         if ($env:HF_TOKEN) { $curlArgs += @('-H', "Authorization: Bearer $($env:HF_TOKEN)") }
         $code = & $Curl @curlArgs $url
-        if ($LASTEXITCODE -ne 0) { Fail "downloading $Path was interrupted. Run the same command again to resume." }
-    } else {
-        # Windows before 1803 has no curl.exe; this way cannot resume.
+        if ($LASTEXITCODE -ne 0 -and -not ($code -match '^[45]\d\d$')) {
+            # curl.exe checks certificate revocation, which fails behind some
+            # company proxies, where .NET downloads fine: one try that way.
+            Say "curl stopped (exit code $LASTEXITCODE). Trying once more another way; this one starts $Path over."
+            $code = $null
+        }
+    }
+    if (-not $code) {
+        # Windows before 1803 has no curl.exe, and this way cannot resume.
         try {
             Invoke-WebRequest -Uri $url -OutFile $part -Headers $Headers -UseBasicParsing
             $code = '200'
         } catch {
-            $code = [string][int]$_.Exception.Response.StatusCode
+            if ($_.Exception.Response) { $code = [string][int]$_.Exception.Response.StatusCode }
+            else { Fail "downloading $Path failed: $($_.Exception.Message) Check the connection and run the same command again." }
         }
     }
     switch -regex ($code) {
@@ -202,6 +210,13 @@ if (-not $Pinned) {
 
 # --- disk space ---------------------------------------------------------------------
 $need = [int64](($Files | Measure-Object Bytes -Sum).Sum * 1.4)
+# What an earlier, interrupted run already downloaded needs no more room.
+foreach ($file in $Files) {
+    $done = Join-Path $DownloadDir $file.Path
+    foreach ($candidate in $done, "$done.part") {
+        if (Test-Path -LiteralPath $candidate) { $need -= (Get-Item -LiteralPath $candidate).Length }
+    }
+}
 $drive = $null
 try {
     $drive = New-Object System.IO.DriveInfo ([System.IO.Path]::GetPathRoot((Resolve-Path -LiteralPath $RaiHome).Path))

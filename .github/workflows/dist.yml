@@ -325,8 +325,16 @@ jobs:
           $payload = 'dist/setup'
           New-Item -ItemType Directory -Force -Path $payload | Out-Null
           Copy-Item target/release/rai.exe, launchers/rai-studio.cmd, launchers/rai-get-model.cmd,
-                    launchers/rai-get-model.ps1, launchers/models.tsv, LICENSE, NOTICE,
+                    launchers/rai-get-model-windows.ps1, launchers/models.tsv, LICENSE, NOTICE,
                     THIRD-PARTY-NOTICES.md, README.md, INSTALL.md -Destination $payload
+          # Setup removes the files it lists and nothing else, so a file it
+          # installs without listing would outlive every uninstall.
+          $nsi = Get-Content -Raw -LiteralPath installers/windows/rai.nsi
+          foreach ($file in Get-ChildItem -LiteralPath $payload -File) {
+            if (-not $nsi.Contains("Delete `"`$INSTDIR\$($file.Name)`"")) {
+              throw "installers/windows/rai.nsi installs $($file.Name) but never removes it: add it to RAI_DELETE_FILES"
+            }
+          }
 
           choco install nsis --version=3.12.0 --allow-downgrade -y --no-progress
           if ($LASTEXITCODE -ne 0) { throw "choco install nsis failed with exit code $LASTEXITCODE" }

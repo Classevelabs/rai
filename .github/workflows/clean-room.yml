@@ -133,7 +133,7 @@ jobs:
               Write-Host "Studio's API answered: $text"
               if ($text -notmatch $env:EXPECT) { return "Studio's API did not answer $($env:EXPECT)" }
               return $null
-            } finally { if (-not $server.HasExited) { $server.Kill() } }
+            } finally { if (-not $server.HasExited) { $server.Kill(); [void]$server.WaitForExit(30000) } }
           }
 
           # The one-line installer, from this run's files or from the release.
@@ -152,7 +152,7 @@ jobs:
           $installed = "$env:LOCALAPPDATA\Programs\RAI"
           $p = Start-Process -FilePath $setup.FullName -ArgumentList '/S' -Wait -PassThru
           if ($p.ExitCode -ne 0) { $failures.Add("Setup /S exited $($p.ExitCode)") }
-          foreach ($file in 'rai.exe', 'rai-studio.cmd', 'rai-get-model.cmd', 'rai-get-model.ps1', 'models.tsv', 'uninstall.exe') {
+          foreach ($file in 'rai.exe', 'rai-studio.cmd', 'rai-get-model.cmd', 'rai-get-model-windows.ps1', 'models.tsv', 'uninstall.exe') {
             if (-not (Test-Path -LiteralPath (Join-Path $installed $file))) { $failures.Add("Setup did not install $file") }
           }
           $r = Run (Join-Path $installed 'rai.exe') @('--version') $windowsPath
@@ -187,6 +187,8 @@ jobs:
           Write-Host $r.out; Write-Host $r.err
           if ($r.code -ne 0) { $failures.Add("the one-line installer exited $($r.code)") }
           $rai = Join-Path $installed 'rai.exe'
+          $resolved = Run $ps51 @('-NoProfile', '-Command', '(Get-Command rai-get-model).Source') "$windowsPath;$installed"
+          if ($resolved.out.Trim() -notlike '*\rai-get-model.cmd') { $failures.Add("typed in PowerShell, rai-get-model runs '$($resolved.out.Trim())', not rai-get-model.cmd") }
           $model = "$env:USERPROFILE\RAI\models\$env:MODEL\$env:MODEL-q4.raimodel"
           if (-not (Test-Path -LiteralPath $model)) { $failures.Add("no converted model at $model") }
           else {
@@ -370,6 +372,29 @@ jobs:
               echo "$HOME/.local/bin" >> "$GITHUB_PATH"
               ;;
           esac
+
+      - name: The install script updates in place and refuses a folder that is not RAI's
+        if: matrix.method == 'script'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$SOURCE" = artifact ]; then
+            again() { RAI_INSTALL_FROM="$PWD/dist" sh dist/install.sh --no-model "$@" < /dev/null; }
+          elif [ -n "$TAG" ]; then
+            again() { curl -fsSL "$REPO_URL/releases/download/$TAG/install.sh" | sh -s -- --version "$TAG" --no-model "$@"; }
+          else
+            again() { curl -fsSL "$REPO_URL/releases/latest/download/install.sh" | sh -s -- --no-model "$@"; }
+          fi
+          # An update over the install made above.
+          again
+          test -f "$HOME/.local/share/rai/.rai-install"
+          "$HOME/.local/bin/rai" --version
+          # ~/.local/bin holds a file named rai now; it must never be emptied.
+          before=$(ls -A "$HOME/.local/bin" | sort)
+          if again --dir "$HOME/.local/bin"; then echo "::error::the installer took over ~/.local/bin"; exit 1; fi
+          after=$(ls -A "$HOME/.local/bin" | sort)
+          [ "$before" = "$after" ] || { echo "::error::a refused install changed ~/.local/bin"; exit 1; }
+          echo "updated in place, and refused a folder that is not RAI's"
 
       - name: Download a model with rai-get-model
         shell: bash

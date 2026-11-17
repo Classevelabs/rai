@@ -31,6 +31,24 @@ NO_PATH="${RAI_NO_PATH:-0}"
 
 say() { printf '%s\n' "$*"; }
 die() { printf '\nRAI installer: %s\n\n' "$*" >&2; exit 1; }
+# From a function, not from the comment above: piped into sh, $0 is "sh".
+usage() {
+    cat <<'USAGE'
+Install RAI on Linux or macOS:
+
+  curl -fsSL https://github.com/Classevelabs/rai/releases/latest/download/install.sh | sh
+  curl -fsSL https://github.com/Classevelabs/rai/releases/latest/download/install.sh | sh -s -- [options]
+
+  --model NAME   also download this starter model (qwen2.5-0.5b, qwen2.5-1.5b, qwen2.5-7b)
+  --no-model     do not offer a model
+  --version X    install release X instead of the latest (for example 0.2.6)
+  --dir DIR      install into DIR (default: ~/.local/share/rai)
+  --no-path      do not add RAI to your PATH
+
+The same as environment variables: RAI_INSTALL_MODEL, RAI_NO_MODEL=1,
+RAI_VERSION, RAI_INSTALL_DIR, RAI_NO_PATH=1.
+USAGE
+}
 
 # Every desktop has these; a minimal container image may not, and saying so
 # beats a "command not found" halfway through.
@@ -48,12 +66,25 @@ while [ $# -gt 0 ]; do
         --dir) shift; [ $# -gt 0 ] || die "--dir needs a folder"; DIR="$1" ;;
         --dir=*) DIR="${1#--dir=}" ;;
         --no-path) NO_PATH=1 ;;
-        -h|--help) sed -n '2,19p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) usage; exit 0 ;;
         *) die "unknown option: $1" ;;
     esac
     shift
 done
 VERSION="${VERSION#v}"
+
+# Absolute, with no trailing slash: `--dir=~/x` arrives with its ~ unexpanded,
+# a relative folder would leave the links in BIN pointing nowhere, and a
+# trailing slash would put the staging folder inside the install folder.
+absolute() {
+    p="$1"
+    case "$p" in "~") p="$HOME" ;; "~/"*) p="$HOME/${p#??}" ;; esac
+    case "$p" in /*) ;; *) p="$(pwd)/$p" ;; esac
+    while [ "${#p}" -gt 1 ] && [ "${p%/}" != "$p" ]; do p="${p%/}"; done
+    printf '%s' "$p"
+}
+DIR=$(absolute "$DIR")
+BIN=$(absolute "$BIN")
 
 # --- which build this computer needs -----------------------------------------
 os=$(uname -s)
@@ -123,10 +154,14 @@ if [ -z "$VERSION" ]; then
         latest=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$REPO_URL/releases/latest") || latest=""
         VERSION=${latest##*/v}
     else
-        latest=$(wget -S --spider "$REPO_URL/releases/latest" 2>&1 | sed -n 's/^ *[Ll]ocation: .*\/tag\/v\(.*\)$/\1/p' | tail -n 1)
+        # GNU wget follows the redirect and logs "Location: <url> [following]".
+        latest=$(wget -S --spider "$REPO_URL/releases/latest" 2>&1 | sed -n 's/^ *[Ll]ocation: .*\/tag\/v\([^ ]*\).*$/\1/p' | tail -n 1)
         VERSION="$latest"
     fi
 fi
+case "$VERSION" in
+    *[!0-9A-Za-z.-]*) VERSION="" ;;
+esac
 case "$VERSION" in
     [0-9]*.[0-9]*.[0-9]*) ;;
     *) die "could not find out the latest RAI version. Name one with --version, for example --version 0.2.6" ;;
@@ -156,19 +191,36 @@ tar -xzf "$tmp/$archive" -C "$tmp"
 unpacked="$tmp/rai-$VERSION-$target"
 [ -f "$unpacked/rai" ] || die "the archive has no rai program in it."
 
-# Replace any earlier install in one move, so a failure leaves the old one.
-# Only a folder that is empty or holds a previous RAI is ever replaced: --dir
-# pointed at a folder of other things must not delete them.
-if [ -d "$DIR" ] && [ ! -f "$DIR/rai" ] && [ -n "$(ls -A "$DIR" 2>/dev/null)" ]; then
+# RAI's folder carries this file, and only an empty folder or one that has it
+# is ever replaced. A file named `rai` proves nothing: after one install,
+# ~/.local/bin holds one, and --dir pointed there must not empty it.
+MARK=.rai-install
+if [ -d "$DIR" ] && [ ! -f "$DIR/$MARK" ] && [ -n "$(ls -A "$DIR" 2>/dev/null)" ]; then
     die "$DIR already holds other files and is not an earlier RAI install. Choose an empty folder with --dir."
 fi
-mkdir -p "$(dirname -- "$DIR")"
-rm -rf "$DIR.new" "$DIR.old"
-cp -R "$unpacked" "$DIR.new"
-if [ -d "$DIR" ]; then mv "$DIR" "$DIR.old"; fi
-mv "$DIR.new" "$DIR"
-rm -rf "$DIR.old"
-chmod +x "$DIR/rai" "$DIR/launchers/rai-studio.sh" "$DIR/launchers/rai-get-model" 2>/dev/null || true
+
+# Staged beside the install and swapped in, so an interrupted install leaves
+# the earlier one working.
+parent=$(dirname -- "$DIR")
+mkdir -p "$parent" || die "cannot create $parent."
+stage=$(mktemp -d "$parent/.rai-new.XXXXXX") || die "cannot write to $parent."
+trap 'rm -rf "$tmp" "$stage"' EXIT INT TERM
+cp -R "$unpacked/." "$stage/"
+printf '%s\n' "$VERSION" > "$stage/$MARK"
+chmod 755 "$stage"
+chmod +x "$stage/rai" "$stage/launchers/rai-studio.sh" "$stage/launchers/rai-get-model" 2>/dev/null || true
+if [ -d "$DIR" ]; then
+    old="$parent/.rai-old.$$"
+    rm -rf "$old"
+    mv "$DIR" "$old" || die "could not move the earlier install in $DIR aside. Nothing was changed."
+    if ! mv "$stage" "$DIR"; then
+        mv "$old" "$DIR"
+        die "could not put the new install in place. The earlier one is back."
+    fi
+    rm -rf "$old"
+else
+    mv "$stage" "$DIR" || die "could not create $DIR."
+fi
 
 mkdir -p "$BIN"
 ln -sf "$DIR/rai" "$BIN/rai"
@@ -181,15 +233,37 @@ say "Installed: $DIR"
 on_path=0
 case ":$PATH:" in *":$BIN:"*) on_path=1 ;; esac
 if [ "$on_path" = 0 ] && [ "$NO_PATH" != 1 ]; then
+    profile=""
     case "${SHELL:-}" in
-        */zsh) profile="$HOME/.zshrc" ;;
-        */bash) if [ "$os" = Darwin ]; then profile="$HOME/.bash_profile"; else profile="$HOME/.bashrc"; fi ;;
+        # fish has a syntax of its own; the closing message gives its command.
+        */fish) ;;
+        */zsh) profile="${ZDOTDIR:-$HOME}/.zshrc" ;;
+        */bash)
+            if [ "$os" = Darwin ]; then
+                # A login bash reads the first of these that exists, so a new
+                # .bash_profile would hide an existing .profile.
+                profile="$HOME/.bash_profile"
+                if [ ! -f "$profile" ]; then
+                    if [ -f "$HOME/.bash_login" ]; then profile="$HOME/.bash_login"
+                    elif [ -f "$HOME/.profile" ]; then profile="$HOME/.profile"
+                    fi
+                fi
+            else
+                profile="$HOME/.bashrc"
+            fi
+            ;;
         *) profile="$HOME/.profile" ;;
     esac
     line="export PATH=\"$BIN:\$PATH\""
-    if ! grep -qsF "$line" "$profile"; then
-        printf '\n# Added by the RAI installer\n%s\n' "$line" >> "$profile"
-        say "Added $BIN to your PATH in $profile."
+    if [ -n "$profile" ] && ! grep -qsF "$line" "$profile"; then
+        # A plain command, not a { } block: a failed redirection on a block ends
+        # a POSIX shell, and a profile owned by root is common on macOS.
+        if printf '\n# Added by the RAI installer\n%s\n' "$line" 2>/dev/null >> "$profile"; then
+            say "Added $BIN to your PATH in $profile."
+        else
+            say "Could not write to $profile. Add this line to it yourself:"
+            say "  $line"
+        fi
     fi
 fi
 
@@ -239,6 +313,9 @@ say "  Get a model:            rai-get-model"
 say "  Everything else:        rai --help"
 if [ "$on_path" = 0 ]; then
     say ""
-    say "Open a new terminal first, or run:  export PATH=\"$BIN:\$PATH\""
+    case "${SHELL:-}" in
+        */fish) say "Add RAI to your PATH in fish with:  fish_add_path $BIN" ;;
+        *) say "Open a new terminal first, or run:  export PATH=\"$BIN:\$PATH\"" ;;
+    esac
 fi
 say ""

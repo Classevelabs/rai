@@ -104,24 +104,35 @@ fi
 fetch() {
     url="$ENDPOINT/$REPO/resolve/$REVISION/$1"
     part="$2.part"
+    status=0
     if [ "$FETCH" = curl ]; then
         if [ -n "${HF_TOKEN:-}" ]; then
             code=$(curl -L -# -C - --retry 5 --retry-delay 5 -w '%{http_code}' \
-                   -H "Authorization: Bearer $HF_TOKEN" -o "$part" "$url") || code="net"
+                   -H "Authorization: Bearer $HF_TOKEN" -o "$part" "$url") || status=$?
         else
             code=$(curl -L -# -C - --retry 5 --retry-delay 5 -w '%{http_code}' \
-                   -o "$part" "$url") || code="net"
+                   -o "$part" "$url") || status=$?
+        fi
+        # curl has said why on the line above; a status page it did receive
+        # is judged below, by its code.
+        if [ "$status" -ne 0 ]; then
+            case "$code" in [1-9][0-9][0-9]) [ "$code" -ge 400 ] || code="curl" ;; *) code="curl" ;; esac
         fi
     else
+        # wget exits 8 when the server answered with an error, which -q hides.
         if [ -n "${HF_TOKEN:-}" ]; then
-            wget -q --show-progress -c --header="Authorization: Bearer $HF_TOKEN" -O "$part" "$url" && code=200 || code=net
+            wget -q --show-progress -c --header="Authorization: Bearer $HF_TOKEN" -O "$part" "$url" || status=$?
         else
-            wget -q --show-progress -c -O "$part" "$url" && code=200 || code=net
+            wget -q --show-progress -c -O "$part" "$url" || status=$?
         fi
+        case "$status" in 0) code=200 ;; 8) code=refused ;; *) code=wget ;; esac
     fi
     case "$code" in
         200|206|416) mv -f "$part" "$2" ;;
-        net) die "downloading $1 was interrupted. Run the same command again to resume." ;;
+        curl) die "downloading $1 stopped (curl exit code $status, explained above). Run the same command again; it picks up where it stopped." ;;
+        wget) die "downloading $1 stopped (wget exit code $status). Check the connection, then run the same command again; it picks up where it stopped." ;;
+        refused) rm -f "$part"
+                 die "Hugging Face refused $1 of $REPO. If this model needs a login, accept its license at https://huggingface.co/$REPO, create a token at https://huggingface.co/settings/tokens and run again with HF_TOKEN=<your token>." ;;
         401|403) rm -f "$part"
                  die "Hugging Face refused $REPO ($code). This model needs a login:
     1. Open https://huggingface.co/$REPO and accept its license.
@@ -218,6 +229,18 @@ fi
 
 # --- disk space ------------------------------------------------------------------
 need_kb=$(printf '%s\n' "$FILES" | awk -F'\t' '{ s += $2 } END { printf "%d", s / 1024 * 1.4 }')
+# What an earlier, interrupted run already downloaded needs no more room.
+while IFS="$TAB" read -r path _ _; do
+    [ -n "$path" ] || continue
+    for f in "$DOWNLOAD_DIR/$path" "$DOWNLOAD_DIR/$path.part"; do
+        if [ -f "$f" ]; then
+            size=$(wc -c < "$f" | tr -d ' ')
+            need_kb=$((need_kb - size / 1024))
+        fi
+    done
+done <<FILELIST
+$FILES
+FILELIST
 have_kb=$(free_kb "$HOME_DIR")
 if [ -n "$have_kb" ] && [ "$need_kb" -gt 0 ] && [ "$have_kb" -lt "$need_kb" ]; then
     die "not enough free space in $HOME_DIR: the download and the converted model need about $((need_kb / 1048576 + 1)) GB, and $((have_kb / 1048576)) GB is free."

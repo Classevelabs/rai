@@ -155,7 +155,7 @@ jobs:
         shell: pwsh
         run: |
           $failed = $false
-          foreach ($file in 'installers/install.ps1', 'launchers/rai-get-model.ps1') {
+          foreach ($file in 'installers/install.ps1', 'launchers/rai-get-model-windows.ps1') {
             $errors = $null
             [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $file), [ref]$null, [ref]$errors)
             foreach ($e in $errors) { Write-Host "::error file=$file,line=$($e.Extent.StartLineNumber)::$($e.Message)"; $failed = $true }

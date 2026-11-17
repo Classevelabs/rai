@@ -179,7 +179,12 @@ gh attestation verify <file> --repo Classevelabs/rai
 Run the same installer again: the new Setup, the same PowerShell or terminal
 line, or the new package. It replaces the program and keeps your models.
 
+The folder RAI is installed in belongs to RAI, and an update replaces it.
+Keep your own files, models included, in `~/RAI` or anywhere else.
+
 ## Removing RAI
+
+Close RAI Studio first: a running copy keeps its files in use.
 
 **Windows, installed with Setup.** Open **Settings > Apps**, find **RAI**, and
 choose **Uninstall**. It asks whether to delete your downloaded models too;

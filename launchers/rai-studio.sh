@@ -41,7 +41,13 @@ fi
 PORT="${RAI_PORT:-8090}"
 URL="http://localhost:${PORT}/"
 RAI_HOME="${RAI_HOME:-${HOME}/RAI}"
+# Absolute: the server runs in another folder, where a relative path would
+# name something else.
+case "${RAI_HOME}" in /*) ;; *) RAI_HOME="$(pwd)/${RAI_HOME}" ;; esac
 export RAI_HOME
+if [ -n "${RAI_MODEL:-}" ]; then
+    case "${RAI_MODEL}" in /*) ;; *) RAI_MODEL="$(pwd)/${RAI_MODEL}" ;; esac
+fi
 
 die() {
     printf '\n%s\n\n' "$*" >&2
@@ -139,9 +145,11 @@ printf '  Waiting for the server, then opening your browser.\n'
 printf '  Press Ctrl+C to stop it.\n\n'
 
 # --- start the server and make sure it dies with this script ----------------
-# From the folder rai is in, so the page's library lists models kept beside it
-# as well as those under $RAI_HOME.
-cd -- "${ROOT}" || die "  Cannot enter ${ROOT}."
+# In RAI's home folder, not the install folder: a model Studio converts to a
+# bare file name lands here, beside the downloaded ones, and an update or
+# uninstall never touches it. The library lists the program's folder too.
+mkdir -p -- "${RAI_HOME}" 2>/dev/null || true
+cd -- "${RAI_HOME}" 2>/dev/null || cd -- "${ROOT}" || die "  Cannot enter ${RAI_HOME}."
 if [ -n "${MODEL}" ]; then
     "${RAI}" serve "${MODEL}" --port "${PORT}" &
 else
@@ -185,9 +193,11 @@ port_is_open() {
 deadline=$((SECONDS + 120))
 while [ "${SECONDS}" -lt "${deadline}" ]; do
     if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
-        wait "${SERVER_PID}"
-        code=$?
+        code=0
+        wait "${SERVER_PID}" || code=$?
         trap - EXIT
+        # Ctrl+C while it was still starting: the stop was asked for.
+        [ -n "${STOPPING:-}" ] && exit 0
         die "  rai serve exited with code ${code} before it was ready; see the messages above."
     fi
     if port_is_open; then

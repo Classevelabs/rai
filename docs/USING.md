@@ -18,6 +18,8 @@ The buttons along the left edge open its three screens:
 - **Library** lists the models on this computer. Pick one to load it.
 - **Convert** turns a model folder you downloaded yourself into a RAI model.
   **Check** tells you first whether it will work, before anything is written.
+  Given just a file name, the model is saved in your RAI folder (`~/RAI`, or
+  `%USERPROFILE%\RAI` on Windows).
 - **Chat** is where you talk to the model. Conversations stay in the chat
   list until you delete them, and **Stop** ends a reply early.
 

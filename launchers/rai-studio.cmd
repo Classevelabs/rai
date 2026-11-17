@@ -25,6 +25,10 @@ set "PSModulePath="
 set "HERE=%~dp0"
 if not defined RAI_PORT set "RAI_PORT=8090"
 if not defined RAI_HOME set "RAI_HOME=%USERPROFILE%\RAI"
+rem Full paths: the server runs in another folder, where a relative one would
+rem name something else.
+for %%I in ("%RAI_HOME%") do set "RAI_HOME=%%~fI"
+if defined RAI_MODEL for %%I in ("%RAI_MODEL%") do set "RAI_MODEL=%%~fI"
 
 rem --- where this launcher looks for things ----------------------------------
 rem The release archive ships rai.exe at its root and the launchers one level
@@ -81,7 +85,7 @@ if not "%COUNT%"=="0" goto :start
 rem --- no model yet: offer the recommended one -----------------------------
 rem With no console to type into, `choice` fails, and that counts as No: a
 rem launcher started that way never waits for an answer.
-set "GET=%HERE%rai-get-model.cmd"
+set "GET=%HERE%rai-get-model-windows.ps1"
 if not exist "%GET%" goto :start
 echo.
 echo   RAI needs a model to chat with, and there is none on this computer yet.
@@ -89,8 +93,11 @@ echo   The recommended one is Qwen2.5 1.5B Instruct, a 3.1 GB download. It is
 echo   saved in "%RAI_HOME%" and ready to chat as soon as it is converted.
 echo.
 choice /c YN /n /m "  Download it now? [Y/N] "
+rem 2 is N; 0 is Ctrl+C at the question, also a no.
 if errorlevel 2 goto :start
-call "%GET%" qwen2.5-1.5b --yes
+if not errorlevel 1 goto :start
+rem PowerShell directly, not `call`: call expands % in the path a second time.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%GET%" qwen2.5-1.5b --yes
 if errorlevel 1 goto :start
 set "MODEL=%RAI_HOME%\models\qwen2.5-1.5b\qwen2.5-1.5b-q4.raimodel"
 if not exist "%MODEL%" set "MODEL="
@@ -120,10 +127,12 @@ start "" /b powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "Write-Host '  open http://localhost:%RAI_PORT%/ yourself once it is ready.'"
 
 rem --- run the server in this window so closing the window stops it ----------
-rem From the folder rai.exe is in, so the page's library lists models kept
-rem beside it as well as those under %RAI_HOME%.
+rem In RAI's home folder, not the install folder: a model Studio converts to a
+rem bare file name lands here, beside the downloaded ones, and an update or
+rem uninstall never touches it. The library lists the program's folder too.
 :serve
-cd /d "%ROOT%"
+if not exist "%RAI_HOME%\" mkdir "%RAI_HOME%" 2>nul
+cd /d "%RAI_HOME%" 2>nul || cd /d "%ROOT%"
 if defined MODEL "%RAI%" serve "%MODEL%" --port %RAI_PORT%
 if not defined MODEL "%RAI%" serve --port %RAI_PORT%
 set "RC=%ERRORLEVEL%"

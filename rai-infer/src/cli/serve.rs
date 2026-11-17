@@ -1584,6 +1584,15 @@ fn handle_models(state: &ServerState, query: &str) -> Result<Value, ChatHttpErro
                     }
                 }
             }
+            // The program's own folder: an unpacked archive keeps its models
+            // there, and the launchers start the server in RAI's home folder
+            // so that nothing Studio writes lands where an update replaces it.
+            if let Some(dir) = std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(Path::to_path_buf))
+            {
+                push(dir);
+            }
             // Where rai-get-model puts every model it converts.
             for folder in crate::cli::model_folders() {
                 push(folder);
