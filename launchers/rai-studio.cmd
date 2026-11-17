@@ -18,6 +18,9 @@ rem every path holding one lost it. Paths are expanded only inside double
 rem quotes and never inside a parenthesized block, because a bare `&` runs a
 rem command and a bare `)` ends the block, as in "rai (1)".
 setlocal disabledelayedexpansion
+rem Started from a PowerShell 7 window, the Windows PowerShell this starts would
+rem inherit that window's module path and lose cmdlets of its own.
+set "PSModulePath="
 
 set "HERE=%~dp0"
 if not defined RAI_PORT set "RAI_PORT=8090"

@@ -125,7 +125,14 @@ function Get-RepoFile([string]$Path, [string]$Target) {
     }
 }
 
-function Get-Sha256([string]$Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() }
+# Through .NET rather than Get-FileHash, which Windows PowerShell started from
+# PowerShell 7 loses with the module path it inherits.
+function Get-Sha256([string]$Path) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $stream = [System.IO.File]::OpenRead($Path)
+    try { ([System.BitConverter]::ToString($sha.ComputeHash($stream)) -replace '-', '').ToLowerInvariant() }
+    finally { $stream.Dispose(); $sha.Dispose() }
+}
 
 # --- what to download -------------------------------------------------------------
 $Files = @()

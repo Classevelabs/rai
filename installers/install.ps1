@@ -30,6 +30,14 @@ $From = $env:RAI_INSTALL_FROM
 $Model = $env:RAI_INSTALL_MODEL
 
 function Say([string]$text) { Write-Host $text }
+# Through .NET rather than Get-FileHash and Expand-Archive: Windows PowerShell
+# started from PowerShell 7 inherits PowerShell 7's module path and loses both.
+function Get-Sha256([string]$path) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $stream = [System.IO.File]::OpenRead($path)
+    try { ([System.BitConverter]::ToString($sha.ComputeHash($stream)) -replace '-', '').ToLowerInvariant() }
+    finally { $stream.Dispose(); $sha.Dispose() }
+}
 function Fail([string]$text) {
     Write-Host ''
     Write-Host "RAI installer: $text" -ForegroundColor Red
@@ -82,11 +90,12 @@ try {
         if ($parts.Count -eq 2 -and $parts[1].TrimStart('*') -eq $Archive) { $expected = $parts[0].ToLowerInvariant() }
     }
     if (-not $expected) { Fail "SHA256SUMS has no entry for $Archive." }
-    $actual = (Get-FileHash -LiteralPath (Join-Path $Temp $Archive) -Algorithm SHA256).Hash.ToLowerInvariant()
+    $actual = Get-Sha256 (Join-Path $Temp $Archive)
     if ($actual -ne $expected) { Fail "the download does not match SHA256SUMS (got $actual, expected $expected). Nothing was installed." }
     Say 'Checked: SHA-256 matches the release.'
 
-    Expand-Archive -LiteralPath (Join-Path $Temp $Archive) -DestinationPath $Temp -Force
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::ExtractToDirectory((Join-Path $Temp $Archive), $Temp)
     $unpacked = Join-Path $Temp "rai-$Version-$Target"
     if (-not (Test-Path -LiteralPath (Join-Path $unpacked 'rai.exe'))) { Fail 'the archive has no rai.exe in it.' }
 
