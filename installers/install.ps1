@@ -100,14 +100,23 @@ try {
     # entry covers rai, rai-studio and rai-get-model.
     # Only a folder that is empty or holds a previous RAI is ever replaced:
     # RAI_INSTALL_DIR pointed at a folder of other things must not delete them.
+    # A folder RAI's Setup made keeps Setup's uninstaller, which Settings >
+    # Apps runs, and Setup's own Start menu entry, so updating it this way
+    # leaves one entry and an uninstaller that still removes everything.
+    $setupUninstaller = $null
     if (Test-Path -LiteralPath $Dir) {
         $earlier = (Test-Path -LiteralPath (Join-Path $Dir 'rai.exe')) -or (Test-Path -LiteralPath (Join-Path $Dir 'uninstall.exe'))
         if (-not $earlier -and (Get-ChildItem -LiteralPath $Dir -Force | Select-Object -First 1)) {
             Fail "$Dir already holds other files and is not an earlier RAI install. Choose an empty folder with RAI_INSTALL_DIR."
         }
+        if (Test-Path -LiteralPath (Join-Path $Dir 'uninstall.exe')) {
+            $setupUninstaller = Join-Path $Temp 'uninstall.exe'
+            Copy-Item -LiteralPath (Join-Path $Dir 'uninstall.exe') -Destination $setupUninstaller
+        }
         Remove-Item -LiteralPath $Dir -Recurse -Force
     }
     New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+    if ($setupUninstaller) { Copy-Item -LiteralPath $setupUninstaller -Destination $Dir }
     Get-ChildItem -LiteralPath $unpacked -File | Where-Object { $_.Name -ne 'rai.exe' } |
         Copy-Item -Destination $Dir
     foreach ($name in 'rai-studio.cmd', 'rai-get-model.cmd', 'rai-get-model.ps1', 'models.tsv') {
@@ -138,15 +147,17 @@ try {
         if (-not (($env:Path.Split(';')) -contains $Dir)) { $env:Path = "$env:Path;$Dir" }
     }
 
-    # --- Start menu --------------------------------------------------------------------
-    $programs = [Environment]::GetFolderPath('Programs')
-    $shell = New-Object -ComObject WScript.Shell
-    $link = $shell.CreateShortcut((Join-Path $programs 'RAI Studio.lnk'))
-    $link.TargetPath = Join-Path $Dir 'rai-studio.cmd'
-    $link.WorkingDirectory = $Dir
-    $link.IconLocation = "$rai,0"
-    $link.Description = 'Chat with a model on this computer, in your browser'
-    $link.Save()
+    # --- Start menu, unless Setup's entry already points here ----------------------------
+    if (-not $setupUninstaller) {
+        $programs = [Environment]::GetFolderPath('Programs')
+        $shell = New-Object -ComObject WScript.Shell
+        $link = $shell.CreateShortcut((Join-Path $programs 'RAI Studio.lnk'))
+        $link.TargetPath = Join-Path $Dir 'rai-studio.cmd'
+        $link.WorkingDirectory = $Dir
+        $link.IconLocation = "$rai,0"
+        $link.Description = 'Chat with a model on this computer, in your browser'
+        $link.Save()
+    }
 } finally {
     Remove-Item -LiteralPath $Temp -Recurse -Force -ErrorAction SilentlyContinue
 }

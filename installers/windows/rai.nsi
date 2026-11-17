@@ -129,6 +129,9 @@ Section "Install"
     CreateShortcut "$SMPROGRAMS\${APPNAME}\RAI Studio.lnk" "$INSTDIR\rai-studio.cmd" "" "$INSTDIR\rai.exe" 0
     CreateShortcut "$SMPROGRAMS\${APPNAME}\Uninstall RAI.lnk" "$INSTDIR\uninstall.exe"
     CreateShortcut "$DESKTOP\RAI Studio.lnk" "$INSTDIR\rai-studio.cmd" "" "$INSTDIR\rai.exe" 0
+    ; install.ps1 puts its one entry at the top of the Start menu. Setup's own
+    ; entries replace it, so the menu never shows RAI twice.
+    Delete "$SMPROGRAMS\RAI Studio.lnk"
 
     System::Call 'kernel32::SetEnvironmentVariable(t "RAI_SETUP_DIR", t "$INSTDIR")'
     nsExec::Exec `${RAI_PATH_ADD}`
@@ -157,6 +160,7 @@ Section "Uninstall"
     Delete "$SMPROGRAMS\${APPNAME}\Uninstall RAI.lnk"
     RMDir "$SMPROGRAMS\${APPNAME}"
     Delete "$DESKTOP\RAI Studio.lnk"
+    Delete "$SMPROGRAMS\RAI Studio.lnk"
 
     System::Call 'kernel32::SetEnvironmentVariable(t "RAI_SETUP_DIR", t "$INSTDIR")'
     nsExec::Exec `${RAI_PATH_REMOVE}`

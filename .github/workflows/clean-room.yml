@@ -133,6 +133,17 @@ jobs:
             } finally { if (-not $server.HasExited) { $server.Kill() } }
           }
 
+          # The one-line installer, from this run's files or from the release.
+          if ($env:SOURCE -eq 'artifact') {
+            $env:RAI_INSTALL_FROM = $dist
+            $script = "iex (Get-Content -Raw -LiteralPath '$dist\install.ps1')"
+          } else {
+            if ($env:TAG) { $env:RAI_VERSION = $env:TAG; $from = "$env:REPO_URL/releases/download/$env:TAG/install.ps1" }
+            else { $from = "$env:REPO_URL/releases/latest/download/install.ps1" }
+            $script = "irm $from | iex"
+          }
+          $ps51 = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
+
           # --- Setup: install, start with only Windows on PATH, uninstall -----------
           $setup = Get-ChildItem $dist -Filter 'rai-*-windows-x64-setup.exe' | Select-Object -First 1
           $installed = "$env:LOCALAPPDATA\Programs\RAI"
@@ -147,6 +158,14 @@ jobs:
           $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
           if (-not ($userPath.Split(';') -contains $installed)) { $failures.Add("Setup did not put $installed on the user's PATH: $userPath") }
           if (-not (Test-Path ([Environment]::GetFolderPath('Programs') + '\RAI\RAI Studio.lnk'))) { $failures.Add('Setup made no Start menu entry') }
+          # The one-line installer over a Setup install, as someone updating that
+          # way would: Setup's uninstaller and its one Start menu entry must stay.
+          $env:RAI_NO_MODEL = '1'
+          $r = Run $ps51 @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $script) $windowsPath
+          Remove-Item Env:\RAI_NO_MODEL
+          if ($r.code -ne 0) { $failures.Add("the one-line installer over Setup exited $($r.code): $($r.out) $($r.err)") }
+          if (-not (Test-Path -LiteralPath (Join-Path $installed 'uninstall.exe'))) { $failures.Add("the one-line installer removed Setup's uninstaller") }
+          if (Test-Path -LiteralPath ([Environment]::GetFolderPath('Programs') + '\RAI Studio.lnk')) { $failures.Add("the one-line installer added a second Start menu entry beside Setup's") }
           # In place (_?=), so the uninstall has finished when it returns.
           $p = Start-Process -FilePath (Join-Path $installed 'uninstall.exe') -ArgumentList '/S', "_?=$installed" -Wait -PassThru
           if ($p.ExitCode -ne 0) { $failures.Add("the uninstaller exited $($p.ExitCode)") }
@@ -161,15 +180,7 @@ jobs:
 
           # --- the one-line installer, in Windows PowerShell 5.1, with a model ------
           $env:RAI_INSTALL_MODEL = $env:MODEL
-          if ($env:SOURCE -eq 'artifact') {
-            $env:RAI_INSTALL_FROM = $dist
-            $script = "iex (Get-Content -Raw -LiteralPath '$dist\install.ps1')"
-          } else {
-            if ($env:TAG) { $env:RAI_VERSION = $env:TAG; $from = "$env:REPO_URL/releases/download/$env:TAG/install.ps1" }
-            else { $from = "$env:REPO_URL/releases/latest/download/install.ps1" }
-            $script = "irm $from | iex"
-          }
-          $r = Run "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $script) $windowsPath
+          $r = Run $ps51 @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $script) $windowsPath
           Write-Host $r.out; Write-Host $r.err
           if ($r.code -ne 0) { $failures.Add("the one-line installer exited $($r.code)") }
           $rai = Join-Path $installed 'rai.exe'
