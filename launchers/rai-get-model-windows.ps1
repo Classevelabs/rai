@@ -18,6 +18,9 @@
 # Written for Windows PowerShell 5.1, the version every Windows 10 and 11 has.
 
 $ErrorActionPreference = 'Stop'
+# Windows PowerShell's progress bar slows large downloads through
+# Invoke-WebRequest many times over.
+$ProgressPreference = 'SilentlyContinue'
 # Windows PowerShell 5.1 can default to TLS 1.0, which Hugging Face refuses.
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
@@ -102,10 +105,16 @@ function Get-RepoFile([string]$Path, [string]$Target) {
         $curlArgs = @('-L', '-#', '-C', '-', '--retry', '5', '--retry-delay', '5', '-w', '%{http_code}', '-o', $part)
         if ($env:HF_TOKEN) { $curlArgs += @('-H', "Authorization: Bearer $($env:HF_TOKEN)") }
         $code = & $Curl @curlArgs $url
-        if ($LASTEXITCODE -ne 0 -and -not ($code -match '^[45]\d\d$')) {
+        $curlExit = $LASTEXITCODE
+        if ($curlExit -ne 0 -and -not ($code -match '^[45]\d\d$')) {
             # curl.exe checks certificate revocation, which fails behind some
-            # company proxies, where .NET downloads fine: one try that way.
-            Say "curl stopped (exit code $LASTEXITCODE). Trying once more another way; this one starts $Path over."
+            # company proxies (exit 35) where .NET connects fine: one try that
+            # way. Anything else, a dropped connection above all, is resumed by
+            # running the command again, which .NET could not do.
+            if ($curlExit -notin 35, 60, 77, 83) {
+                Fail "downloading $Path stopped (curl exit code $curlExit, explained above). Run the same command again; it picks up where it stopped."
+            }
+            Say "curl could not set up a secure connection (exit code $curlExit). Trying once more through Windows; this starts $Path over."
             $code = $null
         }
     }

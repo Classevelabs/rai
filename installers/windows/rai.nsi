@@ -93,6 +93,8 @@ VIAddVersionKey "LegalCopyright" "${COMPANYNAME}"
     Delete "$INSTDIR\rai-studio.cmd"
     Delete "$INSTDIR\rai-get-model.cmd"
     Delete "$INSTDIR\rai-get-model-windows.ps1"
+    ; The earlier name, which PowerShell ran in place of rai-get-model.cmd.
+    Delete "$INSTDIR\rai-get-model.ps1"
     Delete "$INSTDIR\models.tsv"
     Delete "$INSTDIR\LICENSE"
     Delete "$INSTDIR\NOTICE"

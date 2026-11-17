@@ -169,7 +169,8 @@ esac
 
 archive="rai-$VERSION-$target.tar.gz"
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT INT TERM
+# HUP too: a terminal closed mid-install would otherwise leave the files behind.
+trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 
 say ""
 say "Installing RAI $VERSION for $target"
@@ -195,7 +196,8 @@ unpacked="$tmp/rai-$VERSION-$target"
 # is ever replaced. A file named `rai` proves nothing: after one install,
 # ~/.local/bin holds one, and --dir pointed there must not empty it.
 MARK=.rai-install
-if [ -d "$DIR" ] && [ ! -f "$DIR/$MARK" ] && [ -n "$(ls -A "$DIR" 2>/dev/null)" ]; then
+# .DS_Store is what Finder leaves in a folder it has merely shown.
+if [ -d "$DIR" ] && [ ! -f "$DIR/$MARK" ] && [ -n "$(ls -A "$DIR" 2>/dev/null | grep -v '^\.DS_Store$')" ]; then
     die "$DIR already holds other files and is not an earlier RAI install. Choose an empty folder with --dir."
 fi
 
@@ -203,8 +205,10 @@ fi
 # the earlier one working.
 parent=$(dirname -- "$DIR")
 mkdir -p "$parent" || die "cannot create $parent."
+# What an install killed outright (a power cut, kill -9) left behind.
+rm -rf "$parent"/.rai-new.* "$parent"/.rai-old.* 2>/dev/null || true
 stage=$(mktemp -d "$parent/.rai-new.XXXXXX") || die "cannot write to $parent."
-trap 'rm -rf "$tmp" "$stage"' EXIT INT TERM
+trap 'rm -rf "$tmp" "$stage"' EXIT HUP INT TERM
 cp -R "$unpacked/." "$stage/"
 printf '%s\n' "$VERSION" > "$stage/$MARK"
 chmod 755 "$stage"

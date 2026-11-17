@@ -22,8 +22,12 @@
 & {
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-# Added to what this PowerShell already allows, never in place of it.
-[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+# .NET before 4.7 offers TLS 1.0 alone, which GitHub refuses: TLS 1.2 is added
+# there. SystemDefault (0) already lets Windows choose it and is left alone.
+$tls = [Net.ServicePointManager]::SecurityProtocol
+if ([int]$tls -ne 0 -and -not ($tls -band [Net.SecurityProtocolType]::Tls12)) {
+    [Net.ServicePointManager]::SecurityProtocol = $tls -bor [Net.SecurityProtocolType]::Tls12
+}
 
 $RepoUrl = 'https://github.com/Classevelabs/rai'
 $Target = 'x86_64-pc-windows-msvc'

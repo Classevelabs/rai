@@ -131,8 +131,9 @@ fetch() {
         200|206|416) mv -f "$part" "$2" ;;
         curl) die "downloading $1 stopped (curl exit code $status, explained above). Run the same command again; it picks up where it stopped." ;;
         wget) die "downloading $1 stopped (wget exit code $status). Check the connection, then run the same command again; it picks up where it stopped." ;;
-        refused) rm -f "$part"
-                 die "Hugging Face refused $1 of $REPO. If this model needs a login, accept its license at https://huggingface.co/$REPO, create a token at https://huggingface.co/settings/tokens and run again with HF_TOKEN=<your token>." ;;
+        # wget exits 8 for any HTTP error, a busy server's 429 or 503 as much as
+        # a login's 401, so the partial file is kept for the next run.
+        refused) die "Hugging Face answered $1 with an error (wget exit code 8). If this model needs a login, accept its license at https://huggingface.co/$REPO, create a token at https://huggingface.co/settings/tokens and run again with HF_TOKEN=<your token>. Otherwise run the same command again; it picks up where it stopped." ;;
         401|403) rm -f "$part"
                  die "Hugging Face refused $REPO ($code). This model needs a login:
     1. Open https://huggingface.co/$REPO and accept its license.
