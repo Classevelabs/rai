@@ -17,9 +17,11 @@ it: inference (`rai-infer`) and the memory/reasoning service (`rai-server` →
 
 ### Runtime flow
 
-1. Convert a HuggingFace checkpoint into `.raimodel` plus `tokenizer.json` —
-   `rai convert` for round-to-nearest, the Python exporters for GPTQ. Their
-   architecture preflights differ; see [MODELS.md](./MODELS.md).
+1. Convert a HuggingFace checkpoint into `.raimodel`, with `tokenizer.json`
+   and the `<name>.chat.json` chat record beside it: `rai convert` for
+   round-to-nearest (`rai-get-model` downloads a checkpoint and runs it), the
+   Python exporters for GPTQ. Their architecture preflights differ; see
+   [MODELS.md](./MODELS.md).
 2. Load the flat `.raimodel` file through `rai-infer`.
 3. Decode with packed 4-bit linears and an 8-bit embedding table.
 4. Generate with `rai run`, chat with `rai serve`.

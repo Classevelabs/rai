@@ -8,14 +8,15 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::cli::{format_bytes, MODEL_EXTENSION, TOKENIZER_FILENAME};
+use crate::cli::{format_bytes, model_folders, MODEL_EXTENSION, TOKENIZER_FILENAME};
 use crate::format::{ModelSummary, RaiModelFile};
 
 #[derive(clap::Args, Debug, Clone)]
 pub struct ModelsArgs {
-    /// Directory to scan (default: the current directory)
-    #[arg(value_name = "DIR", default_value = ".")]
-    pub dir: PathBuf,
+    /// Folder to scan (default: this folder and every model folder under
+    /// ~/RAI/models, where rai-get-model puts models)
+    #[arg(value_name = "DIR")]
+    pub dir: Option<PathBuf>,
 }
 
 /// One row of the listing: a readable file with an outcome attached.
@@ -80,27 +81,40 @@ fn architecture_line(summary: &ModelSummary) -> String {
 }
 
 pub fn run(args: &ModelsArgs) -> Result<()> {
-    let entries = collect(&args.dir)?;
+    let (entries, place) = match &args.dir {
+        Some(dir) => (collect(dir)?, dir.display().to_string()),
+        None => {
+            let mut entries = collect(Path::new("."))?;
+            for folder in model_folders() {
+                entries.extend(collect(&folder)?);
+            }
+            (entries, "this folder or ~/RAI/models".to_string())
+        }
+    };
     if entries.is_empty() {
-        println!("No .raimodel files in {}.", args.dir.display());
-        println!("\nConvert a HuggingFace checkpoint to make one:");
-        println!("  rai convert <model-dir> -o my-model.raimodel");
+        println!("No .raimodel files in {place}.");
+        println!("\nGet a model that is ready to chat with:");
+        println!("  rai-get-model qwen2.5-1.5b");
+        println!("Or convert a Hugging Face checkpoint you already have:");
+        println!("  rai convert <model-folder> -o my-model.raimodel");
         return Ok(());
     }
 
     let plural = if entries.len() == 1 { "" } else { "s" };
-    println!(
-        "{} model{plural} in {}\n",
-        entries.len(),
-        args.dir.display()
-    );
+    println!("{} model{plural} in {place}\n", entries.len());
 
     for entry in &entries {
-        let name = entry
-            .path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| entry.path.display().to_string());
+        // A model in the current folder by its name; one elsewhere by its
+        // path, which is what `rai run` and `rai serve` need.
+        let name = if args.dir.is_none() && entry.path.parent() != Some(Path::new(".")) {
+            entry.path.display().to_string()
+        } else {
+            entry
+                .path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| entry.path.display().to_string())
+        };
         match &entry.summary {
             Ok(summary) => {
                 println!("{name}  ({})", format_bytes(summary.file_bytes));
@@ -136,7 +150,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("notes.txt"), b"ignored").unwrap();
         assert!(collect(&dir).unwrap().is_empty());
-        assert!(run(&ModelsArgs { dir: dir.clone() }).is_ok());
+        assert!(run(&ModelsArgs {
+            dir: Some(dir.clone())
+        })
+        .is_ok());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -149,7 +166,10 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert!(entries[0].summary.is_err());
         // Still a successful listing: the command reports the file's state.
-        assert!(run(&ModelsArgs { dir: dir.clone() }).is_ok());
+        assert!(run(&ModelsArgs {
+            dir: Some(dir.clone())
+        })
+        .is_ok());
         std::fs::remove_dir_all(&dir).ok();
     }
 

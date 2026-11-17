@@ -1,0 +1,275 @@
+#!/bin/sh
+# rai-get-model: download a model from Hugging Face and convert it for RAI.
+#
+#   rai-get-model                 list the starter models
+#   rai-get-model qwen2.5-1.5b    get a starter model by name
+#   rai-get-model Qwen/Qwen2.5-1.5B-Instruct
+#                                 get any supported model by its Hugging Face id
+#
+# Options:
+#   --keep        keep the downloaded checkpoint after converting it
+#   --yes         do not ask before downloading
+#   --home DIR    where models live (default: $RAI_HOME, or ~/RAI)
+#
+# A starter model is pinned to one exact upload, and every file is checked
+# against its SHA-256 before it is used. The rai program itself never goes
+# online; this script is the only part of RAI that downloads anything, and only
+# when you run it. Set HF_TOKEN for models that need a Hugging Face login.
+
+set -u
+
+ENDPOINT="${HF_ENDPOINT:-https://huggingface.co}"
+# The folder this script really lives in: installs link to it from a bin
+# folder, and the model list and rai sit next to the real file.
+SELF="$0"
+while [ -L "$SELF" ]; do
+    LINK=$(readlink "$SELF")
+    case "$LINK" in
+        /*) SELF="$LINK" ;;
+        *) SELF="$(dirname -- "$SELF")/$LINK" ;;
+    esac
+done
+HERE=$(cd -- "$(dirname -- "$SELF")" && pwd)
+HOME_DIR="${RAI_HOME:-${HOME}/RAI}"
+KEEP=0
+YES=0
+WHAT=""
+
+say() { printf '%s\n' "$*"; }
+die() { printf '\nrai-get-model: %s\n\n' "$*" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --keep) KEEP=1 ;;
+        --yes|-y) YES=1 ;;
+        --home) shift; [ $# -gt 0 ] || die "--home needs a folder"; HOME_DIR="$1" ;;
+        --home=*) HOME_DIR="${1#--home=}" ;;
+        -h|--help) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -*) die "unknown option: $1 (try --help)" ;;
+        *) [ -z "$WHAT" ] || die "give one model at a time"; WHAT="$1" ;;
+    esac
+    shift
+done
+
+# --- the starter list: beside this script, or where the packages put it ------
+CATALOG=""
+for candidate in "$HERE/models.tsv" "$HERE/../launchers/models.tsv" \
+                 "$HERE/../lib/rai/models.tsv" "/usr/lib/rai/models.tsv"; do
+    if [ -f "$candidate" ]; then CATALOG="$candidate"; break; fi
+done
+TAB=$(printf '\t')
+
+list_models() {
+    say ""
+    say "Starter models (pinned and checked):"
+    say ""
+    [ -n "$CATALOG" ] || { say "  (the starter list is missing from this install)"; return; }
+    awk -F'\t' '!/^#/ { size[$1] += $5; desc[$1] = $8; repo[$1] = $2;
+                        if (!($1 in seen)) { seen[$1] = 1; order[++n] = $1 } }
+                END { for (i = 1; i <= n; i++) {
+                        m = order[i]
+                        printf "  %-14s %5.1f GB download   %s\n", m, size[m] / 1e9, desc[m] } }' "$CATALOG"
+    say ""
+    say "Get one:    rai-get-model qwen2.5-1.5b"
+    say "Or any supported Hugging Face model by its id, for example:"
+    say "            rai-get-model HuggingFaceTB/SmolLM2-1.7B-Instruct"
+    say ""
+}
+
+if [ -z "$WHAT" ]; then list_models; exit 0; fi
+
+# --- tools --------------------------------------------------------------------
+if command -v curl >/dev/null 2>&1; then
+    FETCH=curl
+elif command -v wget >/dev/null 2>&1; then
+    FETCH=wget
+else
+    die "curl or wget is needed to download models. Install one, for example:
+    sudo apt install curl      (Ubuntu, Debian)
+    sudo dnf install curl      (Fedora, RHEL)"
+fi
+if command -v sha256sum >/dev/null 2>&1; then
+    sha256() { sha256sum "$1" | cut -d' ' -f1; }
+elif command -v shasum >/dev/null 2>&1; then
+    sha256() { shasum -a 256 "$1" | cut -d' ' -f1; }
+else
+    die "sha256sum or shasum is needed to check downloads."
+fi
+
+# Download $1 (a path in the repository) to $2, resuming a partial file.
+# No --fail: curl older than 7.76 (Ubuntu 20.04, Debian 11, RHEL 8) has no
+# --fail-with-body, so the status code decides, and an error page is deleted.
+fetch() {
+    url="$ENDPOINT/$REPO/resolve/$REVISION/$1"
+    part="$2.part"
+    if [ "$FETCH" = curl ]; then
+        if [ -n "${HF_TOKEN:-}" ]; then
+            code=$(curl -L -# -C - --retry 5 --retry-delay 5 -w '%{http_code}' \
+                   -H "Authorization: Bearer $HF_TOKEN" -o "$part" "$url") || code="net"
+        else
+            code=$(curl -L -# -C - --retry 5 --retry-delay 5 -w '%{http_code}' \
+                   -o "$part" "$url") || code="net"
+        fi
+    else
+        if [ -n "${HF_TOKEN:-}" ]; then
+            wget -q --show-progress -c --header="Authorization: Bearer $HF_TOKEN" -O "$part" "$url" && code=200 || code=net
+        else
+            wget -q --show-progress -c -O "$part" "$url" && code=200 || code=net
+        fi
+    fi
+    case "$code" in
+        200|206|416) mv -f "$part" "$2" ;;
+        net) die "downloading $1 was interrupted. Run the same command again to resume." ;;
+        401|403) rm -f "$part"
+                 die "Hugging Face refused $REPO ($code). This model needs a login:
+    1. Open https://huggingface.co/$REPO and accept its license.
+    2. Create a token at https://huggingface.co/settings/tokens
+    3. Run again with HF_TOKEN=<your token> rai-get-model $WHAT" ;;
+        404) rm -f "$part"; die "$REPO has no file $1 at $REVISION (404)." ;;
+        *) rm -f "$part"; die "downloading $1 failed (HTTP $code). Run the same command again." ;;
+    esac
+}
+
+# Free space in kilobytes on the filesystem holding $1.
+free_kb() { df -Pk "$1" 2>/dev/null | awk 'NR == 2 { print $4 }'; }
+
+# --- what to download -----------------------------------------------------------
+FILES=""          # newline-separated: path<TAB>bytes<TAB>sha256 (sha may be empty)
+CONVERT_ARGS=""
+PINNED=0
+case "$WHAT" in
+    */*)
+        REPO="$WHAT"
+        NAME=$(printf '%s' "${WHAT##*/}" | tr 'A-Z' 'a-z')
+        REVISION=main
+        ;;
+    *)
+        [ -n "$CATALOG" ] || die "the starter list (models.tsv) is missing from this install"
+        REPO=$(awk -F'\t' -v n="$WHAT" '!/^#/ && $1 == n { print $2; exit }' "$CATALOG")
+        [ -n "$REPO" ] || { list_models; die "no starter model is called '$WHAT'"; }
+        NAME="$WHAT"
+        REVISION=$(awk -F'\t' -v n="$WHAT" '!/^#/ && $1 == n { print $3; exit }' "$CATALOG")
+        CONVERT_ARGS=$(awk -F'\t' -v n="$WHAT" '!/^#/ && $1 == n { print $7; exit }' "$CATALOG")
+        FILES=$(awk -F'\t' -v n="$WHAT" '!/^#/ && $1 == n { print $4 "\t" $5 "\t" $6 }' "$CATALOG")
+        PINNED=1
+        ;;
+esac
+
+RAI=""
+for candidate in "$HERE/rai" "$HERE/../rai" "$HERE/../bin/rai"; do
+    # A regular file: a folder passes -x too, and /usr/lib/rai/../rai is one.
+    if [ -f "$candidate" ] && [ -x "$candidate" ]; then RAI="$candidate"; break; fi
+done
+[ -n "$RAI" ] || RAI=$(command -v rai 2>/dev/null) || die "the rai program was not found.
+    Put this script next to rai, or put rai on your PATH."
+
+MODEL_DIR="$HOME_DIR/models/$NAME"
+DOWNLOAD_DIR="$HOME_DIR/downloads/$NAME"
+OUTPUT="$MODEL_DIR/$NAME-q4.raimodel"
+if [ -f "$OUTPUT" ]; then
+    say ""
+    say "Already converted: $OUTPUT"
+    say ""
+    say "Chat with it in your browser:   rai-studio"
+    say "Or in the terminal:             rai run \"$OUTPUT\" --prompt \"Hello\""
+    say ""
+    exit 0
+fi
+mkdir -p "$DOWNLOAD_DIR" "$MODEL_DIR" || die "cannot create $HOME_DIR"
+
+if [ "$PINNED" = 0 ]; then
+    # Ask Hugging Face for the file list, take what the converter reads, and
+    # check the configuration before downloading gigabytes of weights.
+    say "Looking up $REPO on Hugging Face..."
+    api="$ENDPOINT/api/models/$REPO"
+    if [ "$FETCH" = curl ]; then
+        if [ -n "${HF_TOKEN:-}" ]; then
+            listing=$(curl -fsSL -H "Authorization: Bearer $HF_TOKEN" "$api") || die "Hugging Face has no model $REPO, or it needs HF_TOKEN."
+        else
+            listing=$(curl -fsSL "$api") || die "Hugging Face has no model $REPO, or it needs a login (set HF_TOKEN)."
+        fi
+    else
+        listing=$(wget -qO- "$api") || die "Hugging Face has no model $REPO, or it needs a login (set HF_TOKEN)."
+    fi
+    REVISION=$(printf '%s' "$listing" | tr ',' '\n' | sed -n 's/^"sha":"\([0-9a-f]\{40\}\)".*/\1/p' | head -n 1)
+    [ -n "$REVISION" ] || REVISION=main
+    for path in $(printf '%s' "$listing" | tr ',' '\n' | sed -n 's/.*"rfilename":"\([^"]*\)".*/\1/p'); do
+        case "$path" in
+            */*) ;;
+            config.json|generation_config.json|tokenizer.json|tokenizer_config.json|\
+            special_tokens_map.json|chat_template.jinja|chat_template.json|\
+            model.safetensors.index.json|LICENSE|*.safetensors)
+                FILES="$FILES$path${TAB}0${TAB}
+" ;;
+        esac
+    done
+    printf '%s' "$FILES" | grep -q "^config.json$TAB" || die "$REPO has no config.json, so it is not a model RAI can convert."
+    printf '%s' "$FILES" | grep -q '\.safetensors' || die "$REPO has no .safetensors weights. RAI converts safetensors checkpoints only."
+
+    say "Checking that RAI can convert it..."
+    for small in config.json tokenizer_config.json generation_config.json; do
+        if printf '%s' "$FILES" | grep -q "^$small$TAB"; then fetch "$small" "$DOWNLOAD_DIR/$small"; fi
+    done
+    "$RAI" check "$DOWNLOAD_DIR" || die "RAI cannot run $REPO (the reason is above). Nothing large was downloaded.
+    See the starter models with: rai-get-model"
+fi
+
+# --- disk space ------------------------------------------------------------------
+need_kb=$(printf '%s\n' "$FILES" | awk -F'\t' '{ s += $2 } END { printf "%d", s / 1024 * 1.4 }')
+have_kb=$(free_kb "$HOME_DIR")
+if [ -n "$have_kb" ] && [ "$need_kb" -gt 0 ] && [ "$have_kb" -lt "$need_kb" ]; then
+    die "not enough free space in $HOME_DIR: the download and the converted model need about $((need_kb / 1048576 + 1)) GB, and $((have_kb / 1048576)) GB is free."
+fi
+
+total=$(printf '%s\n' "$FILES" | awk -F'\t' '{ s += $2 } END { printf "%.1f", s / 1e9 }')
+say ""
+say "Model:     $REPO"
+[ "$PINNED" = 1 ] && say "Download:  $total GB, pinned to $(printf '%s' "$REVISION" | cut -c1-12) and checked file by file"
+say "Saved to:  $MODEL_DIR"
+if [ "$YES" = 0 ] && [ -t 0 ]; then
+    printf 'Download it now? [Y/n] '
+    read -r answer || answer=n
+    case "$answer" in [nN]*) say "Nothing downloaded."; exit 1 ;; esac
+fi
+
+# --- download and check every file -------------------------------------------------
+printf '%s\n' "$FILES" | while IFS="$TAB" read -r path bytes digest; do
+    [ -n "$path" ] || continue
+    target="$DOWNLOAD_DIR/$path"
+    if [ -f "$target" ] && [ -n "$digest" ] && [ "$(sha256 "$target")" = "$digest" ]; then
+        say "  $path: already downloaded"
+        continue
+    fi
+    say "  $path"
+    fetch "$path" "$target"
+    if [ -n "$digest" ]; then
+        actual=$(sha256 "$target")
+        if [ "$actual" != "$digest" ]; then
+            rm -f "$target"
+            die "$path is not the file that was tested (SHA-256 $actual, expected $digest).
+    It was deleted. Run the same command again to download it fresh."
+        fi
+    fi
+done || exit 1
+
+# --- convert -----------------------------------------------------------------------
+say ""
+say "Converting to RAI's format (this takes a minute or two)..."
+# shellcheck disable=SC2086 # CONVERT_ARGS is a list of flags from the pinned list
+if ! "$RAI" convert "$DOWNLOAD_DIR" -o "$OUTPUT" $CONVERT_ARGS; then
+    rm -f "$OUTPUT"
+    die "the conversion failed (the reason is above). The download is kept in $DOWNLOAD_DIR."
+fi
+[ -f "$DOWNLOAD_DIR/LICENSE" ] && cp -f "$DOWNLOAD_DIR/LICENSE" "$MODEL_DIR/LICENSE"
+
+if [ "$KEEP" = 0 ]; then
+    rm -rf "$DOWNLOAD_DIR"
+    rmdir "$HOME_DIR/downloads" 2>/dev/null || true
+fi
+
+say ""
+say "Ready: $OUTPUT"
+say ""
+say "Chat with it in your browser:   rai-studio"
+say "Or in the terminal:             rai run \"$OUTPUT\" --prompt \"Hello\""
+say ""

@@ -1,26 +1,18 @@
-# Support
+# Getting help
 
-RAI is a public Classeve engineering project. The fastest support path is a
-GitHub issue with enough detail to reproduce the problem.
+1. Look up your problem in
+   [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md). Most installation and
+   download problems are there, with the fix.
+2. Search the [issues](https://github.com/Classevelabs/rai/issues): someone may
+   have asked already.
+3. Open a new issue. Please include:
+   - what you ran, and the full message you got;
+   - `rai --version`, your operating system and your processor;
+   - how you installed RAI (Setup, the PowerShell or terminal line, a package,
+     an archive, or built from source);
+   - for a model problem, the model's Hugging Face name and how you got it
+     (`rai-get-model`, `rai convert`, or a Python exporter).
 
-## Where To Ask
+Security problems go to [SECURITY.md](SECURITY.md), not to a public issue.
 
-- Bugs: open a bug report using the issue template.
-- Feature requests: open a feature request and describe the use case.
-- Security issues: follow SECURITY.md instead of opening a public issue.
-- General company information: https://classeve.com
-
-## Useful Details
-
-Please include:
-
-- Operating system and CPU model.
-- `rustc --version` and `cargo --version`.
-- Command that failed.
-- Relevant environment variables, with secrets removed.
-- Whether the issue affects `rai-infer`, `rai-compress`, `rai-server`,
-  `rai-core`, or `rem-nra`.
-
-For inference issues, include model family, tokenizer source, export command,
-and whether the model file was produced by GPTQ export or round-to-nearest
-export.
+For anything else about ClassEve, see <https://classeve.com>.

@@ -2,424 +2,162 @@
 
 [![Latest release](https://img.shields.io/github/v/release/Classevelabs/rai)](https://github.com/Classevelabs/rai/releases/latest) [![License](https://img.shields.io/github/license/Classevelabs/rai)](LICENSE)
 
-**A CPU-only LLM inference engine written in Rust.** RAI runs 4-bit quantized
-language models with hand-written AVX2 kernels — no GPU, no CUDA, no Python
-runtime, no PyTorch, no GGML, no BLAS. Load a `.raimodel` file and generate
-text on any supported x86-64 machine.
+RAI runs language models on your own computer, on the processor alone. There
+is no graphics card to buy, no Python to set up and no account to make, and
+what you type stays on your machine.
 
-Built by [ClassEve](https://classeve.com). Licensed under Apache-2.0.
+Built by [ClassEve](https://classeve.com). Free to use under the Apache-2.0
+license.
 
 > **Official repository.** This is the only official repository for RAI.
 > ClassEve's complete list of official accounts is at [classeve.com/official](https://classeve.com/official).
 > The GitHub account `github.com/ClassEve` is an unrelated third party, not affiliated with ClassEve.
 
-## Measured performance
+## Install
 
-Measured on a consumer-grade laptop CPU (4 cores / 8 threads), 2026-08-09, RAI 0.2.0.
-Full method, roofline, and the results that came out negative are in
-[BENCHMARKS.md](./BENCHMARKS.md).
+**Windows 10 and 11.** Download `rai-<version>-windows-x64-setup.exe` from the
+[latest release](https://github.com/Classevelabs/rai/releases/latest) and run
+it. If Windows says "Windows protected your PC", choose **More info**, then
+**Run anyway**. Or paste this into PowerShell:
 
-**Converting a checkpoint** — `rai convert` streams `.safetensors`, so peak
-memory does not grow with the model:
-
-| | `export_rtn.py` (PyTorch) | **`rai convert`** |
-| --- | --- | --- |
-| TinyLlama-1.1B | 188.8 s, 4,981 MB RAM | **7.6 s, 22.9 MB RAM** |
-| Zephyr-7B | needs ~29 GB — will not run | **82.6 s, 26.3 MB RAM** |
-
-Both produce byte-identical output. A 7B model converts on a 16 GB laptop.
-
-**Running a model** — greedy decoding, same machine:
-
-| | TinyLlama-1.1B (619 MB) | Zephyr-7B (3.9 GB) |
-| --- | --- | --- |
-| Decode | **21.8 tok/s** | **2.96 tok/s** |
-| Peak RSS | 629 MB | ~4.0 GB |
-| Load (warm) | 0.33 s | — |
-
-HuggingFace `transformers` fp32 runs the same TinyLlama checkpoint at 4.3 tok/s
-on this machine, so RAI is **5.1× faster in 1/7th the memory**. The batched-GEMM
-rewrite made prefill **~1.3× faster**, and prompt-lookup decoding adds
-**1.12–1.20×** on context-quoting workloads (off by default; it is slower on
-original prose, and BENCHMARKS.md says by how much).
-
-The decode figure is a quiet-machine number, re-verified 2026-08-18 at
-22.1–23.0 tok/s on the shipped `x86-64-v2` baseline; the same binary under
-background load on this 4-core laptop measured as low as 2 tok/s.
-[BENCHMARKS.md](./BENCHMARKS.md) has the full record and the reconciliation
-with the 0.2.2 changelog's loaded-machine figures.
-
-## Quickstart
-
-```bash
-# 1. Build (or take a release archive — see INSTALL.md)
-cargo build --workspace --release --locked
-
-# 2. Convert a checkpoint — no Python required
-#    (-o sets the output name; convert otherwise preserves the checkpoint's case)
-rai convert /path/to/Qwen2.5-0.5B-Instruct -o qwen2.5-0.5b-instruct-q4.raimodel
-
-# 3. Generate
-rai run qwen2.5-0.5b-instruct-q4.raimodel \
-  --chat-template auto \
-  --prompt "Explain photosynthesis in simple terms." \
-  --max-tokens 64
-
-# 4. Or open the local chat interface
-rai serve qwen2.5-0.5b-instruct-q4.raimodel
-
-# What is on this machine?
-rai models .
+```powershell
+irm https://github.com/Classevelabs/rai/releases/latest/download/install.ps1 | iex
 ```
 
-Conversion writes `tokenizer.json` beside the model, and `rai run` picks it up
-automatically. Instruction-tuned models need the chat template they were
-trained on, or they emit end-of-sequence immediately and print nothing:
-`chatml` for Qwen, `llama3` for Llama-3, `zephyr` for TinyLlama-Chat.
+**macOS and Linux.** Paste this into a terminal:
 
-Prebuilt binaries are in [INSTALL.md](./INSTALL.md); full conversion options,
-including the calibrated GPTQ path, are in
-[docs/INSTALL.md](./docs/INSTALL.md#converting-a-model). The double-click
-launchers in `launchers/` start the local interface without a terminal.
+```bash
+curl -fsSL https://github.com/Classevelabs/rai/releases/latest/download/install.sh | sh
+```
 
-## Which models work
+Ubuntu, Debian, Fedora, RHEL and openSUSE can also use the `.deb` or `.rpm`
+package from the release page. [INSTALL.md](INSTALL.md) has every way to
+install, how to update and remove RAI, and what to do when something goes
+wrong.
 
-RAI runs the Llama-family decoder and the capabilities layered on top of it.
-Anything it cannot represent is refused at conversion time, by name, before a
-file is written — never silently mis-converted.
+## Start chatting
 
-| | |
+Open **RAI Studio** from the Start menu or your app menu, or type `rai-studio`
+in a terminal. The first time, it offers to download a model to talk to. Say
+yes, wait for the download, and the chat opens in your browser at
+<http://localhost:8090>.
+
+Prefer the terminal?
+
+```bash
+rai-get-model qwen2.5-1.5b
+rai run ~/RAI/models/qwen2.5-1.5b/qwen2.5-1.5b-q4.raimodel --prompt "Why is the sky blue?"
+```
+
+On Windows the model lands in `%USERPROFILE%\RAI\models` instead.
+[docs/USING.md](docs/USING.md) covers Studio, every command and the chat API.
+
+## Models
+
+Three models are ready to download by name:
+
+| Name | Download | On disk | |
+| --- | --- | --- | --- |
+| `qwen2.5-0.5b` | 1.0 GB | 0.3 GB | Small and fast. Good for trying RAI out on any computer. |
+| `qwen2.5-1.5b` | 3.1 GB | 0.9 GB | Recommended. Clear answers at a good speed on a laptop. |
+| `qwen2.5-7b` | 15.2 GB | 4.0 GB | Best answers, but slower. For computers with 8 GB of memory or more. |
+
+`rai-get-model` fetches each one from Hugging Face at a fixed version, checks
+every file against its known fingerprint, converts it and deletes the
+download, so only the "on disk" size stays.
+
+Most other models on Hugging Face from these families work too: Llama 2, 3,
+3.1 and 3.2, Mistral, Mixtral 8x7B, Qwen 2, 2.5 and 3, Gemma, Gemma 2, the
+text-only Gemma 3 sizes, Phi-3 mini 4k, OLMo 2, OLMoE, TinyLlama, SmolLM and
+their fine-tunes. Give `rai-get-model` the model's name, such as
+`rai-get-model Qwen/Qwen2.5-3B-Instruct`; it reads the model's settings first
+and stops before the big download if RAI cannot run it.
+[docs/MODELS.md](docs/MODELS.md) lists what works, what doesn't and why.
+
+## What it needs
+
+- **Windows** 10 or 11, **macOS** 10.12 or newer (Intel) or 11 or newer
+  (Apple Silicon), or **Linux** with glibc 2.28 or newer: Ubuntu 20.04,
+  Debian 10, RHEL 8, or anything newer.
+- A 64-bit Intel or AMD processor from 2011 or later, or an Apple Silicon Mac.
+  Processors with AVX2, which most Intel Core and AMD Ryzen chips since 2015
+  have, take RAI's fast path.
+- Free memory of about the model's size on disk, plus some room for the
+  conversation.
+- No graphics card.
+
+## Private by default
+
+The `rai` program never connects to the internet. RAI Studio listens only to
+your own computer and refuses requests from websites. `rai-get-model` talks to
+Hugging Face, and only when you run it. There are no accounts, no telemetry
+and no update checks.
+
+## How fast
+
+Measured with RAI 0.2.0 on a laptop processor with 4 cores, using the
+TinyLlama 1.1B model:
+
+- RAI writes 21.8 tokens a second in 629 MB of memory. The same model in
+  Hugging Face `transformers` writes 4.3 tokens a second and needs 7 times the
+  memory. A token is about three quarters of a word.
+- `rai convert` turns the model into a RAI file in 7.6 seconds, using 23 MB of
+  memory. The same conversion in Python with PyTorch takes 188.8 seconds and
+  4,981 MB.
+- A 7B model writes about 3 tokens a second on the same laptop, and converts
+  in 82.6 seconds in 26 MB of memory, so even a 16 GB laptop converts models
+  that size.
+
+[BENCHMARKS.md](BENCHMARKS.md) has the method and the full record, including
+what 4-bit storage costs in accuracy.
+
+## Commands
+
+| Command | What it does |
 | --- | --- |
-| **Runs** | **Llama-2 / 3 / 3.1 / 3.2**, **Mistral-7B**, **Qwen2 / 2.5 / 3 (dense)**, **Gemma / Gemma2 / Gemma3**, **Phi-3 / 3.5**, **OLMo2**, **mixture-of-experts models** (OLMoE, Mixtral, Qwen3-MoE), TinyLlama, SmolLM / SmolLM2, and fine-tunes of all of them |
-| **Refused** | Models with a *shared* expert running alongside the routed ones; `rope_scaling` other than `default` or `llama3` (`yarn`, `linear`, `dynamic`); an `lm_head` bias; and module trees that are not Llama-shaped — Falcon, GPT-NeoX, MPT, GPT-2, Phi-2. Each refusal names the blocker and a model that works. |
+| `rai-studio` | Opens the chat in your browser |
+| `rai-get-model <name>` | Downloads a model and converts it |
+| `rai run <model> --prompt "..."` | Answers one prompt in the terminal |
+| `rai serve <model>` | Starts the chat page and the chat API |
+| `rai check <folder>` | Says whether a downloaded model will convert |
+| `rai convert <folder>` | Converts a Hugging Face model to a `.raimodel` file |
+| `rai models` | Lists the models on this computer |
+| `rai perplexity <model> --text <file>` | Measures how well a model predicts a text |
 
-Point `rai convert` at your folder, or press **Check** in Studio: both run the
-same preflight, refuse before writing anything, name the blocker, and name a
-model that does work. What to use instead of a refused checkpoint, and what has
-to be in the folder, are in **[docs/MODELS.md](./docs/MODELS.md)**.
-Every family above was converted **and generated coherent text** on the
-machine in the benchmarks: Qwen2.5-0.5B, Qwen3-0.6B, Llama-3.2-1B, gemma-2b-it,
-gemma-2-2b-it, gemma-3-1b-it, Phi-3-mini-4k-instruct, OLMo-2-1B-Instruct and
-OLMoE-1B-7B-Instruct (6.9B parameters, 64 experts, 8 routed per token).
+`rai <command> --help` shows each command's options, with examples.
 
-A folder holding a `pytorch_model.bin` rather than `.safetensors` is not read —
-that is a Python pickle, and loading one executes whatever code the file
-carries. The error names the file and hands you the one-line command that
-converts it.
+## For developers
 
-## Why
-
-Most LLM inference stacks assume a GPU, a CUDA toolchain, or a heavyweight ML
-framework. RAI takes the opposite bet: an auditable Rust workspace whose
-inference matrix kernels are hand-written and whose runtime dependency tree is
-captured in `Cargo.lock`.
-
-- **CPU-only by design.** AVX2 + FMA + F16C accelerate inference on compatible
-  x86-64 CPUs; scalar fallbacks exist for other instruction sets.
-- **4-bit weights, dequantized in registers.** Weights stay packed in memory;
-  unpacking happens on the fly inside the GEMM inner loop. No fp32 weight copy
-  ever exists in RAM.
-- **One flat model file.** The `.raimodel` format is a single binary blob with
-  a 128-byte header. The loader validates its structure after one heap read and
-  then exposes borrowed views over the in-memory sections.
-- **A lean library.** `--no-default-features` builds the inference library —
-  format reader, kernels, model, sampling, speculative decoding — against
-  `half`, `rayon`, `anyhow`, and `rand` alone. The CLI, tokenizer, and chat
-  server sit behind the default-on `cli` feature.
-- **Speculative decoding.** Draft-model and prompt-lookup modes. Both accept or
-  reject each drafted token against the target model's own sampled
-  distribution, with a correction sample on rejection; a seeded statistical
-  smoke test guards that path.
-- **Local serving.** `rai serve`: an HTTP chat server on loopback with a
-  built-in web UI and a JSON chat API.
-
-## Workspace layout
-
-| Crate | Purpose |
-| --- | --- |
-| `rai-infer` | The inference engine: `.raimodel` loader and writer, AVX2 W4A8 GEMM kernels, transformer layers (RMSNorm, RoPE, GQA, SwiGLU/GeGLU), KV cache, sampling, speculative decoding, and the `rai` binary (behind the default-on `cli` feature; `--no-default-features` builds the lean library) |
-| `rai-compress` | Quantization and compression research toolkit. Its Rust GPTQ implementation is independent of the Python `.raimodel` export pipeline; RC/HRC/SAC report modeled sizes and serialize no artifact. Nothing here is on the inference path. |
-
-**RAI is `rai-infer` and `rai-compress`.** The three crates below are a separate
-memory/reasoning service that only shares this workspace. They are **not part of
-the RAI product**, are not published to crates.io (0.1.0 yanked 2026-08-13,
-`publish = false` set), and `rai-server` imports `rai-infer` zero times — it
-cannot run a model.
-
-These three are absent from every release archive, and a release-time gate
-fails the build if one of them reaches an archive again.
-
-| Not part of RAI | Purpose |
-| --- | --- |
-| `rai-server` | REST + MCP server for the memory/reasoning layer |
-| `rai-core` | Memory, embedding and reasoning primitives used by `rai-server` |
-| `rem-nra` | Resonance-memory backend used by `rai-core` |
-
-The inference and memory-service paths are separate. `rai run` and `rai serve`
-load `.raimodel` files through `rai-infer`; `rai-server` does not run those
-models. Instead, its REST/MCP adapters call `rai-core`, which obtains an
-embedding from the configured provider and stores/queries state through
-`rem-nra`. `AppState` serializes REST stores and opted-in MCP stores to
-`RAI_DATA_PATH`.
-
-## Requirements
-
-| Requirement | Details |
-| --- | --- |
-| Rust | 1.87+; the repository pins 1.95.0, edition 2021 |
-| CPU | x86-64 with AVX2, FMA, and F16C for optimized paths; scalar fallbacks otherwise |
-| OS | Linux, Windows, or macOS |
-| GPU at runtime | **Not required** |
-| Python | GPTQ export through `scripts/export_raimodel.py`, and draft-model preparation, only. `rai convert` needs none, calibrated (`--calibration-text`) or not. |
-
-> `.cargo/config.toml` pins the x86-64 build to the **x86-64-v2** baseline —
-> the same floor the release archives use — so a binary you build here runs on
-> any x86-64 machine you copy it to. This costs nothing measurable: the AVX2,
-> FMA, and F16C kernels are chosen at runtime, not by the compile-time
-> baseline. aarch64 (Apple Silicon, ARM servers) is left at the toolchain
-> default. To tune a build to the machine in front of you — for a local
-> benchmark, never for a binary you hand to anyone else —
-> `RUSTFLAGS="-C target-cpu=native" cargo build --release --locked`; that
-> binary dies with SIGILL on any older CPU.
-
-## Build
+RAI is written in Rust. To build it from source:
 
 ```bash
-cargo build --workspace --release --locked
+git clone https://github.com/Classevelabs/rai.git
+cd rai
+cargo build --release --locked -p classeve-rai-infer
 ```
 
-That produces `rai`, plus the deprecated `rai-convert`, `rai-generate`, and
-`rai-chat` wrappers — and, because `--workspace` builds everything in the
-tree, the non-product `rai-server` too. Release archives are built from
-`--package classeve-rai-infer` alone. See [installation](./docs/INSTALL.md)
-for source installs and the container. No container image is published; the
-`Dockerfile` builds the `rai` CLI by default, and
-`docker build --target server .` builds the non-product memory service
-instead.
+The engine is also a library on crates.io,
+[`classeve-rai-infer`](https://crates.io/crates/classeve-rai-infer).
+[docs/BUILDING.md](docs/BUILDING.md) covers building, the container image and
+using the library. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) explains how
+the engine is put together, and [CONTRIBUTING.md](CONTRIBUTING.md) how to send
+a change.
 
-Development checks:
+The workspace holds two crates that make up RAI, `rai-infer` (the engine and
+the `rai` program) and `rai-compress` (quantization research tools), and three
+that belong to a separate memory service and are not part of RAI: `rai-core`,
+`rai-server` and `rem-nra`. Those three are in no release download.
 
-```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --all-targets --locked
-cargo test --workspace --doc --locked
-```
+## Help
 
-## Converting a model
-
-RAI runs models in its own `.raimodel` format. Two paths produce it:
-
-```bash
-# Round-to-nearest — no Python, no torch
-rai convert /path/to/Mistral-7B-Instruct-v0.3 --max-context 4096
-
-# Calibrated, still no Python: each group's rounding weighted by how much the
-# model drives its channels (9.22 against 10.30 perplexity on SmolLM2-1.7B)
-rai convert /path/to/SmolLM2-1.7B --calibration-text corpus.txt
-
-# GPTQ, calibrated — needs the Python environment and a calibration corpus
-python3 rai-infer/scripts/export_raimodel.py \
-  --model /path/to/SmolLM-135M \
-  --output smollm-135m-q4.raimodel
-```
-
-Both write the model file plus a `tokenizer.json` alongside it, and both refuse
-architectures the format cannot represent. They do not cover the same models:
-`rai convert` writes container v2 and handles Qwen2/2.5, Qwen3 (dense and
-MoE), Llama-3.1/3.2, Gemma 1/2/3, OLMo2, Phi-3, and Mixtral, while the Python
-exporters write container v1 and refuse all of those.
-Check [docs/MODELS.md](./docs/MODELS.md) before downloading a checkpoint;
-[docs/INSTALL.md](./docs/INSTALL.md#converting-a-model) has every flag.
-HuggingFace model and dataset revisions are not pinned by the Python exporters,
-so record the exact revisions and arguments for reproducible work.
-
-## Running
-
-### Generate text
-
-```bash
-rai run smollm-135m-q4.raimodel \
-  --prompt "The future of computing is" \
-  --max-tokens 64 \
-  --temperature 0.7
-```
-
-`--tokenizer` defaults to the `tokenizer.json` written beside the model at
-conversion time; pass it explicitly only for a model that was moved away from
-its tokenizer.
-
-Sampling controls: `--temperature`, `--top-k`, `--top-p`,
-`--repetition-penalty`, `--seed`. Test-time compute ("pondering") strategies
-exist behind `--ponder-strategy cfg|ensemble|cfg-ensemble|adaptive` with
-`--guidance-scale`, `--ensemble-n`, `--noise-sigma`, `--entropy-threshold`;
-they multiply the forward passes per token and **no measurement in this
-repository shows a quality win from them** — the module doc in
-`rai-infer/src/ponder.rs` says exactly what each one computes. Leave them off.
-
-Set `RAYON_NUM_THREADS` to cap the inference worker count used by `rai run` and
-`rai serve`. It defaults to the machine's performance cores plus one (physical
-cores where the platform does not tell them apart), never more than the CPUs
-the process may run on.
-
-### Speculative decoding
-
-Two modes, mutually exclusive. Both verify against the target model and are
-gated on exact sampling (`--top-k 0 --top-p 1 --repetition-penalty 1`), so
-verification uses the distribution the target actually produced.
-
-```bash
-# Draft-model speculation: a small model proposes, the big model verifies
-rai run mistral-7b-q4.raimodel \
-  --draft mistral-draft-100m-q4.raimodel \
-  --draft-k 6 \
-  --top-k 0 --top-p 1 --repetition-penalty 1 \
-  --prompt "Explain speculative decoding in one paragraph."
-
-# Prompt-lookup: the draft is copied from the context, so there is no draft
-# model and no draft forward pass
-rai run tinyllama-q4.raimodel \
-  --lookup-k 2 \
-  --top-k 0 --top-p 1 --repetition-penalty 1 \
-  --prompt "Summarise the passage above."
-```
-
-Draft and target must share a tokenizer. Prompt-lookup is off by default: it is
-a gain only when the output reuses the context, and BENCHMARKS.md records both
-the gain and the loss. `rai-infer/scripts/train_draft.py` is an experimental
-distillation helper for compatible Mistral-family teachers; its throughput
-projections are not release benchmarks.
-
-### Chat over HTTP
-
-```bash
-rai serve smollm-135m-q4.raimodel --port 8090
-```
-
-Open `http://localhost:8090` for the built-in web UI, or POST to `/api/chat`
-(JSON) for programmatic access — either a single `message` or a `messages`
-array carrying the whole conversation, oldest first; the server keeps no chat
-state of its own, and the web UI replays the visible thread the same way.
-`--chat-template` selects prompt formatting: `auto` (the default) renders the
-chat template the conversion recorded beside the model, as transformers would;
-`none`, `few-shot`, `mistral`, `llama3`, `chatml`, `zephyr`, `phi3` and `gemma`
-name a built-in one. The chat server binds to `127.0.0.1` only and
-limits request bodies to 64 KiB.
-
-### The memory service is not in the archive
-
-The `rai-server` REST/MCP memory prototype builds from this workspace but is
-not part of RAI and is not in any release archive — see
-[Workspace layout](#workspace-layout). It runs models zero times, and it is the
-only thing here that can open an outbound connection. If you want to build and
-run it from source, [docs/OPERATIONS.md](./docs/OPERATIONS.md) is its runbook.
-
-
-## The `.raimodel` format
-
-A single flat, little-endian binary file:
-
-```text
-┌─────────────────────────────────────────────┐
-│ Header (64 bytes at v1, 128 at v2)          │  magic "RAIM", version,
-│                                             │  architecture hyperparameters,
-│                                             │  quantization config
-├─────────────────────────────────────────────┤
-│ Section index table (16 bytes per section)  │  offset + size per section
-├─────────────────────────────────────────────┤
-│ Section 0: embedding table (8-bit)          │
-│ Sections 1..N: transformer layers (4-bit)   │  per linear: dims, f16
-│ Section N+1: final RMSNorm (f32)            │  scale/zero per group,
-│ Section N+2: lm_head (4-bit, when untied)   │  nibble-packed codes
-└─────────────────────────────────────────────┘
-```
-
-Each layer section holds seven 4-bit projections — `q`, `k`, `v`, `o`, `gate`,
-`up`, `down` — then any f32 bias vectors the header's `bias_mask` declares, then
-two f32 RMSNorm weight vectors. Linear weights carry per-group (128-column by
-default) f16 scale/zero parameters and are packed two codes per byte in the
-layout the AVX2 kernels consume. The embedding table is 8-bit quantized.
-Scale/zero parameters are round-tripped through f16 at export time so the reader
-and the exporter use the same stored values.
-
-Version 1 holds the architecture dimensions, `rope_theta`, and `norm_eps`.
-Version 2 extends the header to 128 bytes: the activation code, the `llama3`
-RoPE rescaling parameters, projection biases, QK norms (per head or over the
-whole projection), sandwich and post-norm placement, the embedding scale, the
-two logit softcaps, the attention scale, a second RoPE base with its layer
-stride, and routed experts — the fields that brought Qwen2/2.5, Qwen3,
-Llama-3.1/3.2, Gemma 1–3, OLMo2, Phi-3 and the mixture-of-experts families
-inside the supported set. A converter emits v1 whenever none of them is needed,
-so files that converted before v2 still produce the same bytes. There is no
-field for anything beyond that, which is what makes the compatibility list in
-[docs/MODELS.md](./docs/MODELS.md) what it is (`rai-infer/src/format.rs` has
-the byte layout).
-
-The loader performs one read of the whole file into heap memory, validates the
-header and section bounds, and then hands out borrowed slices into that buffer.
-This avoids additional copies between parsed sections, but loading still copies
-the file from storage into the process heap. No retained benchmark establishes
-a general performance advantage over `mmap`.
-
-## More measurements
-
-The headline table is at the top of this file. Beyond it, BENCHMARKS.md records
-the roofline analysis (decode reaches 45% of this machine's 26.4 GB/s memory
-ceiling), the batched-GEMM prefill rewrite, and the per-tensor quantization
-error, which ranged from 6.4e-06 (`q_proj`) to 6.2e-09 (the 8-bit embedding).
-
-It also records what was measured and rejected, so nobody re-derives it:
-self-speculative early exit reached 0.4% draft acceptance and ran roughly 15×
-slower than plain decoding, so it is not in the CLI — the library
-implementation remains for use with a trained exit head. An older author-run
-measurement reported ~195 tokens/s for SmolLM-135M, but its raw output and
-environment were not retained; it is kept as historical context, not as release
-evidence.
-
-See [BENCHMARKS.md](./BENCHMARKS.md) for the full method and the
-quantization-quality comparison.
-
-## Project status
-
-RAI is pre-1.0 and interfaces may change. What that means concretely:
-
-- One end-to-end conversion and decode run is measured (TinyLlama-1.1B,
-  BENCHMARKS.md). The rest of the supported list is verified by architecture
-  and, for Qwen2.5-0.5B, Qwen3-0.6B, Llama-3.2-1B, gemma-2b-it, gemma-2-2b-it,
-  gemma-3-1b-it, Phi-3-mini-4k, OLMo-2-1B and OLMoE-1B-7B, by a coherent
-  generation — not by a retained qualification matrix.
-- Architecture coverage is enforced at conversion time, and what remains
-  unsupported is unsupported for something a checkpoint *contains* rather than
-  for its name: a shared expert, a `rope_scaling` scheme the kernels do not
-  implement, an `lm_head` bias, or a module tree that is not Llama-shaped.
-  [docs/MODELS.md](./docs/MODELS.md) names each one and what to use instead.
-- **4-bit conversion costs real quality, and the number is now measured.** On
-  wikitext-2, `rai convert`'s round-to-nearest 4-bit raises perplexity by 13%
-  to 30% over the fp16 checkpoint, across Qwen2.5-0.5B/1.5B/3B and
-  SmolLM2-1.7B, and at `--temperature 0` the 4-bit model emits a different
-  token than fp16 between one time in four and one time in five. llama.cpp's
-  Q4_K_M costs three to eight times less on the same corpus, because it is not
-  uniformly 4-bit — it spends 6 bits on `ffn_down` and `attn_v`, where RAI
-  spends 4 on everything. RAI's files are correspondingly smaller. Method,
-  machine, corpus hash and the full tables are in
-  [BENCHMARKS.md](./BENCHMARKS.md); reproduce any of it with `rai perplexity`.
-- The optimized paths are x86-64 (AVX2 + FMA + F16C). On ARM — including
-  Apple Silicon, which ships a native `aarch64-apple-darwin` archive — the GEMM
-  falls back to a scalar path, so it runs correctly but far slower than the
-  measured x86-64 figures above. NEON kernels are future work, and no ARM
-  throughput is claimed here because none has been measured.
-- The memory/reasoning service and the RC/HRC/SAC compression paths are
-  research prototypes. Their confidence, crowding, and modeled-size outputs are
-  not validated guarantees.
-
-Issues and PRs are welcome. See [SECURITY.md](./SECURITY.md),
-[SUPPORT.md](./SUPPORT.md), and [CONTRIBUTING.md](./CONTRIBUTING.md).
-
-## About
-
-Built and maintained by [ClassEve](https://classeve.com) — engineering for AI agents and developer tooling. Project page: [classeve.com/public/rai](https://classeve.com/public/rai).
+- Something not working: [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md),
+  then [SUPPORT.md](SUPPORT.md).
+- Security issues: [SECURITY.md](SECURITY.md). Please don't file them as
+  public issues.
+- What changed in each release: [CHANGELOG.md](CHANGELOG.md).
+- Why RAI behaves the way it does: [BEHAVIOUR-DECISIONS.md](BEHAVIOUR-DECISIONS.md).
 
 ## License
 
-Apache License 2.0 — see [LICENSE](./LICENSE).
+Apache License 2.0. See [LICENSE](LICENSE).
 Copyright 2025-2026 ClassEve.

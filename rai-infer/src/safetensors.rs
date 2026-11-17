@@ -104,7 +104,8 @@ fn explain_missing_checkpoint(dir: &Path) -> String {
     format!(
         "{where_it_looked}.\n\nA convertible folder holds config.json, one or more \
          .safetensors files, and tokenizer.json. If you downloaded with huggingface-cli, \
-         pass --local-dir so the files land in a plain folder rather than the blob cache."
+         pass --local-dir so the files land in a plain folder rather than the blob cache, \
+         or let rai-get-model download and convert the model."
     )
 }
 

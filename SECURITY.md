@@ -38,6 +38,24 @@ fixture.
   unread. Each connection has a deadline, and a bounded number are read at
   once, so a stalled client cannot hold the server.
 
+### Installers and `rai-get-model`
+
+- `rai` itself opens no network connections; it has no HTTP client and no TLS
+  library. The installers and `rai-get-model` are the only parts that
+  download, and only when run.
+- `install.sh` and `install.ps1` download over HTTPS from this repository's
+  GitHub releases and refuse any file whose SHA-256 differs from the release's
+  `SHA256SUMS`. Every release file also carries a signed build-provenance
+  attestation (`gh attestation verify <file> --repo Classevelabs/rai`).
+- `rai-get-model` downloads over HTTPS from huggingface.co. A starter model is
+  pinned to one commit, and each of its files must match a SHA-256 recorded in
+  `launchers/models.tsv` before it is converted. Any other repository is taken
+  as Hugging Face serves it, and `rai check` reads its configuration before
+  the weights are fetched. A `HF_TOKEN` you set is sent to huggingface.co
+  only.
+- Only `.safetensors` weights are read. Pickle formats (`pytorch_model.bin`,
+  `.pt`, `.pth`) are refused, because loading one can run code.
+
 ### `rai-server` (the memory service; not part of the RAI product)
 
 - The REST listener is local-only and serves plain HTTP. It refuses

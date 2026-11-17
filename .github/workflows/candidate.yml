@@ -1,0 +1,63 @@
+name: Release candidate
+
+# Builds every download from a commit and installs each one on clean machines,
+# exactly as a release does, and publishes nothing. Run it before tagging; it
+# also runs on pull requests that change how RAI is installed.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - installers/**
+      - launchers/**
+      - .cargo/config.toml
+      - .github/workflows/dist.yml
+      - .github/workflows/clean-room.yml
+      - .github/workflows/candidate.yml
+
+concurrency:
+  group: candidate-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Read the version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+      sha: ${{ steps.read.outputs.sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Read the workspace version
+        id: read
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(awk '/^\[workspace.package\]/ { inside = 1; next } /^\[/ { inside = 0 }
+                         inside && /^version *=/ { gsub(/[" ]/, "", $0); sub(/^version=/, "", $0); print; exit }' Cargo.toml)
+          [ -n "$version" ] || { echo "::error::no version in Cargo.toml's [workspace.package]"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "candidate $version at $(git rev-parse HEAD)"
+
+  dist:
+    name: Build
+    needs: version
+    uses: ./.github/workflows/dist.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+      sha: ${{ needs.version.outputs.sha }}
+
+  clean-room:
+    name: Clean room
+    needs: dist
+    uses: ./.github/workflows/clean-room.yml
+    with:
+      source: artifact

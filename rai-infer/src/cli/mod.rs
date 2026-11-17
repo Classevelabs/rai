@@ -17,6 +17,7 @@
 //! inference library with none of this compiled in.
 
 pub mod catalog;
+pub mod check;
 pub mod convert;
 mod http;
 pub mod jobs;
@@ -34,6 +35,35 @@ pub const MODEL_EXTENSION: &str = "raimodel";
 
 /// The tokenizer file `rai convert` writes beside every model it produces.
 pub const TOKENIZER_FILENAME: &str = "tokenizer.json";
+
+/// Where `rai-get-model` keeps models: `$RAI_HOME`, or a folder called `RAI`
+/// in the user's home folder.
+pub fn rai_home() -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("RAI_HOME").filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(home));
+    }
+    let user = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })?;
+    Some(PathBuf::from(user).join("RAI"))
+}
+
+/// Every model folder under the RAI home's `models`, sorted. Each holds one
+/// model with its tokenizer and chat record, as `rai-get-model` writes them;
+/// one folder per model is what keeps two tokenizers from colliding.
+pub fn model_folders() -> Vec<PathBuf> {
+    let Some(root) = rai_home().map(|home| home.join("models")) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut folders: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    folders.sort();
+    folders
+}
 
 /// Resolve the tokenizer for `model`, defaulting to `tokenizer.json` beside it.
 ///

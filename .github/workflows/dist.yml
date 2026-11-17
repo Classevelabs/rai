@@ -1,0 +1,444 @@
+name: Build the downloads
+
+# Every file a release offers, built once: the four archives, the Windows
+# Setup, the Linux .deb and .rpm, the two install scripts, and SHA256SUMS over
+# all of them, handed on as the `rai-dist` artifact. The release and the
+# candidate workflows both call this and then test those exact bytes on clean
+# machines (clean-room.yml), so what is tested is what ships.
+#
+# The one flag no build here may use is `target-cpu=native`: a binary built
+# that way runs only on CPUs at least as new as the runner that built it, and
+# dies with SIGILL everywhere else, after download, with no diagnostic.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "Workspace version the binaries must report, e.g. 0.2.6"
+        required: true
+        type: string
+      sha:
+        description: "Commit to build"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    timeout-minutes: 60
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Built against glibc 2.28 (AlmaLinux 8), so the program starts on
+          # Ubuntu 20.04, Debian 10, RHEL 8 and every distribution since. Built
+          # on the ubuntu-24.04 runner itself, 0.2.5 needed glibc 2.34 and
+          # refused Ubuntu 20.04, Debian 11 and RHEL 8 with "GLIBC_2.34 not found".
+          - os: ubuntu-24.04
+            container: quay.io/pypa/manylinux_2_28_x86_64@sha256:7e41b1c7fd64dfc69703a1124b43c404382973ee06ec5d764b85c34d2221fded # 2026.11.01-2
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            rustflags: "-C target-cpu=x86-64-v2"
+          # The C runtime is linked in: a fresh Windows has no
+          # VCRUNTIME140.dll, and without it rai.exe died before printing a word.
+          - os: windows-2025
+            container: ""
+            target: x86_64-pc-windows-msvc
+            archive: zip
+            rustflags: "-C target-cpu=x86-64-v2 -C target-feature=+crt-static"
+          - os: macos-15-intel
+            container: ""
+            target: x86_64-apple-darwin
+            archive: tar.gz
+            rustflags: "-C target-cpu=x86-64-v2"
+          # Apple Silicon, built natively at the toolchain default: an x86 CPU
+          # name means nothing on aarch64, and there is no NEON kernel to pick.
+          - os: macos-15
+            container: ""
+            target: aarch64-apple-darwin
+            archive: tar.gz
+            rustflags: ""
+
+    steps:
+      - name: Checkout the commit to build
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+
+      - name: Confirm the commit
+        shell: bash
+        env:
+          SHA: ${{ inputs.sha }}
+        run: |
+          git config --global --add safe.directory "$PWD"
+          test "$(git rev-parse HEAD)" = "$SHA"
+
+      - name: Install Rust in the build container
+        if: matrix.container != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Show the pinned Rust toolchain and the build flags
+        shell: bash
+        run: |
+          rustc --version --verbose
+          cargo --version --verbose
+          echo "RUSTFLAGS=$RUSTFLAGS"
+
+      - name: Cache Cargo registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ matrix.target }}-cargo-dist-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Confirm the portable baseline and the static runtime
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          # RUSTFLAGS in the environment replaces .cargo/config.toml, so the
+          # flags that matter are asserted here rather than trusted.
+          case "$RUSTFLAGS" in
+            *target-cpu=native*) echo "::error::target-cpu=native would crash older CPUs"; exit 1 ;;
+          esac
+          case "$TARGET" in
+            x86_64-*)
+              case "$RUSTFLAGS" in
+                *target-cpu=x86-64-v2*) ;;
+                *) echo "::error::$TARGET must pin target-cpu=x86-64-v2, got '$RUSTFLAGS'"; exit 1 ;;
+              esac ;;
+            aarch64-*)
+              [ -z "$RUSTFLAGS" ] || { echo "::error::$TARGET builds at the toolchain default, got '$RUSTFLAGS'"; exit 1; } ;;
+            *) echo "::error::no baseline policy for $TARGET"; exit 1 ;;
+          esac
+          case "$TARGET" in
+            *-windows-msvc)
+              case "$RUSTFLAGS" in
+                *target-feature=+crt-static*) ;;
+                *) echo "::error::$TARGET must link the C runtime statically"; exit 1 ;;
+              esac ;;
+          esac
+          echo "flags confirmed for $TARGET: '$RUSTFLAGS'"
+
+      # rai-infer owns every shipped binary. The memory crates in this
+      # workspace (rai-server, rai-core, rem-nra) are not the product and are
+      # never built here: building them is what once put an HTTP client inside
+      # an archive whose claim is that nothing leaves the machine.
+      - name: Build release binaries
+        shell: bash
+        run: cargo build --locked --release --package classeve-rai-infer
+
+      - name: Run every shipped binary before packaging it
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          ext=""; if [ "${RUNNER_OS}" = "Windows" ]; then ext=".exe"; fi
+          for bin in rai rai-convert rai-generate rai-chat; do
+            out="$("./target/release/${bin}${ext}" --version)"
+            printf '%s: %s\n' "$bin" "$out"
+            case "$out" in
+              *" $VERSION") ;;
+              *) echo "::error::${bin} --version answered '${out}', not ${VERSION}"; exit 1 ;;
+            esac
+          done
+
+      - name: Linux - the program needs glibc 2.28 at most
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          newest=$(objdump -T target/release/rai | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' | sed 's/GLIBC_//' | sort -Vu | tail -n 1)
+          echo "newest glibc symbol: $newest"
+          if [ "$(printf '%s\n2.28\n' "$newest" | sort -V | tail -n 1)" != "2.28" ]; then
+            echo "::error::rai needs glibc $newest, above the 2.28 the release promises"
+            exit 1
+          fi
+
+      - name: Windows - no Visual C++ runtime to load
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for bin in rai rai-convert rai-generate rai-chat; do
+            if grep -qai 'vcruntime140' "target/release/${bin}.exe"; then
+              echo "::error::${bin}.exe still loads VCRUNTIME140.dll, which a fresh Windows does not have"
+              exit 1
+            fi
+          done
+          echo "no binary loads the Visual C++ runtime"
+
+      - name: Stage the archive
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          stage="dist/rai-${VERSION}-${TARGET}"
+          mkdir -p "$stage"
+          ext=""; if [ "${RUNNER_OS}" = "Windows" ]; then ext=".exe"; fi
+          for bin in rai rai-convert rai-generate rai-chat; do
+            cp "target/release/${bin}${ext}" "$stage/"
+          done
+          cp LICENSE NOTICE THIRD-PARTY-NOTICES.md README.md INSTALL.md "$stage/"
+          cp -r launchers "$stage/"
+          # tar keeps the mode, and a launcher without its executable bit
+          # answers a double-click with "Permission denied".
+          chmod +x "$stage"/launchers/*.sh "$stage"/launchers/*.command "$stage"/launchers/rai-get-model
+          for script in "$stage"/launchers/*.sh "$stage"/launchers/*.command "$stage"/launchers/rai-get-model; do
+            [ -x "$script" ] || { echo "::error::$script is not executable"; exit 1; }
+          done
+
+          cat > "$stage/RUNNING.txt" <<RUNNING
+          RAI ${VERSION} for ${TARGET}
+
+          START HERE
+            Windows: double-click launchers\\rai-studio.cmd
+            macOS:   double-click launchers/rai-studio.command
+            Linux:   run launchers/rai-studio.sh
+            RAI Studio opens in your browser. The first time, it offers to
+            download a model to chat with (Qwen2.5 1.5B Instruct, 3.1 GB).
+
+            To install RAI properly instead, with rai on your PATH and a menu
+            entry, use the one-line installer:
+              Linux, macOS: curl -fsSL https://github.com/Classevelabs/rai/releases/latest/download/install.sh | sh
+              Windows:      irm https://github.com/Classevelabs/rai/releases/latest/download/install.ps1 | iex
+
+          WHAT IS IN HERE
+            rai           the program: convert, run, serve, check, models
+            launchers/    rai-studio (chat in your browser) and
+                          rai-get-model (download a model and convert it)
+            rai-convert, rai-generate and rai-chat are older names for rai's
+            commands, kept so old scripts keep working.
+
+          IF macOS SAYS "rai" CANNOT BE OPENED
+            macOS holds back programs downloaded through a browser. Allow this
+            folder once, in Terminal:
+              xattr -dr com.apple.quarantine /path/to/this/folder
+
+          CHECK YOUR DOWNLOAD
+            Compare it with the line for it in the release's SHA256SUMS:
+              sha256sum <archive>                  (Linux)
+              shasum -a 256 <archive>              (macOS)
+              certutil -hashfile <archive> SHA256  (Windows)
+
+          WHAT IT NEEDS
+            A 64-bit Intel or AMD processor from 2011 or later (with AVX2,
+            as most Intel Core and AMD Ryzen chips since 2015 have, it takes
+            its fast path), or an Apple Silicon Mac. No graphics card. Linux
+            needs glibc 2.28 or newer: Ubuntu 20.04, Debian 10, RHEL 8 or
+            anything newer.
+
+          PRIVACY
+            rai never connects to the internet, and rai serve answers only
+            this computer. rai-get-model downloads models from Hugging Face,
+            and only when you run it.
+
+          MORE
+            README.md, INSTALL.md and https://github.com/Classevelabs/rai
+          RUNNING
+
+      # The product boundary, enforced: exactly these four programs, and none
+      # of them carries a TLS stack or an HTTP client, which is what lets the
+      # documentation say rai never goes online with no conditions attached.
+      - name: Assert the archive carries only the product
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          stage="dist/rai-${VERSION}-${TARGET}"
+          ext=""; if [ "${RUNNER_OS}" = "Windows" ]; then ext=".exe"; fi
+          expected="rai rai-chat rai-convert rai-generate"
+          actual=$(find "$stage" -maxdepth 1 -type f \
+                     ! -name '*.md' ! -name '*.txt' ! -name 'LICENSE' ! -name 'NOTICE' \
+                   | sed 's#.*/##; s#\.exe$##' | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')
+          [ "$actual" = "$expected" ] || { echo "::error::archive programs are '$actual', expected '$expected'"; exit 1; }
+          for bin in $expected; do
+            for marker in rustls webpki BoringSSL reqwest hyper.rs; do
+              if grep -qaiF "$marker" "$stage/${bin}${ext}"; then
+                echo "::error::${bin} contains '$marker': the engine must carry no TLS or HTTP stack"
+                exit 1
+              fi
+            done
+          done
+          echo "programs: $actual; no TLS or HTTP stack in any of them"
+
+      - name: Create the tar.gz
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          TARGET: ${{ matrix.target }}
+          # macOS tar would add AppleDouble `._` files for extended attributes.
+          COPYFILE_DISABLE: "1"
+        run: |
+          set -euo pipefail
+          name="rai-${VERSION}-${TARGET}"
+          tar -C dist -czf "dist/${name}.tar.gz" "$name"
+          rm -rf "dist/${name}"
+          ls -l dist
+
+      - name: Create the zip
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $name = "rai-$env:VERSION-$env:TARGET"
+          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip" -Force
+
+      - name: Windows - build the Setup
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Setup installs one folder: the program, the launchers and the
+          # model list side by side, so one PATH entry covers all three.
+          $payload = 'dist/setup'
+          New-Item -ItemType Directory -Force -Path $payload | Out-Null
+          Copy-Item target/release/rai.exe, launchers/rai-studio.cmd, launchers/rai-get-model.cmd,
+                    launchers/rai-get-model.ps1, launchers/models.tsv, LICENSE, NOTICE,
+                    THIRD-PARTY-NOTICES.md, README.md, INSTALL.md -Destination $payload
+
+          choco install nsis --version=3.12.0 --allow-downgrade -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "choco install nsis failed with exit code $LASTEXITCODE" }
+          $makensis = @("${env:ProgramFiles(x86)}\NSIS\makensis.exe", "$env:ProgramFiles\NSIS\makensis.exe") |
+            Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $makensis) { $found = Get-Command makensis -ErrorAction SilentlyContinue; if ($found) { $makensis = $found.Source } }
+          if (-not $makensis) { throw 'NSIS installed but makensis.exe was not found' }
+
+          $size = [int][math]::Ceiling(((Get-ChildItem -LiteralPath $payload -Recurse -File | Measure-Object Length -Sum).Sum) / 1KB)
+          $out = (Join-Path (Resolve-Path dist).Path "rai-$env:VERSION-windows-x64-setup.exe")
+          & $makensis -V2 "-DVERSION=$env:VERSION" "-DPAYLOAD_DIR=$((Resolve-Path $payload).Path)" "-DINSTALLSIZE=$size" "-DOUTFILE=$out" installers/windows/rai.nsi
+          if ($LASTEXITCODE -ne 0) { throw "makensis failed with exit code $LASTEXITCODE" }
+          Remove-Item -LiteralPath $payload -Recurse -Force
+          Remove-Item -LiteralPath "dist/rai-$env:VERSION-$env:TARGET" -Recurse -Force
+          Get-ChildItem dist | Format-Table Name, Length
+
+      - name: Hand the files on
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  linux-packages:
+    name: Build the .deb and .rpm
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout the commit to build
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+
+      - name: Fetch the Linux archive
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist-x86_64-unknown-linux-gnu
+          path: linux
+
+      - name: Package it
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rpm >/dev/null
+          tar -xzf "linux/rai-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" -C linux
+          bash installers/linux/build-packages.sh "linux/rai-${VERSION}-x86_64-unknown-linux-gnu" "$VERSION" packages
+          dpkg-deb --info "packages/rai_${VERSION}_amd64.deb"
+          rpm -qip "packages/rai-${VERSION}-1.x86_64.rpm"
+
+      - name: Hand the packages on
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-linux-packages
+          path: packages/*
+          if-no-files-found: error
+          retention-days: 7
+
+  sums:
+    name: Gather the downloads and SHA256SUMS
+    needs: [build, linux-packages]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout the commit to build
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+
+      - name: Fetch every build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: release
+
+      - name: Add the install scripts and hash everything
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          cp installers/install.sh installers/install.ps1 release/
+          cd release
+          # The complete set, counted: a SHA256SUMS that leaves a file out
+          # blesses the rest and leaves that one unverifiable.
+          for want in \
+              "rai-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+              "rai-${VERSION}-x86_64-pc-windows-msvc.zip" \
+              "rai-${VERSION}-x86_64-apple-darwin.tar.gz" \
+              "rai-${VERSION}-aarch64-apple-darwin.tar.gz" \
+              "rai-${VERSION}-windows-x64-setup.exe" \
+              "rai_${VERSION}_amd64.deb" \
+              "rai-${VERSION}-1.x86_64.rpm" \
+              install.sh install.ps1; do
+            [ -f "$want" ] || { echo "::error::the release is missing $want"; exit 1; }
+          done
+          [ "$(ls | wc -l)" -eq 9 ] || { echo "::error::unexpected files: $(ls)"; exit 1; }
+          sha256sum -- * > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Hand on the complete release
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rai-dist
+          path: release/*
+          if-no-files-found: error
+          retention-days: 14

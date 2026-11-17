@@ -38,8 +38,11 @@ pub struct GenerationArgs {
     /// The prompt to complete
     #[arg(long)]
     pub prompt: String,
-    /// Maximum number of tokens to generate
-    #[arg(long, default_value = "64")]
+    /// Maximum number of tokens to generate; the reply ends sooner when the
+    /// model finishes it
+    // Room for a full answer to an ordinary question, where 64 stopped one
+    // partway; a model that ends its turn stops well before the limit.
+    #[arg(long, default_value = "512")]
     pub max_tokens: usize,
     /// Sampling temperature; 0 always takes the most likely token
     #[arg(long, default_value = "0.7")]
@@ -83,9 +86,10 @@ pub struct GenerationArgs {
     /// Print per-step decoding diagnostics to stderr
     #[arg(long, default_value = "false")]
     pub verbose: bool,
-    /// Chat template: auto (the model's own, recorded at conversion), model,
-    /// none, few-shot, mistral, llama3, chatml, zephyr, phi3, gemma
-    #[arg(long, default_value = "none")]
+    /// Chat template: auto (the model's own, recorded at conversion; plain
+    /// text for a model that has none), model, none, few-shot, mistral, llama3,
+    /// chatml, zephyr, phi3, gemma
+    #[arg(long, default_value = "auto")]
     pub chat_template: String,
     /// Draft model for speculative decoding (e.g. smollm-135m-q4.raimodel)
     #[arg(long)]
@@ -277,7 +281,13 @@ pub fn run(args: &RunArgs) -> Result<()> {
     eprintln!("Loading tokenizer: {}", tokenizer_path.display());
     let tokenizer = load_tokenizer_for_model(&tokenizer_path, cfg.vocab_size as usize)?;
 
-    let format = ChatFormat::load(&generation.chat_template, &args.model, &tokenizer)?;
+    let mut format = ChatFormat::load(&generation.chat_template, &args.model, &tokenizer)?;
+    // `auto` on a model with no chat template of its own is a completion: the
+    // prompt goes to the model as written, as `--chat-template none` sends it,
+    // not inside the few-shot frame a chat window needs.
+    if generation.chat_template == "auto" && format.builtin() == Some(ChatTemplate::FewShot) {
+        format = ChatFormat::load("none", &args.model, &tokenizer)?;
+    }
     if format.builtin() != Some(ChatTemplate::None) {
         eprintln!("Chat template: {}", format.name());
     }
@@ -749,14 +759,19 @@ pub fn run(args: &RunArgs) -> Result<()> {
         println!();
         if tokens_generated == 0 {
             // Silence here reads as a broken tool. The usual cause is an
-            // instruction-tuned model given a bare prompt: it ends the
-            // sequence immediately because nothing marks a turn.
-            eprintln!(
-                "\nNo tokens generated: the model emitted end-of-sequence first. \
-                 If this is an instruction-tuned model, pass --chat-template auto \
-                 (its own template, recorded at conversion) or name one: mistral, \
-                 llama3, chatml, zephyr, phi3, gemma, few-shot."
-            );
+            // instruction-tuned model given plain text, which ends the sequence
+            // at once because nothing marks a turn: `--chat-template none`, or
+            // a model converted before its chat format was recorded.
+            if format.builtin() == Some(ChatTemplate::None) {
+                eprintln!(
+                    "\nNo tokens generated: the model ended its reply at once. An \
+                     instruction-tuned model needs its chat format: convert it again \
+                     so the format is recorded beside it, or name one with \
+                     --chat-template (chatml, llama3, mistral, zephyr, phi3, gemma, few-shot)."
+                );
+            } else {
+                eprintln!("\nNo tokens generated: the model ended its reply at once.");
+            }
         }
         eprintln!("\n--- Stats ---");
         eprintln!("Tokens: {tokens_generated}, {decode_tps:.2} tok/s");

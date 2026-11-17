@@ -1,378 +1,239 @@
-# Which models work
+# Models
 
-## I have a folder — what now?
+RAI runs models stored in its own file format, `.raimodel`. You get one by
+converting a model from [Hugging Face](https://huggingface.co), and
+`rai-get-model` does the downloading and converting for you.
 
-Point the converter at it. Nothing is written until the checkpoint has passed
-the preflight, so a wrong answer costs seconds:
+- [Starter models](#starter-models)
+- [Any other model](#any-other-model)
+- [Will my model work?](#will-my-model-work)
+- [A model you already downloaded](#a-model-you-already-downloaded)
+- [Conversion options](#conversion-options)
+- [The Python exporters](#the-python-exporters)
+- [Details](#details): why some models are refused, and the limits that apply
+  to all of them
+
+## Starter models
 
 ```bash
-rai convert /path/to/Qwen2.5-0.5B-Instruct -o qwen2.5-0.5b-q4.raimodel
+rai-get-model qwen2.5-1.5b
 ```
 
-Or press **Check** in Studio (`rai serve`, then the Convert screen). It calls
-`POST /api/inspect`, which runs the same preflight the converter runs and
-reports the same verdict — with the difference that Studio reads folders only.
-It has no HTTP client, so a repository id is answered with the download command
-rather than a fetch:
-
-```bash
-huggingface-cli download Qwen/Qwen2.5-0.5B-Instruct --local-dir ./Qwen2.5-0.5B-Instruct
-```
-
-Either way the answer is one of three things: it converts, it converts with a
-different flag, or it is refused by name. A refusal always names the blocker;
-the table below says what to run instead.
-
-On Windows, download into a plain directory: `huggingface_hub` fills its cache
-with symlinks, which Windows refuses without Developer Mode
-([INSTALL.md](./INSTALL.md#downloading-on-windows)).
-
-## What has to be in the folder
-
-Any directory holding these converts. Where it came from and what it is called
-do not matter.
-
-| File | Needed | Notes |
-| --- | --- | --- |
-| `config.json` | Yes | Read first, and alone when you inspect a config-only folder. |
-| `model.safetensors` | Yes, or the shards below | Single-file checkpoints. |
-| `model-00001-of-0000N.safetensors` + `model.safetensors.index.json` | Yes, or the single file above | Sharded checkpoints; the index is what the converter walks. |
-| `tokenizer.json` | Yes | Conversion refuses without it, because the runtime needs it next to the model. It is copied there for you. |
-| `pytorch_model.bin`, `*.pth`, `*.pt` | Deliberately not read | Python pickles. Unpickling runs whatever code the file contains, and a checkpoint downloaded from a model hub is exactly the file that must not be able to do that. The error names yours and prints the command that converts it. |
-| `*.gguf` | Not read | llama.cpp's format, already quantized. RAI converts from the original fp16/bf16 weights so it controls the quantization itself. |
-
-Two layouts fail for reasons that have nothing to do with the architecture, and
-both are fixable where you stand:
-
-- **Weights only as `pytorch_model.bin`.** Most such models have a
-  `.safetensors` sibling revision on the Hub; take that one. Otherwise convert
-  it once, in an environment that already has torch — the exact command,
-  including the `weights_only=True` that keeps the load from executing code, is
-  printed in the error. This is a deliberate limit, not a missing feature: a
-  pickle reader would put arbitrary code execution inside a binary whose whole
-  argument is an auditable dependency tree.
-- **A `tokenizer.model` and no `tokenizer.json`.** Older SentencePiece
-  repositories ship only the former. Load the folder once with
-  `transformers.AutoTokenizer.from_pretrained(...)` and
-  `.save_pretrained(...)`, which writes the fast `tokenizer.json` beside it.
-
-## Will my model convert?
-
-Find your family. The **Use instead** column is a checkpoint of comparable size
-that this format does store.
-
-| Your checkpoint | Verdict | Use instead | Why |
+| Name | Download | On disk | |
 | --- | --- | --- | --- |
-| Llama-2, Llama-3, Llama-3.1, Llama-3.2 | **Converts** | — | Reference architecture. `llama3` RoPE rescaling is stored in the v2 header. |
-| Mistral-7B v0.1 / v0.2 / v0.3 | **Converts** | — | Identical module tree to Llama. Convert with `--max-context 4096` or lower (see sliding windows). |
-| Qwen2, Qwen2.5 | **Converts** | — | Projection bias vectors are stored as f32 in the layer section. |
-| Gemma (first generation) | **Converts** | — | GeGLU is a stored activation code; the `(1 + w)` norm and embedding scale are folded at conversion. |
-| TinyLlama-1.1B | **Converts** | — | The measured reference model. |
-| SmolLM, SmolLM2 (135M / 360M / 1.7B) | **Converts** | — | `LlamaForCausalLM` with no bias and no RoPE scaling. |
-| Llama-2 / Mistral fine-tunes (Zephyr, OpenHermes, Vicuna, Nous-Hermes) | **Converts** | — | Fine-tuning changes weights, not architecture. |
-| Qwen3 (dense: 0.6B, 1.7B, 4B, 8B, 14B, 32B) | **Converts** | — | Per-head QK norm is stored in the v2 layer section. Verified: Qwen3-0.6B converts to 399 MB and generates. |
-| Gemma2 (2B, 9B, 27B) | **Converts** | — | Logit softcapping and the two block-output norms are stored. Convert with `--max-context 4096` or lower (see sliding windows). Verified: gemma-2-2b-it converts to 1.70 GB and generates. |
-| OLMo2 | **Converts** | — | Projection-wide QK norms and post-norm placement are both stored. Verified: OLMo-2-1B-Instruct converts in 47.2 s to 898 MB and generates. |
-| Gemma3 270M and 1B (`gemma3_text`) | **Converts** | — | Both RoPE bases and the layer stride are stored. Convert with `--max-context 512` or lower (its sliding window). Verified: gemma-3-1b-it converts in 41.5 s to 660 MB and generates. |
-| Gemma3 4B, 12B, 27B (`gemma3`) | **Refused** | Gemma2 or Qwen3 of a similar size | Multimodal: the language model's settings sit under `text_config`, beside a vision tower the container does not store, and its full-attention layers use `linear` RoPE scaling. |
-| Mixtral-8x7B | **Converts** | — | Router and every expert are stored. A 4-bit Mixtral-8x7B is ~24 GB on disk and needs that much RAM to run — check before you start. |
-| Qwen3-MoE (30B-A3B) | **Converts** | — | Routed experts are stored. Verified on OLMoE-1B-7B (64 experts, 8 per token): converts in 121.3 s to 3.5 GB and generates. |
-| Mixtral-8x22B, Qwen3-MoE 235B-A22B | **Refused** | Mixtral-8x7B, Qwen3-30B-A3B | At 4 bits every stored expert comes to more than the reader's 64 GiB file limit, so the conversion is refused before it starts rather than producing a file that cannot be loaded. |
-| Any config with `shared_expert_intermediate_size` or `n_shared_experts` | **Refused** | The same family without a shared expert | A shared expert runs for *every* token alongside the routed ones; the container stores routed experts only, so dropping it would remove a pathway rather than degrade one. |
-| Phi-3 with a 4k context | **Converts** | — | Its fused `qkv_proj` and `gate_up_proj` are split at conversion. Convert with `--max-context 2047` or lower (see sliding windows). Verified: Phi-3-mini-4k-instruct converts to 2,083 MB in 22.8 s and generates. |
-| Phi-3 128k, Phi-3.5 | **Refused** | `microsoft/Phi-3-mini-4k-instruct` | `longrope` RoPE scaling, which the container does not store. |
-| Phi-2 | **Refused** | `meta-llama/Llama-3.2-3B-Instruct` | Not a Llama-shaped module tree; unlike Phi-3 it is not a fused variant of one. |
-| Falcon | **Refused** | `mistralai/Mistral-7B-Instruct-v0.3` | No Llama-style module tree. |
-| GPT-NeoX, Pythia | **Refused** | `meta-llama/Llama-3.2-1B-Instruct` (or SmolLM2 below 1B) | No Llama-style module tree. |
-| MPT | **Refused** | `mistralai/Mistral-7B-Instruct-v0.3` | No Llama-style module tree. |
-| GPT-2 | **Refused** | `HuggingFaceTB/SmolLM2-360M-Instruct` | Learned position embeddings, fused attention, no `model.layers`. |
-| Anything with `rope_scaling` other than `default` or `llama3` (`linear`, `dynamic`, `yarn`) | **Refused** | The unscaled base checkpoint, or a Llama-3.1 model | Positions would be computed wrong; the container stores two schemes. |
-| Anything carrying `lm_head.bias` | **Refused** | The base checkpoint it was tuned from | Biases are stored for the seven layer projections only, so it would be dropped in silence. |
-| Granite (dense), MiniCPM | **Refused** | A Llama, Mistral or Qwen3 checkpoint of the same size | Llama tensor names, but scales applied outside any tensor (`residual_multiplier`, `scale_depth`, …) that the header has no slot for. |
-| SmolLM3 | **Refused** | `HuggingFaceTB/SmolLM2-1.7B-Instruct` | Every fourth layer skips RoPE (`no_rope_layers`); the runtime rotates every layer. |
-| StableLM, StableLM-2 | **Refused** | `HuggingFaceTB/SmolLM2-1.7B-Instruct` | Biased LayerNorm and partial rotary (`partial_rotary_factor`); the container stores RMSNorm and rotates the full head. |
+| `qwen2.5-0.5b` | 1.0 GB | 0.3 GB | Small and fast. Good for trying RAI out on any computer. |
+| `qwen2.5-1.5b` | 3.1 GB | 0.9 GB | Recommended. Clear answers at a good speed on a laptop. |
+| `qwen2.5-7b` | 15.2 GB | 4.0 GB | Best answers, but slower. For computers with 8 GB of memory or more. |
 
-A refusal is a hard error at export, never a warning, and never a file that
-loads cleanly and generates nonsense.
+These are Qwen2.5 Instruct models, released by Alibaba's Qwen team under the
+Apache-2.0 license and free to download without a Hugging Face account. Each is
+pinned to one upload, and every file is checked against its SHA-256
+fingerprint before it is converted, so everyone gets exactly the same model.
+The model's license is copied next to it.
 
-### Where the line falls now
+The models go into `~/RAI/models/<name>` (on Windows,
+`%USERPROFILE%\RAI\models\<name>`), or under `RAI_HOME` if you set it. The
+download is deleted once the model is converted.
 
-A family converts once its forward pass has been verified: the `model_type`
-list in the table further down. Matching tensor names prove nothing about the
-arithmetic — ERNIE-4.5 rotates interleaved pairs and EXAONE-4 skips RoPE on its
-global layers, both under Llama tensor names — so any other `model_type` is
-refused. Within those families, what is refused is refused for something a
-checkpoint *contains*:
+## Any other model
 
-- **A shared expert.** A routed mixture-of-experts model converts; one that
-  also runs a shared expert for every token does not. That expert has no slot,
-  and leaving it out removes a pathway rather than degrading one.
-- **A RoPE scheme other than `default` or `llama3`.** `yarn`, `linear` and
-  `dynamic` each compute inverse frequencies differently. Getting one wrong
-  shows up as quality loss at long context, not as a failure, so it is refused.
-- **An `lm_head` bias.** Biases are stored for the seven layer projections
-  only, so it would be dropped in silence.
-- **A scale with no slot.** Granite multiplies its embeddings, residual
-  branches, attention scores and logits by configured factors, and MiniCPM
-  scales by depth and width; none of those live in a tensor, so a file that
-  left them out would load and compute something else.
-- **Rotary on part of the head, or on some layers only.** A
-  `partial_rotary_factor` below 1 or a `no_rope_layers` entry of 0 changes
-  where positions enter; the runtime rotates every dimension of every layer.
-- **A norm with a bias.** That is a LayerNorm, not an RMSNorm, and running it
-  as one would drop both the bias and the mean subtraction.
-- **A module tree that is not Llama-shaped.** Falcon, GPT-NeoX, MPT, GPT-2 and
-  Phi-2 do not expose the tensors a layer stores. Phi-3 *is* a fused Llama tree,
-  which is why it converts and Phi-2 does not.
-
-Two families illustrate why the family name alone never settles it. OLMo2 carries
-`q_norm`/`k_norm` — the same tensor names Qwen3 uses — but sized over the whole
-projection and applied before the split into heads: different arithmetic, not a
-longer vector. Both are stored, under different flags, and which one a
-checkpoint has is read from the stored width rather than guessed from its name.
-Gemma3 looked like it needed the same QK norm; it did not. It needed two RoPE
-bases, because its sliding and global layers rotate at different frequencies —
-a difference that produces a model which loads, runs, and is quietly worse.
-
-Studio does not read this page: it reports whatever the server's preflight
-says, so a family that becomes supported stops being offered an alternative.
-
-### What has actually been run
-
-Qwen2.5-0.5B-Instruct, Llama-3.2-1B-Instruct, gemma-2b-it, **Qwen3-0.6B**, **gemma-2-2b-it**, **gemma-3-1b-it**, **Phi-3-mini-4k-instruct**, **OLMo-2-1B-Instruct** and **OLMoE-1B-7B-Instruct** were each converted and generated coherent text. The last two
-are the checkpoints that exercise the capabilities added for them: Qwen3-0.6B
-writes 399 MB with the QK-norm flag set, gemma-2-2b-it writes 1.70 GB with the
-sandwich-norm flag and both softcaps. Their stored norm vectors were also read
-back from the container at documented byte offsets and compared against the
-source `.safetensors` — bit-exact, so the capability is stored correctly and
-not merely accepted. TinyLlama-1.1B-Chat is the one
-checkpoint measured end to end: 2,200 MB of fp16 weights become a 619.5 MB
-`.raimodel` in 7.6 s at 22.9 MB peak RSS, and decode 21.8 tok/s
-([BENCHMARKS.md](../BENCHMARKS.md)). Zephyr-7B-beta and SmolLM2-1.7B-Instruct
-were converted and measured on disk. Every other row above is supported by
-architecture, not by a retained run.
-
-## Check before downloading 14 GB
-
-Every config-level blocker is visible in `config.json`, which is a few
-kilobytes. Fetch that file alone first.
+Give `rai-get-model` the model's name as Hugging Face shows it:
 
 ```bash
-curl -sL https://huggingface.co/<org>/<model>/raw/main/config.json -o config.json
-python - <<'PY'
-import json
-c = json.load(open("config.json"))
-print("model_type       ", c.get("model_type"))
-print("architectures    ", c.get("architectures"))
-print("rope_scaling     ", c.get("rope_scaling"))
-print("rope_parameters  ", c.get("rope_parameters"))
-print("experts          ", c.get("num_experts"), c.get("num_local_experts"))
-print("sliding_window   ", c.get("sliding_window"))
-print("softcapping      ", c.get("attn_logit_softcapping"), c.get("final_logit_softcapping"))
-print("hidden_act       ", c.get("hidden_act"), c.get("hidden_activation"))
-PY
+rai-get-model HuggingFaceTB/SmolLM2-1.7B-Instruct
 ```
 
-The three fields that decide it most often are `model_type`, `num_experts`, and
-`rope_scaling`. Read the output against this:
+It downloads the model's small settings files first and asks RAI whether it
+can run it. Only then does it download the weights, convert them, and keep the
+result in `~/RAI/models`. Add `--keep` to keep the downloaded originals too.
 
-| Field | Convert it | Do not download |
+Some models, Llama and Gemma among them, ask you to accept their license on
+Hugging Face before you can download them. Accept it on the model's page,
+create a read token at <https://huggingface.co/settings/tokens>, and run:
+
+```bash
+HF_TOKEN=hf_your_token rai-get-model meta-llama/Llama-3.2-1B-Instruct
+```
+
+For chatting, take a model whose name ends in `-Instruct`, `-Chat` or `-it`.
+The others are base models: they continue a text rather than answer it.
+
+## Will my model work?
+
+| Family | | Notes |
 | --- | --- | --- |
-| `model_type` | `llama`, `mistral`, `qwen2`, `qwen3`, `qwen3_moe`, `gemma`, `gemma2`, `gemma3_text`, `phi3`, `olmo2`, `olmoe`, `mixtral` | Any other, such as `gemma3` (multimodal), `phi`, `falcon`, `mpt`, `gpt_neox`, `gpt2`, `granite`, `smollm3` |
-| `text_config` | Absent | Present: a multimodal checkpoint |
-| `num_experts` / `num_local_experts` | Any value — routed experts convert | — |
-| `shared_expert_intermediate_size` | Absent or zero | Any positive value: a shared expert has no slot |
-| `rope_scaling`, or `rope_parameters` in a config written by transformers 5 | `null`, absent, `{"rope_type": "default"}`, or `{"rope_type": "llama3", ...}` | Any other `rope_type`, including `linear`, `dynamic`, `yarn`, `longrope` |
-| `partial_rotary_factor` (top level or inside `rope_parameters`) | Absent or `1.0` | Anything below 1 |
-| `no_rope_layers` | Absent, or every entry `1` | Any entry `0` |
-| `embedding_multiplier`, `residual_multiplier`, `logits_scaling`, `scale_emb` | Absent or `1.0` | Any other value |
-| `attention_multiplier`, `scale_depth`, `dim_model_base` | Absent | Present |
-| `sliding_window` | Absent, or at least your `--max-context` | Present and below your `--max-context` — lower the context rather than dropping the model |
-| `hidden_act` / `hidden_activation` | `silu`, `swish`, `gelu_pytorch_tanh`, or absent | Any other named activation |
+| Llama 2, 3, 3.1, 3.2 | Works | |
+| Mistral 7B (v0.1 to v0.3) | Works | |
+| Mixtral 8x7B | Works | About 24 GB on disk, and it needs that much memory |
+| Qwen 2 and 2.5 | Works | |
+| Qwen 3 (0.6B to 32B) and Qwen3 30B-A3B | Works | |
+| Gemma (first generation) | Works | |
+| Gemma 2 | Works | Conversations up to 4,096 tokens ([why](#sliding-window-models)) |
+| Gemma 3 270M and 1B | Works | Conversations up to 512 tokens |
+| Gemma 3 4B, 12B and 27B | No | These also see images; take Gemma 2 or Qwen 3 of a similar size |
+| Phi-3 mini 4k | Works | Conversations up to 2,047 tokens |
+| Phi-3 128k, Phi-3.5 | No | Take `microsoft/Phi-3-mini-4k-instruct` |
+| OLMo 2, OLMoE | Works | |
+| TinyLlama, SmolLM, SmolLM2 | Works | |
+| Fine-tunes of the above (Zephyr, OpenHermes, Vicuna, Nous-Hermes, ...) | Works | Fine-tuning changes the weights, not the design |
+| Mixtral 8x22B, Qwen3 235B-A22B | No | Too big for one RAI file; take Mixtral 8x7B or Qwen3 30B-A3B |
+| SmolLM3, StableLM, Granite, MiniCPM | No | Take SmolLM2 1.7B, or a Llama, Mistral or Qwen 3 of the same size |
+| Phi-2, Falcon, GPT-NeoX, Pythia, MPT, GPT-2 | No | A different design; take Llama 3.2, Mistral 7B or SmolLM2 |
+| Long-context versions that change position handling (`yarn`, `linear`, `dynamic` or `longrope` scaling) | No | Take the original model they were made from, or Llama 3.1 |
+| Models with a shared expert (some Qwen MoE and DeepSeek-style models) | No | Take the same family without one |
 
-The `config.json` read is a filter, not the verdict. The converter loads the
-real weights and re-checks them — it walks every layer looking for `q_norm` /
-`k_norm` modules on the attention block and for the seven projections it
-stores, and it collects every problem it finds before failing. The error names
-the count, the first offending tensor, and the reason, one bullet per problem:
+You don't have to work this out yourself: `rai-get-model` and `rai check`
+answer from the model's settings before anything large is downloaded, and the
+answer names the reason.
 
+Each of these has been converted and run, and gave sensible answers:
+Qwen2.5 0.5B, Qwen3 0.6B, Llama 3.2 1B, Gemma 2B, Gemma 2 2B, Gemma 3 1B,
+Phi-3 mini 4k, OLMo 2 1B, OLMoE 1B-7B and TinyLlama 1.1B. Every release is
+installed on clean computers and has to answer a question correctly with the
+Qwen2.5 0.5B starter before it is published.
+
+## A model you already downloaded
+
+Point RAI at the folder. `rai check` answers in a second, from the settings
+alone:
+
+```bash
+rai check ./Qwen2.5-3B-Instruct
+rai convert ./Qwen2.5-3B-Instruct -o qwen2.5-3b-q4.raimodel
 ```
-tensor 'model.layers.0.self_attn.q_norm.weight' holds 96 values, which is
-neither head_dim (128, a per-head norm as Qwen3 uses) nor num_heads*head_dim
-(4096, a projection-wide norm as OLMo2 uses); the container implements those
-two shapes.
-```
 
-It is deliberately specific: the tensor has a name RAI supports and a width it
-does not, which a message saying only "unsupported architecture" would have
-hidden.
+RAI Studio's **Convert** screen does the same with buttons: **Check**, then
+**Convert**.
 
-It fails before calibration, so a refusal costs seconds, not hours.
+The folder needs:
 
-## The two conversion paths do not cover the same models
+| File | |
+| --- | --- |
+| `config.json` | The model's settings |
+| `model.safetensors`, or `model-00001-of-0000N.safetensors` files with `model.safetensors.index.json` | The weights |
+| `tokenizer.json` | How text becomes tokens. Copied next to the converted model |
 
-`rai convert` writes container v2. The Python exporters
-(`export_raimodel.py`, `export_fast.py`, `export_rtn.py`) write container v1
-only, so they still refuse everything v2 added:
+RAI does not read `pytorch_model.bin`, `.pt` or `.pth` files: loading those
+can run code hidden inside them. Most models offer `.safetensors` too. For one
+that doesn't, the error message gives you the command that converts it. A
+folder with `tokenizer.model` and no `tokenizer.json` needs the fast tokenizer
+saved once with Python's `transformers`
+(`AutoTokenizer.from_pretrained(folder).save_pretrained(folder)`).
 
-| Checkpoint | `rai convert` | Python exporters |
+RAI also doesn't read `.gguf` files. Those are already compressed by another
+program; RAI starts from the original weights so it controls the compression
+itself.
+
+Converting writes three files side by side: the model (`.raimodel`), its
+tokenizer (`tokenizer.json`) and its chat format (`<name>.chat.json`). Keep
+them together. Conversion reads the weights a piece at a time, so it needs
+little memory: a 7B model converts on a 16 GB laptop.
+
+## Conversion options
+
+| Option | Default | What it does |
 | --- | --- | --- |
-| Llama, Mistral, TinyLlama, SmolLM | Converts | Converts |
-| Qwen2, Qwen2.5 | Converts | Refused — projection bias vectors |
-| Llama-3.1, Llama-3.2 | Converts | Refused — `rope_type: "llama3"` |
-| Gemma | Converts | Refused — embedding scale and `(1 + w)` RMSNorm |
+| `-o`, `--output FILE` | `<folder>-q4.raimodel` | Where the model is written |
+| `--max-context N` | the model's own | The longest conversation, in tokens, the file allows. Lower it to save memory |
+| `--group-size N` | 128 | Smaller is more accurate and a little bigger: 64 adds about 5% to the file, 32 about 15% |
+| `--calibration-text FILE` | none | Tunes the conversion on a sample of real text. Same file size, better accuracy, takes minutes instead of seconds |
+| `--calibration-sequences N`, `--calibration-seq-len N` | 16, 512 | How much of the sample text is used |
+| `--embed-group-size N` | 64 | The same as `--group-size`, for the word table |
+| `--quiet` | off | No progress output |
 
-Use `rai convert` unless you specifically want GPTQ, which only the Python
-path implements — and note that the trade is real in both directions. On
-SmolLM2-1.7B, a checkpoint both paths accept, GPTQ costs +11.2% perplexity
-against fp16, `rai convert --calibration-text` +16.6% and plain round-to-nearest
-+30.3% ([BENCHMARKS.md](../BENCHMARKS.md#the-calibrated-quantizer-measured-end-to-end)).
-So for a model in the "Refused" column above, `rai convert` is not merely the
-easier path, it is the only one; give it `--calibration-text` to close most of
-the gap.
+**Use `--calibration-text` if you can.** Any plain text file of a few thousand
+words that looks like what you will use the model for will do:
 
-## Why the line falls where it does
+```bash
+rai convert ./SmolLM2-1.7B-Instruct --calibration-text my-notes.txt
+```
 
-The `.raimodel` container stores exactly this and nothing else:
+On SmolLM2 1.7B it lowered perplexity (lower is better) from 10.30 to 9.22.
+It works for Llama, Mistral, TinyLlama, SmolLM, Qwen 2 and 2.5, Llama 3.1
+and 3.2, and the first Gemma. For Qwen 3, Gemma 2 and 3, OLMo 2, Mixtral and
+Qwen3-MoE it is refused with the reason; convert those without it.
 
-- a header holding the architecture dimensions, `rope_theta` (and, for
-  models whose layers alternate between two bases, a second one with the
-  layer stride that picks between them), `norm_eps`, the activation code, the
-  RoPE scaling parameters, the bias mask, the embedding scale, the two logit
-  softcaps, the attention scale, and the expert counts
-- one 8-bit quantized embedding table
-- per layer: seven 4-bit projections (`q`, `k`, `v`, `o`, `gate`, `up`,
-  `down`), an optional f32 bias vector per projection, an optional pair of
-  `head_dim`-long f32 QK norm vectors, an optional pair of hidden-sized f32
-  block-output norms, and two f32 RMSNorm weight vectors
-- one final f32 RMSNorm
-- an optional 4-bit `lm_head` (omitted when the head is tied to the embedding)
+A model converted with a `--group-size` other than 128 opens in RAI 0.2.5 and
+later only.
 
-Each optional block is *absent* rather than zero-length when unused, which is
-why a model needing none of them still writes a file byte-identical to what
-earlier versions produced.
+## The Python exporters
 
-The kernels implement exactly this and nothing else: RMSNorm as `x / rms * w`,
-applied per token or per head; rotary embeddings from one theta per layer (two
-tables at most, as Gemma3 needs) with an optional `llama3` frequency rescale;
-full causal attention with grouped-query head mapping, an optional non-default
-scale and an optional `tanh` softcap on the scores; and a gated MLP with either
-a SiLU or a GeLU-tanh gate, routed to experts where the file has them.
+`rai-infer/scripts` holds Python exporters, including GPTQ, the most accurate
+of the conversions. They need Python 3.11, PyTorch and a calibration dataset,
+and they support fewer families than `rai convert`: Llama, Mistral, TinyLlama
+and SmolLM, but not Qwen, Llama 3.1 and 3.2, Gemma, Qwen 3, OLMo 2 or Phi-3.
 
-A model needing a weight or an operation outside those two lists has nowhere to
-put it. It would be dropped at export and the resulting file would load cleanly
-and generate nonsense, so the exporter rejects it instead.
+```bash
+python -m venv .venv
+.venv/bin/pip install -r rai-infer/scripts/requirements-lock.txt     # Windows: .venv\Scripts\pip.exe
+.venv/bin/python rai-infer/scripts/export_raimodel.py --model ./SmolLM2-1.7B-Instruct --output smollm2-gptq.raimodel
+```
+
+On SmolLM2 1.7B, GPTQ cost 11.2% in perplexity against the original model,
+`rai convert --calibration-text` 16.6% and plain `rai convert` 30.3%
+([BENCHMARKS.md](../BENCHMARKS.md#the-calibrated-quantizer-measured-end-to-end)).
+`export_rtn.py` writes exactly the same file as plain `rai convert`, much more
+slowly; it exists to check one against the other.
+
+## Details
+
+### Why some models are refused
+
+A `.raimodel` file stores a fixed set of things: the model's dimensions, its
+position settings (`rope_theta`, a second base for models whose layers
+alternate, and `llama3` rescaling), the activation (SiLU or GeLU-tanh),
+optional biases on the seven layer projections, optional per-head or
+projection-wide QK norms, optional norms around each block, Gemma's embedding
+scale and logit softcaps, the attention scale, and routed experts. RAI's
+arithmetic does exactly these things and nothing else.
+
+A model that needs anything outside that list would load and quietly compute
+the wrong thing, so it is refused at conversion instead:
+
+- **A shared expert** that runs for every token next to the routed ones.
+- **Position scaling other than the default or `llama3`.** `yarn`, `linear`,
+  `dynamic` and `longrope` each compute positions differently, and a mistake
+  there only shows as worse answers in long conversations.
+- **A bias on the output layer** (`lm_head.bias`).
+- **Scales outside the weights**: Granite's and MiniCPM's multipliers.
+- **Position encoding on part of a head or some layers only**
+  (`partial_rotary_factor` below 1, `no_rope_layers`).
+- **A LayerNorm with a bias** where RAI stores RMSNorm.
+- **A different layer layout**: Falcon, GPT-NeoX, MPT, GPT-2, Phi-2.
+- **Any `model_type` that has not been checked.** Matching names prove
+  nothing: ERNIE-4.5 and EXAONE-4 use Llama's tensor names with different
+  arithmetic. The families that convert are those whose `model_type` is
+  `llama`, `mistral`, `qwen2`, `qwen3`, `qwen3_moe`, `gemma`, `gemma2`,
+  `gemma3_text`, `phi3`, `olmo2`, `olmoe` or `mixtral`.
+
+The converter checks the real weights too, not just the settings, and lists
+every problem it finds, naming the first tensor and the reason.
 
 ### Sliding-window models
 
-Mistral and Gemma2 declare `sliding_window: 4096`; Phi-3-mini-4k declares
-`2047`. RAI always runs full causal attention.
-Inside the window that is identical arithmetic; past it, the two diverge. The
-exporter therefore accepts a sliding-window checkpoint up to the window length
-and refuses a longer `--max-context`, naming the window in the error. Convert
-Mistral-7B and Gemma2 with `--max-context 4096` or lower, and Phi-3-mini-4k
-with `--max-context 2047`. This is the one refusal that needs no different
-model — the same folder converts at a shorter context, and Studio offers that
-as a button rather than an alternative model.
+Some models look back over only their most recent tokens: Mistral 7B v0.1 and
+Gemma 2 over 4,096, Phi-3 mini 4k over 2,047, Gemma 3 over 512 on most layers.
+RAI always looks back over the whole conversation, which is the same
+arithmetic up to that length and different past it. So RAI converts these
+with their window as the longest conversation, without being asked, and
+refuses a longer `--max-context` with the window named.
 
-### Shape constraints that apply to every model
+### Limits that apply to every model
 
-These are enforced identically by the converter and by the Rust loader, so a
-file that converts always loads:
-
-| Constraint | Consequence |
+| Limit | |
 | --- | --- |
-| `head_dim` is a multiple of 8 | Required by the SIMD attention kernels. A decoupled `head_dim` (`num_heads * head_dim != hidden_size`, as Gemma uses) is fine: only the interior of the attention block changes width. |
-| `num_heads * head_dim` is even | Required by nibble-packed 4-bit weights. |
-| `hidden_size` and `intermediate_size` are even | Required by nibble-packed 4-bit weights. |
-| `num_heads` divisible by `num_kv_heads` | Required by the grouped-query head mapping. |
-| At most 1024 quantization groups per row | `hidden_size` and `intermediate_size` divided by `--group-size` must each be at most 1024. At the default 128 that allows 131,072, which no published architecture approaches; at `--group-size 32` it allows 32,768, which covers every model in the table above that fits the 64 GiB file limit except Gemma2-27B, whose 36,864-wide MLP needs `--group-size 64` or more. |
-| Group sizes are even and at most 254 | The group size is one header byte. |
-| RoPE table at most 512 MB | The table costs `max_context * head_dim / 2 * 8` bytes. At `head_dim 128` that allows 1,048,576 positions, so the separate hard cap of 1,000,000 on `--max-context` binds first. |
+| Head size a multiple of 8 | What the fast attention code is written for |
+| Even layer widths | Two 4-bit weights share each byte |
+| Query heads a multiple of key-value heads | Grouped-query attention |
+| At most 1,024 groups per row | Width divided by `--group-size`. Gemma 2 27B needs `--group-size 64` or more |
+| Group sizes even, 2 to 254 | Stored in one byte |
+| `--max-context` at most 1,000,000 | |
+| A file at most 64 GiB | |
 
-A model refused for one of these is refused over a flag, not over its
-architecture: raise `--group-size`, or lower `--max-context`, and convert it
-again.
+A model refused for one of these converts with a different `--group-size` or
+`--max-context`.
 
-### Which checkpoints can be calibrated
+### The file format
 
-`--calibration-text` runs the checkpoint over real text to see what each
-projection receives. That means the pass has to reproduce the model exactly, so
-it covers what it can reproduce and refuses the rest:
-
-| Checkpoint | Calibrated conversion |
-| --- | --- |
-| Llama, Mistral, TinyLlama, SmolLM, SmolLM2 | Yes |
-| Qwen2, Qwen2.5 | Yes — projection biases are handled |
-| Llama-3.1, Llama-3.2 | Yes — `llama3` RoPE rescaling is handled |
-| Qwen3 | **Refused** — per-head QK norms |
-| Gemma2, Gemma3 | **Refused** — sandwich norms, per-head QK norms |
-| OLMo2 | **Refused** — post-norm placement |
-| Mixtral, Qwen3-MoE | **Refused** — expert routing |
-
-A refusal is a clear error naming the reason, not a silent fallback. Convert
-those without `--calibration-text`; round-to-nearest supports every architecture
-in the table at the top of this file.
-
-### Choosing a group size
-
-Weights are quantized in groups of `--group-size` columns, and each group
-carries its own scale and zero point. Smaller groups track the weights more
-closely and cost a little more room:
-
-| `--group-size` | extra bits per weight | when to use it |
-| --- | ---: | --- |
-| 128 | +0.25 | the default, and what every model published before this release uses |
-| 64 | +0.50 | measurably more accurate; the recommended setting when the extra ~5% of file size is acceptable |
-| 32 | +1.00 | matches the granularity llama.cpp's K-quants use; the most accurate setting this format offers |
-
-Sizes are not restricted to powers of two — any even value from 2 to 254 works,
-and a value that does not divide the row evenly simply leaves a shorter final
-group.
-
-**A model converted at a group size other than 128 needs this release to
-load.** Older builds capped the group count at 128 and refuse such a file with
-`model requires N quantization groups; kernel maximum is 128`. It is a clean
-refusal, not a misread — but if a file has to open in an older `rai`, convert
-it at 128.
-
-## What it would take to support the rest
-
-Each of these is tractable. None is free. They are listed roughly in ascending
-cost.
-
-### YaRN and other RoPE schemes — long-context fine-tunes
-
-The header already carries a scaling-type byte and the `llama3` parameters.
-`linear`, `dynamic`, and `yarn` each compute their inverse frequencies
-differently, so each needs a `RoPETable::new` branch and its own
-positional-accuracy test — this is where a subtle error shows up as quality
-loss at long context rather than as a failure.
-
-### Shared experts — Qwen-MoE variants and DeepSeek-style layers
-
-Routed mixture-of-experts is stored and runs; what has no slot is a *shared*
-expert evaluated for every token alongside the routed ones. The layer section
-would grow one more gate/up/down triple with its own size accounting, and the
-forward pass one unconditional MLP added into the routed sum. Leaving it out
-would remove a pathway rather than degrade one, which is why such checkpoints
-are refused instead of approximated.
-
-### `lm_head` bias
-
-Biases are stored for the seven layer projections only. A head bias is one
-more optional f32 vector in the final section and an add in the last matvec —
-small, but it needs a header bit, and no checkpoint anyone has asked about
-carries one yet.
-
-(Full-width QK norms, Gemma3's per-layer RoPE tables, and routed
-mixture-of-experts each sat in this list once; the support table above records
-where they landed.)
-
-## See also
-
-- [INSTALL.md](./INSTALL.md#converting-a-model) — the conversion commands.
-- [BENCHMARKS.md](../BENCHMARKS.md) — the measured TinyLlama-1.1B conversion
-  and decode run.
-- [ARCHITECTURE.md](./ARCHITECTURE.md) — where the format and the kernels live
-  in the workspace.
+`rai-infer/src/format.rs` documents the byte layout, and
+[ARCHITECTURE.md](ARCHITECTURE.md) shows where everything lives in the code.

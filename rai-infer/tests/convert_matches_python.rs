@@ -2357,3 +2357,42 @@ fn check_refuses_what_the_conversion_refuses() {
         assert!(error.contains(needle), "{label}: {error}");
     }
 }
+
+/// `rai check` answers from config.json alone, as `rai-get-model` asks it
+/// before downloading weights, and again once the weights are there; a family
+/// the converter refuses is refused by name.
+#[test]
+fn rai_check_answers_before_and_after_the_weights_arrive() {
+    use rai_infer::cli::check::{run, CheckArgs};
+    let root = scratch_dir("check-cli");
+    let model_dir = root.join("checkpoint");
+    write_checkpoint(&model_dir, &Spec::default());
+    let check = |path: &Path| {
+        run(&CheckArgs {
+            path: path.to_path_buf(),
+            max_context: Some(MAX_CONTEXT),
+        })
+    };
+    let with_weights = check(&model_dir);
+    let config_only = root.join("config-only");
+    std::fs::create_dir_all(&config_only).unwrap();
+    std::fs::copy(
+        model_dir.join("config.json"),
+        config_only.join("config.json"),
+    )
+    .unwrap();
+    let before_download = check(&config_only);
+    let the_file_itself = check(&config_only.join("config.json"));
+    std::fs::write(
+        config_only.join("config.json"),
+        r#"{"model_type":"gpt2","n_embd":768}"#,
+    )
+    .unwrap();
+    let refused = check(&config_only);
+    let _ = std::fs::remove_dir_all(&root);
+    with_weights.expect("a convertible checkpoint with its weights");
+    before_download.expect("the same checkpoint from config.json alone");
+    the_file_itself.expect("config.json named directly");
+    let error = refused.expect_err("GPT-2 does not convert").to_string();
+    assert!(error.contains("gpt2"), "{error}");
+}

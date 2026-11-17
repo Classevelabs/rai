@@ -88,29 +88,50 @@ git tag -a v0.2.0 -m "RAI v0.2.0"
 git push origin v0.2.0
 ```
 
+## Before tagging: the release candidate
+
+Run **Actions > Release candidate > Run workflow** on the commit you mean to
+tag (it also runs on pull requests that touch `installers/`, `launchers/` or
+the build workflows). It builds every download exactly as a release does and
+installs each one on clean machines, and publishes nothing. Tag only a commit
+whose candidate run is green.
+
 ## Binaries
 
 Pushing a `v*` tag runs [`.github/workflows/release.yml`](../.github/workflows/release.yml),
 which needs no manual step:
 
-1. Resolves the tag to one commit (from the tag namespace only, so a branch
-   of the same name cannot stand in for it), verifies it against the
-   workspace version, waits for green CI on that commit, and opens a
-   **draft** release. Every later job builds that commit and checks that it
-   did, so a tag moved between a failed job and its re-run cannot mix two
-   trees in one release.
-2. Builds `rai` plus the deprecated `rai-convert`,
-   `rai-generate`, and `rai-chat` wrappers — `--package classeve-rai-infer`
-   only, so no non-product crate can reach an archive — on `ubuntu-24.04`, `windows-2025`,
-   `macos-15-intel`, and `macos-15` (Apple Silicon) — the x86 targets with
-   `RUSTFLAGS="-C target-cpu=x86-64-v2"` — then **executes every binary** and
-   requires `--version` to answer with the release's version before anything
-   is packaged, and packages each platform as
-   `rai-<version>-<target>.{tar.gz,zip}` with LICENSE, NOTICE, README.md,
-   INSTALL.md, the `launchers/` scripts, and RUNNING.txt.
-3. Downloads the four archives back from the release, asserts the count,
-   writes `SHA256SUMS` from what the release actually serves, attaches it, and
-   only then clears the draft flag.
+1. **prepare** resolves the tag to one commit (from the tag namespace only, so
+   a branch of the same name cannot stand in for it), checks it against the
+   workspace version, waits for green CI on that commit, and opens a **draft**
+   release. Every later job builds that commit.
+2. **dist** ([`dist.yml`](../.github/workflows/dist.yml)) builds `rai` and the
+   deprecated `rai-convert`, `rai-generate` and `rai-chat` wrappers from
+   `--package classeve-rai-infer` alone, on four runners: Linux inside the
+   `manylinux_2_28` container (glibc 2.28), Windows with the C runtime linked
+   statically, Intel macOS and Apple Silicon macOS, the x86 ones at
+   `target-cpu=x86-64-v2`. It runs every binary, fails if Linux needs a glibc
+   symbol newer than 2.28 or Windows imports `VCRUNTIME140.dll`, and packages
+   `rai-<version>-<target>.{tar.gz,zip}`. Then it builds the Windows Setup
+   (NSIS), the `.deb` and the `.rpm`, adds `install.sh` and `install.ps1`, and
+   writes `SHA256SUMS` over exactly those nine files.
+3. **clean-room** ([`clean-room.yml`](../.github/workflows/clean-room.yml))
+   installs those files on machines that never saw the build: Windows Server
+   2022 and 2025 with the Visual C++ runtime hidden and PATH cut to Windows'
+   own folders (Setup, then `install.ps1` in Windows PowerShell 5.1), macOS 15
+   on Apple Silicon and Intel (`install.sh`), and bare containers of Ubuntu
+   20.04, 22.04 and 24.04, Debian 11 and 12, Fedora, Rocky Linux 8 and 9,
+   openSUSE Tumbleweed and Arch (packages or `install.sh`). On each it
+   downloads the `qwen2.5-0.5b` starter, converts it, and requires the answer
+   "Paris" to "What is the capital of France?" from `rai run` and from
+   RAI Studio's `/api/chat`. Setup's uninstaller must remove everything it
+   added.
+4. **attach** checks the files against `SHA256SUMS`, attests each one's build
+   provenance, and uploads them to the draft.
+5. **publish** downloads every file back from the draft, requires all ten,
+   checks them against `SHA256SUMS`, and only then publishes the release.
+6. **verify-public** runs the clean room again against what GitHub now
+   serves, through the one-line installers a user would paste.
 
 `workflow_dispatch` accepts an existing tag and re-runs the same path,
 addressing the draft by release id rather than by tag so a draft re-run can
@@ -119,32 +140,31 @@ rebuilt, because a rebuild replaced every archive and rewrote `SHA256SUMS`
 under hashes people had already pinned. A bad published release is fixed
 forward with a new version.
 
-Each archive also gets a signed build-provenance attestation
-(`actions/attest-build-provenance`), which ties it to this workflow and the
-tagged commit. Users verify one with
-`gh attestation verify <archive> --repo Classevelabs/rai`; the release notes
-say so.
+The provenance attestations tie each file to this workflow and the tagged
+commit; users verify one with
+`gh attestation verify <file> --repo Classevelabs/rai`. Together with
+`SHA256SUMS` they are how a download is checked, so neither may be missing
+from a published release.
+
+The clean room also runs every Monday against the latest public release, so a
+change on the runners or in a distribution that breaks installing RAI shows up
+without waiting for the next release.
 
 **Never let this workflow build with `target-cpu=native`.** Such binaries die
 with SIGILL on any CPU older than the runner that built them, after download,
 with no diagnostic. `.cargo/config.toml` pins the same `x86-64-v2` floor this
-workflow sets, so nothing has to be overridden — but the build job still
+workflow sets, so nothing has to be overridden, but the build job still
 asserts `RUSTFLAGS` explicitly, because that config file is one edit away from
 being changed back and a published release is the wrong place to discover it.
 `x86-64-v2` is the right floor rather than `v3` because the AVX2/FMA/F16C
 kernels are selected at runtime by `has_avx2()` in `rai-infer/src/gemm.rs`, not
 by the compile-time baseline.
 
-Releasing a binary without platform code signing is deliberate: macOS users
-clear the quarantine attribute themselves and Windows shows a SmartScreen
-warning. `SHA256SUMS` and the provenance attestations are the integrity story,
-so neither may be missing from a published release.
-
 ## Release notes
 
-The workflow writes a default body covering checksum verification and the CPU
-baseline. Add what changed, verification status, known limitations, and
-benchmark notes when performance claims changed.
+The workflow writes a default body: how to install on each system, how to
+check a download, what RAI needs, and what it does on the network. Add what
+changed, and benchmark notes when performance claims changed.
 
 ## Publishing crates
 

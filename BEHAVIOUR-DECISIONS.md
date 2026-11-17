@@ -8,6 +8,60 @@ is the second copy, for people reading the product rather than the file.
 
 ---
 
+## 2026-11-17 — Nothing ships that was not installed on a clean machine
+
+**Decision.** `dist.yml` builds every download once; `clean-room.yml` installs
+each on machines that never saw a build: Windows with the Visual C++ runtime
+renamed away and PATH cut to Windows' own folders, both kinds of Mac, and ten
+Linux distributions in bare containers. Each must download a model, convert
+it and answer "Paris", from `rai run` and from Studio's `/api/chat`. The
+release attaches only the files that passed, and runs the test again on what
+GitHub serves.
+
+**Symptom.** 0.2.5 passed every test on the machines that built it and failed
+on a fresh one: `VCRUNTIME140.dll` missing on Windows, `GLIBC_2.34` missing on
+Ubuntu 20.04 and RHEL 8, and no route from download to first answer without
+Python.
+
+**Verified against.** The `Release candidate` workflow, green on the commit
+that was tagged.
+
+**If regressed.** The first thing a new user sees is a missing-DLL or glibc
+error, or an empty chat page.
+
+## 2026-11-17 — The program stays offline; one script downloads
+
+**Decision.** `rai` never opens a network connection. Downloading lives in
+`rai-get-model`, a shell and a PowerShell script that call `curl`, check each
+file against a pinned SHA-256 (starter models) and run `rai check` before the
+weights (any other repository).
+
+**Symptom.** None; this keeps a promise the README makes. A downloader inside
+the binary would bring a TLS stack and a network path into a program that
+says it has none.
+
+**Verified against.** `every_starter_model_is_pinned_and_complete`, and the
+clean-room runs, which download through the script on every platform.
+
+**If regressed.** `rai` gains a network dependency and an attack surface its
+users were told it does not have.
+
+## 2026-11-17 — Windows links the C runtime statically; Linux builds on glibc 2.28
+
+**Decision.** `.cargo/config.toml` sets `+crt-static` for
+`x86_64-pc-windows-msvc`; the Linux release builds in
+`manylinux_2_28` and fails if any symbol needs a newer glibc.
+
+**Symptom.** See the first entry of this date.
+
+**Verified against.** `dist.yml`'s import check (no `VCRUNTIME140.dll`) and
+its `objdump` glibc check; the clean room on Ubuntu 20.04 and Rocky 8.
+
+**If regressed.** "VCRUNTIME140.dll was not found" on Windows, or
+"GLIBC_2.xx not found" on older Linux.
+
+---
+
 ## 2026-11-16 — Zero points meet the quantized activation sum, not the exact one
 
 **Decision.** The W4A8 kernels apply each group's zero point to the sum of the

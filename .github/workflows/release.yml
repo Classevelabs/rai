@@ -1,22 +1,20 @@
 name: Release
 
-# Publishes the downloadable binaries. Until this existed the only way to get
-# RAI was `git clone` + `cargo build`, which is not a product.
+# Publishes a release, in this order:
 #
-# The one thing this workflow must never build with is `target-cpu=native`. A
-# release built that way runs only on CPUs at least as new as whichever runner
-# happened to pick up the job, and fails everywhere else with SIGILL on the
-# first instruction it does not know — after download, after install, with no
-# diagnostic. `.cargo/config.toml` pins the same portable x86-64-v2 floor for
-# x86 targets, so the two agree; every build job still sets RUSTFLAGS from its
-# matrix entry and asserts it, because that config file is one edit away from
-# being changed back and a release is the wrong place to find out.
+#   1. prepare      the tag names one commit, CI passed on it, a draft opens
+#   2. dist         every download is built from that commit (dist.yml)
+#   3. clean-room   each is installed and used on clean machines: Windows
+#                   without the Visual C++ runtime, both kinds of Mac, ten
+#                   Linux distributions; each downloads a model, converts it
+#                   and must answer a question correctly (clean-room.yml)
+#   4. attach       only the files that passed, attested, go on the draft
+#   5. publish      every file is downloaded back and checked, then published
+#   6. verify-public  the one-line installers run again against the release
+#                   people now see
 #
-# The floor is per-target. aarch64 builds at the toolchain default — an x86 CPU
-# name means nothing there and would fail the build — and the assertion knows
-# which answer to expect for which architecture.
-#
-# Nothing here publishes to crates.io. That is a separate, human-approved act.
+# The build flags and the reasons for them live in dist.yml. Nothing here
+# publishes to crates.io; that is publish.yml.
 
 on:
   push:
@@ -238,42 +236,45 @@ jobs:
           }
 
           cat > notes.md <<'NOTES'
-          Prebuilt binaries for x86-64 Linux and Windows, and for macOS on both
-          Intel and Apple Silicon: the
-          `rai` inference CLI (`convert`, `run`, `serve`, `models`), plus the
-          deprecated `rai-convert`, `rai-generate`, and `rai-chat` wrappers.
+          ## Install
 
-          Every binary in these archives is the inference engine. Nothing in
-          them opens a network connection to anything but your own loopback
-          interface.
-
-          **Verify your download before running it.** Fetch `SHA256SUMS` from
-          this release, put it next to the archive, and run:
+          **Windows:** download `rai-@VERSION@-windows-x64-setup.exe` below and run it. If Windows shows "Windows protected your PC", choose **More info**, then **Run anyway**. Or, in PowerShell:
 
           ```
-          sha256sum --ignore-missing -c SHA256SUMS
+          irm https://github.com/Classevelabs/rai/releases/latest/download/install.ps1 | iex
           ```
 
-          Each archive also carries a signed build-provenance attestation, which
-          ties it to this repository's release workflow and the tagged commit.
-          With the GitHub CLI:
+          **macOS and Linux:** in a terminal:
 
           ```
-          gh attestation verify <archive> --repo Classevelabs/rai
+          curl -fsSL https://github.com/Classevelabs/rai/releases/latest/download/install.sh | sh
           ```
 
-          The x86-64 archives are built with `-C target-cpu=x86-64-v2`, so they
-          start on any x86-64 CPU from roughly 2009 onward, and their
-          AVX2/FMA/F16C kernels are selected at runtime on CPUs that report
-          them. The `aarch64-apple-darwin` archive is native Apple Silicon and
-          runs the scalar kernels — there is no NEON path yet, so expect it to
-          be slower than the x86 archives on comparable hardware.
+          **Linux packages:**
 
-          Setup and a sixty-second first run: see `INSTALL.md`.
+          - Ubuntu and Debian: `sudo apt install ./rai_@VERSION@_amd64.deb`
+          - Fedora and RHEL: `sudo dnf install ./rai-@VERSION@-1.x86_64.rpm`
+          - openSUSE: `sudo zypper install ./rai-@VERSION@-1.x86_64.rpm`
 
-          What changed in this release, and whether it fixes something you hit:
-          see `CHANGELOG.md`.
+          Then open **RAI Studio** from the Start menu or your app menu, or run `rai-studio`. The first time, it offers to download a model to chat with. The archives (`.zip`, `.tar.gz`) hold the same program for running without installing.
+
+          ## Check your download
+
+          Every file is listed in `SHA256SUMS`. Put it next to your download and run `sha256sum --ignore-missing -c SHA256SUMS` (on Windows, `certutil -hashfile <file> SHA256` and compare). Each file also carries a signed build-provenance attestation that ties it to this repository and the tagged commit: `gh attestation verify <file> --repo Classevelabs/rai`.
+
+          ## What it needs
+
+          A 64-bit Intel or AMD processor from 2011 or later (with AVX2, as most Intel Core and AMD Ryzen chips since 2015 have, it takes its fast path), or an Apple Silicon Mac, where it runs natively. No graphics card. On Linux, glibc 2.28 or newer: Ubuntu 20.04, Debian 10, RHEL 8 or anything newer.
+
+          Every download here was installed on clean Windows, macOS and Linux machines before release, where it downloaded a model, converted it and answered a question.
+
+          ## Privacy
+
+          The `rai` program never connects to the internet, and RAI Studio answers only your own computer. `rai-get-model` downloads models from Hugging Face, and only when you run it.
+
+          What changed in this release: see `CHANGELOG.md`.
           NOTES
+          sed -i "s/@VERSION@/${TAG#v}/g" notes.md
 
           # Three outcomes of the POST worth telling apart. 422 means the
           # release appeared since it was looked for. 5xx means GitHub is having
@@ -323,504 +324,134 @@ jobs:
           echo "release_id=$id" >> "$GITHUB_OUTPUT"
           echo "draft release id: $id"
 
-  build:
-    name: Build ${{ matrix.target }}
+  dist:
+    name: Build
     needs: prepare
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    uses: ./.github/workflows/dist.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+      sha: ${{ needs.prepare.outputs.sha }}
+
+  # Nothing reaches the release that has not been installed and used on clean
+  # machines: bare Windows, both kinds of Mac, ten Linux distributions, each
+  # downloading a model, converting it and answering a question.
+  clean-room:
+    name: Clean room
+    needs: dist
+    uses: ./.github/workflows/clean-room.yml
+    with:
+      source: artifact
+
+  attach:
+    name: Attest and attach the tested files
+    needs: [prepare, clean-room]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     permissions:
       contents: write
       # Build provenance: a signed statement that this workflow, at this
-      # commit, produced the archive.
+      # commit, produced each file.
       id-token: write
       attestations: write
-    env:
-      RUSTFLAGS: ${{ matrix.rustflags }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            archive: tar.gz
-            rustflags: "-C target-cpu=x86-64-v2"
-          - os: windows-2025
-            target: x86_64-pc-windows-msvc
-            archive: zip
-            rustflags: "-C target-cpu=x86-64-v2"
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            archive: tar.gz
-            rustflags: "-C target-cpu=x86-64-v2"
-          # Apple Silicon, built natively on an ARM runner. No target-cpu is
-          # pinned: the aarch64 baseline every M-series Mac shares is already
-          # the toolchain default, and there is no NEON kernel to select for,
-          # so the GEMM takes the scalar path. Slower than the x86 archives on
-          # comparable hardware, and still far better than the Intel build
-          # under Rosetta, which emulates no AVX2 at all.
-          - os: macos-15
-            target: aarch64-apple-darwin
-            archive: tar.gz
-            rustflags: ""
-
     steps:
-      - name: Checkout the commit prepare resolved
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Fetch the files the clean room tested
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          ref: ${{ needs.prepare.outputs.sha }}
-          persist-credentials: false
+          name: rai-dist
+          path: release
 
-      - name: Confirm the commit
+      - name: Check them against their SHA256SUMS
         shell: bash
-        env:
-          SHA: ${{ needs.prepare.outputs.sha }}
-        run: test "$(git rev-parse HEAD)" = "$SHA"
+        run: cd release && sha256sum -c SHA256SUMS
 
-      - name: Show pinned Rust toolchain and release flags
-        shell: bash
-        run: |
-          rustc --version --verbose
-          cargo --version --verbose
-          echo "RUSTFLAGS=$RUSTFLAGS"
-
-      - name: Cache Cargo registry
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
-
-      - name: Confirm the portable baseline actually took effect
-        shell: bash
-        env:
-          TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-
-          # RUSTFLAGS (env) replaces whatever .cargo/config.toml sets. That
-          # file pins the same portable floor today, but if someone puts
-          # `target-cpu=native` back — or adds a second flag source, or the
-          # precedence changes — this build would silently go back to shipping
-          # native-only binaries. Assert instead of trusting.
-          #
-          # `native` is refused on every target. What counts as correct beyond
-          # that depends on the architecture, so the check asks per target
-          # rather than demanding one x86 answer everywhere.
-          case "$RUSTFLAGS" in
-            *target-cpu=native*)
-              echo "::error::release build is using target-cpu=native — the artifacts would crash on older CPUs"
-              exit 1 ;;
-          esac
-
-          case "$TARGET" in
-            x86_64-*)
-              case "$RUSTFLAGS" in
-                *target-cpu=x86-64-v2*)
-                  echo "portable x86 baseline confirmed: $RUSTFLAGS" ;;
-                *)
-                  echo "::error::$TARGET must pin target-cpu=x86-64-v2, got: '$RUSTFLAGS'"
-                  exit 1 ;;
-              esac ;;
-            aarch64-*)
-              # The toolchain default is the shared baseline here, and naming
-              # a specific ARM CPU would narrow the archive to one machine.
-              if [ -n "$RUSTFLAGS" ]; then
-                echo "::error::$TARGET must build at the toolchain default, got: '$RUSTFLAGS'"
-                exit 1
-              fi
-              echo "aarch64 baseline confirmed: toolchain default" ;;
-            *)
-              echo "::error::no baseline policy for target $TARGET"
-              exit 1 ;;
-          esac
-
-      # Same command the CI release-build step runs, plus --locked. RAI is
-      # `rai-infer` plus `rai-compress`, and `rai-infer` owns every shipped
-      # binary, so it is the only package the release compiles. The
-      # memory/reasoning crates (rai-server, rai-core, rem-nra) share this
-      # workspace and are not the product: building them here is what used to
-      # put an OpenAI-calling binary — and its reqwest/rustls/ring dependency
-      # tree — inside an archive whose whole claim is that nothing leaves the
-      # machine.
-      - name: Build release binaries
-        shell: bash
-        run: |
-          cargo build --locked --release \
-            --package classeve-rai-infer
-
-      # A compile is not an execution: a green build has shipped a stale or
-      # broken exe before. Every binary the archive will carry answers
-      # --version here, on the same runner and target that built it, and the
-      # answer must name this release — not whatever was in a cache.
-      - name: Run every shipped binary before packaging it
-        shell: bash
-        env:
-          VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          set -euo pipefail
-          ext=""
-          if [ "${RUNNER_OS}" = "Windows" ]; then ext=".exe"; fi
-          for bin in rai rai-convert rai-generate rai-chat; do
-            out="$("./target/release/${bin}${ext}" --version)"
-            printf '%s: %s\n' "$bin" "$out"
-            # Anchored to the end: a substring match would let 0.2.10 pass a
-            # 0.2.1 gate.
-            case "$out" in
-              *" $VERSION") ;;
-              *) echo "::error::${bin} --version answered '${out}', not ${VERSION}"
-                 exit 1 ;;
-            esac
-          done
-
-      - name: Stage archive contents
-        shell: bash
-        env:
-          VERSION: ${{ needs.prepare.outputs.version }}
-          TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-
-          stage="dist/rai-${VERSION}-${TARGET}"
-          mkdir -p "$stage"
-
-          ext=""
-          if [ "${RUNNER_OS}" = "Windows" ]; then ext=".exe"; fi
-
-          # Every one of these is a user-facing product binary. A missing one is
-          # a broken release, not a smaller archive — fail loudly. `rai` is the
-          # CLI the documentation and the launchers use; the three legacy names
-          # are deprecated wrappers kept so existing scripts keep working.
-          for bin in rai rai-convert rai-generate rai-chat; do
-            src="target/release/${bin}${ext}"
-            if [ ! -f "$src" ]; then
-              echo "::error::expected release binary $src was not produced"
-              exit 1
-            fi
-            cp "$src" "$stage/"
-          done
-
-          # INSTALL.md is referenced from RUNNING.txt below, and the launchers
-          # are useless if they are not next to the binary they start.
-          cp LICENSE NOTICE THIRD-PARTY-NOTICES.md README.md INSTALL.md "$stage/"
-          cp -r launchers "$stage/"
-
-          # `cp` preserves the checkout's mode, and tar preserves it again, so a
-          # launcher committed without the executable bit reaches the user as a
-          # file that cannot be double-clicked and answers `./rai-studio.sh`
-          # with "Permission denied" — on the two platforms where those scripts
-          # are the entire point. The index should carry 100755 (see
-          # .gitattributes); this makes the shipped archive correct either way.
-          chmod +x "$stage"/launchers/*.sh "$stage"/launchers/*.command
-
-          for script in "$stage"/launchers/*.sh "$stage"/launchers/*.command; do
-            [ -x "$script" ] || { echo "::error::$script is not executable in the archive"; exit 1; }
-          done
-
-          cat > "$stage/RUNNING.txt" <<RUNNING
-          RAI ${VERSION} — ${TARGET}
-
-          WHAT IS IN HERE
-            rai           the inference CLI:
-                            rai convert <model-dir>     checkpoint -> .raimodel
-                            rai run <model.raimodel>    generate text
-                            rai serve <model.raimodel>  local chat UI (:8090)
-                            rai models [dir]            what is on this machine
-                            rai perplexity <model>      quality on a text file
-            launchers/    double-click scripts that start the chat UI
-
-            rai-convert, rai-generate and rai-chat are deprecated wrappers over
-            the same code, kept so existing scripts keep working. Use rai.
-
-          BEFORE YOU RUN ANYTHING
-            Verify the download against the release's SHA256SUMS:
-              sha256sum --ignore-missing -c SHA256SUMS      (Linux/macOS)
-              CertUtil -hashfile <archive> SHA256           (Windows)
-
-          INSTALL
-            Copy these binaries anywhere on your PATH. There is no installer,
-            no service, and nothing is written outside the paths you name.
-
-          SIXTY-SECOND FIRST RUN
-            1) Convert a checkpoint you already have on disk. No Python is
-               needed; rai convert writes tokenizer.json beside the model.
-                 rai convert /path/to/TinyLlama-1.1B-Chat-v1.0 \\
-                   -o tinyllama-q4.raimodel
-            2) Generate. The tokenizer beside the model is found for you:
-                 rai run tinyllama-q4.raimodel \\
-                   --chat-template zephyr \\
-                   --prompt "Explain photosynthesis in simple terms."
-
-            Instruction-tuned models need their own chat template. Without
-            --chat-template a chat model usually emits end-of-sequence at once
-            and prints nothing. That is not a crash.
-
-          CPU REQUIREMENTS
-            These binaries are built for the x86-64-v2 baseline, so they start
-            on any x86-64 CPU from roughly 2009 onward. The fast kernels need
-            AVX2 + FMA + F16C and are chosen at runtime; without them RAI still
-            runs, on scalar code, slower.
-
-          NO GPU IS REQUIRED, AND NOTHING PHONES HOME
-            Every binary here is the inference engine. rai serve binds
-            127.0.0.1 and refuses any request whose Host is not loopback.
-            Nothing in this archive contains an HTTP client, a TLS stack, or
-            the address of any server but your own.
-
-          MORE
-            INSTALL.md, README.md, and https://github.com/Classevelabs/rai
-          RUNNING
-
-          # YAML has already taken off the block's own indentation, so the
-          # heredoc body is written as it should read.
-
-          ls -l "$stage"
-          cat "$stage/RUNNING.txt"
-
-      # The product boundary, enforced instead of documented.
-      #
-      # RAI is the inference engine. The memory/reasoning crates (rai-server,
-      # rai-core, rem-nra) share this workspace, are `publish = false`, and are
-      # not the product — yet the archive shipped `rai-server` for four
-      # releases because the boundary lived only in prose. Prose does not fail
-      # a build.
-      #
-      # This asserts the staged executable set is exactly the allowlist, and
-      # that nothing in it links a TLS stack or an HTTP client. The second half
-      # matters independently: it is what lets RUNNING.txt say "nothing phones
-      # home" with no conditional attached, and it would fail if a future
-      # dependency edit pulled reqwest back onto the inference path.
-      - name: Assert the archive carries only the product
-        shell: bash
-        env:
-          VERSION: ${{ needs.prepare.outputs.version }}
-          TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          stage="dist/rai-${VERSION}-${TARGET}"
-          ext=""
-          if [ "${RUNNER_OS}" = "Windows" ]; then ext=".exe"; fi
-
-          # `sed` rather than `-exec basename {} "$ext"`: BSD basename on the
-          # macOS runners does not handle an empty suffix the way GNU does, and
-          # this gate has to behave identically on all four targets. LC_ALL=C
-          # so the comparison does not depend on the runner's collation either.
-          expected="rai rai-chat rai-convert rai-generate"
-          actual=$(find "$stage" -maxdepth 1 -type f \
-                     ! -name '*.md' ! -name '*.txt' ! -name 'LICENSE' ! -name 'NOTICE' \
-                   | sed 's#.*/##; s#\.exe$##' \
-                   | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')
-
-          if [ "$actual" != "$expected" ]; then
-            echo "::error::archive binaries are '$actual', expected '$expected'"
-            echo "::error::a binary outside the product allowlist reached the archive"
-            exit 1
-          fi
-          echo "archive binaries: $actual"
-
-          # No shipped binary may carry a TLS implementation or an HTTP client.
-          # Both reach this workspace only through rai-core's OpenAI embedder,
-          # so a hit here means the inference engine grew a network dependency.
-          for bin in $expected; do
-            path="$stage/${bin}${ext}"
-            # `grep -a` rather than `strings`: grep is present on all three
-            # runner images, and binutils is not guaranteed on the Windows one.
-            for marker in rustls webpki BoringSSL reqwest hyper.rs; do
-              if grep -qaiF "$marker" "$path"; then
-                echo "::error::${bin} contains '$marker' — the engine must carry no TLS or HTTP stack"
-                exit 1
-              fi
-            done
-          done
-          echo "no TLS or HTTP stack in any shipped binary"
-
-      - name: Create tar.gz
-        if: runner.os != 'Windows'
-        shell: bash
-        env:
-          VERSION: ${{ needs.prepare.outputs.version }}
-          TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          name="rai-${VERSION}-${TARGET}"
-          tar -C dist -czf "dist/${name}.tar.gz" "$name"
-          ls -l "dist/${name}.tar.gz"
-
-      - name: Create zip
-        if: runner.os == 'Windows'
-        shell: pwsh
-        env:
-          VERSION: ${{ needs.prepare.outputs.version }}
-          TARGET: ${{ matrix.target }}
-        run: |
-          $ErrorActionPreference = "Stop"
-          $name = "rai-$env:VERSION-$env:TARGET"
-          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip" -Force
-          Get-Item "dist/$name.zip"
-
-      - name: Attest the archive's build provenance
+      - name: Attest each file's build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: dist/rai-${{ needs.prepare.outputs.version }}-${{ matrix.target }}.${{ matrix.archive }}
+          subject-path: release/*
 
-      - name: Upload the archive to the draft release
+      - name: Upload every file to the draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          TAG: ${{ needs.prepare.outputs.tag }}
           RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
-          VERSION: ${{ needs.prepare.outputs.version }}
-          TARGET: ${{ matrix.target }}
-          ARCHIVE: ${{ matrix.archive }}
         shell: bash
         run: |
           set -euo pipefail
-          asset="dist/rai-${VERSION}-${TARGET}.${ARCHIVE}"
-          test -f "$asset"
           test -n "$RELEASE_ID"
-
-          name=$(basename "$asset")
-
-          # By id, like every other release call here. `gh release upload`
-          # resolves the release by tag, and a draft cannot be found that way
-          # reliably — it failed on two of four runners while the builds
-          # themselves were green.
-          #
-          # An asset of the same name already present is a re-run of this
-          # draft (prepare refuses a published release); the upload API rejects
-          # the duplicate rather than replacing it, so clear it first.
-          existing=$(gh api --paginate "repos/$REPO/releases/$RELEASE_ID/assets" \
-                       --jq ".[] | select(.name == \"$name\") | .id" || true)
-          for old in $existing; do
-            echo "replacing existing asset $old"
-            gh api --method DELETE "repos/$REPO/releases/assets/$old" || true
+          for asset in release/*; do
+            name=$(basename "$asset")
+            # By id: a draft cannot be found reliably by its tag. A file of the
+            # same name is a re-run of this draft; the API will not replace it,
+            # so it is removed first.
+            existing=$(gh api --paginate "repos/$REPO/releases/$RELEASE_ID/assets" \
+                         --jq ".[] | select(.name == \"$name\") | .id" || true)
+            for old in $existing; do
+              gh api --method DELETE "repos/$REPO/releases/assets/$old" || true
+            done
+            type=application/octet-stream
+            case "$name" in SHA256SUMS|*.sh|*.ps1) type=text/plain ;; esac
+            for attempt in 1 2 3 4 5; do
+              if gh api --method POST \
+                   "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=$name" \
+                   -H "Content-Type: $type" --input "$asset" --silent; then
+                echo "uploaded $name"
+                break
+              fi
+              if [ "$attempt" -eq 5 ]; then echo "::error::could not upload $name"; exit 1; fi
+              echo "upload of $name failed (attempt $attempt), retrying"
+              sleep $((attempt * 15))
+            done
           done
 
-          for attempt in 1 2 3 4 5; do
-            if gh api --method POST \
-                 "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=$name" \
-                 -H "Content-Type: application/octet-stream" \
-                 --input "$asset" --silent; then
-              echo "uploaded $name"
-              exit 0
-            fi
-            echo "upload failed (attempt $attempt) — retrying"
-            sleep $((attempt * 15))
-          done
-
-          echo "::error::could not upload $name after 5 attempts"
-          exit 1
-
-  checksums:
-    name: Publish SHA256SUMS and release
-    needs: [prepare, build]
+  publish:
+    name: Check what GitHub serves, then publish
+    needs: [prepare, attach]
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     permissions:
       contents: write
-
     steps:
-      - name: Download every archive back from the release
+      - name: Download every file back from the draft and check it
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          TAG: ${{ needs.prepare.outputs.tag }}
           RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p dist
-
-          # Hashing what the release actually serves — not what a build job
-          # happened to have on disk — is the only version of this check that
-          # can catch a truncated or clobbered upload.
-          #
-          # The release is still a draft at this point. `gh release download`
-          # resolves drafts by listing them, but that is a fallback path inside
-          # gh rather than a documented guarantee, so a failure here drops to
-          # the REST API, which addresses assets by id and has no such
-          # ambiguity. Either way the count is asserted below.
-          # Addressed by id, not tag. `gh release download` resolves a draft by
-          # listing releases rather than by ref and answers "release not found"
-          # often enough that a release cannot be built on it; the id comes
-          # from the job that created the release, so there is nothing to
-          # resolve and nothing to race.
-          test -n "$RELEASE_ID"
-
-          # The API has answered 503 mid-release before. A transient outage
-          # should cost a retry, not a release that has to be cut again.
+          # Hashing what the release serves, not what a job had on disk, is
+          # the only check that catches a truncated or clobbered upload.
+          mkdir -p served
           for attempt in 1 2 3 4 5; do
             if gh api --paginate "repos/$REPO/releases/$RELEASE_ID/assets" \
-                 --jq '.[] | select(.name | test("^rai-.*\\.(tar\\.gz|zip)$")) | "\(.id) \(.name)"' \
-                 > assets.txt; then
-              break
-            fi
-            echo "asset listing failed (attempt $attempt) — retrying"
-            sleep $((attempt * 5))
+                 --jq '.[] | "\(.id) \(.name)"' > assets.txt; then break; fi
+            echo "asset listing failed (attempt $attempt), retrying"; sleep $((attempt * 5))
           done
-          test -s assets.txt
-
-          while read -r asset_id asset_name; do
-            echo "downloading $asset_name"
-            gh api -H "Accept: application/octet-stream" \
-              "repos/$REPO/releases/assets/$asset_id" > "dist/$asset_name"
+          while read -r id name; do
+            gh api -H "Accept: application/octet-stream" "repos/$REPO/releases/assets/$id" > "served/$name"
           done < assets.txt
+          ls -l served
+          # Nine files and their SHA256SUMS; a short list would bless some
+          # downloads and leave the rest unverifiable.
+          [ "$(ls served | wc -l)" -eq 10 ] || { echo "::error::the draft holds $(ls served | wc -l) files, not 10"; exit 1; }
+          cd served && sha256sum -c SHA256SUMS
 
-          ls -l dist
-
-          # One archive per entry in the build matrix. A short SHA256SUMS is
-          # worse than none — it silently blesses some downloads and leaves the
-          # rest unverifiable — so the count is asserted rather than assumed.
-          # Keep this in step with the matrix in the build job.
-          expected=4
-          found=$(find dist -maxdepth 1 -type f \
-            \( -name 'rai-*.tar.gz' -o -name 'rai-*.zip' \) | wc -l)
-          if [ "$found" -ne "$expected" ]; then
-            echo "::error::expected $expected release archives to hash, found $found"
-            exit 1
-          fi
-
-      - name: Generate SHA256SUMS
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd dist
-          sha256sum rai-*.tar.gz rai-*.zip > SHA256SUMS
-          sha256sum -c SHA256SUMS
-          cat SHA256SUMS
-
-      - name: Attach SHA256SUMS and publish
+      - name: Publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          TAG: ${{ needs.prepare.outputs.tag }}
           RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
         shell: bash
         run: |
-          set -euo pipefail
-          # By id, for the same reason as every other call here.
-          existing=$(gh api --paginate "repos/$REPO/releases/$RELEASE_ID/assets" \
-                       --jq '.[] | select(.name == "SHA256SUMS") | .id' || true)
-          for old in $existing; do
-            gh api --method DELETE "repos/$REPO/releases/assets/$old" || true
-          done
+          gh api --method PATCH "repos/$REPO/releases/$RELEASE_ID" -F draft=false \
+            --jq '"published \(.tag_name) with \(.assets|length) files"'
 
-          for attempt in 1 2 3 4 5; do
-            if gh api --method POST \
-                 "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=SHA256SUMS" \
-                 -H "Content-Type: text/plain" \
-                 --input dist/SHA256SUMS --silent; then
-              echo "uploaded SHA256SUMS"
-              break
-            fi
-            if [ "$attempt" -eq 5 ]; then
-              echo "::error::could not upload SHA256SUMS after 5 attempts"
-              exit 1
-            fi
-            echo "SHA256SUMS upload failed (attempt $attempt) — retrying"
-            sleep $((attempt * 15))
-          done
-
-          # Publish by id for the same reason the download does: the release is
-          # still a draft at this point, so the tag is not a reliable handle.
-          gh api --method PATCH "repos/$REPO/releases/$RELEASE_ID" -F draft=false             --jq '"published \(.tag_name) with \(.assets|length) assets"'
+  # Once more from the public side: the one-line installers and packages,
+  # downloaded from the release a person now sees.
+  verify-public:
+    name: Install what GitHub now serves
+    needs: [prepare, publish]
+    uses: ./.github/workflows/clean-room.yml
+    with:
+      source: release
+      tag: ${{ needs.prepare.outputs.tag }}

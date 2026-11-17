@@ -71,13 +71,15 @@ const MAX_CHAT_REQUEST_BYTES: usize = 64 * 1024;
 /// This is a *default*, not a ceiling. The ceiling is whatever the prompt
 /// leaves free in the loaded model's context window — see
 /// [`resolve_max_tokens`] — because a fixed one silently truncated every reply
-/// on a model with a 40k window.
-const DEFAULT_CHAT_GENERATION_TOKENS: usize = 200;
+/// on a model with a 40k window. The same 512 as `rai run`: room for a full
+/// answer, where 200 stopped longer ones partway.
+const DEFAULT_CHAT_GENERATION_TOKENS: usize = 512;
 const MAX_ENSEMBLE_SIZE: usize = 8;
 const MAX_ENTROPY_THRESHOLD: f32 = 32.0;
-/// Directories one `GET /api/models` will scan. Only ever 1-2 today; the cap
-/// exists so the defaulting rule can never turn into an unbounded walk.
-const MAX_SCANNED_DIRECTORIES: usize = 8;
+/// Directories one `GET /api/models` will scan: the current folder, the
+/// loaded model's, and each model folder under ~/RAI/models. The cap keeps
+/// the defaulting rule from turning into an unbounded walk.
+const MAX_SCANNED_DIRECTORIES: usize = 32;
 
 #[derive(Debug)]
 struct ChatHttpError {
@@ -1581,6 +1583,10 @@ fn handle_models(state: &ServerState, query: &str) -> Result<Value, ChatHttpErro
                         push(parent.to_path_buf());
                     }
                 }
+            }
+            // Where rai-get-model puts every model it converts.
+            for folder in crate::cli::model_folders() {
+                push(folder);
             }
         }
     }

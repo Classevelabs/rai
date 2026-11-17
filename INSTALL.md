@@ -1,251 +1,214 @@
 # Installing RAI
 
-RAI is one command-line program and no installer:
+Pick the way that suits you. Every one of them installs RAI for you alone,
+needs no administrator password (except the Linux packages), and leaves your
+models in a folder of their own, so you can reinstall or remove RAI without
+losing them.
 
-| Binary | What it is for |
-| --- | --- |
-| `rai` | Convert checkpoints, generate text, serve a local chat UI, list models, measure perplexity |
+- [Windows](#windows)
+- [macOS and Linux](#macos-and-linux)
+- [Ubuntu, Debian, Fedora, RHEL and openSUSE packages](#linux-packages)
+- [Without installing](#without-installing)
+- [Your first model](#your-first-model)
+- [Check your download](#check-your-download)
+- [Updating](#updating)
+- [Removing RAI](#removing-rai)
 
-`rai` has five subcommands:
+If something goes wrong, [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)
+lists the usual problems and their fixes.
 
-| Command | What it does |
-| --- | --- |
-| `rai convert <model-dir>` | Turn a HuggingFace checkpoint into a `.raimodel` file |
-| `rai run <model.raimodel>` | Generate text on the CPU |
-| `rai serve <model.raimodel>` | Serve a local chat UI over HTTP |
-| `rai models [dir]` | List the `.raimodel` files in a directory |
-| `rai perplexity <model.raimodel> --text <file>` | Measure what quantization cost the model on a text |
+## Windows
 
-The archives also carry `rai-convert`, `rai-generate`, and `rai-chat`. Those
-are deprecated wrappers over the same code, kept so existing scripts keep
-working; new work should use `rai`.
+You need Windows 10 or 11 on a 64-bit Intel or AMD processor.
 
-Nothing runs as a service, nothing writes outside the paths you name, and no
-GPU is required. `rai serve` binds loopback only, and the binary carries no
-HTTP client and no TLS stack — there is no server it could reach.
+**With Setup.** Download `rai-<version>-windows-x64-setup.exe` from the
+[latest release](https://github.com/Classevelabs/rai/releases/latest) and run
+it. If Windows says "Windows protected your PC", choose **More info**, then
+**Run anyway**.
 
-If you want to build from source instead, skip to
-[Installing from source](#installing-from-source). For model export details,
-Python requirements, and chat-template behaviour, see
-[docs/INSTALL.md](./docs/INSTALL.md).
+Setup installs RAI into `%LOCALAPPDATA%\Programs\RAI`, puts **RAI Studio** in
+the Start menu and on the desktop, and adds RAI to your PATH, so `rai`,
+`rai-studio` and `rai-get-model` work in any new terminal. When it finishes,
+open RAI Studio.
 
-## 1. Download a release archive
-
-Every tagged release publishes one archive per platform, plus a `SHA256SUMS`
-file, at <https://github.com/Classevelabs/rai/releases>.
-
-| Platform | Archive |
-| --- | --- |
-| Linux, x86-64 | `rai-<version>-x86_64-unknown-linux-gnu.tar.gz` |
-| macOS, Intel | `rai-<version>-x86_64-apple-darwin.tar.gz` |
-| macOS, Apple Silicon | `rai-<version>-aarch64-apple-darwin.tar.gz` |
-| Windows, x86-64 | `rai-<version>-x86_64-pc-windows-msvc.zip` |
-
-The x86-64 archives are built for the **x86-64-v2** baseline, so they start on
-any x86-64 CPU from roughly 2009 onward. The fast kernels need AVX2, FMA, and
-F16C; RAI probes for those at runtime and uses them when present, so the same
-download is both portable and fast on a modern machine.
-
-**On Apple Silicon, take the `aarch64` archive.** It is a native ARM build, and
-it runs the scalar kernels — the optimized ones are x86-64 AVX2 and there is no
-NEON implementation yet, so expect it to be slower than the x86-64 archives on
-comparable hardware. Take it anyway: the Intel archive runs on Apple Silicon
-only under Rosetta, which emulates no AVX2 at all, so it lands on the same
-scalar path *and* pays translation on top.
-
-ARM64 Linux still has to build from source, and gets the same scalar path.
-
-**The Linux archive needs glibc 2.34 or newer** — Ubuntu 22.04, Debian 12,
-RHEL 9, or later. It is built on a current runner and links against that
-runner's glibc, so on an older distribution it fails at load with a
-`GLIBC_2.34 not found` message rather than running slowly. Ubuntu 20.04,
-Debian 11, RHEL 8 and Amazon Linux 2 are all below that floor; build from
-source there. Apart from libc the binary needs only `libgcc_s` and `libm`,
-both of which are already present anywhere those exist.
-
-The Intel macOS archive goes back to 10.12; the Apple Silicon archive needs
-macOS 11, the first release that arm64 Macs shipped with. Both load nothing
-outside `/usr/lib`.
-
-## 2. Verify the checksum
-
-Do this before you run anything. Put `SHA256SUMS` in the same directory as the
-archive you downloaded.
-
-Linux and macOS:
-
-```bash
-sha256sum --ignore-missing -c SHA256SUMS
-# rai-<version>-x86_64-unknown-linux-gnu.tar.gz: OK
-```
-
-macOS without GNU coreutils:
-
-```bash
-shasum -a 256 --ignore-missing -c SHA256SUMS
-```
-
-Windows PowerShell:
+**With PowerShell.** The same install from one line, without the desktop
+shortcut:
 
 ```powershell
-$file = (Get-ChildItem rai-*-x86_64-pc-windows-msvc.zip | Select-Object -First 1).Name
-$want = (Select-String -Path SHA256SUMS -Pattern ([regex]::Escape($file))).Line.Split()[0]
-$got  = (Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
-if ($want -eq $got) { "OK" } else { throw "checksum mismatch" }
+irm https://github.com/Classevelabs/rai/releases/latest/download/install.ps1 | iex
 ```
 
-`--ignore-missing` is what lets you check one archive against a `SHA256SUMS`
-that lists every platform's. If the check fails, delete the download; do not
-run it.
+It downloads the release, checks it against the release's `SHA256SUMS`,
+installs it and offers to download a model. To change what it does, set one
+of these first, in the same PowerShell window:
 
-Each archive also carries a signed build-provenance attestation tying it to
-this repository's release workflow and the tagged commit. With the GitHub CLI:
+| Setting | What it does |
+| --- | --- |
+| `$env:RAI_INSTALL_MODEL = 'qwen2.5-0.5b'` | Downloads this model without asking |
+| `$env:RAI_NO_MODEL = '1'` | Doesn't offer a model |
+| `$env:RAI_VERSION = '0.2.6'` | Installs that release instead of the latest |
+| `$env:RAI_INSTALL_DIR = 'D:\Tools\RAI'` | Installs somewhere else |
+| `$env:RAI_NO_PATH = '1'` | Leaves your PATH alone |
+
+## macOS and Linux
+
+You need macOS 10.12 or newer on an Intel Mac, macOS 11 or newer on an Apple
+Silicon Mac, or a 64-bit Intel or AMD Linux with glibc 2.28 or newer (Ubuntu
+20.04, Debian 10, RHEL 8, or anything newer). In a terminal:
 
 ```bash
-gh attestation verify rai-<version>-<target>.tar.gz --repo Classevelabs/rai
+curl -fsSL https://github.com/Classevelabs/rai/releases/latest/download/install.sh | sh
 ```
 
-## 3. Put the binaries on your PATH
+It downloads the release for your computer, checks it against the release's
+`SHA256SUMS`, and installs it into `~/.local/share/rai`, with `rai`,
+`rai-studio` and `rai-get-model` linked into `~/.local/bin`. If that folder is
+not on your PATH yet, it adds a line to your shell's profile (`~/.zshrc`,
+`~/.bashrc`, `~/.bash_profile` or `~/.profile`), so open a new terminal
+afterwards. On a Linux desktop it also adds RAI Studio to your app menu.
+Nothing is written outside your home folder, and `sudo` is never needed.
 
-Unpack, then move the binaries somewhere already on `PATH`. They are
-self-contained and can live anywhere.
-
-Linux and macOS:
+Options go after `sh -s --`:
 
 ```bash
-archive=$(ls rai-*-x86_64-unknown-linux-gnu.tar.gz)   # the archive you downloaded
-tar xzf "$archive"
-cd "${archive%.tar.gz}"
-install -m 0755 rai ~/.local/bin/
-rai --help
+curl -fsSL https://github.com/Classevelabs/rai/releases/latest/download/install.sh | sh -s -- --model qwen2.5-0.5b
 ```
 
-On macOS the archive ends in `-x86_64-apple-darwin.tar.gz` (Intel) or
-`-aarch64-apple-darwin.tar.gz` (Apple Silicon); use that name instead.
+| Option | What it does |
+| --- | --- |
+| `--model NAME` | Downloads this model without asking |
+| `--no-model` | Doesn't offer a model |
+| `--version 0.2.6` | Installs that release instead of the latest |
+| `--dir DIR` | Installs into DIR instead of `~/.local/share/rai` |
+| `--no-path` | Leaves your PATH and shell profile alone |
 
-If `~/.local/bin` is not on your `PATH`, add it (`export
-PATH="$HOME/.local/bin:$PATH"` in your shell profile), or use `/usr/local/bin`
-with `sudo`.
+## Linux packages
 
-macOS marks downloaded files with a quarantine attribute, and these binaries
-are not notarized. Gatekeeper will refuse them until you clear it:
+Download the package from the
+[latest release](https://github.com/Classevelabs/rai/releases/latest), then:
 
 ```bash
-xattr -d com.apple.quarantine rai
+# Ubuntu and Debian
+sudo apt install ./rai_<version>_amd64.deb
+
+# Fedora, RHEL, Rocky and AlmaLinux
+sudo dnf install ./rai-<version>-1.x86_64.rpm
+
+# openSUSE
+sudo zypper install ./rai-<version>-1.x86_64.rpm
 ```
 
-Windows PowerShell:
+The package puts `rai`, `rai-studio` and `rai-get-model` in `/usr/bin` and adds
+RAI Studio to the app menu.
+
+## Without installing
+
+Each release also has a plain archive per platform. Unpack it anywhere and
+start RAI Studio from the `launchers` folder inside:
+
+| Computer | Archive | Start |
+| --- | --- | --- |
+| Windows | `rai-<version>-x86_64-pc-windows-msvc.zip` | double-click `launchers\rai-studio.cmd` |
+| Mac with Apple Silicon | `rai-<version>-aarch64-apple-darwin.tar.gz` | double-click `launchers/rai-studio.command` |
+| Mac with Intel | `rai-<version>-x86_64-apple-darwin.tar.gz` | double-click `launchers/rai-studio.command` |
+| Linux | `rai-<version>-x86_64-unknown-linux-gnu.tar.gz` | run `launchers/rai-studio.sh` |
+
+On an Apple Silicon Mac, take the Apple Silicon archive: the Intel one would
+run under translation and be slower.
+
+macOS holds back programs downloaded through a browser. If it says "rai"
+cannot be opened, allow the folder once, in Terminal:
+
+```bash
+xattr -dr com.apple.quarantine /path/to/the/unpacked/folder
+```
+
+## Your first model
+
+RAI Studio offers a model the first time it starts, and the installers offer
+one too. To get one yourself:
+
+```bash
+rai-get-model qwen2.5-1.5b
+```
+
+| Name | Download | On disk | |
+| --- | --- | --- | --- |
+| `qwen2.5-0.5b` | 1.0 GB | 0.3 GB | Small and fast. Good for trying RAI out on any computer. |
+| `qwen2.5-1.5b` | 3.1 GB | 0.9 GB | Recommended. Clear answers at a good speed on a laptop. |
+| `qwen2.5-7b` | 15.2 GB | 4.0 GB | Best answers, but slower. For computers with 8 GB of memory or more. |
+
+Models go into `~/RAI/models` (on Windows, `%USERPROFILE%\RAI\models`), one
+folder each. Set `RAI_HOME` to keep them somewhere else; RAI Studio, `rai
+models` and `rai-get-model` all follow it. While it works, `rai-get-model`
+needs free space of about one and a half times the download. When it is done,
+it deletes the download and keeps only the converted model.
+
+Any other model from a supported family works the same way, by its Hugging
+Face name. [docs/MODELS.md](docs/MODELS.md) has the list.
+
+```bash
+rai-get-model HuggingFaceTB/SmolLM2-1.7B-Instruct
+```
+
+## Check your download
+
+The installers do this for you. For a file you downloaded yourself, every
+release has a `SHA256SUMS` file listing each download's fingerprint. Put it
+next to your download, then:
+
+```bash
+sha256sum --ignore-missing -c SHA256SUMS         # Linux
+shasum -a 256 --ignore-missing -c SHA256SUMS     # macOS
+```
+
+On Windows, in PowerShell, compare the output of
+`Get-FileHash <file> -Algorithm SHA256` with the line for that file in
+`SHA256SUMS`. If they differ, delete the download and don't run it.
+
+Each file also carries a signed build record that ties it to this repository
+and the exact commit it was built from. With the
+[GitHub CLI](https://cli.github.com):
+
+```bash
+gh attestation verify <file> --repo Classevelabs/rai
+```
+
+## Updating
+
+Run the same installer again: the new Setup, the same PowerShell or terminal
+line, or the new package. It replaces the program and keeps your models.
+
+## Removing RAI
+
+**Windows, installed with Setup.** Open **Settings > Apps**, find **RAI**, and
+choose **Uninstall**. It asks whether to delete your downloaded models too;
+the answer is no unless you say yes.
+
+**Windows, installed with PowerShell.** In PowerShell:
 
 ```powershell
-$zip = Get-ChildItem rai-*-x86_64-pc-windows-msvc.zip | Select-Object -First 1
-Expand-Archive $zip.FullName -DestinationPath $HOME\bin
-$dir = "$HOME\bin\$($zip.BaseName)"
-[Environment]::SetEnvironmentVariable(
-  "Path", "$([Environment]::GetEnvironmentVariable('Path','User'));$dir", "User")
-# open a new terminal, then:
-rai --help
+$dir = Join-Path $env:LOCALAPPDATA 'Programs\RAI'
+Remove-Item -Recurse -Force $dir
+Remove-Item -Force (Join-Path ([Environment]::GetFolderPath('Programs')) 'RAI Studio.lnk')
+$key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+$path = $key.GetValue('Path', '', 'DoNotExpandEnvironmentNames')
+$key.SetValue('Path', (($path.Split(';') | Where-Object { $_ -and $_.TrimEnd('\') -ne $dir }) -join ';'), 'ExpandString')
 ```
 
-The Windows binaries are unsigned, so SmartScreen may warn on first run. The
-checksum you verified in step 2 is the assurance here.
-
-## 4. Sixty seconds to your first generation
-
-You need a checkpoint on disk. A ~1B model converts in well under a minute.
-TinyLlama-1.1B-Chat is the one these instructions were verified against.
+**macOS and Linux, installed with the terminal line:**
 
 ```bash
-# Convert it once. No Python, no torch — `rai convert` reads the checkpoint
-# directory directly and writes tokenizer.json and the model's chat template
-# next to the model file.
-rai convert /path/to/TinyLlama-1.1B-Chat-v1.0 -o tinyllama-q4.raimodel
-
-# Generate. The tokenizer and template beside the model are found automatically.
-rai run tinyllama-q4.raimodel \
-        --chat-template auto \
-        --prompt "Explain photosynthesis in simple terms."
+rm -rf ~/.local/share/rai ~/.local/bin/rai ~/.local/bin/rai-studio ~/.local/bin/rai-get-model
+rm -f ~/.local/share/applications/rai-studio.desktop
 ```
 
-Then, if you want a browser instead of a terminal:
+If the installer added RAI to your PATH, your shell profile also has a line
+`# Added by the RAI installer` with an `export PATH=` line under it. Delete
+both.
 
-```bash
-rai serve tinyllama-q4.raimodel
-# open http://127.0.0.1:8090
-```
+**Linux packages:** `sudo apt remove rai`, `sudo dnf remove rai` or
+`sudo zypper remove rai`.
 
-The double-click launchers in `launchers/` start that same interface without a
-terminal: `rai-studio.cmd` on Windows, `rai-studio.command` on macOS,
-`rai-studio.sh` (plus the `rai-studio.desktop` template) on Linux. Put one
-beside the `rai` binary and your `.raimodel` file. On macOS and Linux, if
-double-clicking does nothing or you get `Permission denied`, the executable bit
-did not survive the trip — restore it once:
-
-```bash
-chmod +x rai-studio.sh rai-studio.command
-```
-
-To see what is already on the machine:
-
-```bash
-rai models .
-```
-
-Not every checkpoint converts. RAI runs Qwen2/2.5, Qwen3 (dense and MoE),
-Llama-2/3/3.1/3.2, Gemma 1/2, text-only Gemma3, OLMo2, Phi-3, Mistral, Mixtral,
-TinyLlama, and SmolLM. What is refused is refused for something a checkpoint
-contains — a shared expert, a RoPE scheme other than `default` or `llama3`, an
-`lm_head` bias, a module tree that is not Llama-shaped — with the reason named
-at conversion time. Check [docs/MODELS.md](./docs/MODELS.md) before downloading
-weights.
-
-**The one thing that trips everybody up:** instruction-tuned checkpoints need
-the prompt format they were trained on, and `rai run` sends raw text unless
-told otherwise. Pass a bare instruction without `--chat-template` and the model
-emits end-of-sequence immediately and prints nothing at all. That is not a
-crash and not a broken conversion: pass `--chat-template auto`, which uses the
-chat template the conversion recorded beside the model. See
-[Running a chat model](./docs/INSTALL.md#running-a-chat-model).
-
-## Installing from source
-
-You need Rust 1.87 or newer. The repository pins 1.95.0 for repeatable checks,
-which `rustup` will install automatically from `rust-toolchain.toml`.
-
-```bash
-git clone https://github.com/Classevelabs/rai.git
-cd rai
-cargo install --locked --path rai-infer     # rai, and the deprecated wrappers
-```
-
-`cargo install` puts them in `~/.cargo/bin`, which `rustup` already added to
-your `PATH`.
-
-**A source-built binary is safe to copy to another machine.** The repository's
-`.cargo/config.toml` pins x86-64 builds to `target-cpu=x86-64-v2`, the same
-portable floor the release workflow uses, so the compiler cannot emit an
-instruction your build machine has and the destination lacks. aarch64 builds
-are left at the toolchain default.
-
-If you want a binary tuned to the machine in front of you — worth it only for a
-local benchmark, never for anything you hand to someone else:
-
-```bash
-RUSTFLAGS="-C target-cpu=native" cargo install --locked --path rai-infer
-```
-
-That one dies with SIGILL — an illegal-instruction crash, on startup, with no
-useful message — on any CPU older than the one that built it. The portable
-default costs nothing measurable in exchange: the hot kernels are
-runtime-dispatched, not selected by the compile-time baseline.
-
-## Container
-
-The `Dockerfile` builds the `rai` inference CLI by default, and the separate
-memory service with `--target server`. See
-[docs/INSTALL.md](./docs/INSTALL.md#container) for how to run each.
-
-## Uninstalling
-
-Delete the binaries. RAI creates no registry entries, no services, and no
-config files. The only state it can leave behind is whatever you pointed
-`RAI_DATA_PATH` at, and whatever `.raimodel` files you converted.
+**Your models** are in `~/RAI` (on Windows, `%USERPROFILE%\RAI`). Delete that
+folder if you don't want them any more.

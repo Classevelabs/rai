@@ -20,19 +20,17 @@ use rai_infer::cli;
     ),
     after_help = concat!(
         "EXAMPLE:\n",
-        "  rai convert ./TinyLlama-1.1B-Chat -o tinyllama.raimodel\n",
-        "  rai run tinyllama.raimodel --prompt \"The capital of France is\"\n",
-        "  rai serve tinyllama.raimodel        # chat UI on http://localhost:8090\n",
-        "  rai models                          # what is in this directory\n",
-        "  rai perplexity tinyllama.raimodel --text wiki.test.raw\n",
+        "  rai-get-model qwen2.5-1.5b          # download and convert a starter model\n",
+        "  rai run model.raimodel --prompt \"What is the capital of France?\"\n",
+        "  rai serve model.raimodel            # chat in your browser at http://localhost:8090\n",
+        "  rai check ./SomeModel               # will this checkpoint convert?\n",
+        "  rai convert ./SomeModel -o some-model.raimodel\n",
+        "  rai models                          # the models here and in ~/RAI/models\n",
         "\n",
         "The tokenizer and the model's chat template (<name>.chat.json) are\n",
-        "written beside the model at conversion time and picked up automatically;\n",
-        "--tokenizer overrides the first.\n",
-        "\n",
-        "Instruction-tuned models need their chat template: pass\n",
-        "--chat-template auto to `rai run`. Without it they usually emit\n",
-        "end-of-sequence immediately and print nothing."
+        "written beside the model when it is converted and found automatically.\n",
+        "`rai run` and `rai serve` use the model's own chat template; pass\n",
+        "--chat-template none to send a prompt as plain text."
     ),
     subcommand_required = true,
     arg_required_else_help = true
@@ -52,7 +50,7 @@ enum Command {
 
     /// Generate text from a .raimodel
     #[command(
-        after_help = "EXAMPLE:\n  rai run tinyllama.raimodel --prompt \"The capital of France is\" --max-tokens 40\n  rai run zephyr-7b.raimodel --chat-template auto --prompt \"Explain photosynthesis.\"\n\n--tokenizer defaults to tokenizer.json beside the model.\nInstruction-tuned models need --chat-template auto, their own template as\nthe conversion recorded it; without it they usually emit end-of-sequence\nimmediately and print nothing."
+        after_help = "EXAMPLE:\n  rai run model.raimodel --prompt \"Explain photosynthesis in two sentences.\"\n  rai run base-model.raimodel --chat-template none --prompt \"Once upon a time\"\n\n--tokenizer defaults to tokenizer.json beside the model. The model's own\nchat template, recorded when it was converted, is used unless you pass\n--chat-template; a model without one gets the prompt as plain text."
     )]
     Run(cli::run::RunArgs),
 
@@ -63,7 +61,13 @@ loopback) and rejects requests from other hosts."
     )]
     Serve(cli::serve::ServeArgs),
 
-    /// List the .raimodel files in a directory
+    /// Check whether a Hugging Face checkpoint can be converted
+    #[command(
+        after_help = "EXAMPLE:\n  rai check ./Qwen2.5-1.5B-Instruct\n  rai check ./downloads/config.json\n\nOnly config.json is needed, so you can check a model before downloading its\nweights. With the weights in the folder, every tensor is checked as well.\nExits 0 when the model converts, 1 when it does not, with the reason."
+    )]
+    Check(cli::check::CheckArgs),
+
+    /// List the models in a folder (default: here and ~/RAI/models)
     #[command(after_help = "EXAMPLE:\n  rai models\n  rai models ~/models")]
     Models(cli::models::ModelsArgs),
 
@@ -79,6 +83,7 @@ fn main() -> Result<()> {
         Command::Convert(args) => cli::convert::run(&args),
         Command::Run(args) => cli::run::run(&args),
         Command::Serve(args) => cli::serve::run(&args),
+        Command::Check(args) => cli::check::run(&args),
         Command::Models(args) => cli::models::run(&args),
         Command::Perplexity(args) => cli::perplexity::run(&args),
     }

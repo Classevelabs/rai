@@ -1,106 +1,161 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# rai-studio.sh - launcher for the local rai chat UI (Linux).
+# rai-studio.sh - chat with a model in your browser (Linux and macOS).
 #
-# Put this file in the same directory as the `rai` binary and your .raimodel
-# file, then run it (or install rai-studio.desktop for a desktop icon). It
-# starts `rai serve`, waits for the port to come up, and opens your default
-# browser. Ctrl+C, or closing the terminal, stops the server.
+# It finds the rai program and a model, starts `rai serve`, and opens your
+# browser at http://localhost:8090. With no model on this computer yet, it
+# offers to download the recommended one, and starts the page either way.
+# Ctrl+C, or closing the terminal, stops the server.
 #
-# Override the defaults with environment variables:
-#   RAI_PORT=9000 ./rai-studio.sh
-#   RAI_MODEL=/models/tinyllama-1.1b-q4.raimodel ./rai-studio.sh
+# Settings, as environment variables:
+#   RAI_PORT=9000                       another port
+#   RAI_MODEL=/path/to/model.raimodel   the model to start with
+#   RAI_HOME=/data/rai                  where models live (default: ~/RAI)
+#   RAI_NO_BROWSER=1                    do not open a browser
 # ---------------------------------------------------------------------------
 set -u
 
-HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# The folder this script really lives in: installs link to it as rai-studio
+# from a bin folder, and rai-get-model and the archive root are found from here.
+SELF="${BASH_SOURCE[0]}"
+while [ -L "${SELF}" ]; do
+    LINK="$(readlink "${SELF}")"
+    case "${LINK}" in
+        /*) SELF="${LINK}" ;;
+        *) SELF="$(dirname -- "${SELF}")/${LINK}" ;;
+    esac
+done
+HERE="$(cd -- "$(dirname -- "${SELF}")" && pwd)"
 
 # The release archive ships the binary at its root and the launchers one level
 # down, so the parent directory counts as home too. Looking only beside this
 # script is what made a downloaded archive fail on the first double-click.
+# A program is a regular file that can run: a folder also passes -x, and in
+# the packages' layout /usr/lib/rai/../rai is one.
+is_program() { [ -f "$1" ] && [ -x "$1" ]; }
+
 ROOT="${HERE}"
-if [ ! -x "${HERE}/rai" ] && [ -x "${HERE}/../rai" ]; then
+if ! is_program "${HERE}/rai" && is_program "${HERE}/../rai"; then
     ROOT="$(cd -- "${HERE}/.." && pwd)"
 fi
 PORT="${RAI_PORT:-8090}"
 URL="http://localhost:${PORT}/"
+RAI_HOME="${RAI_HOME:-${HOME}/RAI}"
+export RAI_HOME
 
 die() {
     printf '\n%s\n\n' "$*" >&2
     # Keep the message on screen when this was double-clicked from a file
-    # manager and the terminal would otherwise close instantly.
+    # manager or Finder and the window would otherwise close at once.
     if [ -t 0 ]; then
         read -r -p "Press Enter to close. " _ || true
     fi
     exit 1
 }
 
-# --- locate the rai binary: beside this script first, then PATH -------------
-if [ -x "${HERE}/rai" ]; then
+# --- locate the rai binary: beside this script, the archive root, then PATH --
+if is_program "${HERE}/rai"; then
     RAI="${HERE}/rai"
-elif [ -x "${ROOT}/rai" ]; then
+elif is_program "${ROOT}/rai"; then
     RAI="${ROOT}/rai"
 elif RAI="$(command -v rai 2>/dev/null)"; then
     :
 else
-    die "  Could not find the rai binary.
+    die "  Could not find the rai program.
 
-  Put it in ${ROOT} or on your PATH, then run this launcher again."
+  Put it in ${ROOT} or on your PATH, then run this again."
 fi
 
-# --- pick a model -----------------------------------------------------------
+# macOS holds back a program it has marked as downloaded through a browser
+# until the mark is cleared. The installer script never sets it; an archive
+# opened in Finder does, so say exactly how to clear it.
+if [ "$(uname -s)" = Darwin ] && xattr -p com.apple.quarantine "${RAI}" >/dev/null 2>&1; then
+    die "  macOS is holding back rai because it was downloaded through a browser.
+  Allow it once by running this in Terminal, then open this again:
+
+    xattr -dr com.apple.quarantine \"${ROOT}\""
+fi
+
+# --- pick a model: RAI_MODEL, then beside rai, then $RAI_HOME/models ---------
+MODEL=""
+count_models() {
+    # Counts the files among its arguments into COUNT (a glob that matched
+    # nothing is not one) and keeps the last of them in LAST.
+    local n=0 path
+    for path in "$@"; do
+        [ -f "${path}" ] || continue
+        n=$((n + 1))
+        LAST="${path}"
+    done
+    COUNT="${n}"
+}
+
 if [ -n "${RAI_MODEL:-}" ]; then
     [ -f "${RAI_MODEL}" ] || die "  RAI_MODEL is set to \"${RAI_MODEL}\" but that file does not exist."
     MODEL="${RAI_MODEL}"
 else
-    models=()
-    found=0
-    while IFS= read -r -d '' path; do
-        models+=("${path}")
-        found=$((found + 1))
-    done < <(find "${ROOT}" -maxdepth 1 -type f -name '*.raimodel' -print0 2>/dev/null | sort -z)
-
-    case "${found}" in
-        0)
-            die "  No .raimodel file found in this directory:
-    ${ROOT}
-
-  Convert a HuggingFace checkpoint first, for example:
-    \"${RAI}\" convert /path/to/TinyLlama-1.1B-Chat -o \"${ROOT}/tinyllama.raimodel\"
-
-  Then run this launcher again."
-            ;;
-        1)
-            MODEL="${models[0]}"
-            ;;
-        *)
-            listing=""
-            for path in "${models[@]}"; do
-                listing="${listing}    $(basename -- "${path}")"$'\n'
-            done
-            die "  More than one .raimodel file is in this directory, so it is not
-  obvious which one to start:
-
-${listing}
-  Pick one by setting RAI_MODEL and running this launcher again:
-    RAI_MODEL=${ROOT}/<name>.raimodel $0"
-            ;;
-    esac
+    # One model next to rai, as an unpacked archive keeps it, starts at once;
+    # several start the page with none loaded, so you choose there.
+    LAST=""
+    count_models "${ROOT}"/*.raimodel
+    if [ "${COUNT}" -eq 0 ]; then
+        # The models rai-get-model converted, one folder each.
+        count_models "${RAI_HOME}"/models/*/*.raimodel
+    fi
+    if [ "${COUNT}" -eq 1 ]; then
+        MODEL="${LAST}"
+    elif [ "${COUNT}" -eq 0 ]; then
+        GET=""
+        if is_program "${HERE}/rai-get-model"; then
+            GET="${HERE}/rai-get-model"
+        elif command -v rai-get-model >/dev/null 2>&1; then
+            GET="$(command -v rai-get-model)"
+        fi
+        if [ -n "${GET}" ] && [ -t 0 ]; then
+            printf '\n  RAI needs a model to chat with, and there is none on this computer yet.\n'
+            printf '  The recommended one is Qwen2.5 1.5B Instruct, a 3.1 GB download. It is\n'
+            printf '  saved in %s and ready to chat as soon as it is converted.\n\n' "${RAI_HOME}"
+            read -r -p "  Download it now? [Y/n] " answer || answer=n
+            case "${answer}" in
+                [nN]*) ;;
+                *)
+                    if "${GET}" qwen2.5-1.5b --yes; then
+                        candidate="${RAI_HOME}/models/qwen2.5-1.5b/qwen2.5-1.5b-q4.raimodel"
+                        [ -f "${candidate}" ] && MODEL="${candidate}"
+                    fi
+                    ;;
+            esac
+        fi
+    fi
 fi
 
-printf '  Model:  %s\n' "${MODEL}"
+if [ -n "${MODEL}" ]; then
+    printf '  Model:  %s\n' "${MODEL}"
+else
+    printf '  Model:  none yet - choose or get one in the page that opens\n'
+fi
 printf '  Server: %s\n\n' "${URL}"
-printf '  Waiting for the model to load, then opening your browser.\n'
-printf '  Press Ctrl+C to stop the server.\n\n'
+printf '  Waiting for the server, then opening your browser.\n'
+printf '  Press Ctrl+C to stop it.\n\n'
 
 # --- start the server and make sure it dies with this script ----------------
-"${RAI}" serve "${MODEL}" --port "${PORT}" &
+# From the folder rai is in, so the page's library lists models kept beside it
+# as well as those under $RAI_HOME.
+cd -- "${ROOT}" || die "  Cannot enter ${ROOT}."
+if [ -n "${MODEL}" ]; then
+    "${RAI}" serve "${MODEL}" --port "${PORT}" &
+else
+    "${RAI}" serve --port "${PORT}" &
+fi
 SERVER_PID=$!
 trap 'kill "${SERVER_PID}" 2>/dev/null || true' EXIT INT TERM
 
 # --- wait for the port, then open the browser -------------------------------
 open_url() {
-    for opener in xdg-open gio open sensible-browser x-www-browser firefox; do
+    # `open` is macOS's; on Debian and Ubuntu the same name is openvt.
+    local openers="xdg-open gio sensible-browser x-www-browser firefox"
+    [ "$(uname -s)" = Darwin ] && openers="open"
+    for opener in ${openers}; do
         if command -v "${opener}" >/dev/null 2>&1; then
             case "${opener}" in
                 gio) "${opener}" open "${URL}" >/dev/null 2>&1 && return 0 ;;
@@ -127,10 +182,15 @@ port_is_open() {
 deadline=$((SECONDS + 120))
 while [ "${SECONDS}" -lt "${deadline}" ]; do
     if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
-        die "  The server stopped before it was ready; see the messages above."
+        wait "${SERVER_PID}"
+        code=$?
+        trap - EXIT
+        die "  rai serve exited with code ${code} before it was ready; see the messages above."
     fi
     if port_is_open; then
-        open_url || printf '  Could not open a browser. Visit %s yourself.\n' "${URL}"
+        if [ -z "${RAI_NO_BROWSER:-}" ]; then
+            open_url || printf '  Could not open a browser. Visit %s yourself.\n' "${URL}"
+        fi
         break
     fi
     sleep 0.5

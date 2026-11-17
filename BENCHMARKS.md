@@ -895,7 +895,7 @@ MODEL=rai-infer/scripts/smollm-135m-q4.raimodel
 
 # End-to-end decode timing
 ./target/release/rai run "$MODEL" \
-  --tokenizer rai-infer/scripts/tokenizer.json \
+  --tokenizer rai-infer/scripts/tokenizer.json --chat-template none \
   --prompt "The future of computing is" --max-tokens 128
 
 # Compression kernels (criterion)

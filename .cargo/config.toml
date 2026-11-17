@@ -36,3 +36,11 @@
 
 [target.'cfg(target_arch = "x86_64")']
 rustflags = ["-C", "target-cpu=x86-64-v2"]
+
+# Windows: the C runtime linked into rai.exe rather than loaded from
+# VCRUNTIME140.dll, which a fresh Windows does not have. Without it the
+# program died before printing anything, with "The code execution cannot
+# proceed because VCRUNTIME140.dll was not found". Joined with the x86-64
+# floor above, and the release build sets the same pair.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

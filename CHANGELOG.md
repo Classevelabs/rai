@@ -7,6 +7,26 @@ versioning for its pre-1.0 releases.
 ## [0.2.6] - Unreleased
 
 ### Added
+- Installers. On Windows, `rai-<version>-windows-x64-setup.exe` installs RAI
+  for the current user without administrator rights, puts `rai` on PATH and
+  RAI Studio in the Start menu, and uninstalls from Settings; `install.ps1`
+  does the same from one PowerShell line. On macOS and Linux, `install.sh`
+  installs from one terminal line into `~/.local`, and there are `.deb` and
+  `.rpm` packages. The one-line installers check every download against
+  `SHA256SUMS` before installing it.
+- `rai-get-model` downloads a model, checks it, converts it and puts it where
+  RAI Studio finds it. Three starter models (Qwen2.5 0.5B, 1.5B and 7B) are
+  pinned to one Hugging Face commit and one SHA-256 per file. Given any other
+  Hugging Face repository, it reads the model's configuration first and stops
+  before the weights if RAI cannot convert it. `rai` itself still never
+  connects to the internet.
+- `rai check <folder>` says whether a checkpoint converts, and how big it will
+  be, from its `config.json` alone, before the weights are downloaded.
+- RAI Studio opens without a model and shows how to get one. The launchers
+  look for models in `~/RAI/models` (`%USERPROFILE%\RAI\models` on Windows,
+  or wherever `RAI_HOME` points) as well as beside the program, and offer to
+  download the recommended model the first time. `rai models` and Studio's
+  model list look there too.
 - `rai serve` keeps the keys and values of the prompt prefix a request shares
   with the previous one and prefills only the rest. A chat client re-sends
   the whole thread every turn: on Qwen2.5-0.5B the fifth turn's prefill went
@@ -248,6 +268,27 @@ versioning for its pre-1.0 releases.
   context; `COPY . .` baked them into a layer.
 
 ### Changed
+- `rai.exe` carries its own C runtime. A Windows machine without the Visual
+  C++ Redistributable refused to start 0.2.5 with "VCRUNTIME140.dll was not
+  found".
+- The Linux build is made on glibc 2.28 and runs on Ubuntu 20.04, Debian 10,
+  RHEL 8 and anything newer. 0.2.5 needed glibc 2.34, so it stopped with
+  "GLIBC_2.34 not found" on Ubuntu 20.04, Debian 11, RHEL 8 and Amazon
+  Linux 2.
+- `rai run` uses the model's own chat template by default, as `rai serve`
+  and Studio do, so a question typed at an instruction-tuned model reaches it
+  in the form it was trained on. The old default sent the prompt as plain
+  text. A model with no template of its own still gets the text as written.
+- A reply may run to 512 tokens unless you ask for another limit, in
+  `rai run` (was 64) and in `/api/chat` (was 200), so ordinary answers are no
+  longer cut off partway. A model still stops as soon as it ends its turn.
+- Every download is installed and used on clean machines before a release is
+  published: Windows Server 2022 and 2025 with the Visual C++ runtime
+  removed, macOS on Apple Silicon and Intel, and ten Linux distributions from
+  Ubuntu 20.04 to Arch. On each, the installer runs, a model is downloaded and
+  converted, and it must answer a question correctly from the command line
+  and through RAI Studio. Once the release is public, the same test runs again
+  against what GitHub serves.
 - One chunked, batched prefill serves `rai run`, `rai serve` and all three
   speculative decoders, and computes no logits for prompt tokens. Batched
   tied output head, and shared-input Q/K/V and gate/up projections on the

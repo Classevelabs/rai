@@ -1,0 +1,380 @@
+name: Clean-room installs
+
+# What a person downloads has to install and work on a computer that has
+# never seen a compiler, Python or a Visual C++ runtime. The build machines
+# prove nothing about that: they are full of tools. So each download is
+# installed here the way a person installs it, on bare Windows (the runtime
+# hidden, nothing but Windows on PATH), on both kinds of Mac, and in fresh
+# containers of ten Linux distributions. Then the whole first hour of use
+# runs: download the smallest starter model, convert it, ask it a question
+# and check the answer, from the command line and through Studio's server.
+#
+# The release runs this on the files it built before anything is published,
+# and again on what GitHub serves once it is. Weekly, it checks that the
+# public release still installs.
+
+on:
+  workflow_call:
+    inputs:
+      source:
+        description: "artifact: the rai-dist files this run built; release: what GitHub serves"
+        type: string
+        default: artifact
+      tag:
+        description: "With source release: the tag to test (empty: the latest release)"
+        type: string
+        default: ""
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to test (empty: the latest release)"
+        type: string
+        default: ""
+  schedule:
+    - cron: '41 5 * * 1'
+
+permissions:
+  contents: read
+
+env:
+  # Dispatched or scheduled, it tests what GitHub serves.
+  SOURCE: ${{ inputs.source || 'release' }}
+  TAG: ${{ inputs.tag }}
+  REPO_URL: https://github.com/Classevelabs/rai
+  # The smallest starter model keeps the whole path, download to answer, to
+  # minutes; the same code serves every model.
+  MODEL: qwen2.5-0.5b
+  QUESTION: "What is the capital of France? Answer with one word."
+  EXPECT: Paris
+
+jobs:
+  windows:
+    name: Windows (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    steps:
+      - name: Fetch the downloads this run built
+        if: env.SOURCE == 'artifact'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: rai-dist
+          path: dist
+
+      - name: Fetch the downloads GitHub serves
+        if: env.SOURCE == 'release'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:TAG) { gh release download $env:TAG --repo Classevelabs/rai --dir dist }
+          else { gh release download --repo Classevelabs/rai --dir dist }
+          if ($LASTEXITCODE -ne 0) { throw 'could not download the release' }
+
+      # One step on purpose: the runner image has the Visual C++ runtime that
+      # a fresh Windows lacks, and once it is hidden no later step may need it.
+      - name: Install, start, ask, and uninstall, on a Windows without the Visual C++ runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dist = (Resolve-Path dist).Path
+          Get-ChildItem $dist | Format-Table Name, Length
+
+          $hidden = 0
+          foreach ($dir in "$env:WINDIR\System32", "$env:WINDIR\SysWOW64") {
+            Get-ChildItem -LiteralPath $dir -File | Where-Object { $_.Name -match '^(msvcp140|vcruntime140|concrt140|vccorlib140)(_\w+)?\.dll$' } | ForEach-Object {
+              & takeown.exe /f $_.FullName | Out-Null
+              & icacls.exe $_.FullName /grant '*S-1-5-32-544:F' | Out-Null
+              Rename-Item -LiteralPath $_.FullName -NewName "$($_.Name).clean-room"
+              $hidden++
+            }
+          }
+          Write-Host "hid $hidden Visual C++ runtime files"
+
+          # Only Windows' own folders: nothing the runner installed may stand in
+          # for something RAI or its scripts need.
+          $windowsPath = "$env:WINDIR\System32;$env:WINDIR;$env:WINDIR\System32\Wbem;$env:WINDIR\System32\WindowsPowerShell\v1.0"
+          $failures = [System.Collections.Generic.List[string]]::new()
+          function Run([string]$exe, [string[]]$arguments, [string]$path) {
+            $psi = [System.Diagnostics.ProcessStartInfo]::new($exe)
+            foreach ($a in $arguments) { $psi.ArgumentList.Add($a) }
+            $psi.UseShellExecute = $false
+            $psi.Environment['PATH'] = $path
+            $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+            $p = [System.Diagnostics.Process]::Start($psi)
+            $out = $p.StandardOutput.ReadToEndAsync(); $err = $p.StandardError.ReadToEndAsync()
+            if (-not $p.WaitForExit(900000)) { $p.Kill(); throw "$exe $arguments did not finish in 15 minutes" }
+            [pscustomobject]@{ code = $p.ExitCode; out = $out.Result; err = $err.Result }
+          }
+          function Ask-Server([string]$rai, [string]$model, [int]$port, [string]$path) {
+            $psi = [System.Diagnostics.ProcessStartInfo]::new($rai)
+            foreach ($a in 'serve', $model, '--port', "$port") { $psi.ArgumentList.Add($a) }
+            $psi.UseShellExecute = $false
+            $psi.Environment['PATH'] = $path
+            $server = [System.Diagnostics.Process]::Start($psi)
+            try {
+              $deadline = (Get-Date).AddMinutes(3); $info = $null
+              while ((Get-Date) -lt $deadline -and -not $info) {
+                try { $info = Invoke-RestMethod "http://127.0.0.1:$port/api/info" } catch { Start-Sleep -Milliseconds 500 }
+              }
+              if (-not $info -or -not $info.loaded) { return "the server never reported the model loaded" }
+              $page = Invoke-WebRequest "http://127.0.0.1:$port/" -UseBasicParsing
+              if ($page.Content -notmatch 'RAI Studio') { return "the page at / is not RAI Studio" }
+              $body = @{ message = $env:QUESTION; temperature = 0; max_tokens = 16 } | ConvertTo-Json
+              $reply = Invoke-RestMethod -Method Post "http://127.0.0.1:$port/api/chat" -ContentType 'application/json' -Body $body
+              $text = $reply | ConvertTo-Json -Depth 5
+              Write-Host "Studio's API answered: $text"
+              if ($text -notmatch $env:EXPECT) { return "Studio's API did not answer $($env:EXPECT)" }
+              return $null
+            } finally { if (-not $server.HasExited) { $server.Kill() } }
+          }
+
+          # --- Setup: install, start with only Windows on PATH, uninstall -----------
+          $setup = Get-ChildItem $dist -Filter 'rai-*-windows-x64-setup.exe' | Select-Object -First 1
+          $installed = "$env:LOCALAPPDATA\Programs\RAI"
+          $p = Start-Process -FilePath $setup.FullName -ArgumentList '/S' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { $failures.Add("Setup /S exited $($p.ExitCode)") }
+          foreach ($file in 'rai.exe', 'rai-studio.cmd', 'rai-get-model.cmd', 'rai-get-model.ps1', 'models.tsv', 'uninstall.exe') {
+            if (-not (Test-Path -LiteralPath (Join-Path $installed $file))) { $failures.Add("Setup did not install $file") }
+          }
+          $r = Run (Join-Path $installed 'rai.exe') @('--version') $windowsPath
+          Write-Host "installed rai --version: exit $($r.code), '$($r.out.Trim())'"
+          if ($r.code -ne 0 -or $r.out -notmatch '^rai \d+\.\d+\.\d+') { $failures.Add("the installed rai.exe did not start: exit $('0x{0:X8}' -f $r.code) $($r.err)") }
+          $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+          if (-not ($userPath.Split(';') -contains $installed)) { $failures.Add("Setup did not put $installed on the user's PATH: $userPath") }
+          if (-not (Test-Path ([Environment]::GetFolderPath('Programs') + '\RAI\RAI Studio.lnk'))) { $failures.Add('Setup made no Start menu entry') }
+          # In place (_?=), so the uninstall has finished when it returns.
+          $p = Start-Process -FilePath (Join-Path $installed 'uninstall.exe') -ArgumentList '/S', "_?=$installed" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { $failures.Add("the uninstaller exited $($p.ExitCode)") }
+          if (Test-Path -LiteralPath (Join-Path $installed 'rai.exe')) { $failures.Add('the uninstaller left rai.exe behind') }
+          $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+          if ($userPath -and ($userPath.Split(';') -contains $installed)) { $failures.Add('the uninstaller left RAI on the PATH') }
+          foreach ($left in ([Environment]::GetFolderPath('Programs') + '\RAI'), ([Environment]::GetFolderPath('Desktop') + '\RAI Studio.lnk'),
+                            'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\RAI') {
+            if (Test-Path -LiteralPath $left) { $failures.Add("the uninstaller left $left behind") }
+          }
+          Remove-Item -LiteralPath $installed -Recurse -Force -ErrorAction SilentlyContinue
+
+          # --- the one-line installer, in Windows PowerShell 5.1, with a model ------
+          $env:RAI_INSTALL_MODEL = $env:MODEL
+          if ($env:SOURCE -eq 'artifact') {
+            $env:RAI_INSTALL_FROM = $dist
+            $script = "iex (Get-Content -Raw -LiteralPath '$dist\install.ps1')"
+          } else {
+            if ($env:TAG) { $env:RAI_VERSION = $env:TAG; $from = "$env:REPO_URL/releases/download/$env:TAG/install.ps1" }
+            else { $from = "$env:REPO_URL/releases/latest/download/install.ps1" }
+            $script = "irm $from | iex"
+          }
+          $r = Run "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $script) $windowsPath
+          Write-Host $r.out; Write-Host $r.err
+          if ($r.code -ne 0) { $failures.Add("the one-line installer exited $($r.code)") }
+          $rai = Join-Path $installed 'rai.exe'
+          $model = "$env:USERPROFILE\RAI\models\$env:MODEL\$env:MODEL-q4.raimodel"
+          if (-not (Test-Path -LiteralPath $model)) { $failures.Add("no converted model at $model") }
+          else {
+            $r = Run $rai @('run', $model, '--prompt', $env:QUESTION, '--temperature', '0', '--max-tokens', '16') "$windowsPath;$installed"
+            Write-Host "rai run answered: $($r.out.Trim())"
+            if ($r.code -ne 0 -or $r.out -notmatch $env:EXPECT) { $failures.Add("rai run did not answer $($env:EXPECT): $($r.out) $($r.err)") }
+            $problem = Ask-Server $rai $model 18090 "$windowsPath;$installed"
+            if ($problem) { $failures.Add($problem) }
+          }
+
+          # --- removing a PowerShell install, with the steps INSTALL.md gives ------
+          $dir = Join-Path $env:LOCALAPPDATA 'Programs\RAI'
+          Remove-Item -Recurse -Force $dir
+          Remove-Item -Force (Join-Path ([Environment]::GetFolderPath('Programs')) 'RAI Studio.lnk')
+          $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+          $path = $key.GetValue('Path', '', 'DoNotExpandEnvironmentNames')
+          $key.SetValue('Path', (($path.Split(';') | Where-Object { $_ -and $_.TrimEnd('\') -ne $dir }) -join ';'), 'ExpandString')
+          $key.Close()
+          if (Test-Path -LiteralPath $dir) { $failures.Add('the documented removal left the RAI folder') }
+          $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+          if ($userPath -and ($userPath.Split(';') -contains $dir)) { $failures.Add('the documented removal left RAI on the PATH') }
+
+          if ($failures.Count -gt 0) {
+            foreach ($f in $failures) { Write-Host "::error::$f" }
+            throw "$($failures.Count) clean-room failure(s)"
+          }
+          Write-Host "Setup and the one-line installer work, and the model answers, on a Windows without the Visual C++ runtime"
+
+  macos:
+    name: macOS (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel]
+    steps:
+      - name: Fetch the downloads this run built
+        if: env.SOURCE == 'artifact'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: rai-dist
+          path: dist
+
+      - name: The one-line installer, with a model
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$SOURCE" = artifact ]; then
+            RAI_INSTALL_FROM="$PWD/dist" RAI_INSTALL_MODEL="$MODEL" sh dist/install.sh
+          elif [ -n "$TAG" ]; then
+            curl -fsSL "$REPO_URL/releases/download/$TAG/install.sh" | sh -s -- --version "$TAG" --model "$MODEL"
+          else
+            curl -fsSL "$REPO_URL/releases/latest/download/install.sh" | sh -s -- --model "$MODEL"
+          fi
+
+      - name: The program links nothing but macOS
+        shell: bash
+        run: |
+          set -euo pipefail
+          otool -L ~/.local/share/rai/rai
+          if otool -L ~/.local/share/rai/rai | tail -n +2 | grep -vE '^\s+/(usr/lib|System/Library)/'; then
+            echo "::error::rai links a library macOS does not ship"
+            exit 1
+          fi
+
+      - name: Ask the model, from the command line and through Studio
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+          model="$HOME/RAI/models/$MODEL/$MODEL-q4.raimodel"
+          answer=$(rai run "$model" --prompt "$QUESTION" --temperature 0 --max-tokens 16)
+          echo "rai run answered: $answer"
+          case "$answer" in *"$EXPECT"*) ;; *) echo "::error::rai run did not answer $EXPECT"; exit 1 ;; esac
+
+          RAI_NO_BROWSER=1 RAI_PORT=18090 rai-studio > studio.log 2>&1 &
+          studio=$!
+          for _ in $(seq 1 180); do
+            if curl -fsS http://127.0.0.1:18090/api/info 2>/dev/null | grep -q '"loaded":true'; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:18090/ | grep -q 'RAI Studio' || { cat studio.log; echo "::error::Studio did not come up"; exit 1; }
+          reply=$(curl -fsS -X POST -H 'Content-Type: application/json' \
+                  -d "{\"message\": \"$QUESTION\", \"temperature\": 0, \"max_tokens\": 16}" \
+                  http://127.0.0.1:18090/api/chat)
+          echo "Studio's API answered: $reply"
+          kill "$studio" 2>/dev/null || true
+          case "$reply" in *"$EXPECT"*) ;; *) echo "::error::Studio's API did not answer $EXPECT"; exit 1 ;; esac
+
+  linux:
+    name: Linux (${{ matrix.image }}, ${{ matrix.method }})
+    runs-on: ubuntu-24.04
+    container: ${{ matrix.image }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { image: 'ubuntu:20.04', method: deb }
+          - { image: 'ubuntu:22.04', method: deb }
+          - { image: 'ubuntu:24.04', method: deb }
+          - { image: 'debian:11', method: deb }
+          - { image: 'debian:12', method: deb }
+          - { image: 'fedora:latest', method: rpm }
+          - { image: 'rockylinux:8', method: rpm }
+          - { image: 'rockylinux:9', method: rpm }
+          - { image: 'opensuse/tumbleweed:latest', method: rpm }
+          - { image: 'archlinux:latest', method: script, flags: '--no-model' }
+          # As a Dockerfile runs it: no terminal to ask on and no model named.
+          # The installer must skip the question and finish, not fail on it.
+          - { image: 'ubuntu:22.04', method: script, flags: '' }
+    steps:
+      - name: Fetch the downloads this run built
+        if: env.SOURCE == 'artifact'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: rai-dist
+          path: dist
+
+      # What a person has before installing: the system's package manager,
+      # and curl for the one-line installer.
+      - name: Install RAI the way this distribution installs things
+        shell: bash
+        env:
+          METHOD: ${{ matrix.method }}
+          FLAGS: ${{ matrix.flags }}
+        run: |
+          set -euo pipefail
+          need_curl() {
+            command -v curl >/dev/null 2>&1 && return 0
+            if command -v apt-get >/dev/null; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl ca-certificates >/dev/null
+            elif command -v dnf >/dev/null; then dnf install -y -q curl >/dev/null
+            elif command -v zypper >/dev/null; then zypper --non-interactive install -y curl >/dev/null
+            elif command -v pacman >/dev/null; then pacman -Sy --noconfirm --needed curl >/dev/null
+            fi
+          }
+          if [ "$SOURCE" = release ]; then
+            need_curl
+            if [ -n "$TAG" ]; then base="$REPO_URL/releases/download/$TAG"; else base="$REPO_URL/releases/latest/download"; fi
+            mkdir -p dist
+            version="${TAG#v}"
+            if [ -z "$version" ]; then
+              version=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$REPO_URL/releases/latest"); version="${version##*/v}"
+            fi
+            case "$METHOD" in
+              deb) curl -fsSL -o "dist/rai_${version}_amd64.deb" "$base/rai_${version}_amd64.deb" ;;
+              rpm) curl -fsSL -o "dist/rai-${version}-1.x86_64.rpm" "$base/rai-${version}-1.x86_64.rpm" ;;
+            esac
+          fi
+          case "$METHOD" in
+            deb)
+              apt-get update -qq
+              DEBIAN_FRONTEND=noninteractive apt-get install -y ./dist/rai_*_amd64.deb
+              ;;
+            rpm)
+              if command -v zypper >/dev/null; then
+                zypper --non-interactive install --allow-unsigned-rpm ./dist/rai-*.x86_64.rpm
+              else
+                dnf install -y ./dist/rai-*.x86_64.rpm
+              fi
+              ;;
+            script)
+              need_curl
+              # FLAGS is split on purpose: empty, or one option.
+              if [ "$SOURCE" = artifact ]; then
+                RAI_INSTALL_FROM="$PWD/dist" sh dist/install.sh $FLAGS < /dev/null
+              elif [ -n "$TAG" ]; then
+                curl -fsSL "$REPO_URL/releases/download/$TAG/install.sh" | sh -s -- --version "$TAG" $FLAGS
+              else
+                curl -fsSL "$REPO_URL/releases/latest/download/install.sh" | sh -s -- $FLAGS
+              fi
+              echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+              ;;
+          esac
+
+      - name: Download a model with rai-get-model
+        shell: bash
+        run: |
+          set -euo pipefail
+          rai --version
+          rai-get-model "$MODEL" --yes
+
+      - name: Ask the model, from the command line and through Studio
+        shell: bash
+        run: |
+          set -euo pipefail
+          model="$HOME/RAI/models/$MODEL/$MODEL-q4.raimodel"
+          answer=$(rai run "$model" --prompt "$QUESTION" --temperature 0 --max-tokens 16)
+          echo "rai run answered: $answer"
+          case "$answer" in *"$EXPECT"*) ;; *) echo "::error::rai run did not answer $EXPECT"; exit 1 ;; esac
+
+          RAI_NO_BROWSER=1 RAI_PORT=18090 rai-studio > studio.log 2>&1 &
+          studio=$!
+          for _ in $(seq 1 180); do
+            if curl -fsS http://127.0.0.1:18090/api/info 2>/dev/null | grep -q '"loaded":true'; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:18090/ | grep -q 'RAI Studio' || { cat studio.log; echo "::error::Studio did not come up"; exit 1; }
+          reply=$(curl -fsS -X POST -H 'Content-Type: application/json' \
+                  -d "{\"message\": \"$QUESTION\", \"temperature\": 0, \"max_tokens\": 16}" \
+                  http://127.0.0.1:18090/api/chat)
+          echo "Studio's API answered: $reply"
+          kill "$studio" 2>/dev/null || true
+          case "$reply" in *"$EXPECT"*) ;; *) echo "::error::Studio's API did not answer $EXPECT"; exit 1 ;; esac

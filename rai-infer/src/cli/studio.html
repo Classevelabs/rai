@@ -1138,8 +1138,17 @@ function threadEmptyState(){
   if(!INFO||!INFO.loaded){
     const acts=[el("button",{class:"btn",onclick:openPicker},["Choose a model"]),
       el("button",{class:"btn ghost",onclick:()=>go("convert")},["Convert a model"])];
+    if(!MODELS.length){
+      /* The first-run case: nothing to pick yet. One command gets a model
+         that downloads without a login and converts; it lands in ~/RAI. */
+      const cmd="rai-get-model qwen2.5-1.5b";
+      acts.unshift(el("button",{class:"btn",onclick:()=>copy(cmd,"Command copied")},["Copy the command"]));
+      return el("div",{class:"empty"},[el("h3",{text:"No model yet"}),
+        el("p",{text:"Get one in a single step: run "+cmd+" in a terminal. It downloads Qwen2.5 1.5B Instruct (3 GB) and converts it, which takes a few minutes. Then choose it here."}),
+        el("div",{class:"acts"},acts)]);
+    }
     return el("div",{class:"empty"},[el("h3",{text:"No model loaded"}),
-      el("p",{text:MODELS.length?"Pick one of the models on this machine and it loads right here — the library screen is not a detour you have to take.":"No .raimodel files were found in the scanned folders. Convert a checkpoint or scan the folder your models are in."}),
+      el("p",{text:"Pick one of the models on this machine and it loads right here — the library screen is not a detour you have to take."}),
       el("div",{class:"acts"},acts)]);
   }
   const chip=text=>el("button",{class:"btn sm ghost",onclick:()=>{$("#prompt").value=text;sizePrompt();$("#prompt").focus()}},[text]);
@@ -1540,21 +1549,14 @@ function logAppend(lines){
   l.scrollTop=l.scrollHeight;
 }
 /* ---------- a refusal has to end in a next step ----------
-   The server says precisely why a checkpoint cannot be represented. That is
-   true and, on its own, useless: the user still has a folder and no model.
-   Map the blocker it named onto a checkpoint from the same family that this
-   format does store, at the closest size, and hand over the command that
-   fetches it. The server stays the authority on the verdict — nothing here
-   decides what is supported, it only answers a refusal the server issued. */
-const LADDERS={
-  qwen:[[0.5e9,"Qwen/Qwen2.5-0.5B-Instruct"],[1.5e9,"Qwen/Qwen2.5-1.5B-Instruct"],
-        [3e9,"Qwen/Qwen2.5-3B-Instruct"],[7e9,"Qwen/Qwen2.5-7B-Instruct"],
-        [14e9,"Qwen/Qwen2.5-14B-Instruct"],[32e9,"Qwen/Qwen2.5-32B-Instruct"]],
-  gemma:[[2.5e9,"google/gemma-2b-it"],[8.5e9,"google/gemma-7b-it"]],
-  llama:[[0.36e9,"HuggingFaceTB/SmolLM2-360M-Instruct"],[1.2e9,"meta-llama/Llama-3.2-1B-Instruct"],
-         [3.2e9,"meta-llama/Llama-3.2-3B-Instruct"],[8e9,"meta-llama/Llama-3.1-8B-Instruct"]],
-  mistral:[[7.2e9,"mistralai/Mistral-7B-Instruct-v0.3"]],
-};
+   The server says precisely why a checkpoint cannot be converted, in plain
+   words, and stays the authority on that verdict. What the page adds is the
+   way out: the starter models, which download without a Hugging Face login,
+   are pinned to an upload this build was tested on, and convert. The one
+   nearest in size to the refused checkpoint comes first. */
+const STARTERS=[[0.5e9,"qwen2.5-0.5b","Qwen2.5 0.5B Instruct: small and fast, 1 GB download."],
+  [1.5e9,"qwen2.5-1.5b","Qwen2.5 1.5B Instruct: the recommended one, 3 GB download."],
+  [7e9,"qwen2.5-7b","Qwen2.5 7B Instruct: the best answers, 15 GB download, needs 8 GB of memory."]];
 /* Parameter count if the config parsed; otherwise read the size out of the
    folder name, which is where model names carry it. Zero means unknown. */
 function paramCount(r,source){
@@ -1565,70 +1567,10 @@ function paramCount(r,source){
   if(m)return parseFloat(m[1])*1e6;
   return 0;
 }
-/* Closest rung by ratio, so 0.6B lands on 0.5B rather than on 1.5B. */
-function pick(family,params,why){
-  const rungs=LADDERS[family];
-  let best=rungs[Math.min(1,rungs.length-1)];
-  if(params>0){
-    let d=Infinity;
-    for(const rung of rungs){
-      const gap=Math.abs(Math.log(params/rung[0]));
-      if(gap<d){d=gap;best=rung}
-    }
-  }
-  return{id:best[1],why:why};
-}
-/* Which blocker the server named, in one plain sentence, plus what to run
-   instead. Matched on the wording the converter emits; an unrecognized
-   refusal still gets the generic answer rather than nothing. */
-function diagnose(r,source){
-  const reason=String((r&&r.reason)||""), tag=(String((r&&r.model_type)||"")+" "+source).toLowerCase();
-  const params=paramCount(r,source), qwen=/qwen/.test(tag), gemma=/gemma/.test(tag);
-  const same="Same family, same tokenizer and chat format.";
-  const near="Llama architecture at a comparable size; this is the shape the format is built around.";
-  if(/mixture-of-experts|num_experts|num_local_experts/.test(reason)){
-    /* An MoE checkpoint counts every expert in its parameter total but runs
-       only a few per token, so matching a dense model to that total would
-       propose far more compute than the model actually spends. */
-    const dense=Math.min(params||0,14e9);
-    return{plain:"This checkpoint routes each token through a set of expert MLPs. A layer here stores one gate/up/down MLP and no router, so there is nowhere for the experts to go.",
-      picks:qwen?[pick("qwen",dense,same),pick("mistral",dense,"Dense 7B with the same module tree.")]
-                :[pick("mistral",dense,"The dense Mistral-7B that Mixtral is assembled from."),pick("llama",dense,near)]};
-  }
-  const verifiedGemma={id:"google/gemma-2b-it",why:"The Gemma checkpoint verified generating on this build."};
-  /* When the converter refuses an architecture by name it also says, in plain
-     words, what that architecture does differently. Quote it rather than
-     guessing: this branch stays correct as the supported set moves. */
-  const named=/is not supported: ([^\n]+)/.exec(reason);
-  if(named)
-    return{plain:named[1].replace(/\s+/g," ").trim(),
-      picks:gemma?[pick("gemma",params,"An earlier Gemma generation, which this format does store."),verifiedGemma]
-           :qwen?[pick("qwen",params,same)]
-                :[pick("llama",params,near),pick("mistral",params,"Dense 7B with the same module tree.")]};
-  if(/QK norm|q_norm|k_norm/.test(reason))
-    return{plain:"Every attention head in this checkpoint carries its own Q and K normalization weights. A layer here has two norm vectors and both are already spoken for.",
-      picks:qwen?[pick("qwen",params,"Qwen2.5 is the previous generation of the same family and carries no per-head norms.")]
-           :gemma?[pick("gemma",params,"The first Gemma generation has no per-head norms."),verifiedGemma]
-                 :[pick("llama",params,near),pick("mistral",params,"Dense 7B alternative with the same module tree.")]};
-  if(/softcapping/.test(reason))
-    return{plain:"The config caps attention scores and final logits through a tanh. That is an extra operation in the forward pass, not an extra weight, and this format stores weights.",
-      picks:gemma?[pick("gemma",params,"The first Gemma generation has no softcapping."),verifiedGemma]
-                 :[pick("llama",params,near)]};
-  if(/rope_scaling|rope_type/.test(reason))
-    return{plain:"This checkpoint rescales rotary positions with a scheme the container does not store. It holds plain RoPE and the llama3 scheme, and nothing else.",
-      picks:[pick("llama",params,"Llama-3.1 and 3.2 use the llama3 scheme, which is stored and applied."),
-             pick("mistral",params,"Plain RoPE, no scaling.")]};
-  if(/does not expose model\.layers|LlamaForCausalLM/.test(reason))
-    return{plain:"The projections in this checkpoint are fused or named differently, so the seven tensors a layer stores are not there to read.",
-      picks:[pick("llama",params,near),pick("mistral",params,"Dense 7B with the same seven projections per layer.")]};
-  if(/lm_head\.bias/.test(reason))
-    return{plain:"This checkpoint puts a bias on the output projection. Biases are stored for the seven layer projections only, so that vector would be dropped in silence.",
-      picks:[pick("llama",params,near)]};
-  if(/inconsistent/.test(reason))
-    return{plain:"The layers of this checkpoint disagree about which projections carry biases, and one mask covers the whole file. Converting it would drop real parameters.",
-      picks:[pick("qwen",params,"Qwen2.5 biases the same projections in every layer.")]};
-  return{plain:"This checkpoint needs a weight or an operation the .raimodel container does not store.",
-    picks:[pick("llama",params,near),pick("qwen",params,"Qwen2.5, verified generating at 0.5B.")]};
+/* Every starter, nearest in size first (by ratio, so 0.6B lands on 0.5B). */
+function starters(params){
+  const rows=STARTERS.map(s=>({id:s[1],why:s[2],gap:params>0?Math.abs(Math.log(params/s[0])):(s[1]==="qwen2.5-1.5b"?0:1)}));
+  return rows.sort((a,b)=>a.gap-b.gap);
 }
 /* A sliding window is not a family problem: the same checkpoint converts at a
    shorter context. Offer that instead of an alternative model. */
@@ -1636,7 +1578,7 @@ function windowFix(reason){
   const m=/sliding_window=(\d+)/.exec(String(reason||""));
   return m?Number(m[1]):0;
 }
-function downloadCmd(id){return "huggingface-cli download "+id+" --local-dir ./"+(id.split("/").pop()||"model")}
+function downloadCmd(id){return "rai-get-model "+id}
 function fallbackCopy(text,done){
   const box=document.createElement("textarea");
   box.value=text;box.style.position="fixed";box.style.opacity="0";
@@ -1651,8 +1593,7 @@ function copy(text,label){
   fallbackCopy(text,done);
 }
 function altRow(a){
-  return `<div class="alt"><code>${esc(a.id)}</code>
-    <button class="btn sm ghost" data-alt-use="${esc(a.id)}">Use</button>
+  return `<div class="alt"><code>${esc(downloadCmd(a.id))}</code>
     <button class="btn sm ghost" data-alt-cmd="${esc(a.id)}">Copy command</button>
     <span class="why">${esc(a.why)}</span></div>`;
 }
@@ -1662,15 +1603,15 @@ function refusalPanel(r,source){
   const win=windowFix(r&&r.reason);
   const plain=win
     ?"This checkpoint attends over a "+win+"-token window. RAI always runs full causal attention, so past that window the two diverge."
-    :diagnose(r,source).plain;
+    :"RAI cannot convert this checkpoint, for the reason below.";
   let html=`<div style="color:var(--fg);font-size:13px">${esc(plain)}</div>
     <div class="tech">${esc((r&&r.reason)||"")}</div>
     <div class="nx"><h4>What to do instead</h4>`;
   if(win)return html+`<p class="hint">The same folder converts at a context of ${win} or lower. Nothing else about it is a problem.</p>
     <p class="hint"><button class="btn sm ghost" data-ctxfix="${win}">Set context to ${win}</button></p></div>`;
-  const seen=new Set(), picks=diagnose(r,source).picks.filter(a=>a&&!seen.has(a.id)&&seen.add(a.id));
-  if(picks.length)html+=`<div>${picks.map(altRow).join("")}</div>
-    <p class="hint">Download one into a folder, then point Source at that folder. Use fills the field above; Copy command gives you the <code>huggingface-cli</code> line.</p>`;
+  const picks=starters(paramCount(r,source));
+  html+=`<p class="hint">These models convert and run well, and download without a Hugging Face login. Copy the command, run it in a terminal, and the model appears in the library when it is done.</p>
+    <div>${picks.map(altRow).join("")}</div>`;
   return html+"</div>";
 }
 /* /api/inspect answers a repository id with 501: this build has no HTTP
@@ -1679,21 +1620,17 @@ function notLocalPanel(source,message){
   const id=source.replace(/^[\s\/]+|[\s\/]+$/g,"");
   const dir="./"+(id.split("/").pop()||"model");
   const cmd=downloadCmd(id);
-  return `<p class="hint">RAI inspects checkpoints on disk. This build carries no HTTP client, so it will not fetch <code>${esc(id)}</code> for you. Download it first:</p>
+  return `<p class="hint">RAI reads models from folders on this computer and never goes online by itself. To download <code>${esc(id)}</code> and convert it in one step, run this in a terminal:</p>
     <div class="cmd"><code>${esc(cmd)}</code>
       <button class="btn sm ghost" data-cmd="${esc(cmd)}">Copy</button></div>
-    <p class="hint">Then put that folder in Source: <code>${esc(dir)}</code>
+    <p class="hint">It checks first that RAI can convert the model, so nothing large is downloaded for a model that will not run. If you already downloaded it yourself, put that folder in Source instead: <code>${esc(dir)}</code>
       <button class="btn sm ghost" data-usedir="${esc(dir)}">Use it</button></p>
-    <p class="hint">Any folder works as long as it holds <code>config.json</code>, the <code>.safetensors</code> weights, and <code>tokenizer.json</code>. Where you keep it is your choice.</p>
+    <p class="hint">A folder works as long as it holds <code>config.json</code>, the <code>.safetensors</code> weights, and <code>tokenizer.json</code>.</p>
     <p class="hint">If you meant a folder on this machine, this is also what an unknown path looks like. Check the spelling.</p>
     <div class="tech">${esc(message||"")}</div>`;
 }
 /* Wire the buttons the panels above just wrote. */
 function bindNextStep(){
-  $$("[data-alt-use]").forEach(b=>b.addEventListener("click",()=>{
-    $("#src").value=b.dataset.altUse;$("#src").focus();
-    toast("Source set to "+b.dataset.altUse);
-  }));
   $$("[data-alt-cmd]").forEach(b=>b.addEventListener("click",()=>
     copy(downloadCmd(b.dataset.altCmd),"Download command copied")));
   $$("[data-cmd]").forEach(b=>b.addEventListener("click",()=>copy(b.dataset.cmd,"Command copied")));

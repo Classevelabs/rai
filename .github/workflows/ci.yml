@@ -131,6 +131,37 @@ jobs:
           # Rust reader tests were validated against.
           git diff --exit-code rai-infer/tests/fixtures/
 
+  # The scripts a person runs to install RAI and fetch a model are compiled by
+  # nothing, so they are checked here: shellcheck for the shell ones, the
+  # PowerShell parser for the Windows ones. Running them end to end on clean
+  # machines is the candidate and release workflows' job.
+  scripts:
+    name: Install scripts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: shellcheck
+        run: |
+          shellcheck --version
+          shellcheck --severity=warning installers/install.sh installers/linux/build-packages.sh \
+            launchers/rai-studio.sh launchers/rai-studio.command launchers/rai-get-model
+
+      - name: The PowerShell scripts parse
+        shell: pwsh
+        run: |
+          $failed = $false
+          foreach ($file in 'installers/install.ps1', 'launchers/rai-get-model.ps1') {
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $file), [ref]$null, [ref]$errors)
+            foreach ($e in $errors) { Write-Host "::error file=$file,line=$($e.Extent.StartLineNumber)::$($e.Message)"; $failed = $true }
+          }
+          if ($failed) { exit 1 }
+
   supply-chain:
     name: Advisory and package gate
     runs-on: ubuntu-24.04

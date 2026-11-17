@@ -193,7 +193,7 @@ impl ContextSource {
     }
 
     /// How the choice is narrated in the conversion log.
-    fn describe(self) -> &'static str {
+    pub(crate) fn describe(self) -> &'static str {
         match self {
             ContextSource::Requested => "requested with --max-context",
             ContextSource::ModelConfig => "the model's own max_position_embeddings",
