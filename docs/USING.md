@@ -13,19 +13,20 @@ terminal. A small window stays open while it runs; close that window, or
 press Ctrl+C in it, to stop RAI Studio. The chat opens in your browser at
 <http://localhost:8090>.
 
-Along the left edge:
+The buttons along the left edge open its three screens:
 
-- **Chat** is where you talk to the model. Each conversation is kept in the
-  chat list until you delete it. **Stop** ends a reply early.
 - **Library** lists the models on this computer. Pick one to load it.
 - **Convert** turns a model folder you downloaded yourself into a RAI model.
   **Check** tells you first whether it will work, before anything is written.
+- **Chat** is where you talk to the model. Conversations stay in the chat
+  list until you delete them, and **Stop** ends a reply early.
 
-Above the chat, the settings button opens **Tuning**: how long a reply may be
-(**Max new tokens**), how adventurous the wording is (**Temperature**; 0
-always picks the most likely word), the chat format and the context window.
-The system monitor button next to it shows your processor, memory and how much
-of the model's context the conversation has used.
+Along the top of the chat, the model menu switches models and the settings
+button opens **Tuning**: how long a reply may be (**Max new tokens**), how
+adventurous the wording is (**Temperature**; 0 always picks the most likely
+word), the chat format and the context window. The system monitor button
+beside it shows your processor, memory and how much of the model's context
+the conversation has used.
 
 Conversations stay in your browser, on this computer. RAI Studio answers only
 pages it served itself, so other websites can't reach it.
@@ -111,8 +112,9 @@ The answer, shortened to the fields most programs need:
 | `repetition_penalty` | 1 turns it off. Default 1.1 |
 
 The answer also carries the prompt's token count, the speed, and
-`stop_reason`: `eos` when the model finished its turn, `stop_sequence` when it wrote one
-of its chat format's stop markers, and `max_tokens` when it hit the limit.
+`stop_reason`: `eos` when the model finished its turn, `stop_sequence` when
+it wrote one of its chat format's stop markers, and `max_tokens` when it hit
+the limit.
 
 `POST /api/chat/stream` takes the same request and answers one JSON object per
 line while the reply is written, ending with a `done` record. Closing the

@@ -145,9 +145,9 @@ model appears in RAI Studio's model list.
 
 - Close other busy programs: RAI uses every core it can.
 - Try a smaller model. Speed falls as models grow.
-- Open the system monitor in RAI Studio (the button at the top). If **AVX2**
-  isn't lit, your processor runs RAI's portable code, which is slower. Apple
-  Silicon Macs also run the portable code. A smaller model helps most there.
+- Open the system monitor in RAI Studio (the button at the top of the chat).
+  If **AVX2** isn't lit, your processor runs RAI's portable code, which is
+  slower, and a smaller model helps most.
 
 ### The computer freezes, or RAI stops with an out-of-memory error
 
